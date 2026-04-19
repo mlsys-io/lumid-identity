@@ -9,7 +9,11 @@ services:
     ports:
       - "9900:9900"
     environment:
+      MYSQL_HOST: host.docker.internal
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD required}
+      REDIS_ADDR: host.docker.internal:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
+      SIGNING_KEY_DIR: /app/configs/signing-keys
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}

@@ -57,6 +57,12 @@ func Introspect(c *gin.Context) {
 		return
 	}
 
+	// Phase 8 metric: record which prefixes are still seen in the
+	// wild so we can time the sunset of legacy rm_pat_*/rmk_*/flm-*.
+	// Written async — introspect is on the hot path for every
+	// downstream service + must not block on a DB insert.
+	go recordIntrospectAudit(c.ClientIP(), c.GetHeader("User-Agent"), token)
+
 	// Fast path for legacy prefixes during shadow.
 	if config.G.Legacy.Enabled && strings.HasPrefix(token, "rm_pat_") {
 		if resp := introspectLegacyLQA(token); resp != nil {
@@ -240,6 +246,30 @@ func introspectJWT(token string) *IntrospectResponse {
 		Iat:       claims.IssuedAt.Unix(),
 		Source:    "native",
 	}
+}
+
+// recordIntrospectAudit writes one row per /oauth/introspect hit so
+// the deprecation dashboard can see which legacy prefixes are still
+// in play. Token body is never logged — only its prefix.
+func recordIntrospectAudit(ip, ua, token string) {
+	prefix := "unknown"
+	switch {
+	case strings.HasPrefix(token, "lm_pat_"):
+		prefix = "lm_pat"
+	case strings.HasPrefix(token, "rm_pat_"):
+		prefix = "rm_pat-legacy"
+	case strings.HasPrefix(token, "rmk_"):
+		prefix = "rmk-legacy"
+	case strings.HasPrefix(token, "flm-"):
+		prefix = "flm-legacy"
+	case strings.Count(token, ".") == 2:
+		prefix = "jwt"
+	}
+	common.DB.Exec(
+		`INSERT INTO audit_log (event, source, path, detail, ip, user_agent)
+		 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?)`,
+		prefix, `{"prefix":"`+prefix+`"}`, ip, ua,
+	)
 }
 
 func itoa(i int64) string {

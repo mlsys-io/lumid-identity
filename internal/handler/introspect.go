@@ -43,22 +43,17 @@ type IntrospectResponse struct {
 // tbl_rm_personal_access_token directly so the response is
 // byte-for-byte a mirror of LQA's /api/v1/identity/introspect —
 // that's the acceptance gate for Phase 1.
+//
+// Response envelope: when the route is the legacy LQA-compatible
+// alias `/api/v1/identity/introspect`, we wrap in LQA's
+// `{ret_code,message,data}` so Runmesh's existing mapLqaResponse
+// stays happy. The OIDC-standard `/oauth/introspect` stays flat
+// per RFC 7662.
 func Introspect(c *gin.Context) {
-	token := c.PostForm("token")
-	if token == "" {
-		// accept raw body too, for curl ergonomics
-		if c.Request.ContentLength > 0 {
-			b, _ := c.GetRawData()
-			token = strings.TrimSpace(string(b))
-			if strings.HasPrefix(token, "token=") {
-				token = strings.TrimPrefix(token, "token=")
-			}
-		}
-	}
-	token = strings.TrimSpace(token)
+	token := extractIntrospectToken(c)
 
 	if token == "" {
-		c.JSON(http.StatusOK, IntrospectResponse{Active: false, Reason: "no token"})
+		writeIntrospect(c, IntrospectResponse{Active: false, Reason: "no token"})
 		return
 	}
 
@@ -71,7 +66,7 @@ func Introspect(c *gin.Context) {
 	// Fast path for legacy prefixes during shadow.
 	if config.G.Legacy.Enabled && strings.HasPrefix(token, "rm_pat_") {
 		if resp := introspectLegacyLQA(token); resp != nil {
-			c.JSON(http.StatusOK, resp)
+			writeIntrospect(c, *resp)
 			return
 		}
 	}
@@ -79,7 +74,7 @@ func Introspect(c *gin.Context) {
 	// Native lm_* tokens (Phase 3 onward)
 	if strings.HasPrefix(token, "lm_") {
 		if resp := introspectNative(token); resp != nil {
-			c.JSON(http.StatusOK, resp)
+			writeIntrospect(c, *resp)
 			return
 		}
 	}
@@ -87,12 +82,62 @@ func Introspect(c *gin.Context) {
 	// JWT (lm_session cookies, Bearer Authorization headers)
 	if strings.Count(token, ".") == 2 {
 		if resp := introspectJWT(token); resp != nil {
-			c.JSON(http.StatusOK, resp)
+			writeIntrospect(c, *resp)
 			return
 		}
 	}
 
-	c.JSON(http.StatusOK, IntrospectResponse{Active: false, Reason: "unknown token"})
+	writeIntrospect(c, IntrospectResponse{Active: false, Reason: "unknown token"})
+}
+
+// extractIntrospectToken pulls the token out of form body, JSON body,
+// or Authorization header — whichever the caller used. Runmesh sends
+// JSON `{"token": "..."}` via WebClient; curl tends to use form;
+// OAuth2 clients may use either per the RFC 7662 spec.
+func extractIntrospectToken(c *gin.Context) string {
+	if t := strings.TrimSpace(c.PostForm("token")); t != "" {
+		return t
+	}
+	// Try JSON body.
+	ct := c.ContentType()
+	if strings.Contains(ct, "application/json") {
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := c.ShouldBindJSON(&body); err == nil {
+			if t := strings.TrimSpace(body.Token); t != "" {
+				return t
+			}
+		}
+	}
+	// Final fallback: raw body (handles `token=xxx` without proper
+	// Content-Type header, which some hand-rolled curl scripts send).
+	if c.Request.ContentLength > 0 {
+		b, _ := c.GetRawData()
+		raw := strings.TrimSpace(string(b))
+		if strings.HasPrefix(raw, "token=") {
+			return strings.TrimPrefix(raw, "token=")
+		}
+		// Accept a bare JWT in the body too.
+		return raw
+	}
+	// Authorization header: Bearer <token>.
+	if h := c.GetHeader("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	}
+	return ""
+}
+
+// writeIntrospect picks the envelope shape per route. /oauth/introspect
+// stays flat (RFC 7662 + OIDC-compatible); the LQA-compatible alias
+// at /api/v1/identity/introspect wraps in `{ret_code,message,data}`
+// because downstream Runmesh code reads `envelope.data`.
+func writeIntrospect(c *gin.Context, resp IntrospectResponse) {
+	if strings.HasPrefix(c.FullPath(), "/api/v1/identity/") {
+		ok(c, "operation.success", resp)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // introspectLegacyLQA mirrors the shape of LQA's IdentityLogic.Introspect.

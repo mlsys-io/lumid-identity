@@ -12,6 +12,34 @@ import (
 	"lumid_identity/models"
 )
 
+// GET /api/v1/session-bearer — returns the current session JWT to JS
+// on lum.id so it can forward it as Authorization: Bearer <jwt> on
+// cross-domain admin calls (runmesh.ai, etc.) where the HttpOnly
+// `.lum.id` cookie cannot reach. Only exposes to the authenticated
+// caller themselves — 401 when no session.
+//
+// This is a pragmatic bridge until every downstream app lives under
+// `*.lum.id` where the session cookie flows automatically. The
+// returned token is the same JWT already in lm_session; exposing it
+// to JS widens the XSS blast radius marginally but is bounded by
+// the session's own TTL and logout-everywhere.
+func SessionBearerHandler(c *gin.Context) {
+	tok := bearerToken(c)
+	if tok == "" {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	claims, err := common.VerifyJWT(tok)
+	if err != nil {
+		fail(c, http.StatusUnauthorized, 1003, "invalid session")
+		return
+	}
+	ok(c, "ok", gin.H{
+		"token":      tok,
+		"expires_at": claims.ExpiresAt.Unix(),
+	})
+}
+
 // GET /api/v1/user — return the current user based on the session
 // cookie. This is what every frontend calls on mount to decide
 // "logged in or not". 401 means no/expired session.

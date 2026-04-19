@@ -21,18 +21,19 @@ func Register(r *gin.Engine) {
 
 	v1 := r.Group("/api/v1")
 	{
-		v1.POST("/login", Login)
-		v1.POST("/register", RegisterUser)
-		v1.POST("/send-verification-code", SendVerificationCode)
+		v1.POST("/login", LoginHandler)
+		v1.POST("/logout", LogoutHandler)
+		v1.POST("/register", RegisterHandler)
+		v1.POST("/send-verification-code", SendVerificationCodeHandler)
 		v1.POST("/oauth/google/login", GoogleLogin)
 		v1.POST("/oauth/github/login", GithubLogin)
 
 		// LQA-compatible PAT surface — same path so downstream code
 		// (frontend /account/tokens, install.sh) works unchanged after
 		// Phase 3 repoints the proxy.
-		v1.POST("/identity/personal-access-tokens", PATMint)
-		v1.GET("/identity/personal-access-tokens", PATList)
-		v1.DELETE("/identity/personal-access-tokens/:id", PATRevoke)
+		v1.POST("/identity/personal-access-tokens", PATMintHandler)
+		v1.GET("/identity/personal-access-tokens", PATListHandler)
+		v1.DELETE("/identity/personal-access-tokens/:id", PATRevokeHandler)
 
 		// LQA-compatible introspect path so Runmesh's existing
 		// LUMID_LQA_BASE_URL switch is literally a URL change.

@@ -23,20 +23,15 @@ func notImplemented(feature string) gin.HandlerFunc {
 }
 
 // Phase 2 — login / register / 3rd-party
+// Social OAuth is deferred to Phase 2 proper (needs client creds
+// wired + redirect URIs reclaimed at the provider console).
 var (
-	Login                = notImplemented("POST /api/v1/login")
-	RegisterUser         = notImplemented("POST /api/v1/register")
-	SendVerificationCode = notImplemented("POST /api/v1/send-verification-code")
-	GoogleLogin          = notImplemented("POST /api/v1/oauth/google/login")
-	GithubLogin          = notImplemented("POST /api/v1/oauth/github/login")
+	GoogleLogin = notImplemented("POST /api/v1/oauth/google/login")
+	GithubLogin = notImplemented("POST /api/v1/oauth/github/login")
 )
 
-// Phase 2/3 — PAT CRUD (move from LQA)
-var (
-	PATMint   = notImplemented("POST /api/v1/identity/personal-access-tokens")
-	PATList   = notImplemented("GET /api/v1/identity/personal-access-tokens")
-	PATRevoke = notImplemented("DELETE /api/v1/identity/personal-access-tokens/:id")
-)
+// Login / Register / SendVerificationCode now live in auth.go.
+// PAT mint/list/revoke now live in pat.go.
 
 // Phase 2 — OIDC authorization + token + userinfo
 var (

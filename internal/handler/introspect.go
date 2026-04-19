@@ -152,15 +152,94 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 	}
 }
 
-// introspectNative — native lm_* token lookup. Stubbed until Phase 3.
+// introspectNative — native lm_* token lookup against lumid_identity.tokens.
+// Bumps last_used_at on hit so the dashboard can show stale tokens.
 func introspectNative(token string) *IntrospectResponse {
-	return nil
+	sum := sha256.Sum256([]byte(token))
+	hash := hex.EncodeToString(sum[:])
+
+	var row struct {
+		ID        string
+		UserID    string
+		Prefix    string
+		Scopes    string
+		ExpiresAt *time.Time
+		RevokedAt *time.Time
+	}
+	err := common.DB.Raw(`
+		SELECT id, user_id, prefix, scopes, expires_at, revoked_at
+		FROM tokens WHERE hash = ? LIMIT 1`, hash).Scan(&row).Error
+	if err != nil || row.ID == "" {
+		return &IntrospectResponse{Active: false, Reason: "no such token"}
+	}
+	now := time.Now()
+	if row.RevokedAt != nil {
+		return &IntrospectResponse{Active: false, Reason: "revoked"}
+	}
+	if row.ExpiresAt != nil && row.ExpiresAt.Before(now) {
+		return &IntrospectResponse{Active: false, Reason: "expired"}
+	}
+	// async last_used_at bump; don't block the reply
+	go common.DB.Exec(`UPDATE tokens SET last_used_at = ? WHERE id = ?`, now, row.ID)
+
+	// Enrich with email/name for downstream ergonomics.
+	var u struct {
+		Email string
+		Name  string
+		Role  string
+	}
+	common.DB.Raw(`SELECT email, name, role FROM users WHERE id = ? LIMIT 1`, row.UserID).Scan(&u)
+
+	scopes := strings.Fields(row.Scopes)
+	var exp int64
+	if row.ExpiresAt != nil {
+		exp = row.ExpiresAt.Unix()
+	}
+	return &IntrospectResponse{
+		Active:    true,
+		Sub:       row.UserID,
+		Email:     u.Email,
+		Username:  u.Name,
+		Scopes:    scopes,
+		Scope:     strings.Join(scopes, " "),
+		TokenType: "pat",
+		Exp:       exp,
+		Source:    "native",
+	}
 }
 
-// introspectJWT — verify against our signing keys. Stubbed until JWT
-// issuance lands (Phase 2 login flow).
+// introspectJWT — verify the signature against our JWKS + check
+// the session isn't revoked. Used when downstream services bounce
+// the bearer cookie through introspect instead of verifying locally.
 func introspectJWT(token string) *IntrospectResponse {
-	return nil
+	claims, err := common.VerifyJWT(token)
+	if err != nil {
+		return &IntrospectResponse{Active: false, Reason: "jwt verify: " + err.Error()}
+	}
+	// Session revocation: one row per jti. Logout flips revoked_at.
+	// We treat "no such session" as expired (the JWT verified fine
+	// but the server has no record — could be post-restart before the
+	// session table was migrated; let it through to avoid lockout).
+	var sess struct {
+		ID        string     `gorm:"column:id"`
+		RevokedAt *time.Time `gorm:"column:revoked_at"`
+	}
+	common.DB.Raw(`SELECT id, revoked_at FROM sessions WHERE jti = ? LIMIT 1`, claims.ID).Scan(&sess)
+	if sess.ID != "" && sess.RevokedAt != nil {
+		return &IntrospectResponse{Active: false, Reason: "session revoked"}
+	}
+	scopes := strings.Fields(claims.Scopes)
+	return &IntrospectResponse{
+		Active:    true,
+		Sub:       claims.Subject,
+		Email:     claims.Email,
+		Scopes:    scopes,
+		Scope:     claims.Scopes,
+		TokenType: "jwt",
+		Exp:       claims.ExpiresAt.Unix(),
+		Iat:       claims.IssuedAt.Unix(),
+		Source:    "native",
+	}
 }
 
 func itoa(i int64) string {

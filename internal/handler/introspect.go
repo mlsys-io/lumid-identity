@@ -22,6 +22,11 @@ type IntrospectResponse struct {
 	Sub       string   `json:"sub,omitempty"`        // canonical user id
 	Username  string   `json:"username,omitempty"`
 	Email     string   `json:"email,omitempty"`
+	// Role from the user record — "user" or "admin". Downstream
+	// services (Runmesh admin UI via lum.id, etc.) read this to
+	// decide whether a lum.id-issued token is allowed to hit admin
+	// endpoints without an extra permission map of their own.
+	Role      string   `json:"role,omitempty"`
 	Scopes    []string `json:"scopes,omitempty"`
 	Scope     string   `json:"scope,omitempty"`      // space-separated, RFC 7662 shape
 	ClientID  string   `json:"client_id,omitempty"`
@@ -129,13 +134,14 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 		return &IntrospectResponse{Active: false, Reason: "expired"}
 	}
 
-	// Pull the LQA user so downstream gets a useful sub + email.
+	// Pull the LQA user so downstream gets a useful sub + email + role.
 	var u struct {
 		ID       int64  `gorm:"column:id"`
 		Email    string `gorm:"column:email"`
 		Username string `gorm:"column:username"`
+		Role     string `gorm:"column:role"`
 	}
-	common.LegacyDB.Raw(`SELECT id, email, username FROM tbl_user WHERE id = ? LIMIT 1`, row.UserID).Scan(&u)
+	common.LegacyDB.Raw(`SELECT id, email, username, role FROM tbl_user WHERE id = ? LIMIT 1`, row.UserID).Scan(&u)
 
 	// LQA stores scopes comma-separated; Runmesh stores space-separated.
 	// Accept either and normalize so downstream consumers see a clean array.
@@ -150,6 +156,7 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 		Sub:       itoa(row.UserID),
 		Email:     u.Email,
 		Username:  u.Username,
+		Role:      u.Role,
 		Scopes:    scopeList,
 		Scope:     strings.Join(scopeList, " "),
 		TokenType: "pat",
@@ -206,6 +213,7 @@ func introspectNative(token string) *IntrospectResponse {
 		Sub:       row.UserID,
 		Email:     u.Email,
 		Username:  u.Name,
+		Role:      u.Role,
 		Scopes:    scopes,
 		Scope:     strings.Join(scopes, " "),
 		TokenType: "pat",
@@ -239,6 +247,7 @@ func introspectJWT(token string) *IntrospectResponse {
 		Active:    true,
 		Sub:       claims.Subject,
 		Email:     claims.Email,
+		Role:      claims.Role,
 		Scopes:    scopes,
 		Scope:     claims.Scopes,
 		TokenType: "jwt",

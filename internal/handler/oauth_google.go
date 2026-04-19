@@ -156,14 +156,26 @@ func GoogleLoginHandler(c *gin.Context) {
 	})
 	setSessionCookie(c, sessionTok, exp)
 
-	ok(c, "login ok", loginResp{
-		Token:     sessionTok,
-		ExpiresAt: exp,
-		User: userOut{
-			ID:    u.ID,
-			Email: u.Email,
-			Name:  u.Name,
-			Role:  u.Role,
+	// Keep the response shape that the ported lumid.market callback
+	// page expects: {token, expires_in, user_info}. We include the
+	// invitation_code field so the frontend's check can see it — it's
+	// unused on lum.id but still wired in the shared types.
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0,
+		"message":  "login ok",
+		"data": gin.H{
+			"token":      sessionTok,
+			"expires_in": int(time.Until(exp).Seconds()),
+			"user_info": gin.H{
+				"id":              u.ID,
+				"email":           u.Email,
+				"username":        u.Name,
+				"avatar":          u.AvatarURL,
+				"role":            u.Role,
+				"status":          u.Status,
+				"invitation_code": u.InvitationCodeUsed,
+				"email_verified":  u.EmailVerified,
+			},
 		},
 	})
 }

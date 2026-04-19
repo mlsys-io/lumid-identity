@@ -250,8 +250,16 @@ func SendVerificationCodeHandler(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "store otp")
 		return
 	}
-	// TODO(phase-2): send email. For now log so testers can read it.
-	fmt.Printf("[otp] %s -> %s\n", req.Email, code)
+	// Real SMTP send (Gmail app password). If unconfigured the
+	// helper falls back to stdout so dev builds still work.
+	if err := common.SendVerificationCode(req.Email, code); err != nil {
+		// OTP is already in Redis, so a retry will deliver. Log the
+		// cause and return a generic failure so we don't leak SMTP
+		// internals to the client.
+		fmt.Printf("[email] verification send failed for %s: %v\n", req.Email, err)
+		fail(c, http.StatusInternalServerError, 1500, "could not send verification email")
+		return
+	}
 	ok(c, "verification code sent", nil)
 }
 

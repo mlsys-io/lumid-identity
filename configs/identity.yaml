@@ -42,3 +42,15 @@ legacy:
   # introspect responses without migrating data. Set false after Phase 3.
   enabled: true
   dsn: "root:${MYSQL_ROOT_PASSWORD}@tcp(${MYSQL_HOST}:3306)/trading_community?parseTime=true&charset=utf8mb4"
+
+email:
+  # Gmail app password — same account already used for LQA verification
+  # emails, ported into this service so lum.id owns the sender identity.
+  # Empty SMTP_HOST falls back to stdout logging (dev mode).
+  smtp_host: "${EMAIL_SMTP_HOST}"
+  smtp_port: 465
+  smtp_user: "${EMAIL_SMTP_USER}"
+  smtp_password: "${EMAIL_SMTP_PASSWORD}"
+  from_address: "${EMAIL_FROM_ADDRESS}"
+  from_name: "${EMAIL_FROM_NAME}"
+  reset_base_url: "https://lum.id/auth/reset-password"

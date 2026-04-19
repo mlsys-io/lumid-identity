@@ -63,6 +63,23 @@ type Config struct {
 		Enabled       bool   `yaml:"enabled"`
 		DSN           string `yaml:"dsn"` // trading_community MySQL DSN
 	} `yaml:"legacy"`
+
+	// Email / SMTP — used for verification codes, password-reset
+	// links, and any future transactional email. When Host is empty
+	// the email package falls back to stdout logging so local
+	// dev doesn't need SMTP creds.
+	Email struct {
+		SMTPHost     string `yaml:"smtp_host"`
+		SMTPPort     int    `yaml:"smtp_port"`
+		SMTPUser     string `yaml:"smtp_user"`
+		SMTPPassword string `yaml:"smtp_password"`
+		FromAddress  string `yaml:"from_address"`
+		FromName     string `yaml:"from_name"`
+		// ResetBaseURL — where the reset-password page lives.
+		// Appended to the emailed link as ?token=... so operators can
+		// repoint without a code change if the URL ever moves.
+		ResetBaseURL string `yaml:"reset_base_url"`
+	} `yaml:"email"`
 }
 
 var G *Config

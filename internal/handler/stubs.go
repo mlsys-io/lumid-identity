@@ -22,10 +22,9 @@ func notImplemented(feature string) gin.HandlerFunc {
 	}
 }
 
-// Phase 2 — 3rd-party social login. Deferred (needs client creds
-// wired + redirect URIs reclaimed at the provider console).
+// Google login handler now lives in oauth_google.go.
+// GitHub login still stubbed — needs a registered GitHub OAuth App.
 var (
-	GoogleLogin = notImplemented("POST /api/v1/oauth/google/login")
 	GithubLogin = notImplemented("POST /api/v1/oauth/github/login")
 )
 

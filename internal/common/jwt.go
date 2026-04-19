@@ -16,7 +16,7 @@ import (
 type JWTClaims struct {
 	Scopes string `json:"scope,omitempty"` // space-separated, standard OAuth shape
 	Email  string `json:"email,omitempty"`
-	Role   string `json:"role,omitempty"`
+	Role   string `json:"role,omitempty"`   // "user" | "admin"
 	jwt.RegisteredClaims
 }
 

@@ -13,6 +13,7 @@ var AllTables = []interface{}{
 	&OAuthCode{},
 	&Session{},
 	&SigningKey{},
+	&InvitationCode{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

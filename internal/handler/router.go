@@ -39,6 +39,14 @@ func Register(r *gin.Engine) {
 		// LQA-compatible introspect path so Runmesh's existing
 		// LUMID_LQA_BASE_URL switch is literally a URL change.
 		v1.POST("/identity/introspect", Introspect)
+
+		// Admin invitation-code management (ported from LQA management UI).
+		admin := v1.Group("/admin", RequireAdmin())
+		{
+			admin.POST("/invitation-codes", AdminInviteMint)
+			admin.GET("/invitation-codes", AdminInviteList)
+			admin.DELETE("/invitation-codes/:code", AdminInviteRevoke)
+		}
 	}
 }
 

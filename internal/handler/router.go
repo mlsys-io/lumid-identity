@@ -25,6 +25,7 @@ func Register(r *gin.Engine) {
 		v1.POST("/logout", LogoutHandler)
 		v1.POST("/register", RegisterHandler)
 		v1.POST("/send-verification-code", SendVerificationCodeHandler)
+		v1.GET("/user", CurrentUserHandler)
 		v1.POST("/oauth/google/login", GoogleLogin)
 		v1.POST("/oauth/github/login", GithubLogin)
 

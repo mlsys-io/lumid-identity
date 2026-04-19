@@ -24,7 +24,7 @@ signing:
   key_dir: "${SIGNING_KEY_DIR}"
 
 jwt:
-  access_ttl_sec: 900        # 15 min
+  access_ttl_sec: 86400      # 24h — dashboards expect a working-day session
   refresh_ttl_sec: 2592000   # 30 days
 
 oauth:

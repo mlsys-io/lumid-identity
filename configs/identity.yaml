@@ -4,21 +4,24 @@ app:
   issuer: https://lum.id
 
 mysql:
-  host: 127.0.0.1
+  # Inside Docker, override MYSQL_HOST=host.docker.internal so we hit
+  # the trading_mysql container via the host gateway.
+  host: "${MYSQL_HOST}"
   port: 3306
   user: root
   password: "${MYSQL_ROOT_PASSWORD}"
   database: lumid_identity
 
 redis:
-  addr: 127.0.0.1:6379
+  addr: "${REDIS_ADDR}"
   password: "${REDIS_PASSWORD}"
   db: 3   # db 0 is LQA, 1-2 reserved, 3 for identity
 
 signing:
   # Each .pem here = one RS256 keypair. Filename (sans ext) = kid.
-  # Generate initial key: see migrations/seed_signing_key.sh
-  key_dir: /proj/lumid_identity/configs/signing-keys
+  # Losing this dir invalidates every issued JWT — the Docker compose
+  # persists it at /var/lib/lumid-identity/signing-keys on the host.
+  key_dir: "${SIGNING_KEY_DIR}"
 
 jwt:
   access_ttl_sec: 900        # 15 min
@@ -38,4 +41,4 @@ legacy:
   # Shadow mode: read from QuantArena MySQL so we can mirror its
   # introspect responses without migrating data. Set false after Phase 3.
   enabled: true
-  dsn: "root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/trading_community?parseTime=true&charset=utf8mb4"
+  dsn: "root:${MYSQL_ROOT_PASSWORD}@tcp(${MYSQL_HOST}:3306)/trading_community?parseTime=true&charset=utf8mb4"

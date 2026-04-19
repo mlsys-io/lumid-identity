@@ -72,8 +72,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Expand ${ENV_VAR} in place before parsing — keeps the YAML
+	// declarative but lets ops inject secrets via env without a
+	// separate templating pass.
+	expanded := os.Expand(string(b), os.Getenv)
 	c := &Config{}
-	if err := yaml.Unmarshal(b, c); err != nil {
+	if err := yaml.Unmarshal([]byte(expanded), c); err != nil {
 		return nil, err
 	}
 	G = c

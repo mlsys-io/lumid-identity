@@ -1,0 +1,8 @@
+/bin/
+/identity
+/vendor/
+*.env
+.env
+.DS_Store
+configs/identity.local.yaml
+configs/signing-keys/*.pem

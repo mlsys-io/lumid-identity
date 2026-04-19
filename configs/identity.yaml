@@ -1,0 +1,41 @@
+app:
+  port: 9900
+  mode: debug
+  issuer: https://lum.id
+
+mysql:
+  host: 127.0.0.1
+  port: 3306
+  user: root
+  password: "${MYSQL_ROOT_PASSWORD}"
+  database: lumid_identity
+
+redis:
+  addr: 127.0.0.1:6379
+  password: "${REDIS_PASSWORD}"
+  db: 3   # db 0 is LQA, 1-2 reserved, 3 for identity
+
+signing:
+  # Each .pem here = one RS256 keypair. Filename (sans ext) = kid.
+  # Generate initial key: see migrations/seed_signing_key.sh
+  key_dir: /proj/lumid_identity/configs/signing-keys
+
+jwt:
+  access_ttl_sec: 900        # 15 min
+  refresh_ttl_sec: 2592000   # 30 days
+
+oauth:
+  google:
+    client_id: "${GOOGLE_CLIENT_ID}"
+    client_secret: "${GOOGLE_CLIENT_SECRET}"
+    redirect_uri: https://lum.id/auth/callback
+  github:
+    client_id: "${GITHUB_CLIENT_ID}"
+    client_secret: "${GITHUB_CLIENT_SECRET}"
+    redirect_uri: https://lum.id/auth/callback
+
+legacy:
+  # Shadow mode: read from QuantArena MySQL so we can mirror its
+  # introspect responses without migrating data. Set false after Phase 3.
+  enabled: true
+  dsn: "root:${MYSQL_ROOT_PASSWORD}@tcp(127.0.0.1:3306)/trading_community?parseTime=true&charset=utf8mb4"

@@ -69,6 +69,46 @@ func IssueJWT(userID, email, role string, scopes []string) (string, string, time
 	return signed, jti, exp, nil
 }
 
+// IssueIDToken signs an OIDC id_token whose `aud` is the requesting
+// client_id (required by the spec, and verified by oauth2-proxy et al).
+// Returns (token, exp).
+func IssueIDToken(userID, email, name, clientID string, emailVerified bool) (string, time.Time, error) {
+	k := Keys.Active()
+	if k == nil {
+		return "", time.Time{}, fmt.Errorf("no active signing key")
+	}
+	jti, err := randID(16)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	ttl := time.Duration(config.G.JWT.AccessTTLSec) * time.Second
+	if ttl == 0 {
+		ttl = 15 * time.Minute
+	}
+	now := time.Now()
+	exp := now.Add(ttl)
+
+	claims := jwt.MapClaims{
+		"iss":            config.G.App.Issuer,
+		"sub":            userID,
+		"aud":            clientID,
+		"exp":            exp.Unix(),
+		"iat":            now.Unix(),
+		"nbf":            now.Add(-30 * time.Second).Unix(),
+		"jti":            jti,
+		"email":          email,
+		"email_verified": emailVerified,
+		"name":           name,
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	tok.Header["kid"] = k.Kid
+	signed, err := tok.SignedString(k.Private)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return signed, exp, nil
+}
+
 // VerifyJWT checks signature + expiry against our keyring. Downstream
 // services that fetch JWKS use their own verify; this is for
 // /oauth/introspect and /oauth/userinfo on our side.

@@ -22,8 +22,7 @@ func notImplemented(feature string) gin.HandlerFunc {
 	}
 }
 
-// Phase 2 — login / register / 3rd-party
-// Social OAuth is deferred to Phase 2 proper (needs client creds
+// Phase 2 — 3rd-party social login. Deferred (needs client creds
 // wired + redirect URIs reclaimed at the provider console).
 var (
 	GoogleLogin = notImplemented("POST /api/v1/oauth/google/login")
@@ -32,6 +31,7 @@ var (
 
 // Login / Register / SendVerificationCode now live in auth.go.
 // PAT mint/list/revoke now live in pat.go.
+// OAuth authorize / token / userinfo now live in oauth.go.
 
 // Phase 2 — OIDC authorization + token + userinfo
 var (

@@ -14,10 +14,10 @@ func Register(r *gin.Engine) {
 	r.GET("/.well-known/openid-configuration", OpenIDConfig)
 	r.GET("/.well-known/jwks.json", Jwks)
 	r.POST("/oauth/introspect", Introspect)
-	r.GET("/oauth/authorize", OAuthAuthorize)
-	r.POST("/oauth/authorize", OAuthAuthorize)
-	r.POST("/oauth/token", OAuthToken)
-	r.GET("/oauth/userinfo", OAuthUserinfo)
+	r.GET("/oauth/authorize", OAuthAuthorizeHandler)
+	r.POST("/oauth/authorize", OAuthAuthorizeHandler)
+	r.POST("/oauth/token", OAuthTokenHandler)
+	r.GET("/oauth/userinfo", OAuthUserinfoHandler)
 
 	v1 := r.Group("/api/v1")
 	{

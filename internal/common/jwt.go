@@ -69,6 +69,65 @@ func IssueJWT(userID, email, role string, scopes []string) (string, string, time
 	return signed, jti, exp, nil
 }
 
+// IssueBridgeJWT mints a short-lived, scope-constrained JWT meant to
+// be handed out to JavaScript on lum.id for forwarding to a specific
+// downstream service (runmesh.ai, etc.) where the HttpOnly `.lum.id`
+// session cookie can't reach. Distinct from IssueJWT in three ways:
+//
+//   1. Caller controls TTL (sessions are 24h; bridge tokens are 10m).
+//   2. Caller picks a service-specific audience (session JWTs carry
+//      `lumid-ecosystem`; bridge JWTs carry e.g. `runmesh`).
+//   3. Caller supplies a narrow scope set so XSS that steals the
+//      bearer can't do more than the specific bridge allows.
+//
+// Still signed by the same keyring so downstream services verifying
+// against our JWKS accept it unchanged.
+func IssueBridgeJWT(userID, email, role, audience string, scopes []string, ttl time.Duration) (string, string, time.Time, error) {
+	k := Keys.Active()
+	if k == nil {
+		return "", "", time.Time{}, fmt.Errorf("no active signing key")
+	}
+	jti, err := randID(16)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	now := time.Now()
+	exp := now.Add(ttl)
+
+	scope := ""
+	for i, s := range scopes {
+		if i > 0 {
+			scope += " "
+		}
+		scope += s
+	}
+
+	claims := JWTClaims{
+		Scopes: scope,
+		Email:  email,
+		Role:   role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    config.G.App.Issuer,
+			Subject:   userID,
+			Audience:  jwt.ClaimStrings{audience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(exp),
+			NotBefore: jwt.NewNumericDate(now.Add(-30 * time.Second)),
+			ID:        jti,
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = k.Kid
+	signed, err := token.SignedString(k.Private)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	return signed, jti, exp, nil
+}
+
 // IssueIDToken signs an OIDC id_token whose `aud` is the requesting
 // client_id (required by the spec, and verified by oauth2-proxy et al).
 // Returns (token, exp).

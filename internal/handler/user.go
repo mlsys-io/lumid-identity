@@ -6,23 +6,33 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
 )
 
-// GET /api/v1/session-bearer — returns the current session JWT to JS
-// on lum.id so it can forward it as Authorization: Bearer <jwt> on
-// cross-domain admin calls (runmesh.ai, etc.) where the HttpOnly
-// `.lum.id` cookie cannot reach. Only exposes to the authenticated
-// caller themselves — 401 when no session.
+// GET /api/v1/session-bearer — mints a short-lived, scope-constrained
+// JWT for same-origin JS on lum.id to forward as Authorization:
+// Bearer on cross-domain admin calls (runmesh.ai, etc.) where the
+// HttpOnly `.lum.id` session cookie cannot reach.
 //
-// This is a pragmatic bridge until every downstream app lives under
-// `*.lum.id` where the session cookie flows automatically. The
-// returned token is the same JWT already in lm_session; exposing it
-// to JS widens the XSS blast radius marginally but is bounded by
-// the session's own TTL and logout-everywhere.
+// Security shape (improvement over returning the raw session JWT):
+//   - TTL: 10 minutes (vs session's 24h) — limits XSS blast radius
+//   - audience: "runmesh" (vs session's "lumid-ecosystem") — prevents
+//     replay as a general lum.id session
+//   - scope: "runmesh:admin" for admins, empty otherwise — principle
+//     of least privilege
+//   - jti NOT persisted in `sessions` — a stolen bearer can't be
+//     turned into an audit artifact or revoked; instead the short
+//     TTL *is* the revocation.
+//
+// Non-admin callers still get a 200 but with an empty scope so the
+// frontend can rely on "200 means authenticated, inspect the scope".
+// Admins get "runmesh:admin". This endpoint is authed via the HttpOnly
+// session cookie that same-origin JS cannot read — the bearer lives
+// on the JS side only as a *copy* of permissions, not the session itself.
 func SessionBearerHandler(c *gin.Context) {
 	tok := bearerToken(c)
 	if tok == "" {
@@ -34,9 +44,47 @@ func SessionBearerHandler(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "invalid session")
 		return
 	}
+
+	var u models.User
+	if err := common.DB.Where("id = ?", claims.Subject).First(&u).Error; err != nil {
+		fail(c, http.StatusUnauthorized, 1003, "user not found")
+		return
+	}
+	if u.Status == "suspended" {
+		fail(c, http.StatusForbidden, 1006, "account suspended")
+		return
+	}
+
+	scopes := []string{}
+	if u.Role == "admin" {
+		scopes = []string{"runmesh:admin"}
+	}
+
+	bridge, jti, exp, err := common.IssueBridgeJWT(
+		u.ID, u.Email, u.Role, "runmesh", scopes, 10*time.Minute,
+	)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "mint bridge: "+err.Error())
+		return
+	}
+
+	// Still persist a session row so admin audit can see *some* trail
+	// of federated access, even if the bearer itself is fire-and-forget.
+	common.DB.Create(&models.Session{
+		ID:        uuid.NewString(),
+		UserID:    u.ID,
+		JTI:       jti,
+		ClientID:  "lumid-bridge",
+		UserAgent: c.GetHeader("User-Agent"),
+		IP:        c.ClientIP(),
+		ExpiresAt: exp,
+	})
+
 	ok(c, "ok", gin.H{
-		"token":      tok,
-		"expires_at": claims.ExpiresAt.Unix(),
+		"token":      bridge,
+		"expires_at": exp.Unix(),
+		"scopes":     scopes,
+		"audience":   "runmesh",
 	})
 }
 

@@ -27,18 +27,9 @@ type loginReq struct {
 	Password string `json:"password" form:"password"`
 }
 
-type loginResp struct {
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expires_at"`
-	User      userOut   `json:"user"`
-}
-
-type userOut struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name,omitempty"`
-	Role  string `json:"role"`
-}
+// Shared response shape for every auth endpoint that issues a session
+// (login, register, oauth/google). Matches what the ported lumid.market
+// callback page expects — see oauth_google.go for the same block.
 
 // POST /api/v1/login — email + password.
 // During shadow we accept logins whose user exists in LQA's tbl_user
@@ -102,10 +93,23 @@ func LoginHandler(c *gin.Context) {
 	// all see the same session without re-auth.
 	setSessionCookie(c, tok, exp)
 
-	ok(c, "login ok", loginResp{
-		Token:     tok,
-		ExpiresAt: exp,
-		User:      userOut{ID: u.ID, Email: u.Email, Name: u.Name, Role: u.Role},
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0,
+		"message":  "login ok",
+		"data": gin.H{
+			"token":      tok,
+			"expires_in": int(time.Until(exp).Seconds()),
+			"user_info": gin.H{
+				"id":              u.ID,
+				"email":           u.Email,
+				"username":        u.Name,
+				"avatar":          u.AvatarURL,
+				"role":            u.Role,
+				"status":          u.Status,
+				"invitation_code": u.InvitationCodeUsed,
+				"email_verified":  u.EmailVerified,
+			},
+		},
 	})
 }
 
@@ -212,7 +216,15 @@ func RegisterHandler(c *gin.Context) {
 		`, u.Email, u.Email, u.PasswordHash, "user", "active", u.InvitationCodeUsed)
 	}
 
-	ok(c, "registered", userOut{ID: u.ID, Email: u.Email, Name: u.Name, Role: u.Role})
+	ok(c, "registered", gin.H{
+		"id":              u.ID,
+		"email":           u.Email,
+		"username":        u.Name,
+		"role":            u.Role,
+		"status":          u.Status,
+		"email_verified":  u.EmailVerified,
+		"invitation_code": u.InvitationCodeUsed,
+	})
 }
 
 // ---------- send verification code ----------

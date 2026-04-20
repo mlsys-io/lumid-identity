@@ -34,15 +34,22 @@ type patMintResp struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
+// JSON shape matches the lumid_auth_ui PATInfo TS interface verbatim.
+// Timestamps are emitted as unix seconds (0 when absent) so the frontend
+// can do plain `t > 0` checks without date parsing. `status` is always
+// "active" here because the list query filters out revoked rows;
+// AuditDialog sees revoked ones through a separate endpoint.
 type patListItem struct {
-	ID         string     `json:"id"`
-	Prefix     string     `json:"prefix"`
-	Name       string     `json:"name"`
-	Scopes     []string   `json:"scopes"`
-	CreatedAt  time.Time  `json:"created_at"`
-	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
-	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
-	Source     string     `json:"source"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	TokenPrefix string   `json:"token_prefix"`
+	Scopes      []string `json:"scopes"`
+	Status      string   `json:"status"`
+	LastUsedAt  int64    `json:"last_used_at"`
+	ExpiresAt   int64    `json:"expires_at"`
+	RevokedAt   int64    `json:"revoked_at"`
+	CreateTime  int64    `json:"create_time"`
+	Source      string   `json:"source"`
 }
 
 func PATMintHandler(c *gin.Context) {
@@ -112,10 +119,23 @@ func PATListHandler(c *gin.Context) {
 		Order("created_at DESC").Find(&rows)
 	out := make([]patListItem, 0, len(rows))
 	for _, r := range rows {
+		var lastUsed, expires int64
+		if r.LastUsedAt != nil {
+			lastUsed = r.LastUsedAt.Unix()
+		}
+		if r.ExpiresAt != nil {
+			expires = r.ExpiresAt.Unix()
+		}
 		out = append(out, patListItem{
-			ID: r.ID, Prefix: r.Prefix, Name: r.Name,
-			Scopes: strings.Fields(r.Scopes), CreatedAt: r.CreatedAt,
-			LastUsedAt: r.LastUsedAt, ExpiresAt: r.ExpiresAt, Source: r.Source,
+			ID:          r.ID,
+			Name:        r.Name,
+			TokenPrefix: r.Prefix,
+			Scopes:      strings.Fields(r.Scopes),
+			Status:      "active", // revoked rows filtered by the WHERE above
+			LastUsedAt:  lastUsed,
+			ExpiresAt:   expires,
+			CreateTime:  r.CreatedAt.Unix(),
+			Source:      r.Source,
 		})
 	}
 	ok_(c, "ok", gin.H{"tokens": out, "total": len(out)})

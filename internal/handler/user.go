@@ -55,9 +55,25 @@ func SessionBearerHandler(c *gin.Context) {
 		return
 	}
 
+	// Scope selection:
+	//   ?scope=admin (or missing, for back-compat) → runmesh:admin if admin,
+	//     otherwise empty scope (user stays least-privilege).
+	//   ?scope=user  → runmesh:user for every caller, regardless of role.
+	//     Even admins get a user-mode JWT here — principle of least privilege
+	//     when viewing user-surface pages (/app/*).
+	// Any other value → 400.
+	requestedScope := strings.ToLower(strings.TrimSpace(c.Query("scope")))
 	scopes := []string{}
-	if u.Role == "admin" {
-		scopes = []string{"runmesh:admin"}
+	switch requestedScope {
+	case "", "admin":
+		if u.Role == "admin" {
+			scopes = []string{"runmesh:admin"}
+		}
+	case "user":
+		scopes = []string{"runmesh:user"}
+	default:
+		fail(c, http.StatusBadRequest, 1001, "scope must be 'user' or 'admin'")
+		return
 	}
 
 	bridge, jti, exp, err := common.IssueBridgeJWT(

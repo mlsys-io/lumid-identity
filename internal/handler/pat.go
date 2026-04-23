@@ -159,18 +159,35 @@ func PATRevokeHandler(c *gin.Context) {
 	ok_(c, "revoked", nil)
 }
 
-// currentUserID resolves the session cookie or Bearer JWT to a user id.
-// Returns (id, true) on success.
+// currentUserID resolves the session cookie, Bearer JWT, or lm_pat_*
+// PAT to a user id. Returns (id, true) on success.
+//
+// Accepting PATs here (not just JWTs) is what makes the unified-auth
+// claim work for callers like lumid /api/v1/user: a power-user with
+// only a PAT must still be able to read their own profile the same
+// way a session-cookie caller can.
 func currentUserID(c *gin.Context) (string, bool) {
 	tok := bearerToken(c)
 	if tok == "" {
 		return "", false
 	}
-	claims, err := common.VerifyJWT(tok)
-	if err != nil {
-		return "", false
+	// JWT path first — fast, no DB hit.
+	if claims, err := common.VerifyJWT(tok); err == nil {
+		return claims.Subject, true
 	}
-	return claims.Subject, true
+	// PAT path — same tokens.hash lookup used by introspectNative.
+	if strings.HasPrefix(tok, "lm_pat_") {
+		sum := sha256.Sum256([]byte(tok))
+		hash := hex.EncodeToString(sum[:])
+		var row models.Token
+		if err := common.DB.Where("hash = ?", hash).First(&row).Error; err == nil {
+			if row.RevokedAt == nil &&
+				(row.ExpiresAt == nil || row.ExpiresAt.After(time.Now())) {
+				return row.UserID, true
+			}
+		}
+	}
+	return "", false
 }
 
 func randHex(n int) (string, error) {

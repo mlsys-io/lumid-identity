@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -96,11 +97,11 @@ func AdminUsersList(c *gin.Context) {
 		return
 	}
 	switch role {
-	case "user", "admin":
+	case "user", "admin", "super_admin":
 		db = db.Where("role = ?", role)
 	case "all", "":
 	default:
-		fail(c, http.StatusBadRequest, 1001, "role must be user|admin|all")
+		fail(c, http.StatusBadRequest, 1001, "role must be user|admin|super_admin|all")
 		return
 	}
 	if q != "" {
@@ -191,9 +192,21 @@ func AdminUsersPatch(c *gin.Context) {
 	updates := map[string]any{}
 	if req.Role != nil {
 		v := strings.ToLower(*req.Role)
-		if v != "user" && v != "admin" {
-			fail(c, http.StatusBadRequest, 1001, "role must be user|admin")
+		if v != "user" && v != "admin" && v != "super_admin" {
+			fail(c, http.StatusBadRequest, 1001, "role must be user|admin|super_admin")
 			return
+		}
+		// Only super_admins may promote to super_admin, so a regular
+		// admin can't self-elevate by editing another admin.
+		if v == "super_admin" {
+			callerID, _ := currentUserID(c)
+			var caller models.User
+			if err := common.DB.Where("id = ?", callerID).First(&caller).Error; err != nil ||
+				caller.Role != "super_admin" {
+				fail(c, http.StatusForbidden, 1005,
+					"only super_admin can promote to super_admin")
+				return
+			}
 		}
 		updates["role"] = v
 	}
@@ -287,19 +300,44 @@ func AdminUsersAccess(c *gin.Context) {
 	common.DB.Where("user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())", id).
 		Find(&toks)
 
+	grants := loadAccessGrants(id)
 	rows := make([]accessRow, 0, len(accessServices))
 	for _, svc := range accessServices {
-		rows = append(rows, computeAccess(svc, u, toks))
+		rows = append(rows, computeAccess(svc, u, toks, grants))
 	}
 	ok(c, "ok", gin.H{"user_id": id, "access": rows})
 }
 
-func computeAccess(svc string, u models.User, toks []models.Token) accessRow {
+// accessGrantMap — loaded per user once by the caller, passed in as a
+// service→level lookup so computeAccess stays pure. Empty map means
+// "no explicit grants, fall through to PAT/role".
+type accessGrantMap map[string]string
+
+func loadAccessGrants(userID string) accessGrantMap {
+	var rows []models.UserAccessGrant
+	common.DB.Where("user_id = ?", userID).Find(&rows)
+	out := make(accessGrantMap, len(rows))
+	for _, r := range rows {
+		out[r.Service] = r.Level
+	}
+	return out
+}
+
+func computeAccess(svc string, u models.User, toks []models.Token, grants accessGrantMap) accessRow {
 	if u.Status != "active" {
 		return accessRow{Service: svc, Level: "none", Source: "suspended"}
 	}
-	if u.Role == "admin" {
-		return accessRow{Service: svc, Level: "admin", Source: "role"}
+	if u.Role == "admin" || u.Role == "super_admin" {
+		src := "role"
+		if u.Role == "super_admin" {
+			src = "role(super)"
+		}
+		return accessRow{Service: svc, Level: "admin", Source: src}
+	}
+	// Explicit admin grant → use it (overrides PAT, matches role
+	// semantics for this one service).
+	if lvl, ok := grants[svc]; ok {
+		return accessRow{Service: svc, Level: lvl, Source: "grant"}
 	}
 	// Authenticated users default to read everywhere; PATs can only
 	// upgrade. Walk each scope through parseScope so legacy flat QA
@@ -380,6 +418,90 @@ func levelRank(l string) int {
 	return 0
 }
 
+// ---- PUT /admin/users/:id/access/:service + DELETE ----
+//
+// Admin-applied fine-grained access grant. Creates or updates one row
+// in user_access_grants; the next matrix render picks it up via
+// loadAccessGrants. Level "none" is valid — it explicitly revokes the
+// default read for a regular user on that service.
+
+type accessPutReq struct {
+	Level string `json:"level"`
+}
+
+var validGrantLevels = map[string]bool{
+	"none": true, "read": true, "write": true, "admin": true,
+}
+
+func AdminUsersAccessPut(c *gin.Context) {
+	adminID, _ := currentUserID(c)
+	uid := c.Param("id")
+	svc := c.Param("service")
+	if !containsStr(accessServices, svc) {
+		fail(c, http.StatusBadRequest, 1001, "unknown service")
+		return
+	}
+	var req accessPutReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, 1001, "invalid body")
+		return
+	}
+	if !validGrantLevels[req.Level] {
+		fail(c, http.StatusBadRequest, 1001, "level must be none|read|write|admin")
+		return
+	}
+	var u models.User
+	if err := common.DB.Where("id = ?", uid).First(&u).Error; err != nil {
+		fail(c, http.StatusNotFound, 1002, "user not found")
+		return
+	}
+	var row models.UserAccessGrant
+	err := common.DB.Where("user_id = ? AND service = ?", uid, svc).First(&row).Error
+	if err != nil {
+		row = models.UserAccessGrant{
+			ID: uuid.NewString(), UserID: uid, Service: svc,
+			Level: req.Level, GrantedBy: adminID,
+		}
+		if err := common.DB.Create(&row).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "persist: "+err.Error())
+			return
+		}
+	} else {
+		row.Level = req.Level
+		row.GrantedBy = adminID
+		if err := common.DB.Save(&row).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "persist: "+err.Error())
+			return
+		}
+	}
+	writeAudit(c, adminID, uid, "access:grant",
+		fmt.Sprintf("service=%s level=%s", svc, req.Level))
+	ok(c, "updated", gin.H{"service": svc, "level": req.Level})
+}
+
+func AdminUsersAccessDelete(c *gin.Context) {
+	adminID, _ := currentUserID(c)
+	uid := c.Param("id")
+	svc := c.Param("service")
+	if !containsStr(accessServices, svc) {
+		fail(c, http.StatusBadRequest, 1001, "unknown service")
+		return
+	}
+	common.DB.Where("user_id = ? AND service = ?", uid, svc).
+		Delete(&models.UserAccessGrant{})
+	writeAudit(c, adminID, uid, "access:revoke", "service="+svc)
+	ok(c, "deleted", nil)
+}
+
+func containsStr(ss []string, v string) bool {
+	for _, s := range ss {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
 // canGrant reports whether the calling user is allowed to mint a PAT
 // with the given scope, based on their matrix row for the target service.
 // Admin role can always grant anything (matches the matrix's role=admin
@@ -389,14 +511,14 @@ func canGrant(u models.User, toks []models.Token, rawScope string) bool {
 	if svc == "" {
 		return false
 	}
-	if u.Role == "admin" {
+	if u.Role == "admin" || u.Role == "super_admin" {
 		return true
 	}
 	if svc == "*" {
 		// Non-admins can never mint global wildcards.
 		return false
 	}
-	row := computeAccess(svc, u, toks)
+	row := computeAccess(svc, u, toks, loadAccessGrants(u.ID))
 	return levelRank(row.Level) >= levelRank(lvl)
 }
 
@@ -417,7 +539,7 @@ func AdminUsersExportCSV(c *gin.Context) {
 		db = db.Where("status = ?", status)
 	}
 	switch role {
-	case "user", "admin":
+	case "user", "admin", "super_admin":
 		db = db.Where("role = ?", role)
 	}
 	if q != "" {
@@ -455,8 +577,9 @@ func AdminUsersExportCSV(c *gin.Context) {
 
 	for _, u := range users {
 		row := []string{u.ID, u.Email, u.Name, u.Role, u.Status, u.CreatedAt.Format(time.RFC3339)}
+		grants := loadAccessGrants(u.ID)
 		for _, svc := range accessServices {
-			row = append(row, computeAccess(svc, u, tokensByUser[u.ID]).Level)
+			row = append(row, computeAccess(svc, u, tokensByUser[u.ID], grants).Level)
 		}
 		_ = w.Write(row)
 	}

@@ -82,6 +82,10 @@ func Register(r *gin.Engine) {
 			admin.PATCH("/users/:id", AdminUsersPatch)
 			admin.POST("/users/:id/revoke-sessions", AdminUsersRevokeSessions)
 			admin.GET("/users/:id/access", AdminUsersAccess)
+			// Fine-grained per-service access grants — admin-applied
+			// override layered on top of role and PAT scopes.
+			admin.PUT("/users/:id/access/:service", AdminUsersAccessPut)
+			admin.DELETE("/users/:id/access/:service", AdminUsersAccessDelete)
 			admin.GET("/audit", AdminAuditList)
 		}
 	}

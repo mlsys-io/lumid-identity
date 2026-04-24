@@ -317,14 +317,15 @@ func GrantableScopesHandler(c *gin.Context) {
 	common.DB.Where("user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())", userID).
 		Find(&toks)
 
+	grants := loadAccessGrants(userID)
 	matrix := make(map[string]string, len(accessServices))
 	for _, svc := range accessServices {
-		matrix[svc] = computeAccess(svc, u, toks).Level
+		matrix[svc] = computeAccess(svc, u, toks, grants).Level
 	}
 	ok(c, "ok", gin.H{
 		"role":         u.Role,
 		"services":     accessServices,
 		"matrix":       matrix,
-		"can_wildcard": u.Role == "admin",
+		"can_wildcard": u.Role == "admin" || u.Role == "super_admin",
 	})
 }

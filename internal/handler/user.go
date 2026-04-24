@@ -55,29 +55,50 @@ func SessionBearerHandler(c *gin.Context) {
 		return
 	}
 
-	// Scope selection:
-	//   ?scope=admin (or missing, for back-compat) → runmesh:admin if admin,
-	//     otherwise empty scope (user stays least-privilege).
-	//   ?scope=user  → runmesh:user for every caller, regardless of role.
-	//     Even admins get a user-mode JWT here — principle of least privilege
-	//     when viewing user-surface pages (/app/*).
-	// Any other value → 400.
-	requestedScope := strings.ToLower(strings.TrimSpace(c.Query("scope")))
+	// Audience selection:
+	//   ?audience=runmesh (default, for back-compat) → scope rules below
+	//   ?audience=flowmesh → any authenticated user gets `flowmesh:ssh`
+	//     (parity with the CLI: anyone with a lum.id PAT can run
+	//     `flowmesh ssh`). Cost control lives in the billing layer,
+	//     not here.
+	requestedAud := strings.ToLower(strings.TrimSpace(c.Query("audience")))
+	if requestedAud == "" {
+		requestedAud = "runmesh"
+	}
+
+	var audience string
 	scopes := []string{}
-	switch requestedScope {
-	case "", "admin":
-		if u.Role == "admin" {
-			scopes = []string{"runmesh:admin"}
+	switch requestedAud {
+	case "runmesh":
+		audience = "runmesh"
+		// Scope selection for runmesh audience:
+		//   ?scope=admin (or missing) → runmesh:admin if admin, else empty
+		//   ?scope=user              → runmesh:user for every caller
+		requestedScope := strings.ToLower(strings.TrimSpace(c.Query("scope")))
+		switch requestedScope {
+		case "", "admin":
+			if u.Role == "admin" {
+				scopes = []string{"runmesh:admin"}
+			}
+		case "user":
+			scopes = []string{"runmesh:user"}
+		default:
+			fail(c, http.StatusBadRequest, 1001, "scope must be 'user' or 'admin'")
+			return
 		}
-	case "user":
-		scopes = []string{"runmesh:user"}
+	case "flowmesh":
+		audience = "flowmesh"
+		// Narrow runtime-only scope: lets the UI submit SSH tasks + poll
+		// + stream logs + open the proxy WebSocket. Not a PAT scope a
+		// user can mint; session-bearer only.
+		scopes = []string{"flowmesh:ssh"}
 	default:
-		fail(c, http.StatusBadRequest, 1001, "scope must be 'user' or 'admin'")
+		fail(c, http.StatusBadRequest, 1001, "audience must be 'runmesh' or 'flowmesh'")
 		return
 	}
 
 	bridge, jti, exp, err := common.IssueBridgeJWT(
-		u.ID, u.Email, u.Role, "runmesh", scopes, 10*time.Minute,
+		u.ID, u.Email, u.Role, audience, scopes, 10*time.Minute,
 	)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "mint bridge: "+err.Error())
@@ -90,7 +111,7 @@ func SessionBearerHandler(c *gin.Context) {
 		ID:        uuid.NewString(),
 		UserID:    u.ID,
 		JTI:       jti,
-		ClientID:  "lumid-bridge",
+		ClientID:  "lumid-bridge-" + audience,
 		UserAgent: c.GetHeader("User-Agent"),
 		IP:        c.ClientIP(),
 		ExpiresAt: exp,
@@ -100,7 +121,7 @@ func SessionBearerHandler(c *gin.Context) {
 		"token":      bridge,
 		"expires_at": exp.Unix(),
 		"scopes":     scopes,
-		"audience":   "runmesh",
+		"audience":   audience,
 	})
 }
 

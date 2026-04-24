@@ -23,8 +23,11 @@ type sshKeyItem struct {
 	Title       string `json:"title"`
 	KeyType     string `json:"key_type"`
 	Fingerprint string `json:"fingerprint"`
-	CreatedAt   int64  `json:"created_at"`
-	LastUsedAt  int64  `json:"last_used_at"`
+	// Public key body — safe to surface to the owner; the gpu-rentals
+	// wizard needs it to embed in the SSHTask authorizedKeys field.
+	PublicKey  string `json:"public_key"`
+	CreatedAt  int64  `json:"created_at"`
+	LastUsedAt int64  `json:"last_used_at"`
 }
 
 // SSHKeysListHandler returns the caller's uploaded keys.
@@ -46,6 +49,7 @@ func SSHKeysListHandler(c *gin.Context) {
 		out = append(out, sshKeyItem{
 			ID: r.ID, Title: r.Title, KeyType: r.KeyType,
 			Fingerprint: r.Fingerprint,
+			PublicKey:   r.PublicKey,
 			CreatedAt:   r.CreatedAt.Unix(),
 			LastUsedAt:  last,
 		})
@@ -107,6 +111,7 @@ func SSHKeysUploadHandler(c *gin.Context) {
 	ok_(c, "added", sshKeyItem{
 		ID: row.ID, Title: row.Title, KeyType: row.KeyType,
 		Fingerprint: row.Fingerprint,
+		PublicKey:   row.PublicKey,
 		CreatedAt:   row.CreatedAt.Unix(),
 	})
 }

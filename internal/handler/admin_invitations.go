@@ -36,8 +36,36 @@ func RequireAdmin() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if claims.Role != "admin" {
+		if claims.Role != "admin" && claims.Role != "super_admin" {
 			fail(c, http.StatusForbidden, 1005, "admin required")
+			c.Abort()
+			return
+		}
+		c.Set("admin_user_id", claims.Subject)
+		c.Next()
+	}
+}
+
+// RequireSuperAdmin — stricter gate than RequireAdmin. Billing and
+// accounting routes use this so a regular admin (operations) can't
+// touch money-moving endpoints. super_admin inherits everything
+// admin can do; additional authority is scoped to this gate.
+func RequireSuperAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tok := bearerToken(c)
+		if tok == "" {
+			fail(c, http.StatusUnauthorized, 1003, "auth required")
+			c.Abort()
+			return
+		}
+		claims, err := common.VerifyJWT(tok)
+		if err != nil {
+			fail(c, http.StatusUnauthorized, 1003, "invalid session")
+			c.Abort()
+			return
+		}
+		if claims.Role != "super_admin" {
+			fail(c, http.StatusForbidden, 1005, "super_admin required")
 			c.Abort()
 			return
 		}

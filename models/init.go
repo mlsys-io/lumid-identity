@@ -15,6 +15,8 @@ var AllTables = []interface{}{
 	&SigningKey{},
 	&InvitationCode{},
 	&PasswordReset{},
+	&SSHKey{},
+	&UserAccessGrant{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

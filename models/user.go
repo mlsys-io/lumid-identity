@@ -13,7 +13,7 @@ type User struct {
 	EmailVerified bool      `gorm:"default:false" json:"email_verified"`
 	PasswordHash  string    `gorm:"type:varchar(255)" json:"-"` // bcrypt; may be empty for OAuth-only users
 	Name          string    `gorm:"type:varchar(255)" json:"name,omitempty"`
-	AvatarURL     string    `gorm:"type:varchar(512)" json:"avatar_url,omitempty"`
+	AvatarURL     string    `gorm:"type:mediumtext" json:"avatar_url,omitempty"` // may be http URL or base64 data URL
 	Role          string    `gorm:"type:varchar(32);default:'user'" json:"role"`
 	Status        string    `gorm:"type:varchar(16);default:'active'" json:"status"` // active | suspended | pending
 	// InvitationCodeUsed preserves LQA's existing invitation gating.

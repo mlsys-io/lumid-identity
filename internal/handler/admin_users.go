@@ -301,30 +301,103 @@ func computeAccess(svc string, u models.User, toks []models.Token) accessRow {
 	if u.Role == "admin" {
 		return accessRow{Service: svc, Level: "admin", Source: "role"}
 	}
-	// Scan PATs for matching scopes.
+	// Authenticated users default to read everywhere; PATs can only
+	// upgrade. Walk each scope through parseScope so legacy flat QA
+	// vocabulary (read / trading / strategy / admin) and the canonical
+	// `<svc>:<level>` shape both land in the matrix correctly.
 	best := "read"
 	src := "role"
 	for _, t := range toks {
-		for _, s := range strings.Fields(t.Scopes) {
-			if s == "*" {
+		for _, raw := range strings.Fields(t.Scopes) {
+			scopeSvc, scopeLvl := parseScope(raw)
+			if scopeSvc == "" {
+				continue
+			}
+			if scopeSvc == "*" {
+				// Global wildcard — admin on every service.
 				return accessRow{Service: svc, Level: "admin", Source: "pat:" + t.Prefix}
 			}
-			// Match `<svc>*` as full ownership of that namespace.
-			if s == svc+":*" || strings.HasPrefix(s, svc+":admin") {
-				return accessRow{Service: svc, Level: "admin", Source: "pat:" + t.Prefix}
+			if scopeSvc != svc {
+				continue
 			}
-			if strings.HasPrefix(s, svc+":") {
-				if strings.Contains(s, ":write") {
-					best = "write"
-					src = "pat:" + t.Prefix
-				} else if best == "read" {
-					best = "write"
-					src = "pat:" + t.Prefix
-				}
+			if levelRank(scopeLvl) > levelRank(best) {
+				best = scopeLvl
+				src = "pat:" + t.Prefix
 			}
 		}
 	}
 	return accessRow{Service: svc, Level: best, Source: src}
+}
+
+// parseScope canonicalises a raw scope string to (service, level).
+// Returns ("*", "admin") for the global wildcard and legacy bare "admin".
+// Returns ("", "") for unrecognised scopes — callers should reject them.
+//
+// Accepted shapes:
+//
+//	"*"                            → global admin
+//	"<svc>:admin" / "<svc>:*"      → admin on <svc>
+//	"<svc>:write"                  → write on <svc>
+//	"<svc>:read"                   → read on <svc>
+//	"admin"                        → global admin (legacy)
+//	"read"                         → qa:read   (legacy QuantArena)
+//	"trading" / "strategy" / "write" → qa:write (legacy QuantArena)
+func parseScope(s string) (service, level string) {
+	switch s {
+	case "*", "admin":
+		return "*", "admin"
+	case "read":
+		return "qa", "read"
+	case "trading", "strategy", "write":
+		return "qa", "write"
+	}
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", ""
+	}
+	svc, lvl := parts[0], parts[1]
+	switch lvl {
+	case "*", "admin":
+		return svc, "admin"
+	case "write":
+		return svc, "write"
+	case "read":
+		return svc, "read"
+	}
+	return "", ""
+}
+
+// levelRank orders the matrix levels so callers can compare "can grant this".
+func levelRank(l string) int {
+	switch l {
+	case "admin":
+		return 3
+	case "write":
+		return 2
+	case "read":
+		return 1
+	}
+	return 0
+}
+
+// canGrant reports whether the calling user is allowed to mint a PAT
+// with the given scope, based on their matrix row for the target service.
+// Admin role can always grant anything (matches the matrix's role=admin
+// → admin-everywhere rule). Global wildcards require admin role.
+func canGrant(u models.User, toks []models.Token, rawScope string) bool {
+	svc, lvl := parseScope(rawScope)
+	if svc == "" {
+		return false
+	}
+	if u.Role == "admin" {
+		return true
+	}
+	if svc == "*" {
+		// Non-admins can never mint global wildcards.
+		return false
+	}
+	row := computeAccess(svc, u, toks)
+	return levelRank(row.Level) >= levelRank(lvl)
 }
 
 // ---- GET /admin/users/export.csv ----

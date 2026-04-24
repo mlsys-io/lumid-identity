@@ -68,6 +68,24 @@ func PATMintHandler(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1001, "scopes required")
 		return
 	}
+	// Gate against the user's effective matrix row. Prevents non-admins
+	// from minting a `*`-scope PAT (which would light up as admin on
+	// every service via computeAccess). Admins pass through; users get
+	// each requested scope checked against their current level.
+	var u models.User
+	if err := common.DB.Where("id = ?", userID).First(&u).Error; err != nil {
+		fail(c, http.StatusUnauthorized, 1003, "user not found")
+		return
+	}
+	var existing []models.Token
+	common.DB.Where("user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())", userID).
+		Find(&existing)
+	for _, s := range req.Scopes {
+		if !canGrant(u, existing, s) {
+			fail(c, http.StatusForbidden, 1005, "scope not grantable: "+s)
+			return
+		}
+	}
 	if req.Name == "" {
 		req.Name = "lm_pat " + time.Now().Format("2006-01-02 15:04")
 	}
@@ -270,3 +288,43 @@ func randHex(n int) (string, error) {
 // ok_ — same shape as the helper in helpers.go. Named with trailing
 // underscore because `ok` is a frequent local var in this file.
 func ok_(c *gin.Context, msg string, data any) { ok(c, msg, data) }
+
+// GrantableScopesHandler — GET /api/v1/identity/grantable-scopes.
+// Tells the caller which scopes they can mint a PAT with, so the UI
+// can render an accurate picker instead of letting the user request
+// scopes the backend will 403. Shape mirrors the admin matrix so the
+// PAT mint dialog and the admin users access view can share widgets.
+//
+// Response:
+//   {
+//     "role":        "user" | "admin",
+//     "services":    [ "lumid", "qa", "runmesh", ... ],
+//     "matrix":      { "lumid": "read", "qa": "write", ... },
+//     "can_wildcard": bool   // true iff the global `*` scope is grantable
+//   }
+func GrantableScopesHandler(c *gin.Context) {
+	userID, found := currentUserID(c)
+	if !found {
+		fail(c, http.StatusUnauthorized, 1003, "auth required")
+		return
+	}
+	var u models.User
+	if err := common.DB.Where("id = ?", userID).First(&u).Error; err != nil {
+		fail(c, http.StatusUnauthorized, 1003, "user not found")
+		return
+	}
+	var toks []models.Token
+	common.DB.Where("user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())", userID).
+		Find(&toks)
+
+	matrix := make(map[string]string, len(accessServices))
+	for _, svc := range accessServices {
+		matrix[svc] = computeAccess(svc, u, toks).Level
+	}
+	ok(c, "ok", gin.H{
+		"role":         u.Role,
+		"services":     accessServices,
+		"matrix":       matrix,
+		"can_wildcard": u.Role == "admin",
+	})
+}

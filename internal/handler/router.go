@@ -41,6 +41,9 @@ func Register(r *gin.Engine) {
 		v1.GET("/identity/personal-access-tokens", PATListHandler)
 		v1.DELETE("/identity/personal-access-tokens/:id", PATRevokeHandler)
 		v1.POST("/identity/personal-access-tokens/:id/rotate", PATRotateHandler)
+		// Drives the PAT mint dialog scope picker — tells the UI what
+		// services + levels the caller can actually grant.
+		v1.GET("/identity/grantable-scopes", GrantableScopesHandler)
 
 		// Active-session management — list + revoke. Revoking a session
 		// here has the same effect as the caller hitting /logout from

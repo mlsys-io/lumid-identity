@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -157,6 +158,74 @@ func PATRevokeHandler(c *gin.Context) {
 		return
 	}
 	ok_(c, "revoked", nil)
+}
+
+// PATRotateHandler revokes an existing PAT and mints a replacement with
+// the same name + scopes + TTL (computed from the remaining lifespan of
+// the original, if it had one). Returns the new cleartext once. The
+// caller is responsible for swapping it into their keyring / env.
+func PATRotateHandler(c *gin.Context) {
+	userID, found := currentUserID(c)
+	if !found {
+		fail(c, http.StatusUnauthorized, 1003, "auth required")
+		return
+	}
+	id := c.Param("id")
+
+	// Atomic handoff: revoke old + mint new in one transaction so the
+	// caller either gets both records or neither.
+	var newToken string
+	var newRow models.Token
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		var old models.Token
+		if err := tx.Where("id = ? AND user_id = ? AND revoked_at IS NULL",
+			id, userID).First(&old).Error; err != nil {
+			return err
+		}
+		now := time.Now()
+		if err := tx.Model(&old).Update("revoked_at", &now).Error; err != nil {
+			return err
+		}
+		raw, err := randHex(32)
+		if err != nil {
+			return err
+		}
+		cleartext := "lm_pat_live_" + raw
+		sum := sha256.Sum256([]byte(cleartext))
+		hash := hex.EncodeToString(sum[:])
+		var expAt *time.Time
+		if old.ExpiresAt != nil {
+			// Preserve the original remaining lifespan (not absolute deadline).
+			t := time.Now().Add(time.Until(*old.ExpiresAt))
+			expAt = &t
+		}
+		newRow = models.Token{
+			ID:        uuid.NewString(),
+			UserID:    userID,
+			Prefix:    "lm_pat_",
+			Hash:      hash,
+			HashAlg:   "sha256",
+			Name:      old.Name,
+			Scopes:    old.Scopes,
+			ExpiresAt: expAt,
+			Source:    "native",
+		}
+		if err := tx.Create(&newRow).Error; err != nil {
+			return err
+		}
+		newToken = cleartext
+		return nil
+	})
+	if err != nil {
+		fail(c, http.StatusNotFound, 1002,
+			"token not found or already revoked")
+		return
+	}
+	scopes := strings.Fields(newRow.Scopes)
+	ok_(c, "rotated", patMintResp{
+		ID: newRow.ID, Token: newToken, Prefix: "lm_pat_live_",
+		Name: newRow.Name, Scopes: scopes, ExpiresAt: newRow.ExpiresAt,
+	})
 }
 
 // currentUserID resolves the session cookie, Bearer JWT, or lm_pat_*

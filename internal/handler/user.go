@@ -77,7 +77,7 @@ func SessionBearerHandler(c *gin.Context) {
 		requestedScope := strings.ToLower(strings.TrimSpace(c.Query("scope")))
 		switch requestedScope {
 		case "", "admin":
-			if u.Role == "admin" {
+			if u.Role == "admin" || u.Role == "super_admin" {
 				scopes = []string{"runmesh:admin"}
 			}
 		case "user":

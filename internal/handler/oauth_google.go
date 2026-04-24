@@ -137,7 +137,7 @@ func GoogleLoginHandler(c *gin.Context) {
 
 	// Step 5 — issue session.
 	scopes := []string{"lumid:profile:read"}
-	if u.Role == "admin" {
+	if u.Role == "admin" || u.Role == "super_admin" {
 		scopes = []string{"*"}
 	}
 	sessionTok, jti, exp, err := common.IssueJWT(u.ID, u.Email, u.Role, scopes)

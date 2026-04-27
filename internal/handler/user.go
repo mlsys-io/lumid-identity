@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -296,4 +297,161 @@ func userInfoFromModel(u *models.User) gin.H {
 		"email_verified":  u.EmailVerified,
 		"invitation_code": u.InvitationCodeUsed,
 	}
+}
+
+// ---- redeem invitation code ----
+//
+// Closes the gap that Google-OAuth users land here without an
+// invitation_code on their first sign-in. The lumid_ui callback page
+// detects empty `user_info.invitation_code` after the OAuth exchange,
+// pops the InvitationCodeDialog (mirroring LQA's pattern), and POSTs
+// here to claim a code.
+//
+// Validation is the same as register: the code must exist in
+// `invitation_codes`, not be revoked, not be expired, and have
+// `uses_remaining > 0` (or `max_uses == 0` = unlimited). On success
+// the user's `invitation_code_used` is filled in atomically with the
+// uses_remaining decrement so a concurrent claim of the last seat
+// can't double-spend.
+
+type redeemInviteReq struct {
+	InvitationCode string `json:"invitation_code"`
+}
+
+func RedeemInvitationCodeHandler(c *gin.Context) {
+	uid, found := currentUserID(c)
+	if !found {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+
+	var req redeemInviteReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, 1001, "invalid request body")
+		return
+	}
+	code := strings.TrimSpace(req.InvitationCode)
+	if code == "" {
+		fail(c, http.StatusBadRequest, 1001, "invitation_code required")
+		return
+	}
+
+	tx := common.DB.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	var u models.User
+	if err := tx.Where("id = ?", uid).First(&u).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusUnauthorized, 1003, "user not found")
+		return
+	}
+	if u.Status == "suspended" {
+		tx.Rollback()
+		fail(c, http.StatusForbidden, 1006, "account suspended")
+		return
+	}
+	if u.InvitationCodeUsed != "" {
+		// Idempotent: a user who already redeemed should not be punished
+		// for retrying (e.g. dialog reopened, race with another tab).
+		// 409 with a clear message lets the UI close the dialog and
+		// move on without another DB write.
+		tx.Rollback()
+		fail(c, http.StatusConflict, 1009, "invitation code already redeemed")
+		return
+	}
+
+	var inv models.InvitationCode
+	if err := tx.Where("code = ?", code).First(&inv).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusBadRequest, 1007, "invitation code invalid")
+		return
+	}
+	if inv.RevokedAt != nil {
+		tx.Rollback()
+		fail(c, http.StatusBadRequest, 1007, "invitation code revoked")
+		return
+	}
+	if inv.ExpiresAt != nil && inv.ExpiresAt.Before(time.Now()) {
+		tx.Rollback()
+		fail(c, http.StatusBadRequest, 1007, "invitation code expired")
+		return
+	}
+	// max_uses == 0 means unlimited; otherwise we need uses_remaining > 0.
+	if inv.MaxUses != 0 && inv.UsesRemaining <= 0 {
+		tx.Rollback()
+		fail(c, http.StatusBadRequest, 1007, "invitation code exhausted")
+		return
+	}
+
+	now := time.Now()
+	updates := map[string]any{"last_used_at": &now}
+	if inv.MaxUses != 0 {
+		// Decrement only when the code is bounded; unlimited stays at 0.
+		// gorm.Expr keeps it server-side so concurrent claims don't race
+		// on a stale read.
+		res := tx.Model(&models.InvitationCode{}).
+			Where("code = ? AND uses_remaining > 0", code).
+			Updates(map[string]any{
+				"uses_remaining": gorm.Expr("uses_remaining - 1"),
+				"last_used_at":   &now,
+			})
+		if res.Error != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 1500,
+				"redeem code: "+res.Error.Error())
+			return
+		}
+		if res.RowsAffected == 0 {
+			// A concurrent claimer drained the last seat between our
+			// SELECT and UPDATE.
+			tx.Rollback()
+			fail(c, http.StatusBadRequest, 1007, "invitation code exhausted")
+			return
+		}
+	} else {
+		if err := tx.Model(&models.InvitationCode{}).
+			Where("code = ?", code).
+			Updates(updates).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 1500,
+				"touch code: "+err.Error())
+			return
+		}
+	}
+
+	if err := tx.Model(&u).
+		Update("invitation_code_used", code).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusInternalServerError, 1500,
+			"set user invitation_code: "+err.Error())
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "commit: "+err.Error())
+		return
+	}
+
+	// Mirror LQA's response shape so the frontend dialog's
+	// `onSuccess(response.token)` path stays a single contract: return
+	// the current session bearer + its remaining lifetime. We don't
+	// re-mint here — the existing JWT is still valid and revoking it
+	// just to bump `invitation_code` would log the user out of every
+	// other tab for no security benefit.
+	tok := bearerToken(c)
+	expiresIn := 0
+	if claims, err := common.VerifyJWT(tok); err == nil && !claims.ExpiresAt.IsZero() {
+		expiresIn = int(time.Until(claims.ExpiresAt.Time).Seconds())
+		if expiresIn < 0 {
+			expiresIn = 0
+		}
+	}
+	ok(c, "invitation code redeemed", gin.H{
+		"token":      tok,
+		"expires_in": expiresIn,
+	})
 }

@@ -29,6 +29,10 @@ func Register(r *gin.Engine) {
 		v1.GET("/session-bearer", SessionBearerHandler)
 		v1.PUT("/user", UpdateUserHandler)
 		v1.POST("/user/password", ChangePasswordHandler)
+		// First-time Google-OAuth users land at /auth/callback without an
+		// invitation_code; the dialog there PUTs here to claim one before
+		// the session is treated as fully established.
+		v1.PUT("/user/invitation-code", RedeemInvitationCodeHandler)
 		v1.POST("/forgot-password", ForgotPasswordHandler)
 		v1.POST("/reset-password", ResetPasswordHandler)
 		v1.POST("/oauth/google/login", GoogleLoginHandler)

@@ -69,7 +69,7 @@ func LoginHandler(c *gin.Context) {
 	// Scopes from role — admin gets *, users get basic identity scopes.
 	// Service-specific scopes come from PATs, not the session cookie.
 	scopes := []string{"lumid:profile:read"}
-	if u.Role == "admin" {
+	if u.Role == "admin" || u.Role == "super_admin" {
 		scopes = []string{"*"}
 	}
 

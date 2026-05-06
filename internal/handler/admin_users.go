@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -242,6 +243,75 @@ func AdminUsersPatch(c *gin.Context) {
 	toks := countActiveTokensByUser([]string{id})
 	ll := lastLoginByUserID([]string{id})
 	ok(c, "updated", gin.H{"user": toUserRow(after, toks[id], ll[id])})
+}
+
+// ---- DELETE /admin/users/:id ----
+//
+// Hard-deletes the user plus their sessions, tokens, identities,
+// password resets, access grants, oauth codes, and SSH keys. Audit
+// log rows are kept (compliance trail). Refuses to delete self;
+// admin/super_admin rows can only be deleted by a super_admin.
+//
+// Use case: wiping a test account so a fresh Google sign-in
+// reproduces the first-time onboarding flow (invitation-code
+// dialog, etc).
+
+func AdminUsersDelete(c *gin.Context) {
+	id := c.Param("id")
+	adminID := c.GetString("admin_user_id")
+	if adminID != "" && adminID == id {
+		fail(c, http.StatusBadRequest, 1001, "cannot delete your own account")
+		return
+	}
+
+	var u models.User
+	if err := common.DB.Where("id = ?", id).First(&u).Error; err != nil {
+		fail(c, http.StatusNotFound, 1002, "user not found")
+		return
+	}
+	if u.Role == "super_admin" || u.Role == "admin" {
+		callerID, _ := currentUserID(c)
+		var caller models.User
+		if err := common.DB.Where("id = ?", callerID).First(&caller).Error; err != nil ||
+			caller.Role != "super_admin" {
+			fail(c, http.StatusForbidden, 1005,
+				"only super_admin can delete admin users")
+			return
+		}
+	}
+
+	err := common.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("user_id = ?", id).Delete(&models.Session{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&models.Token{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&models.Identity{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&models.PasswordReset{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&models.UserAccessGrant{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&models.OAuthCode{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&models.SSHKey{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&models.User{}).Error
+	})
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "delete: "+err.Error())
+		return
+	}
+
+	writeAudit(c, adminID, id, "admin:user:delete",
+		fmt.Sprintf("email=%s role=%s", u.Email, u.Role))
+	ok(c, "deleted", gin.H{"id": id})
 }
 
 // ---- POST /admin/users/:id/revoke-sessions ----

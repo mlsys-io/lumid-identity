@@ -84,6 +84,7 @@ func Register(r *gin.Engine) {
 			admin.GET("/users/export.csv", AdminUsersExportCSV)
 			admin.GET("/users/:id", AdminUsersGet)
 			admin.PATCH("/users/:id", AdminUsersPatch)
+			admin.DELETE("/users/:id", AdminUsersDelete)
 			admin.POST("/users/:id/revoke-sessions", AdminUsersRevokeSessions)
 			admin.GET("/users/:id/access", AdminUsersAccess)
 			// Fine-grained per-service access grants — admin-applied

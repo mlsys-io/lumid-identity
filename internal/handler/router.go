@@ -92,6 +92,24 @@ func Register(r *gin.Engine) {
 			admin.PUT("/users/:id/access/:service", AdminUsersAccessPut)
 			admin.DELETE("/users/:id/access/:service", AdminUsersAccessDelete)
 			admin.GET("/audit", AdminAuditList)
+
+			// Super-admin dashboard read-only tiles. None of these
+			// mutate state; auth-stats / qa-summary / cert-expiry /
+			// backup-status / build-status visible to every admin
+			// because operational visibility shouldn't gate on the
+			// billing role. oauth-clients leaks which services
+			// federate against us — keep that super_admin only.
+			admin.GET("/auth-stats",     AdminAuthStats)
+			admin.GET("/qa-summary",     AdminQASummary)
+			admin.GET("/cert-expiry",    AdminCertExpiry)
+			admin.GET("/backup-status",  AdminBackupStatus)
+			admin.GET("/build-status",   AdminBuildStatus)
+		}
+
+		// super_admin-only — billing/accounting/secrets endpoints.
+		superAdmin := v1.Group("/admin", RequireSuperAdmin())
+		{
+			superAdmin.GET("/oauth-clients", AdminOAuthClientsList)
 		}
 	}
 }

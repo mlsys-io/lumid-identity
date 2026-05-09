@@ -40,15 +40,34 @@ import (
 // are best-effort — missing files don't 500.
 
 type loopRow struct {
-	App                  string  `json:"app"`
-	Loop                 string  `json:"loop"`
-	Schedule             string  `json:"schedule"`
-	DeclaredIn           string  `json:"declared_in"`
-	LastRunTS            float64 `json:"last_run_ts"`
-	LastOk               *bool   `json:"last_ok,omitempty"`
-	ConsecutiveFailures  int     `json:"consecutive_failures"`
-	LastDurationSeconds  float64 `json:"last_duration_s"`
-	Status               string  `json:"status"` // "never" | "ok" | "failing" | "stale"
+	App                  string   `json:"app"`
+	Loop                 string   `json:"loop"`
+	Schedule             string   `json:"schedule"`
+	DeclaredIn           string   `json:"declared_in"`
+	LastRunTS            float64  `json:"last_run_ts"`
+	LastOk               *bool    `json:"last_ok,omitempty"`
+	ConsecutiveFailures  int      `json:"consecutive_failures"`
+	LastDurationSeconds  float64  `json:"last_duration_s"`
+	Status               string   `json:"status"` // "never" | "ok" | "failing" | "stale" | "manual"
+	// Detail fields populated on click; cheap enough to ship inline so
+	// the tile doesn't need a second fetch when a row expands.
+	Description          string   `json:"description,omitempty"`
+	PrimaryRole          string   `json:"primary_role,omitempty"`
+	KnowledgeAgent       string   `json:"knowledge_agent,omitempty"`
+	Mode                 string   `json:"mode,omitempty"`
+	Skills               []string `json:"skills,omitempty"`
+	Steps                []loopStep `json:"steps,omitempty"`
+	Datasets             []string `json:"datasets,omitempty"`
+	GoalPrimary          string   `json:"goal_primary,omitempty"`
+	GoalTracked          []string `json:"goal_tracked,omitempty"`
+	LatestCycleDir       string   `json:"latest_cycle_dir,omitempty"`
+	LatestCycleTS        string   `json:"latest_cycle_ts,omitempty"`
+}
+
+type loopStep struct {
+	ID             string `json:"id"`
+	Skill          string `json:"skill"`
+	KnowledgeAgent string `json:"knowledge_agent,omitempty"`
 }
 
 type schedulerState struct {
@@ -190,9 +209,154 @@ func loopNames(ls []struct {
 }
 
 type rawLoop struct {
-	Name           string `json:"name"           yaml:"name"`
-	Schedule       string `json:"schedule"       yaml:"schedule"`
+	Name           string     `json:"name"            yaml:"name"`
+	Schedule       string     `json:"schedule"        yaml:"schedule"`
+	KnowledgeAgent string     `json:"knowledge_agent" yaml:"knowledge_agent"`
+	Description    string     `json:"description"     yaml:"description"`
+	PrimaryRole    string     `json:"primary_role"    yaml:"primary_role"`
+	Mode           string     `json:"mode"            yaml:"mode"`
+	Skills         []string   `json:"skills"          yaml:"skills"`
+	Datasets       []string   `json:"datasets"        yaml:"datasets"`
+	Steps          []rawStep  `json:"steps"           yaml:"steps"`
+	Goal           rawGoal    `json:"goal"            yaml:"goal"`
+}
+
+type rawStep struct {
+	ID             string `json:"id"              yaml:"id"`
+	Skill          string `json:"skill"           yaml:"skill"`
 	KnowledgeAgent string `json:"knowledge_agent" yaml:"knowledge_agent"`
+}
+
+type rawGoal struct {
+	Primary string   `json:"primary" yaml:"primary"`
+	Tracked []string `json:"tracked" yaml:"tracked"`
+}
+
+// loadLoopDetail walks the app dir to fetch detail-fields for one
+// loop. Best-effort — every field is optional. Reads in order:
+//   manifest.json::loops[name=loop]   (mbb-ai shape, richest)
+//   xpcloud.yaml::loops[name=loop]    (auto-quant shape)
+//   autoresearch.yaml                  (ops/xpio-ops single-loop shape)
+// Also resolves the most recent cycle dir under data/cycles/<loop>/<ts>/
+// or data/outbox/<case>/<ts>/ when present.
+func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
+	appDir := filepath.Join(home, ".xp", "apps", app)
+	// 1) manifest.json::loops[]
+	if loops, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
+		for _, L := range loops {
+			if L.Name == loop {
+				p, ts := latestCycleDir(appDir, loop)
+				return L, p, ts
+			}
+		}
+	}
+	// 2) xpcloud.yaml::loops[]
+	if loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+		for _, L := range loops {
+			if L.Name == loop {
+				p, ts := latestCycleDir(appDir, loop)
+				return L, p, ts
+			}
+		}
+	}
+	// 3) autoresearch.yaml — single-loop apps
+	if rl, err := readAutoresearchYamlFull(filepath.Join(appDir, "autoresearch.yaml")); err == nil && rl.Name == loop {
+		p, ts := latestCycleDir(appDir, loop)
+		return rl, p, ts
+	}
+	return rawLoop{}, "", ""
+}
+
+// readAutoresearchYamlFull is a richer read than the existing
+// readAutoresearchYaml — pulls description + skills + stages.
+func readAutoresearchYamlFull(p string) (rawLoop, error) {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return rawLoop{}, err
+	}
+	var doc struct {
+		Name        string   `yaml:"name"`
+		Schedule    string   `yaml:"schedule"`
+		Description string   `yaml:"description"`
+		Skills      []string `yaml:"skills"`
+		Stages      map[string]struct {
+			Skills []string `yaml:"skills"`
+		} `yaml:"stages"`
+		Goal rawGoal `yaml:"goal"`
+	}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return rawLoop{}, err
+	}
+	if doc.Name == "" {
+		return rawLoop{}, errors.New("no name")
+	}
+	// Aggregate observe + act stage skills as the loop's effective skill list
+	skills := append([]string{}, doc.Skills...)
+	if obs, ok := doc.Stages["observe"]; ok {
+		skills = append(skills, obs.Skills...)
+	}
+	if act, ok := doc.Stages["act"]; ok {
+		skills = append(skills, act.Skills...)
+	}
+	skills = uniqStrings(skills)
+	return rawLoop{
+		Name:        doc.Name,
+		Schedule:    doc.Schedule,
+		Description: doc.Description,
+		Skills:      skills,
+		Goal:        doc.Goal,
+	}, nil
+}
+
+func uniqStrings(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// latestCycleDir returns (path, ts) for the newest cycle output
+// under either data/cycles/<loop>/ (auto-quant/ops shape) or
+// data/outbox/<case>/<ts>/ (mbb-ai shape; no per-loop subdir).
+func latestCycleDir(appDir, loop string) (string, string) {
+	// shape 1: data/cycles/<loop>/<ts>/
+	c1 := filepath.Join(appDir, "data", "cycles", loop)
+	if entries, err := os.ReadDir(c1); err == nil {
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() > entries[j].Name() })
+		for _, e := range entries {
+			if e.IsDir() {
+				return filepath.Join(c1, e.Name()), e.Name()
+			}
+		}
+	}
+	// shape 2: data/outbox/<case>/<ts>/ (mbb-ai); take newest globally.
+	c2 := filepath.Join(appDir, "data", "outbox")
+	type cand struct{ path, ts string }
+	var newest cand
+	if cases, err := os.ReadDir(c2); err == nil {
+		for _, ce := range cases {
+			if !ce.IsDir() {
+				continue
+			}
+			if entries, err := os.ReadDir(filepath.Join(c2, ce.Name())); err == nil {
+				for _, te := range entries {
+					if te.IsDir() && te.Name() > newest.ts {
+						newest = cand{filepath.Join(c2, ce.Name(), te.Name()), te.Name()}
+					}
+				}
+			}
+		}
+	}
+	return newest.path, newest.ts
 }
 
 func readManifestLoops(p string) ([]rawLoop, error) {
@@ -267,6 +431,27 @@ func AdminLoops(c *gin.Context) {
 				LastOk:              s.LastOk,
 				ConsecutiveFailures: s.ConsecutiveFailures,
 				LastDurationSeconds: s.LastDurationSeconds,
+			}
+
+			// Hydrate the per-loop detail fields. Cheap (single file
+			// reads, no LLM calls) so we ship inline rather than gating
+			// on a separate /admin/loops/<id> endpoint.
+			if detail, latestPath, latestTS := loadLoopDetail(home, app.App, L.Name); detail.Name != "" {
+				row.Description = detail.Description
+				row.PrimaryRole = detail.PrimaryRole
+				row.KnowledgeAgent = detail.KnowledgeAgent
+				row.Mode = detail.Mode
+				row.Skills = detail.Skills
+				row.Datasets = detail.Datasets
+				row.GoalPrimary = detail.Goal.Primary
+				row.GoalTracked = detail.Goal.Tracked
+				for _, st := range detail.Steps {
+					row.Steps = append(row.Steps, loopStep{
+						ID: st.ID, Skill: st.Skill, KnowledgeAgent: st.KnowledgeAgent,
+					})
+				}
+				row.LatestCycleDir = latestPath
+				row.LatestCycleTS = latestTS
 			}
 			switch {
 			case L.Schedule == "" || L.Schedule == "@trigger" || L.Schedule == "manual":

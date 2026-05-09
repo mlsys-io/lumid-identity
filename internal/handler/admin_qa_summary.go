@@ -36,31 +36,40 @@ func AdminQASummary(c *gin.Context) {
 	var resp qaSummaryResp
 	resp.Generated = time.Now().UTC()
 
-	// Strategies — all rows, plus those with at least one running version.
+	// Strategies — total rows, plus distinct strategies enrolled in any
+	// active competition (proxy for "active strategies" since
+	// tbl_strategy_version has no status column).
 	common.DB.Raw(
 		`SELECT COUNT(*) FROM trading_community.tbl_strategy`,
 	).Scan(&resp.Strategies.Total)
 	common.DB.Raw(
-		`SELECT COUNT(DISTINCT strategy_id) FROM trading_community.tbl_strategy_version
-		 WHERE status IN ('running','active')`,
+		`SELECT COUNT(DISTINCT p.simulation_strategy_id)
+		 FROM trading_community.tbl_competition_participant p
+		 JOIN trading_community.tbl_competition c ON c.id = p.competition_id
+		 WHERE c.start_time <= UNIX_TIMESTAMP() * 1000
+		   AND (c.end_time IS NULL OR c.end_time > UNIX_TIMESTAMP() * 1000)`,
 	).Scan(&resp.Strategies.Active)
 
-	// Competitions — by status field if present, else by date window.
+	// Competitions — start_time / end_time are bigint epoch milliseconds
+	// (per `DESCRIBE tbl_competition`), not MySQL timestamps. Compare
+	// against UNIX_TIMESTAMP() * 1000 instead of NOW().
 	common.DB.Raw(
 		`SELECT COUNT(*) FROM trading_community.tbl_competition`,
 	).Scan(&resp.Competitions.Total)
 	common.DB.Raw(
 		`SELECT COUNT(*) FROM trading_community.tbl_competition
-		 WHERE start_time <= NOW() AND (end_time IS NULL OR end_time > NOW())`,
+		 WHERE start_time <= UNIX_TIMESTAMP() * 1000
+		   AND (end_time IS NULL OR end_time > UNIX_TIMESTAMP() * 1000)`,
 	).Scan(&resp.Competitions.Ongoing)
 	common.DB.Raw(
-		`SELECT COUNT(*) FROM trading_community.tbl_competition WHERE start_time > NOW()`,
+		`SELECT COUNT(*) FROM trading_community.tbl_competition
+		 WHERE start_time > UNIX_TIMESTAMP() * 1000`,
 	).Scan(&resp.Competitions.Upcoming)
 
-	// 24h trade volume — count rows in trades table.
+	// 24h trade volume — `create_time` (bigint epoch ms), not created_at.
 	common.DB.Raw(
 		`SELECT COUNT(*) FROM trading_community.tbl_competition_trade
-		 WHERE created_at >= NOW() - INTERVAL 24 HOUR`,
+		 WHERE create_time >= (UNIX_TIMESTAMP() - 86400) * 1000`,
 	).Scan(&resp.Trades24h.Count)
 
 	ok(c, "ok", resp)

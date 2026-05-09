@@ -104,6 +104,7 @@ func Register(r *gin.Engine) {
 			admin.GET("/cert-expiry",    AdminCertExpiry)
 			admin.GET("/backup-status",  AdminBackupStatus)
 			admin.GET("/build-status",   AdminBuildStatus)
+			admin.GET("/loops",          AdminLoops)
 		}
 
 		// super_admin-only — billing/accounting/secrets endpoints.

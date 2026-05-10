@@ -38,6 +38,17 @@ func Register(r *gin.Engine) {
 		v1.POST("/oauth/google/login", GoogleLoginHandler)
 		v1.POST("/oauth/github/login", GithubLogin)
 
+		// Personal-agent / app Google scope grants. Init returns the
+		// Google authorize URL with gmail.modify + calendar scopes;
+		// callback persists the encrypted refresh-token; identity/google-token
+		// hands it to the CLI's setup verb. Revoke is a soft-delete.
+		v1.POST("/oauth/google/connect/init", GoogleConnectInit)
+		v1.GET("/oauth/google/connect/callback", GoogleConnectCallback)
+		v1.GET("/identity/google-token", GoogleTokenFetch)
+		v1.DELETE("/identity/google-token", GoogleTokenRevoke)
+		v1.GET("/identity/google-grants", GoogleGrantsList)
+		v1.POST("/identity/google-access-token", GoogleAccessToken)
+
 		// LQA-compatible PAT surface — same path so downstream code
 		// (frontend /account/tokens, install.sh) works unchanged after
 		// Phase 3 repoints the proxy.
@@ -105,6 +116,7 @@ func Register(r *gin.Engine) {
 			admin.GET("/backup-status",  AdminBackupStatus)
 			admin.GET("/build-status",   AdminBuildStatus)
 			admin.GET("/loops",          AdminLoops)
+			admin.GET("/codebase-repos", AdminCodebaseRepos)
 		}
 
 		// super_admin-only — billing/accounting/secrets endpoints.

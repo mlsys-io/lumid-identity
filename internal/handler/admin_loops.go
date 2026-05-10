@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"sort"
@@ -62,12 +64,60 @@ type loopRow struct {
 	GoalTracked          []string `json:"goal_tracked,omitempty"`
 	LatestCycleDir       string   `json:"latest_cycle_dir,omitempty"`
 	LatestCycleTS        string   `json:"latest_cycle_ts,omitempty"`
+	// Failing-loop diagnostics — populated only when the loop's last
+	// run errored. ``last_errors`` reads step_errors.json from the
+	// most recent cycle dir; ``last_journal`` is the trailing entry of
+	// journal.jsonl when the app keeps one (useful when the cycle
+	// errored before reaching the per-step wrapper).
+	LastErrors           []loopErrorRow `json:"last_errors,omitempty"`
+	LastJournal          string         `json:"last_journal,omitempty"`
+	// Engine pattern (Pattern A = runner_steps, Pattern B = command).
+	// When command-driven, EngineModule names the verb the runner
+	// dispatches into; SkillsInvoked is the documentation list of
+	// what the verb actually calls.
+	Engine               string         `json:"engine,omitempty"`
+	EngineModule         string         `json:"engine_module,omitempty"`
+	SkillsInvoked        []string       `json:"skills_invoked,omitempty"`
 }
 
 type loopStep struct {
 	ID             string `json:"id"`
 	Skill          string `json:"skill"`
 	KnowledgeAgent string `json:"knowledge_agent,omitempty"`
+}
+
+// loopErrorRow mirrors one entry of step_errors.json — the runner
+// records {step, skill, error}. We pass through verbatim so the UI
+// can decide how to truncate.
+type loopErrorRow struct {
+	Step  string `json:"step,omitempty"`
+	Skill string `json:"skill,omitempty"`
+	Error string `json:"error"`
+}
+
+// appGitStatus is the per-app repo state surfaced on the dashboard.
+// Combines local checkout state with the xp.io-published metadata so
+// the operator can spot drift (uncommitted edits, unpublished version
+// bumps, branch ahead/behind) without dropping into a shell.
+type appGitStatus struct {
+	App           string `json:"app"`
+	Version       string `json:"version,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	Published     bool   `json:"published"`
+	PublishedSlug string `json:"published_slug,omitempty"`
+	// Local-checkout state (best-effort — not all app dirs are git repos)
+	LocalHasGit       bool   `json:"local_has_git"`
+	LocalDirtyCount   int    `json:"local_dirty_count"`
+	LocalDirtyExample string `json:"local_dirty_example,omitempty"`
+	LocalAheadOrigin  int    `json:"local_ahead_origin,omitempty"`
+	LocalBehindOrigin int    `json:"local_behind_origin,omitempty"`
+	LocalHEAD         string `json:"local_head,omitempty"`
+	LocalBranch       string `json:"local_branch,omitempty"`
+	// xp.io-published HEAD (only set when the app has been published)
+	RemoteHEAD string `json:"remote_head,omitempty"`
+	// summary verdict the dashboard renders inline:
+	// "in_sync" | "dirty" | "ahead" | "behind" | "unpublished" | "no_git"
+	Status string `json:"status"`
 }
 
 type schedulerState struct {
@@ -147,23 +197,27 @@ func discoverManifestLoops(home string) []appSchedulerIndex {
 				continue
 			}
 		}
-		// Fallback: walk the three config files.
+		// Fallback: walk the three config files. Order is load-bearing —
+		// xpcloud.yaml is the canonical runtime source (per the xpio
+		// autoresearch contract at docs/architecture/xpio_autoresearch_canonical.md);
+		// manifest.json is a secondary mirror. We read xpcloud.yaml FIRST
+		// so its schedule wins when both files declare the same loop.
 		idx.App = e.Name()
-		// manifest.json::loops[] (mbb-ai shape)
-		if mf, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
-			for _, L := range mf {
+		// xpcloud.yaml::loops[] (canonical)
+		if yamlLoops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+			for _, L := range yamlLoops {
 				idx.Loops = append(idx.Loops, struct {
 					Name           string `json:"name"`
 					Schedule       string `json:"schedule"`
 					DeclaredIn     string `json:"declared_in"`
 					KnowledgeAgent string `json:"knowledge_agent"`
-				}{Name: L.Name, Schedule: L.Schedule, DeclaredIn: "manifest.json", KnowledgeAgent: L.KnowledgeAgent})
+				}{Name: L.Name, Schedule: L.Schedule, DeclaredIn: "xpcloud.yaml", KnowledgeAgent: L.KnowledgeAgent})
 			}
 		}
-		// xpcloud.yaml::loops[] (auto-quant shape)
+		// manifest.json::loops[] (legacy mirror — only fills in loops xpcloud.yaml didn't declare)
 		if seenNames := loopNames(idx.Loops); true {
-			if yamlLoops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
-				for _, L := range yamlLoops {
+			if mf, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
+				for _, L := range mf {
 					if _, dup := seenNames[L.Name]; dup {
 						continue
 					}
@@ -172,7 +226,7 @@ func discoverManifestLoops(home string) []appSchedulerIndex {
 						Schedule       string `json:"schedule"`
 						DeclaredIn     string `json:"declared_in"`
 						KnowledgeAgent string `json:"knowledge_agent"`
-					}{Name: L.Name, Schedule: L.Schedule, DeclaredIn: "xpcloud.yaml", KnowledgeAgent: L.KnowledgeAgent})
+					}{Name: L.Name, Schedule: L.Schedule, DeclaredIn: "manifest.json", KnowledgeAgent: L.KnowledgeAgent})
 				}
 			}
 		}
@@ -216,9 +270,16 @@ type rawLoop struct {
 	PrimaryRole    string     `json:"primary_role"    yaml:"primary_role"`
 	Mode           string     `json:"mode"            yaml:"mode"`
 	Skills         []string   `json:"skills"          yaml:"skills"`
+	SkillsInvoked  []string   `json:"skills_invoked"  yaml:"skills_invoked"`
 	Datasets       []string   `json:"datasets"        yaml:"datasets"`
 	Steps          []rawStep  `json:"steps"           yaml:"steps"`
+	Engine         rawEngine  `json:"engine"          yaml:"engine"`
 	Goal           rawGoal    `json:"goal"            yaml:"goal"`
+}
+
+type rawEngine struct {
+	Type   string `json:"type"   yaml:"type"`
+	Module string `json:"module" yaml:"module"`
 }
 
 type rawStep struct {
@@ -234,15 +295,17 @@ type rawGoal struct {
 
 // loadLoopDetail walks the app dir to fetch detail-fields for one
 // loop. Best-effort — every field is optional. Reads in order:
-//   manifest.json::loops[name=loop]   (mbb-ai shape, richest)
-//   xpcloud.yaml::loops[name=loop]    (auto-quant shape)
+//   xpcloud.yaml::loops[name=loop]    (canonical runtime source)
+//   manifest.json::loops[name=loop]   (legacy mirror)
 //   autoresearch.yaml                  (ops/xpio-ops single-loop shape)
 // Also resolves the most recent cycle dir under data/cycles/<loop>/<ts>/
 // or data/outbox/<case>/<ts>/ when present.
 func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
 	appDir := filepath.Join(home, ".xp", "apps", app)
-	// 1) manifest.json::loops[]
-	if loops, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
+	// 1) xpcloud.yaml::loops[] — canonical runtime source. Read first
+	//    so its schedule + steps + skills_invoked beat any stale
+	//    manifest.json mirror.
+	if loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
 		for _, L := range loops {
 			if L.Name == loop {
 				p, ts := latestCycleDir(appDir, loop)
@@ -250,8 +313,8 @@ func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
 			}
 		}
 	}
-	// 2) xpcloud.yaml::loops[]
-	if loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+	// 2) manifest.json::loops[] — fallback only.
+	if loops, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
 		for _, L := range loops {
 			if L.Name == loop {
 				p, ts := latestCycleDir(appDir, loop)
@@ -359,6 +422,44 @@ func latestCycleDir(appDir, loop string) (string, string) {
 	return newest.path, newest.ts
 }
 
+// loadLastErrors reads step_errors.json from a cycle dir + the trailing
+// journal entry. Either may be absent — the dashboard renders whichever
+// one we manage to surface.
+func loadLastErrors(cycleDir, appDir string) ([]loopErrorRow, string) {
+	var errs []loopErrorRow
+	if cycleDir != "" {
+		if b, err := os.ReadFile(filepath.Join(cycleDir, "step_errors.json")); err == nil {
+			var raw []loopErrorRow
+			if json.Unmarshal(b, &raw) == nil {
+				errs = raw
+			}
+		}
+	}
+	// journal.jsonl is the runner's append-only event log; the last
+	// line typically captures pre-step failures (no setup, missing
+	// loop, invalid mode) that don't reach step_errors.json. Apps
+	// keep it under either ``journal.jsonl`` (top-level) or
+	// ``data/journal.jsonl`` — try both and pick the newest.
+	journalTail := ""
+	for _, jp := range []string{
+		filepath.Join(appDir, "data", "journal.jsonl"),
+		filepath.Join(appDir, "journal.jsonl"),
+	} {
+		b, err := os.ReadFile(jp)
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+		tail := lines[len(lines)-1]
+		if len(tail) > 800 {
+			tail = tail[:800] + "…"
+		}
+		journalTail = tail
+		break
+	}
+	return errs, journalTail
+}
+
 func readManifestLoops(p string) ([]rawLoop, error) {
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -409,6 +510,197 @@ func readAutoresearchYaml(p string) (string, string, error) {
 	return doc.Name, doc.Schedule, nil
 }
 
+// loadAppGitStatus inspects one app dir on disk plus the matching
+// xpcloud repo metadata. Cheap (3-5 small file reads + maybe one
+// `git status --porcelain` invocation) so we ship inline with the
+// loops response.
+func loadAppGitStatus(home, app string) appGitStatus {
+	out := appGitStatus{App: app, Status: "no_git"}
+	appDir := filepath.Join(home, ".xp", "apps", app)
+	// version + kind from manifest.json (preferred) or xpcloud.yaml
+	if b, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+		var m struct {
+			Version string `json:"version"`
+			Kind    string `json:"kind"`
+		}
+		if json.Unmarshal(b, &m) == nil {
+			out.Version = m.Version
+			out.Kind = m.Kind
+		}
+	}
+	if out.Kind == "" {
+		if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+			var m struct {
+				Kind    string `yaml:"kind"`
+				Version string `yaml:"version"`
+			}
+			if yaml.Unmarshal(b, &m) == nil {
+				if out.Kind == "" {
+					out.Kind = m.Kind
+				}
+				if out.Version == "" {
+					out.Version = m.Version
+				}
+			}
+		}
+	}
+	// origin.json carries owner_sub + slug when the app was installed
+	// from xpcloud. Newly-published-but-not-reinstalled apps may have
+	// a different shape; fall back to the operator's PAT subject.
+	publishedSlug := ""
+	if b, err := os.ReadFile(filepath.Join(appDir, "origin.json")); err == nil {
+		var o struct {
+			Slug    string `json:"slug"`
+			Owner   string `json:"owner_sub"`
+			Name    string `json:"name"`
+		}
+		if json.Unmarshal(b, &o) == nil {
+			if o.Slug != "" {
+				publishedSlug = o.Slug
+			} else if o.Owner != "" && o.Name != "" {
+				publishedSlug = o.Owner + "/" + o.Name
+			}
+		}
+	}
+	out.PublishedSlug = publishedSlug
+	if publishedSlug != "" {
+		out.Published = true
+		out.Status = "in_sync" // optimistic; refined below
+	} else {
+		out.Status = "unpublished"
+	}
+
+	// Local git inspection — opt-in: only when .git exists. Most app
+	// dirs are plain checkouts, not full git repos, so this is a soft
+	// "yes, additionally show drift if git is wired up" path.
+	if _, err := os.Stat(filepath.Join(appDir, ".git")); err == nil {
+		out.LocalHasGit = true
+		// HEAD sha
+		if b, err := exec.Command("git", "-C", appDir, "rev-parse", "HEAD").Output(); err == nil {
+			out.LocalHEAD = strings.TrimSpace(string(b))
+		}
+		// branch
+		if b, err := exec.Command("git", "-C", appDir, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
+			out.LocalBranch = strings.TrimSpace(string(b))
+		}
+		// dirty count + first dirty path (so the UI can show "5 dirty (commands/foo.py + 4 more)")
+		if b, err := exec.Command("git", "-C", appDir, "status", "--porcelain").Output(); err == nil {
+			lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+			if len(lines) > 0 && lines[0] != "" {
+				out.LocalDirtyCount = len(lines)
+				// First entry's path (skip the 2-char status prefix + space)
+				if len(lines[0]) > 3 {
+					out.LocalDirtyExample = strings.TrimSpace(lines[0][3:])
+				}
+			}
+		}
+		// ahead/behind vs origin/<branch>
+		if out.LocalBranch != "" {
+			ref := "origin/" + out.LocalBranch
+			if b, err := exec.Command("git", "-C", appDir, "rev-list", "--left-right", "--count", out.LocalBranch+"..."+ref).Output(); err == nil {
+				parts := strings.Fields(strings.TrimSpace(string(b)))
+				if len(parts) == 2 {
+					if n, err := parseInt(parts[0]); err == nil {
+						out.LocalAheadOrigin = n
+					}
+					if n, err := parseInt(parts[1]); err == nil {
+						out.LocalBehindOrigin = n
+					}
+				}
+			}
+		}
+	}
+
+	// xpcloud-side HEAD via /repos/{slug}/branches — the call is
+	// in-cluster and authless for public repos.
+	if out.Published {
+		owner, name := splitSlug(publishedSlug)
+		if owner != "" && name != "" {
+			if branches := xpcloudBranches(owner, name); len(branches) > 0 {
+				for _, br := range branches {
+					if br.IsDefault || br.Name == "main" {
+						out.RemoteHEAD = br.SHA
+						break
+					}
+				}
+				if out.RemoteHEAD == "" {
+					out.RemoteHEAD = branches[0].SHA
+				}
+			}
+		}
+	}
+
+	// Refine the verdict.
+	switch {
+	case !out.Published:
+		out.Status = "unpublished"
+	case out.LocalDirtyCount > 0:
+		out.Status = "dirty"
+	case out.LocalAheadOrigin > 0:
+		out.Status = "ahead"
+	case out.LocalBehindOrigin > 0:
+		out.Status = "behind"
+	case out.LocalHEAD != "" && out.RemoteHEAD != "" && out.LocalHEAD != out.RemoteHEAD:
+		out.Status = "drift"
+	}
+	return out
+}
+
+func parseInt(s string) (int, error) {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, errors.New("non-digit")
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
+}
+
+func splitSlug(s string) (owner, name string) {
+	if i := strings.Index(s, "/"); i > 0 {
+		return s[:i], s[i+1:]
+	}
+	return "", ""
+}
+
+type xpcloudBranch struct {
+	Name      string `json:"name"`
+	SHA       string `json:"sha"`
+	IsDefault bool   `json:"is_default"`
+}
+
+func xpcloudBranches(owner, name string) []xpcloudBranch {
+	url := xpcloudBaseURL() + "/api/v1/repos/" + owner + "/" + name + "/branches"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	var doc struct {
+		Branches []xpcloudBranch `json:"branches"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return nil
+	}
+	return doc.Branches
+}
+
+func xpcloudBaseURL() string {
+	if v := os.Getenv("XPCLOUD_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://host.docker.internal:8900"
+}
+
 func AdminLoops(c *gin.Context) {
 	home := operatorHome()
 	state := readSchedulerState(home)
@@ -442,9 +734,16 @@ func AdminLoops(c *gin.Context) {
 				row.KnowledgeAgent = detail.KnowledgeAgent
 				row.Mode = detail.Mode
 				row.Skills = detail.Skills
+				row.SkillsInvoked = detail.SkillsInvoked
 				row.Datasets = detail.Datasets
 				row.GoalPrimary = detail.Goal.Primary
 				row.GoalTracked = detail.Goal.Tracked
+				if detail.Engine.Type != "" {
+					row.Engine = detail.Engine.Type
+					row.EngineModule = detail.Engine.Module
+				} else {
+					row.Engine = "runner_steps"
+				}
 				for _, st := range detail.Steps {
 					row.Steps = append(row.Steps, loopStep{
 						ID: st.ID, Skill: st.Skill, KnowledgeAgent: st.KnowledgeAgent,
@@ -452,6 +751,13 @@ func AdminLoops(c *gin.Context) {
 				}
 				row.LatestCycleDir = latestPath
 				row.LatestCycleTS = latestTS
+				// When the daemon flagged this loop as failing, hydrate
+				// the diagnostic fields. Cheap (file reads) so we ship
+				// inline. Skip on success to keep the response slim.
+				if s.LastOk != nil && !*s.LastOk {
+					appDir := filepath.Join(home, ".xp", "apps", app.App)
+					row.LastErrors, row.LastJournal = loadLastErrors(latestPath, appDir)
+				}
 			}
 			switch {
 			case L.Schedule == "" || L.Schedule == "@trigger" || L.Schedule == "manual":
@@ -488,8 +794,25 @@ func AdminLoops(c *gin.Context) {
 		scheduler = "not_installed"
 	}
 
+	// Per-app git status — one entry per unique app referenced by any
+	// loop. The dashboard pivots loops by app, so this is the natural
+	// shape for "git status per repo".
+	seenApps := map[string]struct{}{}
+	apps_status := make([]appGitStatus, 0, len(apps))
+	for _, app := range apps {
+		if _, dup := seenApps[app.App]; dup {
+			continue
+		}
+		seenApps[app.App] = struct{}{}
+		apps_status = append(apps_status, loadAppGitStatus(home, app.App))
+	}
+	sort.Slice(apps_status, func(i, j int) bool {
+		return apps_status[i].App < apps_status[j].App
+	})
+
 	ok(c, "ok", gin.H{
 		"loops":                 rows,
+		"apps":                  apps_status,
 		"summary":               summary,
 		"scheduler_daemon":      scheduler,
 		"operator_home":         home,

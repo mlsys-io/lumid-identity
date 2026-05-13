@@ -6,7 +6,10 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /out/identity ./cmd/identity
 
 FROM --platform=linux/amd64 alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+# git is invoked by /admin/loops → loadAppGitStatus to inspect the
+# bind-mounted ~/.xp/apps/<name>/.git directories (dirty / ahead /
+# behind / HEAD sha). Without it those fields are silently empty.
+RUN apk add --no-cache ca-certificates tzdata git
 WORKDIR /app
 COPY --from=builder /out/identity /app/identity
 COPY configs/identity.yaml /app/configs/identity.yaml

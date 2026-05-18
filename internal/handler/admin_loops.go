@@ -78,6 +78,28 @@ type loopRow struct {
 	Engine               string         `json:"engine,omitempty"`
 	EngineModule         string         `json:"engine_module,omitempty"`
 	SkillsInvoked        []string       `json:"skills_invoked,omitempty"`
+	// Cycle outcome — hydrated from score.json / insight.md / proposal.json
+	// in the latest cycle dir. Present when any of those files exist.
+	Outcome              *loopOutcome   `json:"outcome,omitempty"`
+}
+
+// loopOutcome surfaces the most recent cycle's key metrics so the
+// dashboard tile can show α / benchmark / sharpe without the operator
+// drilling into a cycle dir.
+type loopOutcome struct {
+	AlphaPP      *float64 `json:"alpha_pp,omitempty"`      // realized_alpha_pp from score.json
+	Benchmark    string   `json:"benchmark,omitempty"`     // benchmark_label from score.json
+	Sharpe       *float64 `json:"sharpe,omitempty"`        // sharpe from score.json
+	MaxDD        *float64 `json:"max_dd,omitempty"`        // max_dd from score.json
+	InsightHead  string   `json:"insight_head,omitempty"`  // first 5 lines of insight.md
+	LastProposal *loopProposal `json:"last_proposal,omitempty"` // from proposal.json
+}
+
+type loopProposal struct {
+	Strategy  string  `json:"strategy,omitempty"`
+	Symbol    string  `json:"symbol,omitempty"`
+	Direction string  `json:"direction,omitempty"`
+	SizePctNAV float64 `json:"size_pct_nav,omitempty"`
 }
 
 type loopStep struct {
@@ -93,6 +115,17 @@ type loopErrorRow struct {
 	Step  string `json:"step,omitempty"`
 	Skill string `json:"skill,omitempty"`
 	Error string `json:"error"`
+}
+
+// strategyState is one entry from ~/.xp/apps/<app>/data/strategies/*/state.json
+// (Theme I — strategy-grid-first layout). Fields map 1:1 with what the
+// auto-quant runner writes after each cycle.
+type strategyState struct {
+	Name           string  `json:"name"`
+	LifecycleStage string  `json:"lifecycle_stage,omitempty"` // smoke_test|explore|paper|semi|live|retired
+	CycleCount     int     `json:"cycle_count,omitempty"`
+	RecentSharpe   *float64 `json:"recent_sharpe,omitempty"`
+	LifetimePnL    *float64 `json:"lifetime_pnl,omitempty"`
 }
 
 // appGitStatus is the per-app repo state surfaced on the dashboard.
@@ -118,6 +151,9 @@ type appGitStatus struct {
 	// summary verdict the dashboard renders inline:
 	// "in_sync" | "dirty" | "ahead" | "behind" | "unpublished" | "no_git"
 	Status string `json:"status"`
+	// Strategies — per-strategy lifecycle state from data/strategies/*/state.json
+	// (Theme I). Only populated for apps that have this directory.
+	Strategies []strategyState `json:"strategies,omitempty"`
 }
 
 type schedulerState struct {
@@ -460,6 +496,91 @@ func loadLastErrors(cycleDir, appDir string) ([]loopErrorRow, string) {
 	return errs, journalTail
 }
 
+// loadCycleOutcome reads the outcome artifacts from the latest cycle dir.
+// All fields are optional — whichever files exist are returned.
+func loadCycleOutcome(cycleDir string) *loopOutcome {
+	if cycleDir == "" {
+		return nil
+	}
+	out := &loopOutcome{}
+	found := false
+
+	// score.json — {realized_alpha_pp, benchmark_label, sharpe, max_dd}
+	if b, err := os.ReadFile(filepath.Join(cycleDir, "score.json")); err == nil {
+		var score struct {
+			RealizedAlphaPP *float64 `json:"realized_alpha_pp"`
+			BenchmarkLabel  string   `json:"benchmark_label"`
+			Sharpe          *float64 `json:"sharpe"`
+			MaxDD           *float64 `json:"max_dd"`
+		}
+		if json.Unmarshal(b, &score) == nil {
+			out.AlphaPP = score.RealizedAlphaPP
+			out.Benchmark = score.BenchmarkLabel
+			out.Sharpe = score.Sharpe
+			out.MaxDD = score.MaxDD
+			found = true
+		}
+	}
+
+	// insight.md — first 5 lines
+	if b, err := os.ReadFile(filepath.Join(cycleDir, "insight.md")); err == nil {
+		lines := strings.SplitN(string(b), "\n", 7)
+		nLines := 5
+		if len(lines) < nLines {
+			nLines = len(lines)
+		}
+		head := strings.TrimSpace(strings.Join(lines[:nLines], "\n"))
+		if head != "" {
+			out.InsightHead = head
+			found = true
+		}
+	}
+
+	// proposal.json — {strategy, symbol, direction, size_pct_nav}
+	if b, err := os.ReadFile(filepath.Join(cycleDir, "proposal.json")); err == nil {
+		var p loopProposal
+		if json.Unmarshal(b, &p) == nil && (p.Strategy != "" || p.Symbol != "") {
+			out.LastProposal = &p
+			found = true
+		}
+	}
+
+	if !found {
+		return nil
+	}
+	return out
+}
+
+// loadAppStrategies reads ~/.xp/apps/<app>/data/strategies/*/state.json
+// and returns the lifecycle state for each strategy that has one.
+// Returns nil when the directory doesn't exist (most apps don't use it).
+func loadAppStrategies(home, app string) []strategyState {
+	dir := filepath.Join(home, ".xp", "apps", app, "data", "strategies")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []strategyState
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		stateFile := filepath.Join(dir, e.Name(), "state.json")
+		b, err := os.ReadFile(stateFile)
+		if err != nil {
+			continue
+		}
+		var s strategyState
+		if json.Unmarshal(b, &s) == nil {
+			if s.Name == "" {
+				s.Name = e.Name()
+			}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func readManifestLoops(p string) ([]rawLoop, error) {
 	b, err := os.ReadFile(p)
 	if err != nil {
@@ -643,6 +764,12 @@ func loadAppGitStatus(home, app string) appGitStatus {
 	case out.LocalHEAD != "" && out.RemoteHEAD != "" && out.LocalHEAD != out.RemoteHEAD:
 		out.Status = "drift"
 	}
+
+	// Strategy lifecycle states (Theme I) — best-effort; most apps won't
+	// have this directory.
+	if strats := loadAppStrategies(home, app); len(strats) > 0 {
+		out.Strategies = strats
+	}
 	return out
 }
 
@@ -751,6 +878,8 @@ func AdminLoops(c *gin.Context) {
 				}
 				row.LatestCycleDir = latestPath
 				row.LatestCycleTS = latestTS
+				// Cycle outcome — score.json + insight.md + proposal.json
+				row.Outcome = loadCycleOutcome(latestPath)
 				// When the daemon flagged this loop as failing, hydrate
 				// the diagnostic fields. Cheap (file reads) so we ship
 				// inline. Skip on success to keep the response slim.

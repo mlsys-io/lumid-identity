@@ -117,6 +117,8 @@ func Register(r *gin.Engine) {
 			admin.GET("/build-status",   AdminBuildStatus)
 			admin.GET("/loops",          AdminLoops)
 			admin.GET("/codebase-repos", AdminCodebaseRepos)
+			admin.GET("/jobs",           Jobs)
+			admin.GET("/cycle-artifact", CycleArtifact)
 		}
 
 		// super_admin-only — billing/accounting/secrets endpoints.

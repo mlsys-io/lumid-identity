@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -93,6 +94,19 @@ type loopOutcome struct {
 	MaxDD        *float64 `json:"max_dd,omitempty"`        // max_dd from score.json
 	InsightHead  string   `json:"insight_head,omitempty"`  // first 5 lines of insight.md
 	LastProposal *loopProposal `json:"last_proposal,omitempty"` // from proposal.json
+
+	// Trading-cycle metrics derived from trades.json. Optional — observer
+	// loops (regime_detector, competitor_observer) skip act/execute and
+	// produce no trades.
+	TradesCount    *int     `json:"trades_count,omitempty"`     // # of trades placed this cycle
+	PnL            *float64 `json:"pnl,omitempty"`              // sum of per-trade pnl
+	WinRate        *float64 `json:"win_rate,omitempty"`         // wins / total (0..1)
+	MaxLoss        *float64 `json:"max_single_trade_loss,omitempty"`
+
+	// Downstream jobs submitted during this cycle. Populated by scanning
+	// ~/.lumilake/jobs.jsonl for rows tagged with this loop's name.
+	// Empty for loops that don't use the submit_jobs path.
+	DownstreamJobs []cycleJobRef `json:"downstream_jobs,omitempty"`
 }
 
 type loopProposal struct {
@@ -100,6 +114,17 @@ type loopProposal struct {
 	Symbol    string  `json:"symbol,omitempty"`
 	Direction string  `json:"direction,omitempty"`
 	SizePctNAV float64 `json:"size_pct_nav,omitempty"`
+	Confidence *float64 `json:"confidence,omitempty"`
+}
+
+// cycleJobRef is a slim pointer to a job in the unified ledger. The UI
+// uses {job_id, source, state} to render a chip and link to
+// /dashboard/jobs?submitter_loop=<loop>.
+type cycleJobRef struct {
+	JobID  string `json:"job_id"`
+	Source string `json:"source"`
+	Kind   string `json:"kind,omitempty"`
+	State  string `json:"state"`
 }
 
 type loopStep struct {
@@ -536,7 +561,7 @@ func loadCycleOutcome(cycleDir string) *loopOutcome {
 		}
 	}
 
-	// proposal.json — {strategy, symbol, direction, size_pct_nav}
+	// proposal.json — {strategy, symbol, direction, size_pct_nav, confidence}
 	if b, err := os.ReadFile(filepath.Join(cycleDir, "proposal.json")); err == nil {
 		var p loopProposal
 		if json.Unmarshal(b, &p) == nil && (p.Strategy != "" || p.Symbol != "") {
@@ -545,8 +570,117 @@ func loadCycleOutcome(cycleDir string) *loopOutcome {
 		}
 	}
 
+	// trades.json — array of per-trade records. Schema varies by loop
+	// (auto-quant's place_order writes {symbol, side, qty, fill_price,
+	// pnl}); we tolerate missing fields and only surface aggregates when
+	// the file actually has trades.
+	if b, err := os.ReadFile(filepath.Join(cycleDir, "trades.json")); err == nil {
+		var trades []struct {
+			PnL    *float64 `json:"pnl,omitempty"`
+			Profit *float64 `json:"profit,omitempty"` // alternate field name
+		}
+		if json.Unmarshal(b, &trades) == nil && len(trades) > 0 {
+			n := len(trades)
+			out.TradesCount = &n
+			var sum, worst float64
+			wins, hasPnl := 0, 0
+			worstSet := false
+			for _, t := range trades {
+				p := t.PnL
+				if p == nil {
+					p = t.Profit
+				}
+				if p == nil {
+					continue
+				}
+				hasPnl++
+				sum += *p
+				if *p > 0 {
+					wins++
+				}
+				if !worstSet || *p < worst {
+					worst = *p
+					worstSet = true
+				}
+			}
+			if hasPnl > 0 {
+				out.PnL = &sum
+				wr := float64(wins) / float64(hasPnl)
+				out.WinRate = &wr
+				if worstSet {
+					out.MaxLoss = &worst
+				}
+			}
+			found = true
+		}
+	}
+
 	if !found {
 		return nil
+	}
+	return out
+}
+
+// loadDownstreamJobs scans ~/.lumilake/jobs.jsonl for jobs submitted by
+// the given (app, loop) pair. Read-only and cheap — bounded ledger.
+// Returns the newest 10 (UI shows at most a few chips per cycle row).
+func loadDownstreamJobs(app, loop string) []cycleJobRef {
+	if app == "" || loop == "" {
+		return nil
+	}
+	path := ledgerPath() // shared helper from jobs.go
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	type slimRow struct {
+		JobID         string  `json:"job_id"`
+		Source        string  `json:"source"`
+		Kind          string  `json:"kind"`
+		State         string  `json:"state"`
+		SubmitterApp  string  `json:"submitter_app"`
+		SubmitterLoop string  `json:"submitter_loop"`
+		UpdatedAt     float64 `json:"updated_at"`
+		StartedAt     float64 `json:"started_at"`
+	}
+	var matches []slimRow
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 4096), 256*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var r slimRow
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			continue
+		}
+		if r.SubmitterApp != app || r.SubmitterLoop != loop {
+			continue
+		}
+		matches = append(matches, r)
+	}
+	if len(matches) == 0 {
+		return nil
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		a, b := matches[i].UpdatedAt, matches[j].UpdatedAt
+		if a == 0 {
+			a = matches[i].StartedAt
+		}
+		if b == 0 {
+			b = matches[j].StartedAt
+		}
+		return a > b
+	})
+	if len(matches) > 10 {
+		matches = matches[:10]
+	}
+	out := make([]cycleJobRef, 0, len(matches))
+	for _, m := range matches {
+		out = append(out, cycleJobRef{JobID: m.JobID, Source: m.Source, Kind: m.Kind, State: m.State})
 	}
 	return out
 }
@@ -878,8 +1012,17 @@ func AdminLoops(c *gin.Context) {
 				}
 				row.LatestCycleDir = latestPath
 				row.LatestCycleTS = latestTS
-				// Cycle outcome — score.json + insight.md + proposal.json
+				// Cycle outcome — score.json + insight.md + proposal.json + trades.json
 				row.Outcome = loadCycleOutcome(latestPath)
+				// Downstream jobs the loop dispatched (submit_jobs path).
+				// Attach even when there's no other outcome so loops that
+				// only fire jobs still surface them.
+				if dj := loadDownstreamJobs(app.App, L.Name); len(dj) > 0 {
+					if row.Outcome == nil {
+						row.Outcome = &loopOutcome{}
+					}
+					row.Outcome.DownstreamJobs = dj
+				}
 				// When the daemon flagged this loop as failing, hydrate
 				// the diagnostic fields. Cheap (file reads) so we ship
 				// inline. Skip on success to keep the response slim.

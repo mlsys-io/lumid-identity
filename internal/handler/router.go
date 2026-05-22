@@ -1,8 +1,51 @@
 package handler
 
 import (
+	"net/http"
+	"os"
+	"strings"
+
 	"github.com/gin-gonic/gin"
 )
+
+// meCORS — permissive but bounded CORS for the /api/v1/me/* surface
+// the new web UI calls cross-origin. Allowed origins come from the
+// ME_CORS_ALLOWED_ORIGINS env var (comma-separated). Default in dev:
+// xp.io + lum.id. Credentials are enabled (the UI sends lm_session
+// cookie + PAT bearers).
+//
+// IMPORTANT: never use "*" with credentials — that's a security error
+// browsers reject anyway. The Vary header keeps CDNs honest if any
+// front-of-origin caching appears.
+func meCORS() gin.HandlerFunc {
+	allowed := os.Getenv("ME_CORS_ALLOWED_ORIGINS")
+	if allowed == "" {
+		allowed = "https://xp.io,https://lum.id,http://localhost:5173,http://localhost:13080"
+	}
+	set := map[string]bool{}
+	for _, o := range strings.Split(allowed, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			set[o] = true
+		}
+	}
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+		if origin != "" && set[origin] {
+			c.Header("Access-Control-Allow-Origin", origin)
+			c.Header("Access-Control-Allow-Credentials", "true")
+			c.Header("Vary", "Origin")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+			c.Header("Access-Control-Max-Age", "600")
+		}
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
 
 // Register wires every endpoint. Order-independent: Gin handles
 // routing deterministically and we don't use wildcards that could
@@ -19,8 +62,19 @@ func Register(r *gin.Engine) {
 	r.POST("/oauth/token", OAuthTokenHandler)
 	r.GET("/oauth/userinfo", OAuthUserinfoHandler)
 
-	v1 := r.Group("/api/v1")
+	// CORS applies to the entire /api/v1/* surface, not just /me/*. The
+	// cross-origin web UI at xp.io/go/* needs login/register/OTP/user/
+	// session-bearer/forgot-password/reset-password just as much as the
+	// /me/* write endpoints. Allowlist is bounded (xp.io + lum.id +
+	// localhost dev); see meCORS() for the source-of-truth list.
+	v1 := r.Group("/api/v1", meCORS())
 	{
+		// Catch-all OPTIONS for the v1 surface. meCORS aborts with
+		// 204 + allow headers before this handler runs, so the inner
+		// func is dead code — but the route MUST exist or Gin returns
+		// 405 on OPTIONS before middleware can fire.
+		v1.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
 		v1.POST("/login", LoginHandler)
 		v1.POST("/logout", LogoutHandler)
 		v1.POST("/register", RegisterHandler)
@@ -119,6 +173,46 @@ func Register(r *gin.Engine) {
 			admin.GET("/codebase-repos", AdminCodebaseRepos)
 			admin.GET("/jobs",           Jobs)
 			admin.GET("/cycle-artifact", CycleArtifact)
+		}
+
+		// User-scoped write surface for the new web-first UI (xp.io/go/*
+		// during P0 — landing at /app/* later). All routes here are
+		// gated by currentUserID() (session JWT or PAT). CORS is open
+		// to the allowed-origins set so the xp.io-served bundle can
+		// call cross-origin.
+		// CORS + OPTIONS catch-all live on the parent v1 group; no
+		// extra middleware needed here.
+		me := v1.Group("/me")
+		{
+			// App lifecycle — async via intent queue.
+			me.GET("/apps",                   MeAppsList)
+			me.POST("/apps",                  MeAppsInstall)
+			me.DELETE("/apps/:app",           MeAppsUninstall)
+			me.GET("/intents/:id",            MeIntentGet)
+
+			// Per-loop control.
+			me.PATCH("/loops/:app/:loop",     MeLoopPatch)
+			me.POST("/loops/:app/:loop/run",  MeLoopRunNow)
+			me.GET("/loops/health",           MeLoopsHealth)
+
+			// Per-(app, key) secrets.
+			me.GET("/apps/:app/secrets",                MeSecretsList)
+			me.PUT("/apps/:app/secrets/:key",           MeSecretPut)
+			me.DELETE("/apps/:app/secrets/:key",        MeSecretDelete)
+			me.GET("/apps/:app/secrets/:key/value",     MeSecretFetchValue)
+
+			// Cycle-level feedback (Hook 2 keystone). Same backend
+			// for clickable UI + conversational-agent give_feedback tool.
+			me.POST("/cycles/feedback", MeCycleFeedback)
+
+			// Conversational shell — the natural-interaction layer.
+			// The agent calls the same tools the UI buttons would call.
+			me.POST("/agent/chat", MeAgentChat)
+			// Streaming sibling — same body shape, SSE-style chunked
+			// response. The frontend reads via fetch().body.getReader()
+			// to render text deltas + tool-call events as they arrive,
+			// instead of waiting 5-10s for a synchronous reply.
+			me.POST("/agent/chat/stream", MeAgentChatStream)
 		}
 
 		// super_admin-only — billing/accounting/secrets endpoints.

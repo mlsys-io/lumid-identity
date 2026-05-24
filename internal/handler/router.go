@@ -173,6 +173,9 @@ func Register(r *gin.Engine) {
 			admin.GET("/codebase-repos", AdminCodebaseRepos)
 			admin.GET("/jobs",           Jobs)
 			admin.GET("/cycle-artifact", CycleArtifact)
+			// Phase D follow-up: per-tenant snapshot for the
+			// super-admin dashboard's tenants tile.
+			admin.GET("/tenants",        AdminTenants)
 		}
 
 		// User-scoped write surface for the new web-first UI (xp.io/go/*
@@ -182,7 +185,9 @@ func Register(r *gin.Engine) {
 		// call cross-origin.
 		// CORS + OPTIONS catch-all live on the parent v1 group; no
 		// extra middleware needed here.
-		me := v1.Group("/me")
+		// Phase D3 — /me/* rate limit. 60/min per caller (PAT / session
+		// cookie / IP fallback). Soft-fails when Redis is unreachable.
+		me := v1.Group("/me", MeRateLimit())
 		{
 			// App lifecycle — async via intent queue.
 			me.GET("/apps",                   MeAppsList)
@@ -213,6 +218,58 @@ func Register(r *gin.Engine) {
 			// to render text deltas + tool-call events as they arrive,
 			// instead of waiting 5-10s for a synchronous reply.
 			me.POST("/agent/chat/stream", MeAgentChatStream)
+
+			// Tier-1 quota state — read-only. Used by /app/loops to
+			// render the "Free tier reached" banner + per-loop hints.
+			// Writes flow through /internal/usage/charge below.
+			me.GET("/limits", MeLimits)
+
+			// Today summary — server-side aggregation of journal
+			// entries + drafts queue + quota state for the /app/loops
+			// "Today" section. One round-trip per page load; UI
+			// renders headlines[] directly without per-app fan-out.
+			me.GET("/today",   MeToday)
+
+			// Phase D2 — storage usage snapshot per tenant. Cached
+			// 5 min; under {used_bytes, cap_mb, fraction, largest_path}.
+			me.GET("/storage", MeStorage)
+
+			// Phase D4 — external-API audit log. Same usage_events
+			// table Tier-1 counts against (kind=external_api); now
+			// human-readable so the user can see every Gmail send /
+			// calendar create / Slack post their AI made.
+			me.GET("/audit",   MeAudit)
+
+			// Phase S3-B — cycle inspector. List + drill-down for
+			// the user's per-app cycle artifacts (step outputs +
+			// prompt audit + summary).
+			me.GET("/cycles",                       MeCyclesList)
+			me.GET("/cycles/:app/:loop/:ts",        MeCycleDetail)
+
+			// Phase S3-D — knowledge browser. Per-agent bank.jsonl
+			// listing + paginated memories with kind filter.
+			me.GET("/knowledge/agents",                  MeKnowledgeAgents)
+			me.GET("/knowledge/agents/:id/memories",     MeKnowledgeMemories)
+
+			// Approval queue — drafts produced by personal-agent's
+			// email/draft + calendar/propose skills. The send action
+			// enqueues an intent the picker drains (Gmail call lands
+			// in the tenant context with their OAuth grant); edit +
+			// dismiss are state-only updates.
+			me.GET("/drafts",                MeDraftsList)
+			me.POST("/drafts/:id/send",      MeDraftSend)
+			me.POST("/drafts/:id/edit",      MeDraftEdit)
+			me.POST("/drafts/:id/dismiss",   MeDraftDismiss)
+		}
+
+		// Internal service-to-service surface. The scheduler/picker
+		// (Python) calls /usage/charge at cycle-fire time + per LLM /
+		// external-API call to atomically check-and-record against the
+		// Tier-1 caps. Bridge-secret gated (X-Bridge-Secret header);
+		// never reachable from the public surface.
+		internal := v1.Group("/internal", RequireBridge())
+		{
+			internal.POST("/usage/charge", InternalUsageCharge)
 		}
 
 		// super_admin-only — billing/accounting/secrets endpoints.

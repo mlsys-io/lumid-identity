@@ -496,6 +496,74 @@ func buildToolDefs() []map[string]any {
 				"required": []string{"source_slug"},
 			},
 		},
+		// Phase S6c — close the gap between "show me" and "do it for me".
+		// Drafts, loop tuning, and the today summary are the natural-
+		// language commands users reach for: "send Alice's draft",
+		// "pause cc_watcher for the weekend", "what's pending?".
+		{
+			"name":        "today_summary",
+			"description": "Return the user's headlines + recent cycles + drafts-pending count in one shot. Use when the user asks 'what's pending', 'what's new', or 'what did my AI do today?'.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "list_drafts",
+			"description": "List the user's pending email/calendar drafts the AI has proposed but not yet sent. Each draft has id, subject, to, body, app. Use when the user asks about pending replies or wants you to act on a specific one.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app": map[string]any{"type": "string", "description": "optional — limit to one app's drafts"},
+				},
+			},
+		},
+		{
+			"name":        "send_draft",
+			"description": "Send a drafted email/event by id. The send goes through the user's OAuth grant — irreversible. Confirm with the user before calling unless they explicitly said 'send'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string", "description": "draft id from list_drafts"},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			"name":        "edit_draft",
+			"description": "Rewrite a draft's body or subject. State resets to pending (the user still has to send it). Use when the user wants a tone shift, more detail, or a quick fix.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":      map[string]any{"type": "string"},
+					"body":    map[string]any{"type": "string", "description": "new body text"},
+					"subject": map[string]any{"type": "string", "description": "optional new subject"},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			"name":        "dismiss_draft",
+			"description": "Mark a draft dismissed — no send, no further nudges. Use when the user says 'skip', 'ignore', 'not this one'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"type": "string"},
+				},
+				"required": []string{"id"},
+			},
+		},
+		{
+			"name":        "patch_loop",
+			"description": "Change a loop's schedule or pause/resume it. Writes to .user-overrides.yaml; the underlying app stays untouched. Use for 'pause cc_watcher', 'change morning_brief to 7am', 'resume hourly_triage'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":      map[string]any{"type": "string"},
+					"loop":     map[string]any{"type": "string"},
+					"schedule": map[string]any{"type": "string", "description": "cron expression, e.g. '0 8 * * *'"},
+					"enabled":  map[string]any{"type": "boolean", "description": "true to resume, false to pause"},
+				},
+				"required": []string{"app", "loop"},
+			},
+		},
 	}
 }
 
@@ -616,6 +684,66 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 			"status":    "pending",
 			"note":      "Subscribe queued — memories will flow on the next cycle. Tell the user it may take a moment.",
 		}, true
+
+	// ── Phase S6c new tools ────────────────────────────────────────
+
+	case "today_summary":
+		return toolTodaySummary(userID), true
+
+	case "list_drafts":
+		app, _ := args["app"].(string)
+		return toolListDrafts(userID, app), true
+
+	case "send_draft":
+		id, _ := args["id"].(string)
+		if id == "" {
+			return map[string]any{"error": "id required"}, false
+		}
+		return toolDraftAction(userID, id, "send", nil), true
+
+	case "dismiss_draft":
+		id, _ := args["id"].(string)
+		if id == "" {
+			return map[string]any{"error": "id required"}, false
+		}
+		return toolDraftAction(userID, id, "dismiss", nil), true
+
+	case "edit_draft":
+		id, _ := args["id"].(string)
+		if id == "" {
+			return map[string]any{"error": "id required"}, false
+		}
+		body, _ := args["body"].(string)
+		subject, _ := args["subject"].(string)
+		patch := map[string]any{}
+		if body != "" {
+			patch["body"] = body
+		}
+		if subject != "" {
+			patch["subject"] = subject
+		}
+		if len(patch) == 0 {
+			return map[string]any{"error": "provide body or subject"}, false
+		}
+		return toolDraftAction(userID, id, "edit", patch), true
+
+	case "patch_loop":
+		app, _ := args["app"].(string)
+		loop, _ := args["loop"].(string)
+		if app == "" || loop == "" {
+			return map[string]any{"error": "app and loop required"}, false
+		}
+		patch := map[string]any{}
+		if v, ok := args["schedule"].(string); ok && v != "" {
+			patch["schedule"] = v
+		}
+		if v, ok := args["enabled"].(bool); ok {
+			patch["enabled"] = v
+		}
+		if len(patch) == 0 {
+			return map[string]any{"error": "provide schedule or enabled"}, false
+		}
+		return toolPatchLoop(userID, app, loop, patch), true
 	}
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

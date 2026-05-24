@@ -18,6 +18,8 @@ var AllTables = []interface{}{
 	&SSHKey{},
 	&UserAccessGrant{},
 	&GoogleGrant{},
+	&AppSecret{},
+	&UsageEvent{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

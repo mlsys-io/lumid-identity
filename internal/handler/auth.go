@@ -328,15 +328,27 @@ func findUserOrMirror(email string) (*models.User, error) {
 }
 
 func setSessionCookie(c *gin.Context, token string, exp time.Time) {
-	// SameSite=Lax so cross-subdomain top-level GETs work; Secure so
-	// it's HTTPS-only (dev over http://localhost will be bare).
+	// Cookie policy:
+	//   - Domain=.lum.id (prod) so it's sent to lum.id + every
+	//     subdomain. Blank in dev so it binds to the request host.
+	//   - Secure on HTTPS; bare on dev http://localhost.
+	//   - HttpOnly so JS can't read it.
+	//   - SameSite=None on HTTPS so cross-origin XHR from xp.io/go/*
+	//     can carry the session to lum.id (the new web-first UI's auth
+	//     flow needs this). SameSite=None REQUIRES Secure per the
+	//     modern cookie spec, so dev http://localhost stays Lax to
+	//     avoid the "SameSite=None without Secure" browser reject.
+	//     CSRF risk mitigated by the explicit CORS allowlist (xp.io
+	//     + lum.id only) and the per-PAT-scope gates on /me/*.
 	secure := !strings.HasPrefix(config.G.App.Issuer, "http://")
 	sameSite := http.SameSiteLaxMode
+	if secure {
+		sameSite = http.SameSiteNoneMode
+	}
 	maxAge := int(time.Until(exp).Seconds())
 	if maxAge < 1 {
 		maxAge = 0
 	}
-	// Domain blank in dev (falls back to current host); `.lum.id` in prod.
 	domain := ""
 	if strings.HasSuffix(config.G.App.Issuer, "lum.id") {
 		domain = ".lum.id"

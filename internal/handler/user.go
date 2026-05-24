@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
+	"lumid_identity/internal/config"
 	"lumid_identity/models"
 )
 
@@ -434,6 +435,20 @@ func RedeemInvitationCodeHandler(c *gin.Context) {
 	if err := tx.Commit().Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "commit: "+err.Error())
 		return
+	}
+
+	// Mirror the redeemed code to LQA's tbl_user.invitation_code.
+	// QA's InvitationCodeRequiredMiddleware (middleware.go:421) reads
+	// that column directly and 403s gated routes (/strategies,
+	// /backtesting-tasks, /history-databases, /universes, …) when
+	// empty. Without this mirror, OAuth users redeem successfully on
+	// lum.id but every QA dashboard panel toasts "Please add an
+	// invitation code to access this feature" until the next signup.
+	if config.G.Legacy.Enabled && common.LegacyDB != nil {
+		common.LegacyDB.Exec(
+			`UPDATE tbl_user SET invitation_code = ?, update_time = UNIX_TIMESTAMP() WHERE email = ?`,
+			code, u.Email,
+		)
 	}
 
 	// Mirror LQA's response shape so the frontend dialog's

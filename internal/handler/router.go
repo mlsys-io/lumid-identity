@@ -272,6 +272,11 @@ func Register(r *gin.Engine) {
 			me.GET("/runs",                       MeRuns)
 			me.GET("/runs/:run_id",               MeRunDetail)
 			me.GET("/runs/stream",                MeRunsStream)
+
+			// Mind — the Improve surface (W4). Per-workflow report
+			// cards (plain-English deltas) + on-demand skill evaluation.
+			me.GET("/mind/workflow/:slug",        MeMindWorkflow)
+			me.POST("/mind/evaluate",             MeMindEvaluate)
 		}
 
 		// Internal service-to-service surface. The scheduler/picker

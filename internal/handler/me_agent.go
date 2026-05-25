@@ -631,6 +631,85 @@ func buildToolDefs() []map[string]any {
 				"required": []string{"slug", "enabled"},
 			},
 		},
+
+		// ── Create surface (W2) — chat-driven workflow composition.
+		// These are the highest-value Create tools; they hide the
+		// marketplace-mechanics from the user (they ask "build me X",
+		// the agent picks skills + drafts a workflow).
+		{
+			"name":        "search_marketplace",
+			"description": "Search the curated marketplace for skills / workflows matching a natural-language query. Use this when the user is browsing or you need to know what's available before composing.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":   map[string]any{"type": "string"},
+					"for_app": map[string]any{"type": "string", "description": "optional — narrow to one xpio app's catalog (personal-agent / mbb-ai / auto-quant / eventx / auto-sysresearch)"},
+					"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+				},
+				"required": []string{"query"},
+			},
+		},
+		{
+			"name":        "compose_workflow",
+			"description": "Draft a new workflow from a natural-language intent. Calls /api/v1/skills/suggest to pick the right skills, builds an xpcloud.yaml workflow stitching them together, and stages it under the user's tenant draft directory. The user can then review + adjust in the composer UI.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"intent":   map[string]any{"type": "string", "description": "plain-English description, e.g. 'watch my Slack every hour and draft replies'"},
+					"for_app": map[string]any{"type": "string", "description": "which xpio shape to target — personal-agent is the default for assistant-style intents"},
+					"name":    map[string]any{"type": "string", "description": "optional — friendly name for the new workflow (defaults to a slug derived from the intent)"},
+				},
+				"required": []string{"intent"},
+			},
+		},
+		{
+			"name":        "add_skill_to_workflow",
+			"description": "Add a skill from the marketplace to an existing scheduled workflow's skill_imports[]. Updates the tenant's .user-overrides.yaml. Use after compose_workflow when the user wants to extend an already-installed workflow.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"slug":       map[string]any{"type": "string", "description": "workflow slug, e.g. 'personal-agent:morning_brief'"},
+					"skill_name": map[string]any{"type": "string", "description": "marketplace skill name, e.g. 'tavily-search'"},
+				},
+				"required": []string{"slug", "skill_name"},
+			},
+		},
+
+		// ── Improve surface (W4) ──────────────────────────────────
+		{
+			"name":        "workflow_report_card",
+			"description": "Plain-English progress card for one workflow over the last month vs the month before. Headlines cover reliability, latency, draft accept-rate. Use this for 'how is my morning brief getting better?' or 'is X workflow improving?' questions.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"slug": map[string]any{"type": "string", "description": "workflow slug, e.g. 'personal-agent:morning_brief'"},
+				},
+				"required": []string{"slug"},
+			},
+		},
+		{
+			"name":        "trigger_evaluation",
+			"description": "Enqueue an on-demand evaluation of a marketplace skill against an xpio app's casebook. Skill-roster picks it up within ~60s and posts an attestation to xpcloud. Use when the user wants a fresh score (e.g., right after installing a new skill).",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"skill_name": map[string]any{"type": "string"},
+					"for_app":    map[string]any{"type": "string", "description": "personal-agent / mbb-ai / eventx / auto-quant / auto-sysresearch"},
+				},
+				"required": []string{"skill_name", "for_app"},
+			},
+		},
+		{
+			"name":        "suggest_workflow_improvement",
+			"description": "Look at one workflow's recent failures + report card and recommend ONE concrete change (swap skill, add a step, change schedule). Use when the user asks 'how can I improve X?' or after surfacing a failure they want to fix.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"slug": map[string]any{"type": "string"},
+				},
+				"required": []string{"slug"},
+			},
+		},
 	}
 }
 
@@ -853,6 +932,59 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 			return map[string]any{"error": "pause_workflow only supports scheduled workflows (slug '<app>:<loop>'); use n8n's UI to toggle visual workflows"}, false
 		}
 		return toolPatchLoop(userID, parts[0], parts[1], map[string]any{"enabled": enabled}), true
+
+	// ── Create surface (W2) ───────────────────────────────────
+	case "search_marketplace":
+		query, _ := args["query"].(string)
+		forApp, _ := args["for_app"].(string)
+		limit := 5
+		if v, ok := args["limit"].(float64); ok {
+			limit = int(v)
+		}
+		if query == "" {
+			return map[string]any{"error": "query required"}, false
+		}
+		return toolSearchMarketplace(c, query, forApp, limit), true
+
+	case "compose_workflow":
+		intent, _ := args["intent"].(string)
+		forApp, _ := args["for_app"].(string)
+		name, _ := args["name"].(string)
+		if intent == "" {
+			return map[string]any{"error": "intent required"}, false
+		}
+		return toolComposeWorkflow(c, userID, intent, forApp, name), true
+
+	case "add_skill_to_workflow":
+		slug, _ := args["slug"].(string)
+		skillName, _ := args["skill_name"].(string)
+		if slug == "" || skillName == "" {
+			return map[string]any{"error": "slug and skill_name required"}, false
+		}
+		return toolAddSkillToWorkflow(userID, slug, skillName), true
+
+	// ── Improve surface (W4) ──────────────────────────────────
+	case "workflow_report_card":
+		slug, _ := args["slug"].(string)
+		if slug == "" {
+			return map[string]any{"error": "slug required"}, false
+		}
+		return toolWorkflowReportCard(c, userID, slug), true
+
+	case "trigger_evaluation":
+		skillName, _ := args["skill_name"].(string)
+		forApp, _ := args["for_app"].(string)
+		if skillName == "" || forApp == "" {
+			return map[string]any{"error": "skill_name and for_app required"}, false
+		}
+		return toolTriggerEvaluation(userID, skillName, forApp), true
+
+	case "suggest_workflow_improvement":
+		slug, _ := args["slug"].(string)
+		if slug == "" {
+			return map[string]any{"error": "slug required"}, false
+		}
+		return toolSuggestImprovement(c, userID, slug), true
 	}
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

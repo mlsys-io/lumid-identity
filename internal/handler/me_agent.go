@@ -564,6 +564,73 @@ func buildToolDefs() []map[string]any {
 				"required": []string{"app", "loop"},
 			},
 		},
+
+		// ── Workflow surface (W1) ─────────────────────────────────
+		// In the user-facing vocabulary, "workflow" replaces "loop" /
+		// "app" / "n8n DAG" — all three are kinds of workflow. The
+		// old list_apps / run_loop_now / patch_loop tools stay above
+		// for back-compat; the new tools below are the canonical
+		// surface the chat should prefer.
+		{
+			"name":        "list_workflows",
+			"description": "List the user's workflows across kinds (scheduled = xpio loop; visual = n8n DAG). Returns slug, kind, trigger, last-run state, enabled flag. Prefer this over list_apps.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"kind": map[string]any{
+						"type":        "string",
+						"description": "optional filter: 'scheduled' or 'visual'",
+						"enum":        []string{"scheduled", "visual"},
+					},
+				},
+			},
+		},
+		{
+			"name":        "workflow_detail",
+			"description": "Full definition + last runs for one workflow. Slug shape: '<app>:<loop>' for scheduled or 'n8n:<id>' for visual.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"slug": map[string]any{"type": "string"},
+				},
+				"required": []string{"slug"},
+			},
+		},
+		{
+			"name":        "list_runs",
+			"description": "List recent workflow runs across all kinds. Filter by state ('succeeded'/'failed'/'running'/'skipped') and/or workflow slug. Default window: last 24h.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"state":    map[string]any{"type": "string", "description": "comma-separated states to include"},
+					"workflow": map[string]any{"type": "string", "description": "filter to one workflow slug"},
+					"limit":    map[string]any{"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+				},
+			},
+		},
+		{
+			"name":        "run_detail",
+			"description": "Per-step details for one run (steps, error, artifacts). run_id shape: 'scheduled:<app>:<loop>:<ts>' or 'visual:n8n:<exec_id>'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"run_id": map[string]any{"type": "string"},
+				},
+				"required": []string{"run_id"},
+			},
+		},
+		{
+			"name":        "pause_workflow",
+			"description": "Pause (enabled=false) or resume (enabled=true) a workflow. Equivalent to patch_loop with the enabled flag, but accepts the workflow's slug directly.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"slug":    map[string]any{"type": "string", "description": "<app>:<loop> for scheduled workflows"},
+					"enabled": map[string]any{"type": "boolean"},
+				},
+				"required": []string{"slug", "enabled"},
+			},
+		},
 	}
 }
 
@@ -744,6 +811,48 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 			return map[string]any{"error": "provide schedule or enabled"}, false
 		}
 		return toolPatchLoop(userID, app, loop, patch), true
+
+	// ── Workflow surface (W1) — delegate to MeWorkflows / MeRuns
+	// handlers via thin Go wrappers that bypass the HTTP layer.
+	case "list_workflows":
+		kind, _ := args["kind"].(string)
+		return toolListWorkflows(c, userID, kind), true
+
+	case "workflow_detail":
+		slug, _ := args["slug"].(string)
+		if slug == "" {
+			return map[string]any{"error": "slug required"}, false
+		}
+		return toolWorkflowDetail(c, userID, slug), true
+
+	case "list_runs":
+		state, _ := args["state"].(string)
+		workflow, _ := args["workflow"].(string)
+		limit := 25
+		if v, ok := args["limit"].(float64); ok {
+			limit = int(v)
+		}
+		return toolListRuns(c, userID, state, workflow, limit), true
+
+	case "run_detail":
+		runID, _ := args["run_id"].(string)
+		if runID == "" {
+			return map[string]any{"error": "run_id required"}, false
+		}
+		return toolRunDetail(c, userID, runID), true
+
+	case "pause_workflow":
+		slug, _ := args["slug"].(string)
+		enabled, _ := args["enabled"].(bool)
+		if slug == "" {
+			return map[string]any{"error": "slug required"}, false
+		}
+		// scheduled workflows only — slug shape "<app>:<loop>".
+		parts := strings.SplitN(slug, ":", 2)
+		if len(parts) != 2 || parts[0] == "n8n" {
+			return map[string]any{"error": "pause_workflow only supports scheduled workflows (slug '<app>:<loop>'); use n8n's UI to toggle visual workflows"}, false
+		}
+		return toolPatchLoop(userID, parts[0], parts[1], map[string]any{"enabled": enabled}), true
 	}
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

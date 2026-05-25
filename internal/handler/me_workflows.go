@@ -1,0 +1,300 @@
+// /me/workflows — the unified workflow surface (W1).
+//
+// Aggregates three sources behind a single response shape so Studio's
+// /studio/workflows page renders one table:
+//   1. Scheduled — xpio loops walked from the user's tenant tree +
+//      operator-shared ~/.xp/apps/. Reuses AdminLoops' loopRow scan.
+//   2. Visual — n8n workflows fetched via the REST API (W1 best-effort
+//      without SSO; an empty list is normal until W2 lands the bridge).
+//   3. Skill (catalog-only kind) — not enumerated here. The Studio
+//      "Available" lens hits /api/v1/skills/catalog directly.
+//
+// Tenant-isolated by construction: scheduled rows are scoped to the
+// caller's ~/.tenants/<sub>/ tree via the same MeLoopsHealth path; the
+// n8n REST call uses the caller's session cookie when forwarded.
+
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"lumid_identity/internal/common"
+)
+
+// WorkflowRow is the unified per-workflow record the UI consumes.
+type WorkflowRow struct {
+	Slug         string `json:"slug"`           // unique within tenant: "<app>:<name>" or "n8n:<id>"
+	Kind         string `json:"kind"`           // "scheduled" | "visual"
+	Name         string `json:"name"`           // display name (loop name or n8n workflow name)
+	App          string `json:"app,omitempty"`  // for scheduled
+	Trigger      string `json:"trigger"`        // human-readable
+	Enabled      bool   `json:"enabled"`
+	Tenant       bool   `json:"tenant"`         // true = tenant-installed; false = operator-shared
+	LastRunTS    float64 `json:"last_run_ts,omitempty"`
+	LastRunOK    *bool   `json:"last_run_ok,omitempty"`
+	NextRunTS    float64 `json:"next_run_ts,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Engine       string `json:"engine,omitempty"`        // "runner_steps" | "command:<verb>" (scheduled)
+	StepCount    int    `json:"step_count,omitempty"`
+	N8nID        string `json:"n8n_id,omitempty"`        // for kind=visual
+}
+
+// MeWorkflows — GET /me/workflows[?kind=scheduled|visual]
+//
+// Optional kind filter narrows to one source; default returns the union.
+func MeWorkflows(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	kindFilter := strings.TrimSpace(c.Query("kind"))
+
+	rows := make([]WorkflowRow, 0, 32)
+
+	// 1. Scheduled — reuse the existing AdminLoops scan but scope it
+	//    to the caller's tenant tree + operator-shared. AdminLoops
+	//    today serves operator-only; we duplicate the scan with the
+	//    tenant root prepended.
+	if kindFilter == "" || kindFilter == "scheduled" {
+		rows = append(rows, scheduledWorkflows(userID)...)
+	}
+
+	// 2. Visual — n8n. Soft-fail on unauthenticated (W1 norm); the
+	//    list is empty until the user signs into n8n directly. W2 SSO
+	//    bridge will mint the session cookie automatically.
+	if kindFilter == "" || kindFilter == "visual" {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
+		defer cancel()
+		rows = append(rows, visualWorkflows(ctx, c)...)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"workflows": rows,
+			"count":     len(rows),
+			"as_of":     time.Now().UTC().Format(time.RFC3339),
+		},
+	})
+}
+
+// scheduledWorkflows walks the tenant + operator app trees and returns
+// one WorkflowRow per xpio loop (post-coalesce, so workflows: entries
+// are included as scheduled rows too).
+func scheduledWorkflows(userID string) []WorkflowRow {
+	out := []WorkflowRow{}
+
+	scan := func(appsRoot string, isTenant bool) {
+		entries, err := os.ReadDir(appsRoot)
+		if err != nil {
+			return
+		}
+		state := readSchedulerState(operatorHome())
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			appDir := filepath.Join(appsRoot, e.Name())
+			loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml"))
+			if err != nil || len(loops) == 0 {
+				// Try manifest.json fallback.
+				loops, _ = readManifestLoops(filepath.Join(appDir, "manifest.json"))
+			}
+			if len(loops) == 0 {
+				continue
+			}
+			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
+			for _, L := range loops {
+				if L.Name == "" {
+					continue
+				}
+				jobID := "xpio:" + e.Name() + ":" + L.Name
+				s := state.Loops[jobID]
+				enabled := true
+				if v, ok := enabledMap[L.Name]; ok {
+					enabled = v
+				}
+				engine := "runner_steps"
+				if L.Engine.Type != "" {
+					engine = L.Engine.Type
+					if L.Engine.Module != "" {
+						engine += ":" + L.Engine.Module
+					}
+				}
+				row := WorkflowRow{
+					Slug:        e.Name() + ":" + L.Name,
+					Kind:        "scheduled",
+					Name:        L.Name,
+					App:         e.Name(),
+					Trigger:     L.Schedule,
+					Enabled:     enabled,
+					Tenant:      isTenant,
+					LastRunTS:   s.LastRunTS,
+					Description: L.Description,
+					Engine:      engine,
+					StepCount:   len(L.Steps),
+				}
+				if s.LastOk != nil {
+					b := *s.LastOk
+					row.LastRunOK = &b
+				}
+				out = append(out, row)
+			}
+		}
+	}
+
+	// Tenant first so Studio shows the user's own workflows on top.
+	scan(tenantAppsDir(userID), true)
+	scan(filepath.Join(operatorHome(), ".xp", "apps"), false)
+	return out
+}
+
+// visualWorkflows hits the n8n REST API and maps the result to
+// WorkflowRow. Returns an empty slice on auth failure (W1 norm).
+func visualWorkflows(ctx context.Context, c *gin.Context) []WorkflowRow {
+	cli := common.NewN8nClient()
+	// Forward the user's n8n session cookie if the browser sent one.
+	// Pre-W2 SSO this is typically empty; n8n returns 401 → soft-fail.
+	cookie, _ := c.Cookie("n8n-auth")
+	wfs, err := cli.ListWorkflows(ctx, cookie)
+	if err != nil {
+		return nil
+	}
+	out := make([]WorkflowRow, 0, len(wfs))
+	for _, w := range wfs {
+		trigger := "manual"
+		// Heuristic: an n8n workflow with a Cron node trigger is
+		// scheduled; otherwise treat as manual/webhook.
+		for _, n := range w.Nodes {
+			if strings.Contains(strings.ToLower(n.Type), "cron") ||
+				strings.Contains(strings.ToLower(n.Type), "schedule") {
+				trigger = "cron"
+				break
+			}
+			if strings.Contains(strings.ToLower(n.Type), "webhook") {
+				trigger = "webhook"
+				break
+			}
+		}
+		out = append(out, WorkflowRow{
+			Slug:      "n8n:" + w.ID,
+			Kind:      "visual",
+			Name:      w.Name,
+			Trigger:   trigger,
+			Enabled:   w.Active,
+			Tenant:    true,
+			StepCount: len(w.Nodes),
+			N8nID:     w.ID,
+		})
+	}
+	return out
+}
+
+// readEnabledOverrides — read just the per-loop `enabled` flag from
+// .user-overrides.yaml. Tolerates missing file (returns empty map).
+func readEnabledOverrides(path string) map[string]bool {
+	out := map[string]bool{}
+	overrides := readSimpleOverrides(path)
+	loopsMap, _ := overrides["loops"].(map[string]any)
+	for name, v := range loopsMap {
+		settings, _ := v.(map[string]any)
+		if en, ok := settings["enabled"].(bool); ok {
+			out[name] = en
+		}
+	}
+	return out
+}
+
+// MeWorkflowDetail — GET /me/workflows/:slug
+//
+// Returns the full definition + last N runs + step metadata. Slug
+// shape: "<app>:<loop>" for scheduled, "n8n:<id>" for visual.
+func MeWorkflowDetail(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	slug := c.Param("slug")
+	parts := strings.SplitN(slug, ":", 2)
+	if len(parts) != 2 {
+		fail(c, http.StatusBadRequest, 1400, "invalid slug")
+		return
+	}
+
+	if parts[0] == "n8n" {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
+		defer cancel()
+		cli := common.NewN8nClient()
+		cookie, _ := c.Cookie("n8n-auth")
+		wf, err := cli.GetWorkflow(ctx, parts[1], cookie)
+		if err != nil {
+			fail(c, http.StatusBadGateway, 1500, "n8n: "+err.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"slug":       slug,
+				"kind":       "visual",
+				"definition": wf,
+			},
+		})
+		return
+	}
+
+	// scheduled: parts[0] = app, parts[1] = loop
+	app, loop := parts[0], parts[1]
+	// Read the app's xpcloud.yaml from tenant tree (or operator-shared
+	// as fallback) and surface the matching loop entry verbatim.
+	loops, src := readLoopsFromAnywhere(userID, app)
+	for _, L := range loops {
+		if L.Name == loop {
+			c.JSON(http.StatusOK, gin.H{
+				"ret_code": 0, "message": "ok",
+				"data": gin.H{
+					"slug":         slug,
+					"kind":         "scheduled",
+					"app":          app,
+					"loop":         loop,
+					"source":       src,
+					"definition":   L,
+				},
+			})
+			return
+		}
+	}
+	fail(c, http.StatusNotFound, 1404, "workflow not found")
+}
+
+// readLoopsFromAnywhere tries the user's tenant copy first, then the
+// operator-shared copy. Returns the loops list + a label describing
+// where it came from ("tenant" | "operator-shared").
+func readLoopsFromAnywhere(userID, app string) ([]rawLoop, string) {
+	for _, candidate := range []struct {
+		path  string
+		label string
+	}{
+		{filepath.Join(tenantAppsDir(userID), app, "xpcloud.yaml"), "tenant"},
+		{filepath.Join(operatorHome(), ".xp", "apps", app, "xpcloud.yaml"), "operator-shared"},
+	} {
+		loops, err := readYamlLoops(candidate.path)
+		if err == nil && len(loops) > 0 {
+			return loops, candidate.label
+		}
+	}
+	return nil, ""
+}
+
+// debug helper — included so the request-trace JSON encoding is sane;
+// remove if mypy/staticcheck flags it as unused.
+var _ = json.RawMessage{}

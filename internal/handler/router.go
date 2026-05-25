@@ -260,6 +260,18 @@ func Register(r *gin.Engine) {
 			me.POST("/drafts/:id/send",      MeDraftSend)
 			me.POST("/drafts/:id/edit",      MeDraftEdit)
 			me.POST("/drafts/:id/dismiss",   MeDraftDismiss)
+
+			// Workflow surface — W1 (unifies xpio loops + n8n workflows).
+			// /me/workflows ≈ "list everything you have running" across
+			// runtimes; the per-slug detail returns the full definition.
+			me.GET("/workflows",                  MeWorkflows)
+			me.GET("/workflows/:slug",            MeWorkflowDetail)
+
+			// Runs — unified history across runtimes + SSE state-stream
+			// for live "lights" in /studio/runs.
+			me.GET("/runs",                       MeRuns)
+			me.GET("/runs/:run_id",               MeRunDetail)
+			me.GET("/runs/stream",                MeRunsStream)
 		}
 
 		// Internal service-to-service surface. The scheduler/picker

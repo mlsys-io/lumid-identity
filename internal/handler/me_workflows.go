@@ -53,6 +53,11 @@ type WorkflowRow struct {
 	// "✓"=succeeded, "✗"=failed, "·"=running. The UI renders these as
 	// state-colored squares. Empty when no journal entries exist.
 	RunSpark string `json:"run_spark,omitempty"`
+	// G2 — month-to-date cost in cents from usage_events. 0 when the
+	// workflow hasn't generated any server-funded LLM/external-API
+	// usage this month (visual workflows that run entirely client-side
+	// will be 0 here). Omitted from JSON when 0 for clean responses.
+	CostCentsMTD int `json:"cost_cents_mtd,omitempty"`
 }
 
 // MeWorkflows — GET /me/workflows[?kind=scheduled|visual]
@@ -100,6 +105,10 @@ func MeWorkflows(c *gin.Context) {
 // are included as scheduled rows too).
 func scheduledWorkflows(userID string) []WorkflowRow {
 	out := []WorkflowRow{}
+	// One DB hit for the user's month-to-date costs, keyed by
+	// `endpoint = <app>.<loop>`. Distributed lookup-by-key in the
+	// row-build loop below.
+	costMap := fetchCostsByEndpoint(userID)
 
 	scan := func(appsRoot string, isTenant bool) {
 		entries, err := os.ReadDir(appsRoot)
@@ -139,18 +148,19 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					}
 				}
 				row := WorkflowRow{
-					Slug:        e.Name() + ":" + L.Name,
-					Kind:        "scheduled",
-					Name:        L.Name,
-					App:         e.Name(),
-					Trigger:     L.Schedule,
-					Enabled:     enabled,
-					Tenant:      isTenant,
-					LastRunTS:   s.LastRunTS,
-					Description: L.Description,
-					Engine:      engine,
-					StepCount:   len(L.Steps),
-					RunSpark:    buildRunSpark(filepath.Join(appDir, "data", "journal.jsonl"), L.Name, 14),
+					Slug:         e.Name() + ":" + L.Name,
+					Kind:         "scheduled",
+					Name:         L.Name,
+					App:          e.Name(),
+					Trigger:      L.Schedule,
+					Enabled:      enabled,
+					Tenant:       isTenant,
+					LastRunTS:    s.LastRunTS,
+					Description:  L.Description,
+					Engine:       engine,
+					StepCount:    len(L.Steps),
+					RunSpark:     buildRunSpark(filepath.Join(appDir, "data", "journal.jsonl"), L.Name, 14),
+					CostCentsMTD: costMap[e.Name()+"."+L.Name],
 				}
 				if s.LastOk != nil {
 					b := *s.LastOk
@@ -204,6 +214,40 @@ func visualWorkflows(ctx context.Context, c *gin.Context) []WorkflowRow {
 			StepCount: len(w.Nodes),
 			N8nID:     w.ID,
 		})
+	}
+	return out
+}
+
+// fetchCostsByEndpoint returns a map of "<app>.<loop>" → month-to-date
+// cost in cents for one user. One SQL aggregation. Empty map on error
+// (don't fail the whole /me/workflows response on a missing usage_events
+// table or no rows).
+func fetchCostsByEndpoint(userSub string) map[string]int {
+	out := map[string]int{}
+	if common.DB == nil {
+		return out
+	}
+	now := time.Now().UTC()
+	mtd := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	rows := []struct {
+		Endpoint string
+		Cents    int
+	}{}
+	err := common.DB.Raw(`
+		SELECT endpoint AS endpoint,
+		       COALESCE(SUM(cost_cents), 0) AS cents
+		FROM   usage_events
+		WHERE  user_sub = ?
+		  AND  ts >= ?
+		  AND  kind = 'cycle_llm'
+		  AND  endpoint IS NOT NULL
+		  AND  endpoint <> ''
+		GROUP  BY endpoint`, userSub, mtd).Scan(&rows).Error
+	if err != nil {
+		return out
+	}
+	for _, r := range rows {
+		out[r.Endpoint] = r.Cents
 	}
 	return out
 }

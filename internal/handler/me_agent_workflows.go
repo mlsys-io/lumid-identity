@@ -3,9 +3,19 @@ package handler
 // W1 — workflow surface tools for the chat agent.
 // Mirrors the MeWorkflows / MeRuns HTTP handlers but operates in-process
 // (no HTTP round-trip from the agent back to its own server).
+//
+// W2 adds the Create-surface tools (search_marketplace, compose_workflow,
+// add_skill_to_workflow) below the W1 helpers.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -183,6 +193,489 @@ func sortRunsByTimeDesc(rows []RunRow) {
 		for j := i; j > 0 && rows[j-1].StartedAt < rows[j].StartedAt; j-- {
 			rows[j-1], rows[j] = rows[j], rows[j-1]
 		}
+	}
+}
+
+// ── W2 Create-surface tools ───────────────────────────────────────
+
+// toolSearchMarketplace wraps xpcloud's /api/v1/skills/catalog or
+// /api/v1/skills/suggest depending on whether the query is short
+// (keyword browse) or a longer intent. Returns trimmed cards.
+func toolSearchMarketplace(c *gin.Context, query, forApp string, limit int) map[string]any {
+	if limit < 1 || limit > 10 {
+		limit = 5
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+
+	// Use the suggest endpoint when the query is intent-like (>3 tokens
+	// or starts with a verb). Otherwise hit the catalog with the query
+	// as a search filter.
+	if isIntentLike(query) {
+		body, _ := json.Marshal(map[string]any{
+			"intent":  query,
+			"for_app": forApp,
+			"max":     limit,
+		})
+		resp, err := httpPostJSON(ctx, xpcloudBaseURL()+"/api/v1/skills/suggest", body)
+		if err != nil {
+			return map[string]any{"error": "marketplace search: " + err.Error()}
+		}
+		suggestions, _ := resp["suggestions"].([]any)
+		return map[string]any{
+			"query":       query,
+			"scorer":      resp["scorer"],
+			"results":     trimSuggestions(suggestions, limit),
+			"count":       len(suggestions),
+		}
+	}
+
+	url := xpcloudBaseURL() + "/api/v1/skills/catalog"
+	if forApp != "" {
+		url += "?for_app=" + forApp
+	}
+	resp, err := httpGetJSON(ctx, url)
+	if err != nil {
+		return map[string]any{"error": "marketplace browse: " + err.Error()}
+	}
+	cards, _ := resp["cards"].([]any)
+	filtered := []map[string]any{}
+	q := strings.ToLower(query)
+	for _, raw := range cards {
+		card, _ := raw.(map[string]any)
+		if card == nil {
+			continue
+		}
+		hay := strings.ToLower(fmt.Sprintf("%v %v %v",
+			card["name"], card["display_name"], card["summary"]))
+		if q == "" || strings.Contains(hay, q) {
+			filtered = append(filtered, slimCard(card))
+		}
+		if len(filtered) >= limit {
+			break
+		}
+	}
+	return map[string]any{
+		"query":   query,
+		"results": filtered,
+		"count":   len(filtered),
+	}
+}
+
+// toolComposeWorkflow drafts a new tenant workflow from an intent.
+// Stages an xpcloud.yaml + manifest.json under the tenant draft dir
+// for the user to review in the composer. Doesn't install.
+func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) map[string]any {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	if forApp == "" {
+		forApp = guessForApp(intent)
+	}
+
+	// Step 1: ask xpcloud to suggest skills for the intent.
+	body, _ := json.Marshal(map[string]any{
+		"intent":  intent,
+		"for_app": forApp,
+		"max":     5,
+		"use_llm": true,
+	})
+	resp, err := httpPostJSON(ctx, xpcloudBaseURL()+"/api/v1/skills/suggest", body)
+	if err != nil {
+		return map[string]any{"error": "skill suggest: " + err.Error()}
+	}
+	suggestions, _ := resp["suggestions"].([]any)
+	if len(suggestions) == 0 {
+		return map[string]any{"error": "no matching skills found in the marketplace for that intent"}
+	}
+
+	pickedSkills := []string{}
+	skillSummaries := []map[string]any{}
+	for _, raw := range suggestions {
+		s, _ := raw.(map[string]any)
+		if s == nil {
+			continue
+		}
+		if n, ok := s["name"].(string); ok && n != "" {
+			pickedSkills = append(pickedSkills, n)
+			skillSummaries = append(skillSummaries, map[string]any{
+				"name":         s["name"],
+				"display_name": s["display_name"],
+				"summary":      s["summary"],
+				"why":          s["why"],
+			})
+		}
+	}
+
+	// Step 2: assemble a draft xpcloud.yaml + manifest.json.
+	slug := name
+	if slug == "" {
+		slug = slugify(intent)
+	}
+	yaml := buildDraftXpcloudYaml(slug, intent, forApp, pickedSkills)
+	manifest := map[string]any{
+		"name":        slug,
+		"kind":        "app",
+		"version":     "0.1.0",
+		"description": intent,
+		"status":      "draft",
+	}
+
+	// Step 3: stage under ~/.tenants/<sub>/.xp/apps/<slug>-draft/.
+	draftDir := filepath.Join(tenantAppsDir(userID), slug+"-draft")
+	if err := os.MkdirAll(draftDir, 0o775); err != nil {
+		return map[string]any{"error": "draft dir: " + err.Error()}
+	}
+	if err := os.WriteFile(filepath.Join(draftDir, "xpcloud.yaml"), []byte(yaml), 0o644); err != nil {
+		return map[string]any{"error": "write yaml: " + err.Error()}
+	}
+	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(filepath.Join(draftDir, "manifest.json"), manifestBytes, 0o644); err != nil {
+		return map[string]any{"error": "write manifest: " + err.Error()}
+	}
+
+	return map[string]any{
+		"draft_slug":     slug + "-draft",
+		"draft_dir":      draftDir,
+		"intent":         intent,
+		"for_app":        forApp,
+		"skills_picked":  pickedSkills,
+		"skill_summaries": skillSummaries,
+		"review_url":     "/studio/workflows/" + slug + "-draft:" + slug,
+		"note":           "Drafted as a tenant workflow. Open Studio composer to review + adjust skills + schedule, then Save to install.",
+	}
+}
+
+// toolAddSkillToWorkflow appends a skill to an existing tenant workflow's
+// `skill_imports[]`. Writes back to the same xpcloud.yaml.
+func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
+	parts := splitN(slug, ":", 2)
+	if len(parts) != 2 {
+		return map[string]any{"error": "slug must be '<app>:<loop>'"}
+	}
+	app := parts[0]
+	xpcloudPath := filepath.Join(tenantAppsDir(userID), app, "xpcloud.yaml")
+	if _, err := os.Stat(xpcloudPath); err != nil {
+		return map[string]any{"error": fmt.Sprintf("tenant copy of '%s' not found; install the workflow first via compose_workflow or app_install", app)}
+	}
+	b, err := os.ReadFile(xpcloudPath)
+	if err != nil {
+		return map[string]any{"error": "read xpcloud.yaml: " + err.Error()}
+	}
+	// Minimal-touch YAML edit: append the skill name to skill_imports[]
+	// if it's not already there. Round-trip parse would be cleaner but
+	// pulls in a YAML lib for one append; this is good enough for v1.
+	yamlContent := string(b)
+	needle := "community/" + skillName
+	if strings.Contains(yamlContent, needle) {
+		return map[string]any{
+			"status": "no-op",
+			"note":   "skill already in skill_imports[]",
+		}
+	}
+	// Append below an existing skill_imports: block; otherwise create one.
+	updated := appendToSkillImports(yamlContent, needle)
+	if err := os.WriteFile(xpcloudPath, []byte(updated), 0o644); err != nil {
+		return map[string]any{"error": "write xpcloud.yaml: " + err.Error()}
+	}
+	return map[string]any{
+		"slug":   slug,
+		"added":  skillName,
+		"note":   "Added to skill_imports[]. Re-install the app (app_update) or run a cycle to pick it up.",
+	}
+}
+
+// ── Helpers ───────────────────────────────────────────────────────
+
+func httpGetJSON(ctx context.Context, url string) (map[string]any, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	r, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", r.StatusCode)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func httpPostJSON(ctx context.Context, url string, body []byte) (map[string]any, error) {
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	if r.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", r.StatusCode)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func isIntentLike(q string) bool {
+	if len(q) > 60 {
+		return true
+	}
+	verbs := []string{"watch", "send", "draft", "remind", "find", "summariz", "monitor", "schedule", "build", "every"}
+	low := strings.ToLower(q)
+	for _, v := range verbs {
+		if strings.Contains(low, v) {
+			return true
+		}
+	}
+	return false
+}
+
+func guessForApp(intent string) string {
+	low := strings.ToLower(intent)
+	switch {
+	case strings.Contains(low, "trade") || strings.Contains(low, "market") || strings.Contains(low, "polymarket"):
+		return "auto-quant"
+	case strings.Contains(low, "case") || strings.Contains(low, "consulting"):
+		return "mbb-ai"
+	case strings.Contains(low, "annotat") || strings.Contains(low, "label"):
+		return "eventx"
+	case strings.Contains(low, "benchmark") || strings.Contains(low, "evaluate"):
+		return "auto-sysresearch"
+	default:
+		return "personal-agent"
+	}
+}
+
+func slugify(s string) string {
+	out := []rune{}
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			out = append(out, r)
+		} else if r == ' ' || r == '-' || r == '_' {
+			if len(out) > 0 && out[len(out)-1] != '-' {
+				out = append(out, '-')
+			}
+		}
+	}
+	s2 := strings.Trim(string(out), "-")
+	if s2 == "" {
+		s2 = "new-workflow"
+	}
+	if len(s2) > 40 {
+		s2 = s2[:40]
+	}
+	return s2
+}
+
+func trimSuggestions(raw []any, limit int) []map[string]any {
+	out := []map[string]any{}
+	for i, s := range raw {
+		if i >= limit {
+			break
+		}
+		m, _ := s.(map[string]any)
+		if m == nil {
+			continue
+		}
+		out = append(out, map[string]any{
+			"name":         m["name"],
+			"display_name": m["display_name"],
+			"summary":      m["summary"],
+			"category":     m["category"],
+			"why":          m["why"],
+		})
+	}
+	return out
+}
+
+func slimCard(c map[string]any) map[string]any {
+	return map[string]any{
+		"name":         c["name"],
+		"display_name": c["display_name"],
+		"summary":      c["summary"],
+		"category":     c["category"],
+		"step_count":   c["step_count"],
+		"kind":         c["kind"],
+	}
+}
+
+// buildDraftXpcloudYaml builds a minimal viable xpcloud.yaml for a
+// new tenant workflow. The shape mirrors personal-agent's loops[]
+// schema with one loop named after the slug.
+func buildDraftXpcloudYaml(slug, intent, forApp string, skills []string) string {
+	var sb strings.Builder
+	sb.WriteString("# Draft workflow — review in Studio composer before installing.\n")
+	sb.WriteString("# Generated by /me/agent/chat → compose_workflow.\n")
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "name: %s\n", slug)
+	sb.WriteString("kind: app\n")
+	sb.WriteString("version: 0.1.0\n")
+	fmt.Fprintf(&sb, "description: %q\n", intent)
+	fmt.Fprintf(&sb, "fork_of: %s\n", forApp)
+	sb.WriteString("status: draft\n")
+	sb.WriteString("\n")
+	sb.WriteString("skill_imports:\n")
+	for _, s := range skills {
+		fmt.Fprintf(&sb, "  - community/%s\n", s)
+	}
+	sb.WriteString("\n")
+	sb.WriteString("workflows:\n")
+	fmt.Fprintf(&sb, "  - name: %s\n", slug)
+	sb.WriteString("    schedule: \"@trigger\"  # change to a cron string when ready, e.g. '0 8 * * *'\n")
+	sb.WriteString("    description: |\n")
+	fmt.Fprintf(&sb, "      %s\n", intent)
+	sb.WriteString("    skills:\n")
+	for _, s := range skills {
+		fmt.Fprintf(&sb, "      - %s\n", s)
+	}
+	return sb.String()
+}
+
+// appendToSkillImports appends `entry` to an existing skill_imports[]
+// block; creates one if missing. Best-effort YAML edit — round-trip
+// parser would be cleaner but a single append is fine for v1.
+func appendToSkillImports(yamlContent, entry string) string {
+	lines := strings.Split(yamlContent, "\n")
+	idx := -1
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "skill_imports:") {
+			idx = i
+			break
+		}
+	}
+	newLine := "  - " + entry
+	if idx == -1 {
+		// No skill_imports[] block — append one near the top.
+		return yamlContent + "\nskill_imports:\n" + newLine + "\n"
+	}
+	// Find the end of the block (next non-indented line OR EOF).
+	insertAt := len(lines)
+	for j := idx + 1; j < len(lines); j++ {
+		stripped := strings.TrimRight(lines[j], " \t\r")
+		if stripped == "" {
+			continue
+		}
+		if !strings.HasPrefix(stripped, " ") && !strings.HasPrefix(stripped, "\t") && !strings.HasPrefix(stripped, "- ") {
+			insertAt = j
+			break
+		}
+	}
+	out := append([]string{}, lines[:insertAt]...)
+	out = append(out, newLine)
+	out = append(out, lines[insertAt:]...)
+	return strings.Join(out, "\n")
+}
+
+// ── W4 Improve-surface tools ──────────────────────────────────────
+
+// toolWorkflowReportCard mirrors MeMindWorkflow but returns a slim
+// chat-suitable payload (headline strings only; no nested numbers).
+func toolWorkflowReportCard(c *gin.Context, userID, slug string) map[string]any {
+	parts := splitN(slug, ":", 2)
+	if len(parts) != 2 || parts[0] == "n8n" {
+		return map[string]any{"error": "report cards only for scheduled workflows ('<app>:<loop>')"}
+	}
+	app, loop := parts[0], parts[1]
+	now := time.Now().UTC()
+	thisMonth := now.AddDate(0, -1, 0)
+	prevMonth := now.AddDate(0, -2, 0)
+	cur := buildLoopStats(userID, app, loop, thisMonth, now)
+	prev := buildLoopStats(userID, app, loop, prevMonth, thisMonth)
+	deltas := buildDeltas(cur, prev)
+	// Trim deltas to plain-English headlines for the chat bubble.
+	headlines := []string{}
+	for _, d := range deltas {
+		h := d.Headline
+		if d.Detail != "" {
+			h += " " + d.Detail
+		}
+		headlines = append(headlines, h)
+	}
+	return map[string]any{
+		"slug":             slug,
+		"runs_this_month":  cur.RunCount,
+		"runs_prev_month":  prev.RunCount,
+		"success_rate_now": cur.SuccessRate,
+		"avg_duration_s":   cur.AvgDurationSec,
+		"headlines":        headlines,
+	}
+}
+
+// toolTriggerEvaluation appends a (skill, for_app) entry to skill-roster's
+// evaluate queue; skill-roster picks it up within ~60s.
+func toolTriggerEvaluation(userID, skillName, forApp string) map[string]any {
+	queuePath := filepath.Join(operatorHome(), ".xp", "apps", "skill-roster", "data", "eval-queue.jsonl")
+	if err := os.MkdirAll(filepath.Dir(queuePath), 0o775); err != nil {
+		return map[string]any{"error": "queue dir: " + err.Error()}
+	}
+	entry := map[string]any{
+		"skill":        skillName,
+		"for_app":      forApp,
+		"requested_by": userID,
+		"requested_at": time.Now().UTC().Format(time.RFC3339),
+		"status":       "queued",
+	}
+	row, _ := json.Marshal(entry)
+	f, err := os.OpenFile(queuePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return map[string]any{"error": "open queue: " + err.Error()}
+	}
+	defer f.Close()
+	if _, err := f.Write(append(row, '\n')); err != nil {
+		return map[string]any{"error": "write queue: " + err.Error()}
+	}
+	return map[string]any{
+		"queued":  true,
+		"skill":   skillName,
+		"for_app": forApp,
+		"note":    "skill-roster picks up the queue within 60s; new attestation will land on xpcloud's community repo for the skill.",
+	}
+}
+
+// toolSuggestImprovement looks at one workflow's recent runs + report
+// card and proposes ONE concrete change. Best-effort heuristic for v1;
+// the LLM around it (the chat agent) does the actual recommending —
+// this tool gives it the data + a structured suggestion frame.
+func toolSuggestImprovement(c *gin.Context, userID, slug string) map[string]any {
+	parts := splitN(slug, ":", 2)
+	if len(parts) != 2 || parts[0] == "n8n" {
+		return map[string]any{"error": "suggest_workflow_improvement only supports scheduled workflows"}
+	}
+	app, loop := parts[0], parts[1]
+	now := time.Now().UTC()
+	cur := buildLoopStats(userID, app, loop, now.AddDate(0, -1, 0), now)
+
+	suggestion := ""
+	rationale := ""
+	switch {
+	case cur.RunCount == 0:
+		suggestion = "Run this workflow at least once via Run-now to start gathering data."
+		rationale = "no run history in the last month — there's nothing to optimise yet."
+	case cur.SuccessRate < 0.5 && cur.FailureCount > 0:
+		suggestion = "Open the latest failure in Runs to inspect the failing step; the error usually points at a missing secret, OAuth scope, or a stale skill version."
+		rationale = fmt.Sprintf("success rate is %.0f%% (%d failed of %d runs).", cur.SuccessRate*100, cur.FailureCount, cur.RunCount)
+	case cur.AvgDurationSec > 30 && cur.RunCount > 5:
+		suggestion = "Try splitting the workflow — long-running steps benefit from sub-workflows so you can re-run just the slow piece."
+		rationale = fmt.Sprintf("average cycle takes %.1fs; consider isolating the longest step.", cur.AvgDurationSec)
+	case cur.DraftsCreated > 5 && cur.DraftAcceptRate < 0.4:
+		suggestion = "Browse the marketplace for a different drafting skill (search 'draft' or 'email reply') — your accept-rate is below 40%."
+		rationale = fmt.Sprintf("accepted %d of %d drafts this month.", cur.DraftsAccepted, cur.DraftsCreated)
+	default:
+		suggestion = "Workflow is steady. If you want to compound improvements, ask 'compose_workflow' for related intents (e.g., 'also surface tasks from emails I starred')."
+		rationale = "no obvious failure mode in the last month."
+	}
+
+	return map[string]any{
+		"slug":       slug,
+		"stats":      cur,
+		"suggestion": suggestion,
+		"rationale":  rationale,
 	}
 }
 

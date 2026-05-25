@@ -16,12 +16,14 @@
 package handler
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -46,6 +48,11 @@ type WorkflowRow struct {
 	Engine       string `json:"engine,omitempty"`        // "runner_steps" | "command:<verb>" (scheduled)
 	StepCount    int    `json:"step_count,omitempty"`
 	N8nID        string `json:"n8n_id,omitempty"`        // for kind=visual
+	// Sparkline of recent run states (W5+ visual polish). One char per
+	// run, oldest→newest, last 14 runs max. Encoding: "."=skipped,
+	// "✓"=succeeded, "✗"=failed, "·"=running. The UI renders these as
+	// state-colored squares. Empty when no journal entries exist.
+	RunSpark string `json:"run_spark,omitempty"`
 }
 
 // MeWorkflows — GET /me/workflows[?kind=scheduled|visual]
@@ -143,6 +150,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					Description: L.Description,
 					Engine:      engine,
 					StepCount:   len(L.Steps),
+					RunSpark:    buildRunSpark(filepath.Join(appDir, "data", "journal.jsonl"), L.Name, 14),
 				}
 				if s.LastOk != nil {
 					b := *s.LastOk
@@ -198,6 +206,58 @@ func visualWorkflows(ctx context.Context, c *gin.Context) []WorkflowRow {
 		})
 	}
 	return out
+}
+
+// buildRunSpark scans the per-app journal for entries matching `loop`,
+// and returns a compact string (oldest→newest, max `limit` chars) where
+// each character encodes one run's state. The UI renders this as a row
+// of state-colored squares (a sparkline) for "how has this gone lately".
+func buildRunSpark(journalPath, loop string, limit int) string {
+	f, err := os.Open(journalPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	type pair struct{ ts float64; ch byte }
+	rows := []pair{}
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			continue
+		}
+		if lp, _ := row["loop"].(string); lp != loop {
+			continue
+		}
+		ts := rowUnixTs(row)
+		var ch byte = '.'
+		if skipped, _ := row["skipped"].(bool); skipped {
+			ch = '_'
+		} else if ok, _ := row["ok"].(bool); ok {
+			ch = 'o'
+		} else {
+			ch = 'x'
+		}
+		rows = append(rows, pair{ts: ts, ch: ch})
+	}
+	// Sort newest-first, take limit, then reverse so output is oldest→newest.
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts > rows[j].ts })
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	out := make([]byte, len(rows))
+	for i, p := range rows {
+		out[i] = p.ch
+	}
+	return string(out)
 }
 
 // readEnabledOverrides — read just the per-loop `enabled` flag from

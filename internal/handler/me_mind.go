@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -69,6 +70,84 @@ func MeMindWorkflow(c *gin.Context) {
 			"prev_month":   prevMonthStats,
 			"deltas":       deltas,
 			"as_of":        now.Format(time.RFC3339),
+		},
+	})
+}
+
+// MeMindSkills — GET /me/mind/skills?compare=<skill_name>
+//
+// Returns the parallel-coords dataset for one skill: rows = each
+// attestation run; columns = (version, model, casebook, score,
+// latency_s, cost_cents). Reads the xpcloud-side skill_scores.jsonl
+// which is bind-mounted into identity at /var/lib/lumid-xpcloud-data/
+// (read-only). When the file is missing or empty, returns an empty
+// rows array — the UI handles "coming soon" gracefully.
+//
+// Globally-shared: every tenant sees the same plot. The data is
+// reproducible (skill + casebook + model + score) and contains no
+// personal information per the isolation contract.
+func MeMindSkills(c *gin.Context) {
+	if _, ok := currentUserID(c); !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	skill := strings.TrimSpace(c.Query("compare"))
+	if skill == "" {
+		fail(c, http.StatusBadRequest, 1400, "compare=<skill_name> required")
+		return
+	}
+
+	// Two candidate paths: bind-mounted xpcloud data (preferred),
+	// or the source-of-truth path (host runs).
+	candidates := []string{
+		"/var/lib/lumid-xpcloud-data/scores/skill_scores.jsonl",
+		"/proj/infra/compose/xpcloud/data/scores/skill_scores.jsonl",
+	}
+	scoresPath := ""
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			scoresPath = p
+			break
+		}
+	}
+
+	rows := []map[string]any{}
+	if scoresPath != "" {
+		f, err := os.Open(scoresPath)
+		if err == nil {
+			defer f.Close()
+			sc := bufio.NewScanner(f)
+			sc.Buffer(make([]byte, 64*1024), 1024*1024)
+			for sc.Scan() {
+				line := strings.TrimSpace(sc.Text())
+				if line == "" {
+					continue
+				}
+				var row map[string]any
+				if err := json.Unmarshal([]byte(line), &row); err != nil {
+					continue
+				}
+				if s, _ := row["skill"].(string); s == skill {
+					rows = append(rows, row)
+				}
+			}
+		}
+	}
+
+	// Sort newest first for stable rendering.
+	sort.SliceStable(rows, func(i, j int) bool {
+		ti, _ := rows[i]["ts"].(string)
+		tj, _ := rows[j]["ts"].(string)
+		return ti > tj
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"skill":  skill,
+			"rows":   rows,
+			"count":  len(rows),
+			"as_of":  time.Now().UTC().Format(time.RFC3339),
 		},
 	})
 }

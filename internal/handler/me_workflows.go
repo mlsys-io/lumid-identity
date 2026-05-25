@@ -18,6 +18,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -274,6 +275,147 @@ func MeWorkflowDetail(c *gin.Context) {
 		}
 	}
 	fail(c, http.StatusNotFound, 1404, "workflow not found")
+}
+
+// MeImportFromN8n — POST /me/workflows/import-from-n8n
+//
+// Best-effort translator: given an n8n workflow ID, fetch its JSON
+// via the n8n client and translate to a tenant xpcloud.yaml. Unknown
+// node types become TODO shells in skill_imports[] so the user can
+// fix them up in the YAML editor.
+//
+// Body: {n8n_id: string, target_slug?: string}
+//
+// Returns: {draft_slug, draft_dir, n8n_id, unsupported_nodes[]}
+func MeImportFromN8n(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	var body struct {
+		N8nID       string `json:"n8n_id"`
+		TargetSlug  string `json:"target_slug"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.N8nID == "" {
+		fail(c, http.StatusBadRequest, 1400, "n8n_id required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
+	defer cancel()
+	cli := common.NewN8nClient()
+	cookie, _ := c.Cookie("n8n-auth")
+	wf, err := cli.GetWorkflow(ctx, body.N8nID, cookie)
+	if err != nil {
+		fail(c, http.StatusBadGateway, 1500, "n8n: "+err.Error())
+		return
+	}
+
+	slug := body.TargetSlug
+	if slug == "" {
+		slug = "n8n-" + body.N8nID
+	}
+
+	yaml, unsupported := translateN8nToXpcloud(wf, slug)
+
+	draftDir := filepath.Join(tenantAppsDir(userID), slug)
+	if err := os.MkdirAll(draftDir, 0o775); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "draft dir: "+err.Error())
+		return
+	}
+	if err := os.WriteFile(filepath.Join(draftDir, "xpcloud.yaml"), []byte(yaml), 0o644); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "write yaml: "+err.Error())
+		return
+	}
+	manifest := map[string]any{
+		"name": slug, "kind": "app", "version": "0.1.0",
+		"description": "Promoted from n8n workflow " + body.N8nID,
+		"fork_of":     "n8n:" + body.N8nID,
+	}
+	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(filepath.Join(draftDir, "manifest.json"), manifestBytes, 0o644)
+
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"draft_slug":         slug,
+			"draft_dir":          draftDir,
+			"n8n_id":             body.N8nID,
+			"unsupported_nodes":  unsupported,
+			"note":               "Promoted as a draft. Open /studio/workflows to install + adjust.",
+		},
+	})
+}
+
+// translateN8nToXpcloud — best-effort node-type mapping. Returns the
+// generated YAML + a list of unsupported node names (rendered as
+// TODO shells in skill_imports[] so the user can fix them up).
+//
+// v1 supports: HTTP Request, Code, Schedule trigger, Webhook trigger,
+// Slack, Gmail. Anything else becomes a TODO marker.
+func translateN8nToXpcloud(wf *common.N8nWorkflow, slug string) (string, []string) {
+	unsupported := []string{}
+	skillImports := []string{}
+	steps := []string{}
+	schedule := "@trigger"
+	for _, n := range wf.Nodes {
+		t := strings.ToLower(n.Type)
+		switch {
+		case strings.Contains(t, "schedule") || strings.Contains(t, "cron"):
+			// Best-effort: keep @trigger; the user can paste a real
+			// cron via the YAML editor.
+			schedule = "@trigger  # imported from n8n schedule trigger; edit to a real cron"
+		case strings.Contains(t, "webhook"):
+			schedule = "@trigger  # n8n webhook → manual trigger for now"
+		case strings.Contains(t, "httprequest") || strings.Contains(t, "http.request"):
+			skillImports = appendUnique(skillImports, "community/fetch")
+			steps = append(steps, "      - "+n.Name+"  # fetch (was n8n HTTP Request)")
+		case strings.Contains(t, "code") || strings.Contains(t, "function"):
+			skillImports = appendUnique(skillImports, "community/python-repl")
+			steps = append(steps, "      - "+n.Name+"  # python-repl (was n8n Code node)")
+		case strings.Contains(t, "slack"):
+			skillImports = appendUnique(skillImports, "community/slack-mcp")
+			steps = append(steps, "      - "+n.Name+"  # slack-mcp")
+		case strings.Contains(t, "gmail"):
+			skillImports = appendUnique(skillImports, "community/gmail-mcp")
+			steps = append(steps, "      - "+n.Name+"  # gmail-mcp")
+		default:
+			unsupported = append(unsupported, n.Type)
+			steps = append(steps, "      - TODO  # n8n node \""+n.Type+"\" — no direct skill mapping yet")
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# Promoted from n8n — review + edit before installing.\n")
+	sb.WriteString("# Best-effort node→skill mapping; TODO shells need a hand-pick.\n\n")
+	fmt.Fprintf(&sb, "name: %s\n", slug)
+	sb.WriteString("kind: app\n")
+	sb.WriteString("version: 0.1.0\n\n")
+	if len(skillImports) > 0 {
+		sb.WriteString("skill_imports:\n")
+		for _, s := range skillImports {
+			fmt.Fprintf(&sb, "  - %s\n", s)
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString("workflows:\n")
+	fmt.Fprintf(&sb, "  - name: %s\n", slug)
+	fmt.Fprintf(&sb, "    schedule: \"%s\"\n", schedule)
+	sb.WriteString("    skills:\n")
+	for _, st := range steps {
+		sb.WriteString(st + "\n")
+	}
+	return sb.String(), unsupported
+}
+
+func appendUnique(arr []string, s string) []string {
+	for _, e := range arr {
+		if e == s {
+			return arr
+		}
+	}
+	return append(arr, s)
 }
 
 // readLoopsFromAnywhere tries the user's tenant copy first, then the

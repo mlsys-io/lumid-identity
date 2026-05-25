@@ -266,16 +266,19 @@ func Register(r *gin.Engine) {
 			// runtimes; the per-slug detail returns the full definition.
 			me.GET("/workflows",                  MeWorkflows)
 			me.GET("/workflows/:slug",            MeWorkflowDetail)
+			me.POST("/workflows/import-from-n8n", MeImportFromN8n)
 
 			// Runs — unified history across runtimes + SSE state-stream
 			// for live "lights" in /studio/runs.
 			me.GET("/runs",                       MeRuns)
 			me.GET("/runs/:run_id",               MeRunDetail)
+			me.POST("/runs/:run_id/mark",         MeRunMark)
 			me.GET("/runs/stream",                MeRunsStream)
 
 			// Mind — the Improve surface (W4). Per-workflow report
 			// cards (plain-English deltas) + on-demand skill evaluation.
 			me.GET("/mind/workflow/:slug",        MeMindWorkflow)
+			me.GET("/mind/skills",                MeMindSkills)
 			me.POST("/mind/evaluate",             MeMindEvaluate)
 		}
 

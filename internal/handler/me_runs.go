@@ -113,6 +113,91 @@ func MeRuns(c *gin.Context) {
 	})
 }
 
+// MeRunMark — POST /me/runs/:run_id/mark
+//
+// Manual state override for a scheduled run (Airflow's "mark
+// succeeded" / "mark failed" idiom). Writes a synthetic journal.jsonl
+// entry the scheduler honors when computing the per-loop state.
+//
+// Body: {state: "succeeded" | "failed", note?: string}
+//
+// Visual (n8n) runs aren't supported here — n8n has its own state
+// model + execution-stop endpoint; if a future feature needs it,
+// route through the n8n client.
+func MeRunMark(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	runID := c.Param("run_id")
+	parts := strings.SplitN(runID, ":", 4)
+	if len(parts) < 4 || parts[0] != "scheduled" {
+		fail(c, http.StatusBadRequest, 1400, "mark only supported on scheduled runs (id 'scheduled:<app>:<loop>:<ts>')")
+		return
+	}
+	app, loop, ts := parts[1], parts[2], parts[3]
+
+	var body struct {
+		State string `json:"state"`
+		Note  string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body")
+		return
+	}
+	if body.State != "succeeded" && body.State != "failed" {
+		fail(c, http.StatusBadRequest, 1400, "state must be 'succeeded' or 'failed'")
+		return
+	}
+
+	// Resolve the cycle dir (best-effort) so we can journal next to it.
+	cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
+	journalPath := filepath.Join(tenantAppsDir(userID), app, "data", "journal.jsonl")
+	if _, err := os.Stat(filepath.Dir(journalPath)); err != nil {
+		// Try operator-shared.
+		journalPath = filepath.Join(operatorHome(), ".xp", "apps", app, "data", "journal.jsonl")
+		if _, err := os.Stat(filepath.Dir(journalPath)); err != nil {
+			fail(c, http.StatusNotFound, 1404, "app not installed")
+			return
+		}
+	}
+
+	entry := map[string]any{
+		"ts":        time.Now().UTC().Format(time.RFC3339),
+		"loop":      loop,
+		"ok":        body.State == "succeeded",
+		"manual_mark": true,
+		"original_run_ts": ts,
+		"marked_by": userID,
+	}
+	if cycleDir != "" {
+		entry["cycle_dir"] = cycleDir
+	}
+	if body.Note != "" {
+		entry["note"] = body.Note
+	}
+	row, _ := json.Marshal(entry)
+	f, err := os.OpenFile(journalPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "open journal: "+err.Error())
+		return
+	}
+	defer f.Close()
+	if _, err := f.Write(append(row, '\n')); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "write journal: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"run_id":   runID,
+			"new_state": body.State,
+			"note":     "Manual override recorded. Next scheduler refresh picks it up.",
+		},
+	})
+}
+
 // MeRunDetail — GET /me/runs/:run_id
 //
 // Run IDs are opaque to the caller; we encode them as
@@ -126,13 +211,20 @@ func MeRunDetail(c *gin.Context) {
 		return
 	}
 	runID := c.Param("run_id")
-	parts := strings.SplitN(runID, ":", 3)
+	// Run id shape:
+	//   visual    → "visual:n8n:<exec_id>"        (SplitN with 3)
+	//   scheduled → "scheduled:<app>:<loop>:<ts>" (SplitN with 4)
+	parts := strings.SplitN(runID, ":", 4)
 	if len(parts) < 3 {
 		fail(c, http.StatusBadRequest, 1400, "invalid run id")
 		return
 	}
 	kind := parts[0]
 	if kind == "visual" {
+		if len(parts) < 3 {
+			fail(c, http.StatusBadRequest, 1400, "invalid run id")
+			return
+		}
 		// Visual runs live in n8n; delegate to the n8n client.
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
 		defer cancel()
@@ -154,13 +246,12 @@ func MeRunDetail(c *gin.Context) {
 		return
 	}
 
-	// scheduled: parts = ["scheduled", "<app>:<loop>", "<ts>"]
-	wfParts := strings.SplitN(parts[1], ":", 2)
-	if len(wfParts) != 2 {
-		fail(c, http.StatusBadRequest, 1400, "invalid workflow slug in run id")
+	// scheduled: parts = ["scheduled", "<app>", "<loop>", "<ts>"] (4 segments)
+	if len(parts) < 4 {
+		fail(c, http.StatusBadRequest, 1400, "invalid scheduled run id (expected scheduled:<app>:<loop>:<ts>)")
 		return
 	}
-	app, loop, ts := wfParts[0], wfParts[1], parts[2]
+	app, loop, ts := parts[1], parts[2], parts[3]
 
 	cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
 	if cycleDir == "" {

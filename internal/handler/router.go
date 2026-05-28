@@ -248,6 +248,15 @@ func Register(r *gin.Engine) {
 			// to render text deltas + tool-call events as they arrive,
 			// instead of waiting 5-10s for a synchronous reply.
 			me.POST("/agent/chat/stream", MeAgentChatStream)
+			// Available LLM backends — populates the model dropdown
+			// in StudioChat. Returns [{id, displayName, default}].
+			me.GET("/agent/models", MeAgentModels)
+
+			// Artifacts — saved long-form output from chat. Backed
+			// by ~/.tenants/<userID>/.artifacts/<id>.json.
+			me.GET("/artifacts", MeArtifactsList)
+			me.GET("/artifacts/:id", MeArtifactGet)
+			me.DELETE("/artifacts/:id", MeArtifactDelete)
 
 			// Tier-1 quota state — read-only. Used by /app/loops to
 			// render the "Free tier reached" banner + per-loop hints.

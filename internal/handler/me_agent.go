@@ -53,16 +53,190 @@ const (
 	maxTokensPerTurn     = 4096
 )
 
+// llmProvider describes an upstream LLM endpoint that speaks
+// Anthropic's /v1/messages wire format (including streaming SSE
+// events). New options just need an entry here — the tool-use loop
+// + stream parser don't change.
+type llmProvider struct {
+	id            string // stable id passed from the frontend
+	displayName   string // human label (e.g. "Claude Haiku 4.5")
+	endpoint      string // upstream URL
+	upstreamModel string // the model name sent to the upstream API
+	authHeader    string // "x-api-key" (Anthropic) | "Authorization" (kv.run)
+	authPrefix    string // "" (Anthropic) | "Bearer " (kv.run)
+	keyFn         func() (string, error)
+	// addAnthropicVersion — Anthropic's API needs the "anthropic-version"
+	// header; kv.run's /v1/messages does not. Set to true for Anthropic.
+	addAnthropicVersion bool
+}
+
+var llmProviders = []llmProvider{
+	{
+		id:                  "claude-haiku",
+		displayName:         "Claude Haiku 4.5",
+		endpoint:            anthropicEndpoint,
+		upstreamModel:       anthropicModel,
+		authHeader:          "x-api-key",
+		authPrefix:          "",
+		keyFn:               anthropicKey,
+		addAnthropicVersion: true,
+	},
+	{
+		// kv.run:5000 in-cluster inference gateway. Speaks Anthropic
+		// /v1/messages including SSE streaming — drop-in for the
+		// existing parser. See /proj/CLAUDE.md "Cloud LLM inference".
+		id:                  "kvrun-minimax",
+		displayName:         "MiniMax-M2.7 (kv.run GPU)",
+		endpoint:            "https://kv.run:5000/v1/messages",
+		upstreamModel:       "cyankiwi/MiniMax-M2.7-AWQ-4bit",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+	},
+}
+
+func defaultProvider() llmProvider { return llmProviders[0] }
+
+// MeAgentModels — GET /api/v1/me/agent/models.
+// Lists the LLM backends StudioChat can target. Public-shape only —
+// no keys, no endpoints. Reflects the llmProviders registry; new
+// entries auto-surface in the UI dropdown without frontend changes.
+func MeAgentModels(c *gin.Context) {
+	type item struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"display_name"`
+		Default     bool   `json:"default"`
+	}
+	out := make([]item, 0, len(llmProviders))
+	def := defaultProvider().id
+	for _, p := range llmProviders {
+		out = append(out, item{ID: p.id, DisplayName: p.displayName, Default: p.id == def})
+	}
+	c.JSON(http.StatusOK, gin.H{"models": out})
+}
+
+// resolveProvider picks the provider for a chat request. Falls back
+// to the default (Claude) on empty or unrecognized model strings so
+// clients that don't pass `model` keep working.
+func resolveProvider(modelID string) llmProvider {
+	if modelID != "" {
+		for _, p := range llmProviders {
+			if p.id == modelID {
+				return p
+			}
+		}
+	}
+	return defaultProvider()
+}
+
 type chatMessage struct {
 	Role    string `json:"role"`              // "user" | "assistant"
 	Content string `json:"content,omitempty"` // for the simple text-only frontend
 	// content_blocks (Anthropic's structured form) is what we use
 	// internally during the tool-use loop. The frontend sends only
 	// flat `content` text; we promote to blocks server-side.
+	//
+	// Optional file attachments — the chat footer's paperclip lets
+	// users drop images + small text files into a turn. Images turn
+	// into an Anthropic `image` content block (Claude vision); text
+	// files are inlined as a fenced code block in front of the user
+	// text so the LLM sees them as context.
+	Attachments []chatAttachment `json:"attachments,omitempty"`
+}
+
+// chatAttachment — one file the user dropped into the chat input.
+// Kind=image needs MIME + base64 (Anthropic source.media_type expects
+// "image/png" | "image/jpeg" | "image/gif" | "image/webp"); kind=text
+// just carries the raw text body.
+type chatAttachment struct {
+	Kind     string `json:"kind"`               // "image" | "text"
+	Name     string `json:"name,omitempty"`     // filename hint
+	Mime     string `json:"mime,omitempty"`     // images only
+	DataB64  string `json:"data_b64,omitempty"` // images only — base64-encoded bytes
+	Text     string `json:"text,omitempty"`     // text-files only — raw content
 }
 
 type meAgentChatBody struct {
 	Messages []chatMessage `json:"messages" binding:"required"`
+	// Optional: id from llmProviders. Empty → default (Claude).
+	Model string `json:"model,omitempty"`
+	// Optional UI hint: "search" | "deep_research" | "".
+	// When set, an extra line is appended to the system prompt asking
+	// the agent to call the matching tool for this turn. The agent
+	// can still skip if the question genuinely doesn't need search,
+	// but the strong nudge mirrors what ChatGPT/Claude do with their
+	// "Search" buttons.
+	Mode string `json:"mode,omitempty"`
+	// Independent toggle: enable extended thinking on Anthropic
+	// providers (Claude shows its reasoning before the answer).
+	// kv.run/MiniMax always emits thinking deltas by default; this
+	// flag is a no-op there. Combinable with Mode.
+	Think bool `json:"think,omitempty"`
+}
+
+// thinkingBudgetTokens — Anthropic's extended thinking budget. Pulled
+// out so we can adjust per-provider later if needed. Must leave room
+// in max_tokens for the actual response.
+const thinkingBudgetTokens = 4000
+const thinkingMaxTokens = 8192 // max_tokens when thinking is enabled
+
+// chatMessageToAnthropic promotes one chatMessage into the Anthropic
+// /v1/messages content shape. With no attachments it stays as a plain
+// `content: "<text>"`. With attachments it becomes a list of content
+// blocks — text-files inlined as fenced code, images as image blocks.
+// Returns the {role, content} map suitable for direct append.
+func chatMessageToAnthropic(m chatMessage) map[string]any {
+	if len(m.Attachments) == 0 {
+		return map[string]any{"role": m.Role, "content": m.Content}
+	}
+	blocks := make([]map[string]any, 0, len(m.Attachments)+1)
+	for _, a := range m.Attachments {
+		switch a.Kind {
+		case "image":
+			if a.DataB64 == "" || a.Mime == "" {
+				continue
+			}
+			blocks = append(blocks, map[string]any{
+				"type": "image",
+				"source": map[string]any{
+					"type":       "base64",
+					"media_type": a.Mime,
+					"data":       a.DataB64,
+				},
+			})
+		case "text":
+			if a.Text == "" {
+				continue
+			}
+			name := a.Name
+			if name == "" {
+				name = "attachment"
+			}
+			fence := "```\n"
+			blocks = append(blocks, map[string]any{
+				"type": "text",
+				"text": "Attached file `" + name + "`:\n" + fence + a.Text + "\n```",
+			})
+		}
+	}
+	if m.Content != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": m.Content})
+	}
+	return map[string]any{"role": m.Role, "content": blocks}
+}
+
+// modeSystemSuffix returns the line to append to the system prompt
+// when the user has flipped a tool-forcing toggle in the chat UI.
+// Empty string for "" / unknown modes (no-op).
+func modeSystemSuffix(mode string) string {
+	switch mode {
+	case "search":
+		return "\n\nFor this turn, the user has explicitly enabled web search. Call the `web_search` tool to ground your answer in current web sources before replying. If the question is purely about the user's own knowledge or tenant state and search would be irrelevant, you may skip it — but err on the side of searching."
+	case "deep_research":
+		return "\n\nFor this turn, the user has explicitly enabled deep research. Call the `deep_research` tool with a focused question derived from the user's message, then synthesize a brief from the returned sources. Always cite the top results by URL in your reply."
+	}
+	return ""
 }
 
 type toolCallResult struct {
@@ -93,11 +267,11 @@ func MeAgentChat(c *gin.Context) {
 		return
 	}
 
-	apiKey, err := anthropicKey()
+	provider := resolveProvider(body.Model)
+	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503,
-			"chat unavailable: "+err.Error()+
-				". Operator must set ANTHROPIC_API_KEY or place key at /home/webmaster/.api_keys/anthropic.")
+			"chat unavailable: "+err.Error())
 		return
 	}
 
@@ -122,13 +296,10 @@ func MeAgentChat(c *gin.Context) {
 	// list as it iterates.
 	anthMsgs := make([]map[string]any, 0, len(body.Messages))
 	for _, m := range body.Messages {
-		anthMsgs = append(anthMsgs, map[string]any{
-			"role":    m.Role,
-			"content": m.Content,
-		})
+		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m))
 	}
 
-	systemPrompt := buildSystemPrompt(userID)
+	systemPrompt := buildSystemPrompt(userID) + modeSystemSuffix(body.Mode)
 	tools := buildToolDefs()
 	toolCalls := []toolCallResult{}
 	totalInputTokens := 0
@@ -140,16 +311,26 @@ func MeAgentChat(c *gin.Context) {
 
 	// Tool-use loop.
 	for i := 0; i < maxToolLoopIterations; i++ {
+		maxTok := maxTokensPerTurn
+		if body.Think && provider.addAnthropicVersion {
+			maxTok = thinkingMaxTokens
+		}
 		req := map[string]any{
-			"model":      anthropicModel,
-			"max_tokens": maxTokensPerTurn,
+			"model":      provider.upstreamModel,
+			"max_tokens": maxTok,
 			"system":     systemPrompt,
 			"messages":   anthMsgs,
 			"tools":      tools,
 		}
-		resp, err := callAnthropic(ctx, apiKey, req)
+		if body.Think && provider.addAnthropicVersion {
+			req["thinking"] = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": thinkingBudgetTokens,
+			}
+		}
+		resp, err := callLLM(ctx, provider, apiKey, req)
 		if err != nil {
-			fail(c, http.StatusBadGateway, 1502, "anthropic call: "+err.Error())
+			fail(c, http.StatusBadGateway, 1502, "llm call: "+err.Error())
 			return
 		}
 		if usage, ok := resp["usage"].(map[string]any); ok {
@@ -229,7 +410,7 @@ func MeAgentChat(c *gin.Context) {
 	// Record usage for the daily-budget cap. Best-effort — a DB write
 	// failure shouldn't fail the chat response.
 	if totalInputTokens+totalOutputTokens > 0 {
-		_ = recordUsage(userID, "chat", "/me/agent/chat", anthropicModel,
+		_ = recordUsage(userID, "chat", "/me/agent/chat", provider.upstreamModel,
 			totalInputTokens, totalOutputTokens)
 	}
 
@@ -314,20 +495,40 @@ func anthropicKey() (string, error) {
 	return "", fmt.Errorf("no ANTHROPIC_API_KEY set")
 }
 
-// callAnthropic POSTs to the Messages API. Returns the parsed JSON body
-// on 2xx, or an error otherwise (including the response body for debug).
-func callAnthropic(ctx context.Context, apiKey string, body map[string]any) (map[string]any, error) {
+// kvrunPAT resolves the operator's Lumid PAT used to authenticate
+// against kv.run:5000/v1/*. Env first (KVRUN_LLM_TOKEN), then
+// /home/webmaster/.lumilake/pat on disk.
+func kvrunPAT() (string, error) {
+	if k := strings.TrimSpace(os.Getenv("KVRUN_LLM_TOKEN")); k != "" {
+		return k, nil
+	}
+	if b, err := os.ReadFile("/home/webmaster/.lumilake/pat"); err == nil {
+		tok := strings.TrimSpace(strings.Split(string(b), "\n")[0])
+		if tok != "" {
+			return tok, nil
+		}
+	}
+	return "", fmt.Errorf("no KVRUN_LLM_TOKEN set")
+}
+
+// callLLM POSTs to the provider's /v1/messages endpoint with
+// Anthropic-shaped JSON. Provider determines auth header + key source.
+// Returns the parsed JSON body on 2xx, or an error otherwise
+// (including the response body for debug).
+func callLLM(ctx context.Context, p llmProvider, apiKey string, body map[string]any) (map[string]any, error) {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicEndpoint, bytes.NewReader(buf))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
+	req.Header.Set(p.authHeader, p.authPrefix+apiKey)
+	if p.addAnthropicVersion {
+		req.Header.Set("anthropic-version", anthropicVersion)
+	}
 
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -336,7 +537,7 @@ func callAnthropic(ctx context.Context, apiKey string, body map[string]any) (map
 	defer r.Body.Close()
 	respBody, _ := io.ReadAll(r.Body)
 	if r.StatusCode >= 300 {
-		return nil, fmt.Errorf("anthropic %d: %s", r.StatusCode, string(respBody[:min(400, len(respBody))]))
+		return nil, fmt.Errorf("%s %d: %s", p.id, r.StatusCode, string(respBody[:min(400, len(respBody))]))
 	}
 	var out map[string]any
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -376,6 +577,9 @@ You have tools to:
   - start, stop, or fire one-shot cycles on loops
   - record the user's feedback on cycles (Hook 2 — what worked, what to change)
   - query recent cycle results
+  - search the web (web_search), fetch one URL (web_fetch), or run deep research (deep_research)
+  - look up financial data by symbol (query_findata)
+  - remember things about the user long-term (remember_about_me) — call this whenever the user shares a preference, fact about themselves, or a working style hint that should persist
 
 When the user expresses an intent, prefer doing the work via tools over describing how they could do it themselves. Confirm what you did in 1-2 sentences after each action.
 
@@ -383,7 +587,7 @@ The user already has these apps installed in their tenant: ` + tenantList + `
 
 When you don't know an app's slug, call list_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent cycle of the most likely loop and tell them you did so — they can refine later.
 
-Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.`
+Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.` + renderPrefsBlock(userID)
 }
 
 // buildToolDefs — the Anthropic-format tool schema.
@@ -710,6 +914,93 @@ func buildToolDefs() []map[string]any {
 				"required": []string{"slug"},
 			},
 		},
+		{
+			"name":        "web_search",
+			"description": "Search the open web for a short query. Returns 5-10 result snippets with URLs. Use for current events, factual lookups, or to find authoritative sources to follow up with web_fetch. For multi-source synthesis with a written-up answer, prefer deep_research instead.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":       map[string]any{"type": "string", "description": "Search terms — natural language is fine."},
+					"num_results": map[string]any{"type": "integer", "description": "Optional, default 5, max 10."},
+				},
+				"required": []string{"query"},
+			},
+		},
+		{
+			"name":        "web_fetch",
+			"description": "Fetch one URL and return its readable content as markdown. Use after web_search when the user wants the actual content of a specific page, not just snippets.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url": map[string]any{"type": "string", "description": "Absolute URL (https://…)."},
+				},
+				"required": []string{"url"},
+			},
+		},
+		{
+			"name":        "deep_research",
+			"description": "Multi-source web research with a synthesized answer. Returns a written brief plus the supporting result list. Use when the user asks a question that needs research across multiple sources (e.g. 'what's the current state of X?', 'compare A and B', 'summarize recent developments on Z'). Slower (10-30s) than web_search; choose web_search for simple lookups.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"question":    map[string]any{"type": "string", "description": "The research question, in natural language."},
+					"max_results": map[string]any{"type": "integer", "description": "Optional, default 8, max 10. Lower is faster."},
+				},
+				"required": []string{"question"},
+			},
+		},
+		{
+			"name":        "query_findata",
+			"description": "Look up financial data for a stock/ETF symbol via the kv.run:5000 warehouse. Faster + cheaper than web_search for price + corporate-action queries. Kinds: quote (current price + volume), news (recent headlines), earnings (calendar + results), peers (similar tickers), filings (SEC filings), ohlc (30-day daily bars).",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"kind":   map[string]any{"type": "string", "enum": []string{"quote", "news", "earnings", "peers", "filings", "ohlc"}, "description": "What to fetch."},
+					"symbol": map[string]any{"type": "string", "description": "Ticker symbol, e.g. AAPL, NVDA, BTCUSD."},
+					"limit":  map[string]any{"type": "integer", "description": "Optional row cap (for news/earnings/filings). Default 10, max 50."},
+				},
+				"required": []string{"kind", "symbol"},
+			},
+		},
+		{
+			"name":        "remember_about_me",
+			"description": "Save a fact, preference, or working-style note about the user to long-term memory. Use whenever the user explicitly shares something they want you to remember (\"I prefer terse summaries\", \"my main symbol is NVDA\", \"never ping me before 9am\"). Each call appends one row to the me-prefs knowledge bank; recent rows are injected into your system prompt on every subsequent chat, so saved facts shape future replies automatically. Do NOT use for ephemeral session state.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"note": map[string]any{"type": "string", "description": "The fact or preference, in the user's own framing when possible. One sentence ideal."},
+					"tags": map[string]any{"type": "string", "description": "Optional comma-separated retrieval hints, e.g. 'preference,style' or 'fact,trading'."},
+				},
+				"required": []string{"note"},
+			},
+		},
+		{
+			"name":        "code_run",
+			"description": "Run a short Python 3 snippet in a sandboxed environment and return stdout/stderr/exit_code. Use for math/data calculations, CSV/JSON parsing, quick chart-style aggregation, or any task that's easier to compute than describe. The sandbox is network-isolated, capped at 30s CPU + 512MB memory + 10MB file output, and runs as 'nobody' with no host filesystem access. The standard library is available; no third-party packages.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"code":        map[string]any{"type": "string", "description": "Python 3 source. Use print() to emit results — only stdout/stderr are returned."},
+					"timeout_sec": map[string]any{"type": "integer", "description": "Optional wall-clock timeout, default 30, max 60."},
+				},
+				"required": []string{"code"},
+			},
+		},
+		{
+			"name":        "save_artifact",
+			"description": "Save a piece of output (markdown brief, code listing, JSON dataset, plain text) as a persistent artifact in the user's tenant. The artifact appears in the Studio artifact panel and survives across sessions. Use this when the chat produces a long-form deliverable the user is likely to revisit: a research brief from deep_research, a generated script from code_run, a structured summary they asked you to compile. Always set a clear `title` (e.g. 'AAPL Q1 earnings brief' — not 'untitled'). The returned `id` + `url` can be referenced in follow-up turns.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"title":       map[string]any{"type": "string", "description": "Human-readable name for the artifact, max ~80 chars ideal."},
+					"content":     map[string]any{"type": "string", "description": "Body of the artifact. Plain text, markdown, code, or JSON — match the `kind`."},
+					"kind":        map[string]any{"type": "string", "enum": []string{"markdown", "code", "json", "text"}, "description": "Rendering hint. Default: markdown."},
+					"language":    map[string]any{"type": "string", "description": "For kind=code: source language (python, go, js, sql, …)."},
+					"source_tool": map[string]any{"type": "string", "description": "Optional — which prior tool produced this content (e.g. deep_research, code_run). Surfaces as a badge in the panel."},
+				},
+				"required": []string{"title", "content"},
+			},
+		},
 	}
 }
 
@@ -985,6 +1276,50 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 			return map[string]any{"error": "slug required"}, false
 		}
 		return toolSuggestImprovement(c, userID, slug), true
+
+	case "web_search":
+		query, _ := args["query"].(string)
+		num := 0
+		if v, ok := args["num_results"].(float64); ok {
+			num = int(v)
+		}
+		return toolWebSearch(query, num)
+
+	case "web_fetch":
+		url, _ := args["url"].(string)
+		return toolWebFetch(url)
+
+	case "deep_research":
+		question, _ := args["question"].(string)
+		maxResults := 0
+		if v, ok := args["max_results"].(float64); ok {
+			maxResults = int(v)
+		}
+		return toolDeepResearch(question, maxResults)
+
+	case "query_findata":
+		kind, _ := args["kind"].(string)
+		symbol, _ := args["symbol"].(string)
+		limit := 0
+		if v, ok := args["limit"].(float64); ok {
+			limit = int(v)
+		}
+		return toolQueryFindata(kind, symbol, limit)
+
+	case "remember_about_me":
+		note, _ := args["note"].(string)
+		return toolRememberAboutMe(userID, note, args["tags"])
+
+	case "code_run":
+		code, _ := args["code"].(string)
+		timeout := 0
+		if v, ok := args["timeout_sec"].(float64); ok {
+			timeout = int(v)
+		}
+		return toolCodeRun(code, timeout)
+
+	case "save_artifact":
+		return toolSaveArtifact(userID, args)
 	}
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

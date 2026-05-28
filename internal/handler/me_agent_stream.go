@@ -55,7 +55,8 @@ func MeAgentChatStream(c *gin.Context) {
 		return
 	}
 
-	apiKey, err := anthropicKey()
+	provider := resolveProvider(body.Model)
+	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503, "chat unavailable: "+err.Error())
 		return
@@ -91,13 +92,15 @@ func MeAgentChatStream(c *gin.Context) {
 		return true
 	}
 
-	// Promote frontend's flat content into Anthropic's message shape.
+	// Promote frontend's flat content (+ attachments) into Anthropic's
+	// message shape — images become image blocks, text files become
+	// fenced inline blocks, the user's typed text closes each turn.
 	anthMsgs := make([]map[string]any, 0, len(body.Messages))
 	for _, m := range body.Messages {
-		anthMsgs = append(anthMsgs, map[string]any{"role": m.Role, "content": m.Content})
+		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m))
 	}
 
-	systemPrompt := buildSystemPrompt(userID)
+	systemPrompt := buildSystemPrompt(userID) + modeSystemSuffix(body.Mode)
 	tools := buildToolDefs()
 	totalInputTokens := 0
 	totalOutputTokens := 0
@@ -106,16 +109,26 @@ func MeAgentChatStream(c *gin.Context) {
 	defer cancel()
 
 	for i := 0; i < maxToolLoopIterations; i++ {
+		maxTok := maxTokensPerTurn
+		if body.Think && provider.addAnthropicVersion {
+			maxTok = thinkingMaxTokens
+		}
 		req := map[string]any{
-			"model":      anthropicModel,
-			"max_tokens": maxTokensPerTurn,
+			"model":      provider.upstreamModel,
+			"max_tokens": maxTok,
 			"system":     systemPrompt,
 			"messages":   anthMsgs,
 			"tools":      tools,
 			"stream":     true,
 		}
+		if body.Think && provider.addAnthropicVersion {
+			req["thinking"] = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": thinkingBudgetTokens,
+			}
+		}
 		stopReason, toolUses, assistantBlocks, inTok, outTok, err := streamOneAnthropicTurn(
-			ctx, apiKey, req, emit,
+			ctx, provider, apiKey, req, emit,
 		)
 		totalInputTokens += inTok
 		totalOutputTokens += outTok
@@ -155,7 +168,7 @@ func MeAgentChatStream(c *gin.Context) {
 
 	// Record usage (best-effort; failure doesn't break the stream).
 	if totalInputTokens+totalOutputTokens > 0 {
-		_ = recordUsage(userID, "chat", "/me/agent/chat/stream", anthropicModel, totalInputTokens, totalOutputTokens)
+		_ = recordUsage(userID, "chat", "/me/agent/chat/stream", provider.upstreamModel, totalInputTokens, totalOutputTokens)
 	}
 
 	emit(map[string]any{
@@ -189,17 +202,19 @@ type streamingToolUse struct {
 //   - input/output token counts
 //   - error (if any HTTP / parse failure)
 func streamOneAnthropicTurn(
-	ctx context.Context, apiKey string, body map[string]any,
+	ctx context.Context, p llmProvider, apiKey string, body map[string]any,
 	emit func(map[string]any) bool,
 ) (string, []streamingToolUse, []map[string]any, int, int, error) {
 	buf, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicEndpoint, strings.NewReader(string(buf)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, strings.NewReader(string(buf)))
 	if err != nil {
 		return "", nil, nil, 0, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
+	req.Header.Set(p.authHeader, p.authPrefix+apiKey)
+	if p.addAnthropicVersion {
+		req.Header.Set("anthropic-version", anthropicVersion)
+	}
 	req.Header.Set("Accept", "text/event-stream")
 
 	r, err := http.DefaultClient.Do(req)
@@ -209,7 +224,7 @@ func streamOneAnthropicTurn(
 	defer r.Body.Close()
 	if r.StatusCode >= 300 {
 		body, _ := io.ReadAll(r.Body)
-		return "", nil, nil, 0, 0, fmt.Errorf("anthropic %d: %.300s", r.StatusCode, string(body))
+		return "", nil, nil, 0, 0, fmt.Errorf("%s %d: %.300s", p.id, r.StatusCode, string(body))
 	}
 
 	// Parser state — Anthropic's SSE has fields by content_block index.
@@ -260,6 +275,14 @@ func streamOneAnthropicTurn(
 				id, _ := block["id"].(string)
 				name, _ := block["name"].(string)
 				toolUses[idx] = &streamingToolUse{id: id, name: name}
+				// Tell the UI "agent is about to call this tool" so it
+				// can render a spinner with the tool name before args
+				// finish streaming. Args land via the matching
+				// tool_call event after dispatchTool returns.
+				emit(map[string]any{"type": "tool_start", "name": name, "id": id})
+			} else if bt == "thinking" {
+				// Open a thinking block in the UI. Deltas follow.
+				emit(map[string]any{"type": "thinking_start"})
 			}
 
 		case "content_block_delta":
@@ -270,6 +293,12 @@ func streamOneAnthropicTurn(
 			case "text_delta":
 				if t, ok := delta["text"].(string); ok && t != "" {
 					emit(map[string]any{"type": "text", "delta": t})
+				}
+			case "thinking_delta":
+				// Extended thinking from Anthropic. kv.run/MiniMax emits
+				// the same shape — both paths surface here.
+				if t, ok := delta["thinking"].(string); ok && t != "" {
+					emit(map[string]any{"type": "thinking", "delta": t})
 				}
 			case "input_json_delta":
 				if pj, ok := delta["partial_json"].(string); ok {
@@ -282,6 +311,10 @@ func streamOneAnthropicTurn(
 		case "content_block_stop":
 			idx := intOf(msg["index"])
 			bt := currentBlocks[idx]
+			if bt == "thinking" {
+				// Close the thinking block — UI can collapse it now.
+				emit(map[string]any{"type": "thinking_stop"})
+			}
 			if bt == "tool_use" {
 				tu := toolUses[idx]
 				if tu == nil {

@@ -103,6 +103,18 @@ func Register(r *gin.Engine) {
 		v1.GET("/identity/google-grants", GoogleGrantsList)
 		v1.POST("/identity/google-access-token", GoogleAccessToken)
 
+		// Microsoft Graph OAuth via device-code (no Azure app
+		// registration needed — uses Microsoft's pre-registered
+		// Graph PowerShell SDK public client_id). Centralized auth
+		// + multi-tenant runtime: refresh-tokens encrypted at rest
+		// in microsoft_grants, daemons/skills mint per-call access
+		// tokens via /microsoft-access-token.
+		v1.POST("/oauth/microsoft/connect/init", MicrosoftConnectInit)
+		v1.POST("/oauth/microsoft/connect/poll", MicrosoftConnectPoll)
+		v1.GET("/identity/microsoft-grants",      MicrosoftGrantsList)
+		v1.DELETE("/identity/microsoft-token",    MicrosoftTokenRevoke)
+		v1.POST("/identity/microsoft-access-token", MicrosoftAccessToken)
+
 		// LQA-compatible PAT surface — same path so downstream code
 		// (frontend /account/tokens, install.sh) works unchanged after
 		// Phase 3 repoints the proxy.
@@ -206,6 +218,24 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app/secrets/:key",        MeSecretDelete)
 			me.GET("/apps/:app/secrets/:key/value",     MeSecretFetchValue)
 
+			// Power Automate inbound webhook lifecycle. The Outlook
+			// bridge workaround for users whose org blocks Microsoft
+			// Graph OAuth: user pastes the minted URL into a Power
+			// Automate flow that fires on new email.
+			me.POST("/power-automate-tokens",   MePowerAutomateTokenMint)
+			me.GET("/power-automate-tokens",    MePowerAutomateTokenStatus)
+			me.DELETE("/power-automate-tokens", MePowerAutomateTokenRevoke)
+			// Pre-baked PA package .zip the user imports at
+			// make.powerautomate.com → My flows → Import. Webhook
+			// URL is hard-coded into the HTTP action so post-import
+			// the user just confirms the Outlook connection and
+			// saves. Always rotates the underlying token.
+			me.GET("/power-automate-tokens/flow-template", MePowerAutomateFlowTemplate)
+			// One-click "send me a test email through my flow" — verifies
+			// the outbound POWER_AUTOMATE_SEND_URL end-to-end without
+			// the user needing a PAT + curl.
+			me.POST("/apps/lumid-outlook-pa/test-send", MeOutlookPATestSend)
+
 			// Cycle-level feedback (Hook 2 keystone). Same backend
 			// for clickable UI + conversational-agent give_feedback tool.
 			me.POST("/cycles/feedback", MeCycleFeedback)
@@ -291,6 +321,14 @@ func Register(r *gin.Engine) {
 		{
 			internal.POST("/usage/charge", InternalUsageCharge)
 		}
+
+		// Inbound webhook for Power Automate's Outlook bridge. The
+		// path-segment <token> IS the auth; no Authorization header
+		// (Power Automate's HTTP step can set them but the simpler
+		// integration is URL-only). Per-user random secret, hashed
+		// at rest. Lives outside /me on purpose — Power Automate
+		// doesn't have a lum.id session.
+		v1.POST("/inbox/power-automate/:token", InboxPowerAutomateReceive)
 
 		// super_admin-only — billing/accounting/secrets endpoints.
 		superAdmin := v1.Group("/admin", RequireSuperAdmin())

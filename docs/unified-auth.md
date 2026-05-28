@@ -34,7 +34,7 @@ Reserved service namespaces:
 
 | Namespace | Owner service | Replaces legacy credential |
 |-----------|---------------|----------------------------|
-| `flowmesh:*`, `flowmesh:workflows:submit`, `flowmesh:workflows:cancel`, `flowmesh:workers:manage`, `flowmesh:guardians:register`, `flowmesh:results:read`, `flowmesh:results:write`, `flowmesh:system:metrics` | FlowMesh | `flm-*` keys |
+| `flowmesh:admin` (or `flowmesh:*` / `*`), `flowmesh:workflows:{read,write}`, `flowmesh:tasks:read`, `flowmesh:results:{read,write}`, `flowmesh:nodes:{read,write}`, `flowmesh:workers:{read,write}`, `flowmesh:system:read` — vocab consumed by lumid-flowmesh-plugin v0.2.0+. The UI's `flowmesh:read` / `flowmesh:write` shortcuts are expanded at introspect time (see `common/ExpandFlowmeshScopes`); existing PATs keep working. | FlowMesh | `flm-*` keys |
 | `lumilake:*`, `lumilake:jobs:submit`, `lumilake:jobs:cancel`, `lumilake:trace:read`, `lumilake:metadata:write`, `lumilake:principals:manage` | Lumilake | `lmk-*` keys |
 | `xpcloud:*`, `xpcloud:repos:read`, `xpcloud:repos:write`, `xpcloud:repos:admin`, `xpcloud:pulls:open`, `xpcloud:pulls:merge` | xpcloud | PAT-only already |
 | `qa:*`, `qa:trading:submit`, `qa:leaderboard:read`, `qa:admin:*` | QuantArena | PAT-only already |

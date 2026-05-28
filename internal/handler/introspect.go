@@ -191,7 +191,7 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 	// LQA stores scopes comma-separated; Runmesh stores space-separated.
 	// Accept either and normalize so downstream consumers see a clean array.
 	raw := strings.ReplaceAll(row.Scopes, ",", " ")
-	scopeList := strings.Fields(raw)
+	scopeList := common.ExpandFlowmeshScopes(strings.Fields(raw))
 	var exp int64
 	if row.ExpiresAt != nil {
 		exp = *row.ExpiresAt
@@ -248,7 +248,9 @@ func introspectNative(token string) *IntrospectResponse {
 	}
 	common.DB.Raw(`SELECT email, name, role FROM users WHERE id = ? LIMIT 1`, row.UserID).Scan(&u)
 
-	scopes := strings.Fields(row.Scopes)
+	// Expand flowmesh:read/write shortcuts to the fine-grained vocab
+	// FlowMesh's plugin v0.2.0+ requires. See common/scopes.go.
+	scopes := common.ExpandFlowmeshScopes(strings.Fields(row.Scopes))
 	var exp int64
 	if row.ExpiresAt != nil {
 		exp = row.ExpiresAt.Unix()
@@ -287,14 +289,14 @@ func introspectJWT(token string) *IntrospectResponse {
 	if sess.ID != "" && sess.RevokedAt != nil {
 		return &IntrospectResponse{Active: false, Reason: "session revoked"}
 	}
-	scopes := strings.Fields(claims.Scopes)
+	scopes := common.ExpandFlowmeshScopes(strings.Fields(claims.Scopes))
 	return &IntrospectResponse{
 		Active:    true,
 		Sub:       claims.Subject,
 		Email:     claims.Email,
 		Role:      claims.Role,
 		Scopes:    scopes,
-		Scope:     claims.Scopes,
+		Scope:     strings.Join(scopes, " "),
 		TokenType: "jwt",
 		Exp:       claims.ExpiresAt.Unix(),
 		Iat:       claims.IssuedAt.Unix(),

@@ -94,10 +94,12 @@ func MeAgentChatStream(c *gin.Context) {
 
 	// Promote frontend's flat content (+ attachments) into Anthropic's
 	// message shape — images become image blocks, text files become
-	// fenced inline blocks, the user's typed text closes each turn.
+	// fenced inline blocks, PDFs become document blocks on Claude or
+	// pdftotext-extracted fenced text on non-Claude, the user's typed
+	// text closes each turn.
 	anthMsgs := make([]map[string]any, 0, len(body.Messages))
 	for _, m := range body.Messages {
-		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m))
+		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
 	systemPrompt := buildSystemPrompt(userID) + modeSystemSuffix(body.Mode)

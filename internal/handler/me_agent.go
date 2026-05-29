@@ -70,17 +70,10 @@ type llmProvider struct {
 	addAnthropicVersion bool
 }
 
+// First entry is the default (defaultProvider() returns llmProviders[0]).
+// Order: in-cluster GPU first (no per-call API charge to Anthropic, the
+// fleet is already paid for), Anthropic as the hosted fallback.
 var llmProviders = []llmProvider{
-	{
-		id:                  "claude-haiku",
-		displayName:         "Claude Haiku 4.5",
-		endpoint:            anthropicEndpoint,
-		upstreamModel:       anthropicModel,
-		authHeader:          "x-api-key",
-		authPrefix:          "",
-		keyFn:               anthropicKey,
-		addAnthropicVersion: true,
-	},
 	{
 		// kv.run:5000 in-cluster inference gateway. Speaks Anthropic
 		// /v1/messages including SSE streaming — drop-in for the
@@ -93,6 +86,16 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
+	},
+	{
+		id:                  "claude-haiku",
+		displayName:         "Claude Haiku 4.5",
+		endpoint:            anthropicEndpoint,
+		upstreamModel:       anthropicModel,
+		authHeader:          "x-api-key",
+		authPrefix:          "",
+		keyFn:               anthropicKey,
+		addAnthropicVersion: true,
 	},
 }
 
@@ -146,14 +149,30 @@ type chatMessage struct {
 }
 
 // chatAttachment — one file the user dropped into the chat input.
-// Kind=image needs MIME + base64 (Anthropic source.media_type expects
-// "image/png" | "image/jpeg" | "image/gif" | "image/webp"); kind=text
-// just carries the raw text body.
+//
+//   - kind=image:    Mime + DataB64. Anthropic source.media_type expects
+//                    "image/png" | "image/jpeg" | "image/gif" | "image/webp".
+//   - kind=text:     Text carries the raw content (txt, md, csv, json, yaml,
+//                    log, etc — anything the frontend can read as a string).
+//   - kind=document: Mime + DataB64 for binary documents. Server routes
+//                    by Mime through extractDocumentText():
+//                      application/pdf                   → pdftotext
+//                      application/vnd.openxmlformats-...
+//                                          .wordprocess  → pandoc (docx)
+//                      application/vnd.openxmlformats-...
+//                                          .spreadsheet  → openpyxl (xlsx)
+//                      application/vnd.openxmlformats-...
+//                                          .presentation → pandoc (pptx)
+//                      application/rtf, application/vnd.oasis.opendocument.*,
+//                      application/epub+zip              → pandoc
+//                    On Claude (Anthropic) provider, PDFs ship as a native
+//                    `document` content block instead of going through
+//                    extraction — preserves tables, layout, embedded images.
 type chatAttachment struct {
-	Kind     string `json:"kind"`               // "image" | "text"
+	Kind     string `json:"kind"`               // "image" | "text" | "document"
 	Name     string `json:"name,omitempty"`     // filename hint
-	Mime     string `json:"mime,omitempty"`     // images only
-	DataB64  string `json:"data_b64,omitempty"` // images only — base64-encoded bytes
+	Mime     string `json:"mime,omitempty"`     // image + document
+	DataB64  string `json:"data_b64,omitempty"` // image + document — base64-encoded bytes
 	Text     string `json:"text,omitempty"`     // text-files only — raw content
 }
 
@@ -184,9 +203,11 @@ const thinkingMaxTokens = 8192 // max_tokens when thinking is enabled
 // chatMessageToAnthropic promotes one chatMessage into the Anthropic
 // /v1/messages content shape. With no attachments it stays as a plain
 // `content: "<text>"`. With attachments it becomes a list of content
-// blocks — text-files inlined as fenced code, images as image blocks.
+// blocks — text-files inlined as fenced code, images as image blocks,
+// PDFs as document blocks (Claude) or pdftotext-extracted fenced
+// text (non-Claude providers).
 // Returns the {role, content} map suitable for direct append.
-func chatMessageToAnthropic(m chatMessage) map[string]any {
+func chatMessageToAnthropic(m chatMessage, provider llmProvider) map[string]any {
 	if len(m.Attachments) == 0 {
 		return map[string]any{"role": m.Role, "content": m.Content}
 	}
@@ -204,6 +225,43 @@ func chatMessageToAnthropic(m chatMessage) map[string]any {
 					"media_type": a.Mime,
 					"data":       a.DataB64,
 				},
+			})
+		case "document":
+			if a.DataB64 == "" {
+				continue
+			}
+			name := a.Name
+			if name == "" {
+				name = "document"
+			}
+			// Claude path + PDF: ship as a native document content
+			// block. Preserves layout, tables, and embedded images
+			// for vision. Other doc formats still go through text
+			// extraction even on Claude.
+			if provider.addAnthropicVersion && a.Mime == "application/pdf" {
+				blocks = append(blocks, map[string]any{
+					"type": "document",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "application/pdf",
+						"data":       a.DataB64,
+					},
+					"title": name,
+				})
+				continue
+			}
+			// Everything else: server-side text extraction routed by mime.
+			text, extractor, err := extractDocumentText(a.Mime, a.DataB64)
+			if err != nil {
+				blocks = append(blocks, map[string]any{
+					"type": "text",
+					"text": "Attached document `" + name + "` (" + a.Mime + ") — extraction failed: " + err.Error(),
+				})
+				continue
+			}
+			blocks = append(blocks, map[string]any{
+				"type": "text",
+				"text": "Attached document `" + name + "` (extracted via " + extractor + "):\n```\n" + text + "\n```",
 			})
 		case "text":
 			if a.Text == "" {
@@ -230,11 +288,12 @@ func chatMessageToAnthropic(m chatMessage) map[string]any {
 // when the user has flipped a tool-forcing toggle in the chat UI.
 // Empty string for "" / unknown modes (no-op).
 func modeSystemSuffix(mode string) string {
+	citationRules := "\n\nCITATIONS: cite every fact that came from a web tool using GitHub-flavored markdown footnotes. This is mandatory — a reply with sourced facts and no inline citations is broken. EXACT SHAPE:\n\n  The S&P 500 closed at 6420 yesterday[^1], up 0.4% on the week[^2].\n\n  [^1]: https://example.com/markets-page\n  [^2]: https://other.com/weekly-recap\n\nRules:\n- One `[^n]` marker per claim, attached without a space to the word it cites.\n- Define every `[^n]` you reference at the very end of the reply, one per line.\n- URLs verbatim from the tool — never paraphrase or invent.\n- Reuse the same number for repeated sources; don't duplicate definitions.\n- Skip footnotes entirely only if you didn't actually use a source.\n- Do NOT add a `## Sources` heading — the frontend builds the footnotes block automatically from the `[^n]:` definitions."
 	switch mode {
 	case "search":
-		return "\n\nFor this turn, the user has explicitly enabled web search. Call the `web_search` tool to ground your answer in current web sources before replying. If the question is purely about the user's own knowledge or tenant state and search would be irrelevant, you may skip it — but err on the side of searching."
+		return "\n\nFor this turn, the user has explicitly enabled web search. Call the `web_search` tool to ground your answer in current web sources before replying. If the question is purely about the user's own knowledge or tenant state and search would be irrelevant, you may skip it — but err on the side of searching." + citationRules
 	case "deep_research":
-		return "\n\nFor this turn, the user has explicitly enabled deep research. Call the `deep_research` tool with a focused question derived from the user's message, then synthesize a brief from the returned sources. Always cite the top results by URL in your reply."
+		return "\n\nFor this turn, the user has explicitly enabled deep research. Call the `deep_research` tool with a focused question derived from the user's message, then synthesize a brief from the returned sources." + citationRules
 	}
 	return ""
 }
@@ -296,7 +355,7 @@ func MeAgentChat(c *gin.Context) {
 	// list as it iterates.
 	anthMsgs := make([]map[string]any, 0, len(body.Messages))
 	for _, m := range body.Messages {
-		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m))
+		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
 	systemPrompt := buildSystemPrompt(userID) + modeSystemSuffix(body.Mode)
@@ -987,6 +1046,38 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "send_email",
+			"description": "Send an email from the user's connected Gmail account. The user must have linked Google at /dashboard/account/connect/google (the same OAuth grant that powers personal-agent); if not, the tool returns a clean error pointing them there. ALWAYS read back the subject + recipients in your reply so the user can confirm what was sent. Use plain text bodies — markdown won't render in email.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"to":      map[string]any{"type": "string", "description": "Comma-separated recipient(s). Required."},
+					"subject": map[string]any{"type": "string", "description": "Email subject line. Required, max ~80 chars ideal."},
+					"body":    map[string]any{"type": "string", "description": "Plain text body. Required."},
+					"cc":      map[string]any{"type": "string", "description": "Optional comma-separated CC recipients."},
+					"bcc":     map[string]any{"type": "string", "description": "Optional comma-separated BCC recipients."},
+				},
+				"required": []string{"to", "subject", "body"},
+			},
+		},
+		{
+			"name":        "create_calendar_event",
+			"description": "Create an event on the user's primary Google Calendar. Requires Google connected at /dashboard/account/connect/google. Use ISO-8601 datetimes with offsets (2026-06-01T14:00:00-07:00) for timed events, or YYYY-MM-DD strings for all-day events. Confirm details (title, when, who) back to the user in your reply.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"title":       map[string]any{"type": "string", "description": "Event title. Required."},
+					"start":       map[string]any{"type": "string", "description": "ISO 8601 datetime OR YYYY-MM-DD for all-day. Required."},
+					"end":         map[string]any{"type": "string", "description": "ISO 8601 datetime OR YYYY-MM-DD. Required."},
+					"description": map[string]any{"type": "string", "description": "Optional details. Plain text."},
+					"location":    map[string]any{"type": "string", "description": "Optional location or videoconf URL."},
+					"attendees":   map[string]any{"type": "string", "description": "Optional comma-separated email list. Invitations are sent automatically."},
+					"timezone":    map[string]any{"type": "string", "description": "Optional IANA timezone for timed events, e.g. 'America/Los_Angeles'. Defaults to America/Los_Angeles."},
+				},
+				"required": []string{"title", "start", "end"},
+			},
+		},
+		{
 			"name":        "save_artifact",
 			"description": "Save a piece of output (markdown brief, code listing, JSON dataset, plain text) as a persistent artifact in the user's tenant. The artifact appears in the Studio artifact panel and survives across sessions. Use this when the chat produces a long-form deliverable the user is likely to revisit: a research brief from deep_research, a generated script from code_run, a structured summary they asked you to compile. Always set a clear `title` (e.g. 'AAPL Q1 earnings brief' — not 'untitled'). The returned `id` + `url` can be referenced in follow-up turns.",
 			"input_schema": map[string]any{
@@ -1320,6 +1411,12 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 
 	case "save_artifact":
 		return toolSaveArtifact(userID, args)
+
+	case "send_email":
+		return toolSendEmail(userID, args)
+
+	case "create_calendar_event":
+		return toolCreateCalendarEvent(userID, args)
 	}
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

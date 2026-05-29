@@ -22,7 +22,19 @@ FROM --platform=linux/amd64 alpine:3.20
 # the sandboxed process can reach the same hosts identity itself can.
 # Identity is single-tenant + operator-trusted, so the residual risk
 # is bounded by identity's own egress reachability.
-RUN apk add --no-cache ca-certificates tzdata git util-linux-misc python3
+# Document extraction toolchain for chat file uploads:
+#   - poppler-utils → pdftotext (PDF fallback when provider lacks
+#                     native document blocks; Claude path bypasses
+#                     this and ships the PDF as an Anthropic
+#                     `document` content block).
+#   - pandoc        → docx, rtf, odt, epub, html → plain text. Single
+#                     binary, no per-format extractor needed.
+#   - py3-openpyxl  → xlsx extractor (pandoc doesn't read xlsx;
+#                     openpyxl + a 30-line stdlib helper covers cells
+#                     + sheet names).
+RUN apk add --no-cache \
+      ca-certificates tzdata git util-linux-misc python3 \
+      poppler-utils pandoc py3-openpyxl
 WORKDIR /app
 COPY --from=builder /out/identity /app/identity
 COPY configs/identity.yaml /app/configs/identity.yaml

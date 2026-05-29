@@ -258,6 +258,13 @@ func Register(r *gin.Engine) {
 			me.GET("/artifacts/:id", MeArtifactGet)
 			me.DELETE("/artifacts/:id", MeArtifactDelete)
 
+			// Persistent chat history — sidebar in StudioChat. One
+			// file per thread under ~/.tenants/<userID>/.chats/.
+			me.GET("/chats", MeChatsList)
+			me.GET("/chats/:id", MeChatGet)
+			me.POST("/chats", MeChatSave)
+			me.DELETE("/chats/:id", MeChatDelete)
+
 			// Tier-1 quota state — read-only. Used by /app/loops to
 			// render the "Free tier reached" banner + per-loop hints.
 			// Writes flow through /internal/usage/charge below.

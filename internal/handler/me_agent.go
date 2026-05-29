@@ -119,6 +119,46 @@ func MeAgentModels(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": out})
 }
 
+// providerSupportsVision returns true for providers that can read
+// `image` content blocks. Only Anthropic-shape endpoints in our
+// registry today — kv.run/MiniMax-M2.7 is text-only ("is not a
+// multimodal model" error from the upstream). If we add new
+// providers later, gate on this flag rather than ad-hoc matching.
+func providerSupportsVision(p llmProvider) bool {
+	return p.addAnthropicVersion
+}
+
+// containsImageAttachment scans every message in the request for an
+// image attachment. Used to auto-route to a vision-capable provider
+// when the user's selected model can't read images.
+func containsImageAttachment(msgs []chatMessage) bool {
+	for _, m := range msgs {
+		for _, a := range m.Attachments {
+			if a.Kind == "image" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// autoRouteForTurn — if the resolved provider can't handle the
+// content in the current request, override to claude-haiku (the only
+// vision-capable provider today). Returns (provider, autoRouted)
+// where autoRouted is true when we overrode. Used to surface the
+// override in the usage event so the UI can show "answered by
+// Claude (auto)" instead of pretending the user's selection ran.
+func autoRouteForTurn(req []chatMessage, picked llmProvider) (llmProvider, bool) {
+	if containsImageAttachment(req) && !providerSupportsVision(picked) {
+		for _, p := range llmProviders {
+			if p.id == "claude-haiku" {
+				return p, true
+			}
+		}
+	}
+	return picked, false
+}
+
 // resolveProvider picks the provider for a chat request. Falls back
 // to the default (Claude) on empty or unrecognized model strings so
 // clients that don't pass `model` keep working.
@@ -327,6 +367,8 @@ func MeAgentChat(c *gin.Context) {
 	}
 
 	provider := resolveProvider(body.Model)
+	provider, autoRouted := autoRouteForTurn(body.Messages, provider)
+	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
 	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503,
@@ -478,6 +520,8 @@ func MeAgentChat(c *gin.Context) {
 		"data": gin.H{
 			"reply":      finalText,
 			"tool_calls": toolCalls,
+			"model_used": provider.id,
+			"auto_routed": autoRouted,
 			"usage": gin.H{
 				"input_tokens":  totalInputTokens,
 				"output_tokens": totalOutputTokens,

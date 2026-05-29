@@ -56,6 +56,7 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	provider := resolveProvider(body.Model)
+	provider, autoRouted := autoRouteForTurn(body.Messages, provider)
 	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503, "chat unavailable: "+err.Error())
@@ -109,6 +110,15 @@ func MeAgentChatStream(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 120*time.Second)
 	defer cancel()
+
+	// Surface the routing decision immediately. When auto_routed=true,
+	// the UI can show "answered by Claude (auto — has image)" instead
+	// of the user's selected MiniMax. Sent once, before any text.
+	emit(map[string]any{
+		"type":        "route",
+		"model_used":  provider.id,
+		"auto_routed": autoRouted,
+	})
 
 	for i := 0; i < maxToolLoopIterations; i++ {
 		maxTok := maxTokensPerTurn
@@ -179,6 +189,8 @@ func MeAgentChatStream(c *gin.Context) {
 		"output_tokens": totalOutputTokens,
 		"budget_used":   tokensUsedLast24h(userID),
 		"budget_limit":  budget,
+		"model_used":    provider.id,
+		"auto_routed":   autoRouted,
 	})
 	emit(map[string]any{"type": "done"})
 }

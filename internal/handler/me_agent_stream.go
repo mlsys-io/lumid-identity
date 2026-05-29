@@ -103,8 +103,8 @@ func MeAgentChatStream(c *gin.Context) {
 		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
-	systemPrompt := buildSystemPrompt(userID) + modeSystemSuffix(body.Mode)
-	tools := buildToolDefs()
+	basePrompt, tools, _ := resolvePromptAndTools(userID, body)
+	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
 	totalInputTokens := 0
 	totalOutputTokens := 0
 

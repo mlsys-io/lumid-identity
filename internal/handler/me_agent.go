@@ -232,6 +232,18 @@ type meAgentChatBody struct {
 	// kv.run/MiniMax always emits thinking deltas by default; this
 	// flag is a no-op there. Combinable with Mode.
 	Think bool `json:"think,omitempty"`
+	// Optional: id of an installed xpio agent. When set,
+	// buildSystemPrompt swaps the me-prefs context for that agent's
+	// most-recent bank entries; the chat acts as that agent's
+	// spokesperson. See me_agent_agents.go.
+	AgentID string `json:"agent_id,omitempty"`
+	// Optional: id of a user-defined persona. When set, the persona's
+	// system_prompt REPLACES the LumidOS assistant base, allowed_tools[]
+	// filters the tool catalog, and preferred_model overrides the
+	// picker if no explicit model was passed. Mutually exclusive with
+	// agent_id — persona_id wins when both are set. See
+	// me_agent_personas.go.
+	PersonaID string `json:"persona_id,omitempty"`
 }
 
 // thinkingBudgetTokens — Anthropic's extended thinking budget. Pulled
@@ -400,8 +412,8 @@ func MeAgentChat(c *gin.Context) {
 		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
-	systemPrompt := buildSystemPrompt(userID) + modeSystemSuffix(body.Mode)
-	tools := buildToolDefs()
+	basePrompt, tools, _ := resolvePromptAndTools(userID, body)
+	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
 	toolCalls := []toolCallResult{}
 	totalInputTokens := 0
 	totalOutputTokens := 0
@@ -658,7 +670,43 @@ func min(a, b int) int {
 
 // buildSystemPrompt — the agent's persona + a snapshot of the user's
 // current app inventory so it has context without an extra tool call.
-func buildSystemPrompt(userID string) string {
+// resolvePromptAndTools — single decision point for the chat's
+// system prompt + tool catalog. Three modes, in priority order:
+//
+//  1. PersonaID set → persona's system_prompt + allowed_tools filter
+//     (mutually exclusive with agent_id).
+//  2. AgentID set   → standard LumidOS prompt + agent-bank block
+//     replacing me-prefs.
+//  3. Default       → standard LumidOS prompt + me-prefs block.
+//
+// Returns (systemPrompt, tools, preferredModel). preferredModel is
+// honored only when the request didn't set Model explicitly (handler-
+// level concern, not done here).
+func resolvePromptAndTools(userID string, body meAgentChatBody) (string, []map[string]any, string) {
+	tools := buildToolDefs()
+	if body.PersonaID != "" {
+		p, _ := loadPersona(userID, body.PersonaID)
+		if p != nil {
+			if len(p.AllowedTools) > 0 {
+				allow := map[string]bool{}
+				for _, t := range p.AllowedTools {
+					allow[t] = true
+				}
+				tools = filterTools(tools, allow)
+			}
+			return p.SystemPrompt, tools, p.PreferredModel
+		}
+		// Fall through if persona id is invalid — chat still works.
+	}
+	return buildSystemPrompt(userID, body.AgentID), tools, ""
+}
+
+// buildSystemPrompt assembles the assistant's persona + a snapshot
+// of the user's current tenant. When agentID is set, the trailing
+// memory block swaps from the user's me-prefs to that agent's bank
+// (see renderAgentBankBlock); empty agentID falls through to the
+// default me-prefs path.
+func buildSystemPrompt(userID, agentID string) string {
 	apps := []string{}
 	// Caller's tenant first.
 	if entries, err := os.ReadDir(tenantAppsDir(userID)); err == nil {
@@ -690,7 +738,12 @@ The user already has these apps installed in their tenant: ` + tenantList + `
 
 When you don't know an app's slug, call list_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent cycle of the most likely loop and tell them you did so — they can refine later.
 
-Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.` + renderPrefsBlock(userID)
+Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.` + func() string {
+		if agentID != "" {
+			return renderAgentBankBlock(userID, agentID)
+		}
+		return renderPrefsBlock(userID)
+	}()
 }
 
 // buildToolDefs — the Anthropic-format tool schema.
@@ -1122,6 +1175,20 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "spawn_agent",
+			"description": "Delegate a focused job to a sub-agent. The sub-agent runs its own short tool-use loop (max 5 iterations, 45s) with a curated tool subset, and returns its final reply. Use this when a research-heavy or analysis-heavy sub-task would otherwise clutter your own context with many tool calls — e.g. 'spawn a sub-agent to investigate X across 5 sources and return a 3-paragraph brief'. The sub-agent gets a fresh message history; it doesn't see this conversation. By default the sub-agent gets read-only + research tools (web_search, web_fetch, deep_research, query_findata, query_my_knowledge, code_run, list_*, today_summary). To restrict further, pass tools=[...].",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task":     map[string]any{"type": "string", "description": "The focused job, in natural language. Include enough context for a fresh agent to understand."},
+					"tools":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional whitelist of tool names the sub-agent may use. Defaults to a read-only + research subset."},
+					"agent_id": map[string]any{"type": "string", "description": "Optional xpio agent id to ground the sub-agent in (same effect as the user's agent picker — see /me/agents)."},
+					"max_iter": map[string]any{"type": "integer", "description": "Optional cap on tool-use iterations, default 5, max 5."},
+				},
+				"required": []string{"task"},
+			},
+		},
+		{
 			"name":        "save_artifact",
 			"description": "Save a piece of output (markdown brief, code listing, JSON dataset, plain text) as a persistent artifact in the user's tenant. The artifact appears in the Studio artifact panel and survives across sessions. Use this when the chat produces a long-form deliverable the user is likely to revisit: a research brief from deep_research, a generated script from code_run, a structured summary they asked you to compile. Always set a clear `title` (e.g. 'AAPL Q1 earnings brief' — not 'untitled'). The returned `id` + `url` can be referenced in follow-up turns.",
 			"input_schema": map[string]any{
@@ -1455,6 +1522,9 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 
 	case "save_artifact":
 		return toolSaveArtifact(userID, args)
+
+	case "spawn_agent":
+		return toolSpawnAgent(c, userID, args)
 
 	case "send_email":
 		return toolSendEmail(userID, args)

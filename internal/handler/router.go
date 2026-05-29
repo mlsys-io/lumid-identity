@@ -252,6 +252,18 @@ func Register(r *gin.Engine) {
 			// in StudioChat. Returns [{id, displayName, default}].
 			me.GET("/agent/models", MeAgentModels)
 
+			// Installed xpio agents — populates the agent picker in
+			// StudioChat. Chat body can set agent_id to ground the
+			// turn in that agent's bank.
+			me.GET("/agents", MeAgentsList)
+
+			// User-defined personas — custom system prompts + tool
+			// subsets. Chat body sets persona_id to apply.
+			me.GET("/personas", MePersonasList)
+			me.GET("/personas/:id", MePersonaGet)
+			me.POST("/personas", MePersonaSave)
+			me.DELETE("/personas/:id", MePersonaDelete)
+
 			// Artifacts — saved long-form output from chat. Backed
 			// by ~/.tenants/<userID>/.artifacts/<id>.json.
 			me.GET("/artifacts", MeArtifactsList)

@@ -240,6 +240,14 @@ func Register(r *gin.Engine) {
 			// for clickable UI + conversational-agent give_feedback tool.
 			me.POST("/cycles/feedback", MeCycleFeedback)
 
+			// Improvement ledger — every change to an intent across
+			// the six axes (examples/standard/recipe/pieces/memory/
+			// rules). POST appends a row; the cycle-feedback handler
+			// above also dual-writes here. GET returns events +
+			// axis_movements summary for the Intent detail page.
+			me.POST("/feedback",             MeFeedbackSave)
+			me.GET("/intents/:id/audit",     MeIntentAudit)
+
 			// Conversational shell — the natural-interaction layer.
 			// The agent calls the same tools the UI buttons would call.
 			me.POST("/agent/chat", MeAgentChat)

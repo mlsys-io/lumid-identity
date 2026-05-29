@@ -808,6 +808,20 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "intent_audit",
+			"description": "Show what's changed about an intent over a time window — across the six improvement axes (examples=cases learned from, standard=metrics & rubric, recipe=workflow steps, pieces=skills, memory=banks, rules=patterns figured out). Use when the user asks 'what changed this week?', 'why did the metric move?', 'show me the audit', or when explaining how the AI is adapting. Returns events newest-first + a per-axis movement summary.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":   map[string]any{"type": "string", "description": "intent id (xpio app name, e.g. personal-agent)"},
+					"loop":  map[string]any{"type": "string", "description": "optional: scope to one loop"},
+					"since": map[string]any{"type": "string", "description": "either 'Nd' (last N days) or an RFC3339 timestamp. Default: last 7d."},
+					"limit": map[string]any{"type": "integer", "default": 30, "description": "max events to return"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
 			"name":        "list_recent_cycles",
 			"description": "List the most recent cycle timestamps for a loop. Useful before give_feedback to find the right ts.",
 			"input_schema": map[string]any{
@@ -1283,6 +1297,33 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 			limit = int(v)
 		}
 		return map[string]any{"cycles": agentListCycles(userID, app, loop, limit)}, true
+
+	case "intent_audit":
+		app, _ := args["app"].(string)
+		if app == "" {
+			return map[string]any{"error": "app required"}, false
+		}
+		loop, _ := args["loop"].(string)
+		since, _ := args["since"].(string)
+		if since == "" {
+			since = "7d"
+		}
+		limit := 30
+		if v, ok := args["limit"].(float64); ok && int(v) > 0 {
+			limit = int(v)
+		}
+		events, err := readImprovements(userID, app, loop, since, limit)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		return map[string]any{
+			"intent_id":      app,
+			"loop":           loop,
+			"since":          since,
+			"event_count":    len(events),
+			"axis_movements": summarizeImprovements(events),
+			"events":         events,
+		}, true
 
 	case "list_marketplace":
 		q, _ := args["q"].(string)

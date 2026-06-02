@@ -166,6 +166,14 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					b := *s.LastOk
 					row.LastRunOK = &b
 				}
+				// The scheduler state file is operator-scoped and goes stale
+				// for tenant loops (frozen at the last operator run). The
+				// per-app journal is the real run log — prefer it so
+				// last-run reflects what actually ran.
+				if jts, jok, ok := lastRunFromJournal(filepath.Join(appDir, "data", "journal.jsonl"), L.Name); ok {
+					row.LastRunTS = jts
+					row.LastRunOK = &jok
+				}
 				out = append(out, row)
 			}
 		}
@@ -256,6 +264,44 @@ func fetchCostsByEndpoint(userSub string) map[string]int {
 // and returns a compact string (oldest→newest, max `limit` chars) where
 // each character encodes one run's state. The UI renders this as a row
 // of state-colored squares (a sparkline) for "how has this gone lately".
+// lastRunFromJournal returns the unix ts + ok of the most recent journal
+// entry for `loop`, and whether any was found. Source of truth for "when
+// did this actually last run" (the scheduler state file is operator-scoped
+// and stale for tenant loops).
+func lastRunFromJournal(journalPath, loop string) (float64, bool, bool) {
+	f, err := os.Open(journalPath)
+	if err != nil {
+		return 0, false, false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	var bestTs float64
+	var bestOk bool
+	found := false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row map[string]any
+		if json.Unmarshal([]byte(line), &row) != nil {
+			continue
+		}
+		if lp, _ := row["loop"].(string); lp != loop {
+			continue
+		}
+		ts := rowUnixTs(row)
+		if ts >= bestTs {
+			bestTs = ts
+			ok, _ := row["ok"].(bool)
+			bestOk = ok
+			found = true
+		}
+	}
+	return bestTs, bestOk, found
+}
+
 func buildRunSpark(journalPath, loop string, limit int) string {
 	f, err := os.Open(journalPath)
 	if err != nil {

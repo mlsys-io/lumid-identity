@@ -155,7 +155,11 @@ func MeKnowledgeMemories(c *gin.Context) {
 		if v, ok := raw["id"].(string); ok {
 			row.ID = v
 		}
-		if v, ok := raw["kind"].(string); ok {
+		// MemoryItem stores the category as `type`; older/draft rows use
+		// `kind`. Accept either so the UI badge always renders.
+		if v, ok := raw["kind"].(string); ok && v != "" {
+			row.Kind = v
+		} else if v, ok := raw["type"].(string); ok {
 			row.Kind = v
 		}
 		if v, ok := raw["source"].(string); ok {
@@ -164,14 +168,38 @@ func MeKnowledgeMemories(c *gin.Context) {
 		if v, ok := raw["content"].(string); ok {
 			row.Content = v
 		}
+		// Fall back to title when content is empty (some memories only
+		// carry a title) so the row isn't blank.
+		if row.Content == "" {
+			if v, ok := raw["title"].(string); ok {
+				row.Content = v
+			}
+			// Some banks (auto-quant-*) store text under `body` only.
+			if row.Content == "" {
+				if v, ok := raw["body"].(string); ok {
+					row.Content = v
+				}
+			}
+		}
 		if v, ok := raw["confidence"].(float64); ok {
 			row.Confidence = v
 		}
+		// created_at is stored inconsistently across banks: ISO string in
+		// some, float epoch-seconds in others. Normalize both to ISO so the
+		// UI's relative-time renders correctly (a bare epoch would parse as
+		// 1970 and show wrong/blank).
 		if v, ok := raw["created_at"].(string); ok {
 			row.CreatedAt = v
+		} else if f, ok := raw["created_at"].(float64); ok && f > 0 {
+			row.CreatedAt = time.Unix(int64(f), 0).UTC().Format(time.RFC3339)
 		}
+		// recurrence may be top-level or under metadata.recurrence_count.
 		if v, ok := raw["recurrence"].(float64); ok {
 			row.Recurrence = int(v)
+		} else if md, ok := raw["metadata"].(map[string]any); ok {
+			if rc, ok := md["recurrence_count"].(float64); ok {
+				row.Recurrence = int(rc)
+			}
 		}
 		if kindFilter != "" && row.Kind != kindFilter {
 			continue

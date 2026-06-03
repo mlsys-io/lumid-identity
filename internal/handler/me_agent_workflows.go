@@ -641,7 +641,7 @@ func buildDraftXpcloudYaml(slug, intent, forApp string, skills []string) string 
 		fmt.Fprintf(&sb, "  - community/%s\n", s)
 	}
 	sb.WriteString("\n")
-	sb.WriteString("workflows:\n")
+	sb.WriteString("loops:\n")
 	fmt.Fprintf(&sb, "  - name: %s\n", slug)
 	sb.WriteString("    schedule: \"@trigger\"  # change to a cron string when ready, e.g. '0 8 * * *'\n")
 	sb.WriteString("    description: |\n")
@@ -734,7 +734,7 @@ func buildTradingXpcloudYaml(slug, intent string) string {
 	sb.WriteString("roles:\n")
 	fmt.Fprintf(&sb, "  - {name: trader, memory_agent: %s-trader}\n", slug)
 	fmt.Fprintf(&sb, "  - {name: risk, memory_agent: %s-risk}\n\n", slug)
-	sb.WriteString("workflows:\n")
+	sb.WriteString("loops:\n")
 	fmt.Fprintf(&sb, "  - name: %s\n", slug)
 	sb.WriteString("    schedule: \"0 */12 * * *\"  # every 12 hours\n")
 	sb.WriteString("    mode: paper\n")

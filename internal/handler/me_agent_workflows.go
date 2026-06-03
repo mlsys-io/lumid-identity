@@ -274,6 +274,33 @@ func toolSearchMarketplace(c *gin.Context, query, forApp string, limit int) map[
 	}
 }
 
+// MeComposeWorkflow — POST /me/workflows/compose {intent, name?}
+// Direct (non-chat) compose so the Studio composer gets the draft spec
+// instantly + deterministically — no LLM round-trip to wait on. Reuses
+// toolComposeWorkflow (trading branch + generic skill-suggest).
+func MeComposeWorkflow(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	var body struct {
+		Intent string `json:"intent"`
+		ForApp string `json:"for_app"`
+		Name   string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Intent) == "" {
+		fail(c, http.StatusBadRequest, 1400, "intent required")
+		return
+	}
+	res := toolComposeWorkflow(c, userID, body.Intent, body.ForApp, body.Name)
+	if errMsg, bad := res["error"].(string); bad {
+		fail(c, http.StatusInternalServerError, 1500, errMsg)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
+}
+
 // toolComposeWorkflow drafts a new tenant workflow from an intent.
 // Stages an xpcloud.yaml + manifest.json under the tenant draft dir
 // for the user to review in the composer. Doesn't install.
@@ -283,6 +310,17 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 
 	if forApp == "" {
 		forApp = guessForApp(intent)
+	}
+
+	slug := name
+	if slug == "" {
+		slug = slugify(intent)
+	}
+
+	// Auto-trading showcase: one curated, deterministic case so the live
+	// assembly always renders a complete paper-mode trading bot.
+	if isTradingIntent(intent) {
+		return composeTradingDraft(userID, slug, intent)
 	}
 
 	// Step 1: ask xpcloud to suggest skills for the intent.
@@ -324,10 +362,6 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 	}
 
 	// Step 2: assemble a draft xpcloud.yaml + manifest.json.
-	slug := name
-	if slug == "" {
-		slug = slugify(intent)
-	}
 	yaml := buildDraftXpcloudYaml(slug, intent, forApp, pickedSkills)
 	manifest := map[string]any{
 		"name":        slug,
@@ -364,6 +398,67 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 		"no_match":       noMatch,
 		"review_url":     "/studio/workflows/" + slug + "-draft:" + slug,
 		"note":           note,
+	}
+}
+
+// composeTradingDraft stages the curated paper-mode trading bot and returns a
+// rich result the composer renders as a live assembly (pipeline + risk officer
+// + schedule + goal), not just a skills list.
+func composeTradingDraft(userID, slug, intent string) map[string]any {
+	steps := tradingSteps()
+	skills := []string{}
+	summaries := []map[string]any{}
+	stepOut := []map[string]any{}
+	seen := map[string]bool{}
+	humanize := func(s string) string {
+		w := strings.Split(strings.ReplaceAll(s, "_", " "), " ")
+		if len(w) > 0 && len(w[0]) > 0 {
+			w[0] = strings.ToUpper(w[0][:1]) + w[0][1:]
+		}
+		return strings.Join(w, " ")
+	}
+	for _, st := range steps {
+		stepOut = append(stepOut, map[string]any{"id": st.ID, "stage": st.Stage, "skill": st.Skill, "why": st.Why})
+		if !seen[st.Skill] {
+			seen[st.Skill] = true
+			skills = append(skills, st.Skill)
+			summaries = append(summaries, map[string]any{
+				"name": st.Skill, "display_name": humanize(st.Skill), "summary": st.Why, "why": st.Why,
+			})
+		}
+	}
+
+	draftDir := filepath.Join(tenantAppsDir(userID), slug+"-draft")
+	if err := os.MkdirAll(draftDir, 0o775); err != nil {
+		return map[string]any{"error": "draft dir: " + err.Error()}
+	}
+	if err := os.WriteFile(filepath.Join(draftDir, "xpcloud.yaml"), []byte(buildTradingXpcloudYaml(slug, intent)), 0o644); err != nil {
+		return map[string]any{"error": "write yaml: " + err.Error()}
+	}
+	manifest := map[string]any{"name": slug, "kind": "app", "version": "0.1.0", "description": intent, "status": "draft", "fork_of": "auto-quant"}
+	mb, _ := json.MarshalIndent(manifest, "", "  ")
+	_ = os.WriteFile(filepath.Join(draftDir, "manifest.json"), mb, 0o644)
+
+	return map[string]any{
+		"draft_slug":      slug + "-draft",
+		"draft_dir":       draftDir,
+		"intent":          intent,
+		"for_app":         "auto-quant",
+		"kind":            "trading",
+		"skills_picked":   skills,
+		"skill_summaries": summaries,
+		"steps":           stepOut,
+		"schedule":        "0 */12 * * *",
+		"schedule_human":  "every 12 hours",
+		"mode":            "paper",
+		"risk_agent":      slug + "-risk",
+		"goal": map[string]any{
+			"primary": "maximize paper realized alpha vs buy-hold",
+			"tracked": []string{"realized alpha vs BTC buy-hold", "max drawdown observed", "hit rate (risk-approved proposals)"},
+		},
+		"no_match":   false,
+		"review_url": "/studio/workflows/" + slug + "-draft:" + slug,
+		"note":       "Drafted a paper-mode momentum trading bot — review the pipeline + schedule, then install.",
 	}
 }
 
@@ -578,6 +673,90 @@ func buildDraftXpcloudYaml(slug, intent, forApp string, skills []string) string 
 			}
 			fmt.Fprintf(&sb, "      - {id: %s, stage: %s, skill: %s}\n", id, stage, s)
 		}
+	}
+	return sb.String()
+}
+
+// ── Auto-trading showcase ──────────────────────────────────────────
+// One curated, deterministic case: "spin up a crypto momentum trading bot".
+// When the intent is trading-shaped we skip the generic skill-suggest path
+// and emit the known-good auto-quant scaffold so the composer's live-assembly
+// always renders a complete bot (market sense → signal → backtest → risk
+// officer → journal) and installs as a runnable paper-mode fork.
+
+type composeStep struct {
+	ID, Stage, Skill, Why string
+}
+
+func tradingSteps() []composeStep {
+	return []composeStep{
+		{"observe_market", "observe", "observe_market", "Pulls live crypto OHLC + features so it trades on the current market state."},
+		{"observe_holdings", "observe", "fetch_holdings", "Reads your paper portfolio so sizing respects current exposure."},
+		{"propose_setup", "hypothesize", "propose_trade", "The momentum signal — proposes a sized entry with a target and a stop."},
+		{"preflight", "act", "backtest_strategy", "Backtests the proposed setup before risking any capital."},
+		{"risk_gate", "act", "score_proposal", "The risk officer — vets size, drawdown and regime-fit; can veto the trade."},
+		{"journal", "analyze", "journal_trade", "Records the decision + outcome so it learns which setups actually pay."},
+	}
+}
+
+func isTradingIntent(s string) bool {
+	l := strings.ToLower(s)
+	for _, kw := range []string{"trade", "trading", "crypto", "momentum", "alpha", "btc", "eth", "market", "position", "portfolio", "buy-hold", "quant"} {
+		if strings.Contains(l, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildTradingXpcloudYaml emits the curated paper-mode trading workflow,
+// mirroring auto-quant's momentum_research loop (fork_of auto-quant, lumid-lqa
+// market data, 5-stage steps, every-12h, alpha-vs-buy-hold goal, risk agent).
+func buildTradingXpcloudYaml(slug, intent string) string {
+	var sb strings.Builder
+	sb.WriteString("# Draft auto-trading workflow — review in Studio, then install (paper mode).\n")
+	sb.WriteString("# Generated by compose_workflow (trading case).\n\n")
+	fmt.Fprintf(&sb, "name: %s\n", slug)
+	sb.WriteString("kind: app\n")
+	sb.WriteString("version: 0.1.0\n")
+	fmt.Fprintf(&sb, "description: %q\n", intent)
+	sb.WriteString("fork_of: auto-quant\n")
+	sb.WriteString("status: draft\n")
+	sb.WriteString("mode: paper\n\n")
+	sb.WriteString("skill_imports:\n")
+	sb.WriteString("  - repo: a3f48236-ffe9-4fb9-9548-6e044d5cd9c7/lumid-lqa\n")
+	sb.WriteString("    version: ^0.3.0\n")
+	sb.WriteString("  - repo: a3f48236-ffe9-4fb9-9548-6e044d5cd9c7/lumid-findata\n")
+	sb.WriteString("    version: ^0.1.0\n\n")
+	sb.WriteString("memory_agents:\n")
+	fmt.Fprintf(&sb, "  - %s-trader\n", slug)
+	fmt.Fprintf(&sb, "  - %s-risk\n\n", slug)
+	sb.WriteString("roles:\n")
+	fmt.Fprintf(&sb, "  - {name: trader, memory_agent: %s-trader}\n", slug)
+	fmt.Fprintf(&sb, "  - {name: risk, memory_agent: %s-risk}\n\n", slug)
+	sb.WriteString("workflows:\n")
+	fmt.Fprintf(&sb, "  - name: %s\n", slug)
+	sb.WriteString("    schedule: \"0 */12 * * *\"  # every 12 hours\n")
+	sb.WriteString("    mode: paper\n")
+	sb.WriteString("    goal:\n")
+	sb.WriteString("      primary: maximize paper realized alpha vs buy-hold\n")
+	sb.WriteString("      tracked:\n")
+	sb.WriteString("        - realized alpha vs BTC buy-hold\n")
+	sb.WriteString("        - max drawdown observed\n")
+	sb.WriteString("        - hit rate (risk-approved proposals)\n")
+	sb.WriteString("    description: |\n")
+	fmt.Fprintf(&sb, "      %s\n", intent)
+	sb.WriteString("    skills:\n")
+	seen := map[string]bool{}
+	for _, st := range tradingSteps() {
+		if !seen[st.Skill] {
+			seen[st.Skill] = true
+			fmt.Fprintf(&sb, "      - %s\n", st.Skill)
+		}
+	}
+	sb.WriteString("    steps:\n")
+	for _, st := range tradingSteps() {
+		fmt.Fprintf(&sb, "      - {id: %s, stage: %s, skill: %s}\n", st.ID, st.Stage, st.Skill)
 	}
 	return sb.String()
 }

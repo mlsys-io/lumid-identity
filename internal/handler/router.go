@@ -199,7 +199,14 @@ func Register(r *gin.Engine) {
 		// extra middleware needed here.
 		// Phase D3 — /me/* rate limit. 60/min per caller (PAT / session
 		// cookie / IP fallback). Soft-fails when Redis is unreachable.
-		me := v1.Group("/me", MeRateLimit())
+		// no-store: /me/* is live dashboard data (loop status, cycles,
+		// workflows). Without this the browser heuristically caches the
+		// GETs, so the dashboard's polling re-reads stale cached responses
+		// and looks frozen even though the server has fresh state.
+		me := v1.Group("/me", MeRateLimit(), func(c *gin.Context) {
+			c.Header("Cache-Control", "no-store")
+			c.Next()
+		})
 		{
 			// App lifecycle — async via intent queue.
 			me.GET("/apps",                   MeAppsList)

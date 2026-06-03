@@ -103,6 +103,18 @@ func Register(r *gin.Engine) {
 		v1.GET("/identity/google-grants", GoogleGrantsList)
 		v1.POST("/identity/google-access-token", GoogleAccessToken)
 
+		// Microsoft Graph OAuth via device-code (no Azure app
+		// registration needed — uses Microsoft's pre-registered
+		// Graph PowerShell SDK public client_id). Centralized auth
+		// + multi-tenant runtime: refresh-tokens encrypted at rest
+		// in microsoft_grants, daemons/skills mint per-call access
+		// tokens via /microsoft-access-token.
+		v1.POST("/oauth/microsoft/connect/init", MicrosoftConnectInit)
+		v1.POST("/oauth/microsoft/connect/poll", MicrosoftConnectPoll)
+		v1.GET("/identity/microsoft-grants",      MicrosoftGrantsList)
+		v1.DELETE("/identity/microsoft-token",    MicrosoftTokenRevoke)
+		v1.POST("/identity/microsoft-access-token", MicrosoftAccessToken)
+
 		// LQA-compatible PAT surface — same path so downstream code
 		// (frontend /account/tokens, install.sh) works unchanged after
 		// Phase 3 repoints the proxy.
@@ -187,7 +199,14 @@ func Register(r *gin.Engine) {
 		// extra middleware needed here.
 		// Phase D3 — /me/* rate limit. 60/min per caller (PAT / session
 		// cookie / IP fallback). Soft-fails when Redis is unreachable.
-		me := v1.Group("/me", MeRateLimit())
+		// no-store: /me/* is live dashboard data (loop status, cycles,
+		// workflows). Without this the browser heuristically caches the
+		// GETs, so the dashboard's polling re-reads stale cached responses
+		// and looks frozen even though the server has fresh state.
+		me := v1.Group("/me", MeRateLimit(), func(c *gin.Context) {
+			c.Header("Cache-Control", "no-store")
+			c.Next()
+		})
 		{
 			// App lifecycle — async via intent queue.
 			me.GET("/apps",                   MeAppsList)
@@ -206,9 +225,35 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app/secrets/:key",        MeSecretDelete)
 			me.GET("/apps/:app/secrets/:key/value",     MeSecretFetchValue)
 
+			// Power Automate inbound webhook lifecycle. The Outlook
+			// bridge workaround for users whose org blocks Microsoft
+			// Graph OAuth: user pastes the minted URL into a Power
+			// Automate flow that fires on new email.
+			me.POST("/power-automate-tokens",   MePowerAutomateTokenMint)
+			me.GET("/power-automate-tokens",    MePowerAutomateTokenStatus)
+			me.DELETE("/power-automate-tokens", MePowerAutomateTokenRevoke)
+			// Pre-baked PA package .zip the user imports at
+			// make.powerautomate.com → My flows → Import. Webhook
+			// URL is hard-coded into the HTTP action so post-import
+			// the user just confirms the Outlook connection and
+			// saves. Always rotates the underlying token.
+			me.GET("/power-automate-tokens/flow-template", MePowerAutomateFlowTemplate)
+			// One-click "send me a test email through my flow" — verifies
+			// the outbound POWER_AUTOMATE_SEND_URL end-to-end without
+			// the user needing a PAT + curl.
+			me.POST("/apps/lumid-outlook-pa/test-send", MeOutlookPATestSend)
+
 			// Cycle-level feedback (Hook 2 keystone). Same backend
 			// for clickable UI + conversational-agent give_feedback tool.
 			me.POST("/cycles/feedback", MeCycleFeedback)
+
+			// Improvement ledger — every change to an intent across
+			// the six axes (examples/standard/recipe/pieces/memory/
+			// rules). POST appends a row; the cycle-feedback handler
+			// above also dual-writes here. GET returns events +
+			// axis_movements summary for the Intent detail page.
+			me.POST("/feedback",             MeFeedbackSave)
+			me.GET("/intents/:id/audit",     MeIntentAudit)
 
 			// Conversational shell — the natural-interaction layer.
 			// The agent calls the same tools the UI buttons would call.
@@ -218,6 +263,34 @@ func Register(r *gin.Engine) {
 			// to render text deltas + tool-call events as they arrive,
 			// instead of waiting 5-10s for a synchronous reply.
 			me.POST("/agent/chat/stream", MeAgentChatStream)
+			// Available LLM backends — populates the model dropdown
+			// in StudioChat. Returns [{id, displayName, default}].
+			me.GET("/agent/models", MeAgentModels)
+
+			// Installed xpio agents — populates the agent picker in
+			// StudioChat. Chat body can set agent_id to ground the
+			// turn in that agent's bank.
+			me.GET("/agents", MeAgentsList)
+
+			// User-defined personas — custom system prompts + tool
+			// subsets. Chat body sets persona_id to apply.
+			me.GET("/personas", MePersonasList)
+			me.GET("/personas/:id", MePersonaGet)
+			me.POST("/personas", MePersonaSave)
+			me.DELETE("/personas/:id", MePersonaDelete)
+
+			// Artifacts — saved long-form output from chat. Backed
+			// by ~/.tenants/<userID>/.artifacts/<id>.json.
+			me.GET("/artifacts", MeArtifactsList)
+			me.GET("/artifacts/:id", MeArtifactGet)
+			me.DELETE("/artifacts/:id", MeArtifactDelete)
+
+			// Persistent chat history — sidebar in StudioChat. One
+			// file per thread under ~/.tenants/<userID>/.chats/.
+			me.GET("/chats", MeChatsList)
+			me.GET("/chats/:id", MeChatGet)
+			me.POST("/chats", MeChatSave)
+			me.DELETE("/chats/:id", MeChatDelete)
 
 			// Tier-1 quota state — read-only. Used by /app/loops to
 			// render the "Free tier reached" banner + per-loop hints.
@@ -245,6 +318,9 @@ func Register(r *gin.Engine) {
 			// prompt audit + summary).
 			me.GET("/cycles",                       MeCyclesList)
 			me.GET("/cycles/:app/:loop/:ts",        MeCycleDetail)
+			// Engine-revamp human checkpoint — approve/revamp a cycle's
+			// held actions; writes the engine's side files for next cycle.
+			me.POST("/cycles/:app/:loop/:ts/review", MeCycleReview)
 
 			// Phase S3-D — knowledge browser. Per-agent bank.jsonl
 			// listing + paginated memories with kind filter.
@@ -291,6 +367,14 @@ func Register(r *gin.Engine) {
 		{
 			internal.POST("/usage/charge", InternalUsageCharge)
 		}
+
+		// Inbound webhook for Power Automate's Outlook bridge. The
+		// path-segment <token> IS the auth; no Authorization header
+		// (Power Automate's HTTP step can set them but the simpler
+		// integration is URL-only). Per-user random secret, hashed
+		// at rest. Lives outside /me on purpose — Power Automate
+		// doesn't have a lum.id session.
+		v1.POST("/inbox/power-automate/:token", InboxPowerAutomateReceive)
 
 		// super_admin-only — billing/accounting/secrets endpoints.
 		superAdmin := v1.Group("/admin", RequireSuperAdmin())

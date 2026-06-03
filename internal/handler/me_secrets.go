@@ -101,7 +101,7 @@ func MeSecretsList(c *gin.Context) {
 	}
 	var rows []models.AppSecret
 	if err := common.DB.Where("user_sub = ? AND app_slug = ?", userID, app).
-		Order("key ASC").Find(&rows).Error; err != nil {
+		Order("`key` ASC").Find(&rows).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "list: "+err.Error())
 		return
 	}

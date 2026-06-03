@@ -20,6 +20,9 @@ var AllTables = []interface{}{
 	&GoogleGrant{},
 	&AppSecret{},
 	&UsageEvent{},
+	&PowerAutomateToken{},
+	&MicrosoftGrant{},
+	&MicrosoftGrantPending{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

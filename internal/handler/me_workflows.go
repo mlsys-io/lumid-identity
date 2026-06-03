@@ -53,6 +53,20 @@ type WorkflowRow struct {
 	// "✓"=succeeded, "✗"=failed, "·"=running. The UI renders these as
 	// state-colored squares. Empty when no journal entries exist.
 	RunSpark string `json:"run_spark,omitempty"`
+	// G2 — month-to-date cost in cents from usage_events. 0 when the
+	// workflow hasn't generated any server-funded LLM/external-API
+	// usage this month (visual workflows that run entirely client-side
+	// will be 0 here). Omitted from JSON when 0 for clean responses.
+	CostCentsMTD int `json:"cost_cents_mtd,omitempty"`
+	// Running — a cycle is in-progress right now: the loop's newest cycle
+	// dir is newer than its last completed journal entry (a cycle creates
+	// its dir at start, journals on completion). Lets the dashboard show a
+	// live "running" indicator so long loops don't look frozen/stale.
+	Running bool `json:"running,omitempty"`
+	// LastRunRecovered — the last completed run succeeded but only after a
+	// retry/fallback self-healed an LLM call. Dashboard shows an amber dot
+	// (flaky-but-recovering) instead of clean green.
+	LastRunRecovered bool `json:"last_run_recovered,omitempty"`
 }
 
 // MeWorkflows — GET /me/workflows[?kind=scheduled|visual]
@@ -100,6 +114,10 @@ func MeWorkflows(c *gin.Context) {
 // are included as scheduled rows too).
 func scheduledWorkflows(userID string) []WorkflowRow {
 	out := []WorkflowRow{}
+	// One DB hit for the user's month-to-date costs, keyed by
+	// `endpoint = <app>.<loop>`. Distributed lookup-by-key in the
+	// row-build loop below.
+	costMap := fetchCostsByEndpoint(userID)
 
 	scan := func(appsRoot string, isTenant bool) {
 		entries, err := os.ReadDir(appsRoot)
@@ -139,23 +157,34 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					}
 				}
 				row := WorkflowRow{
-					Slug:        e.Name() + ":" + L.Name,
-					Kind:        "scheduled",
-					Name:        L.Name,
-					App:         e.Name(),
-					Trigger:     L.Schedule,
-					Enabled:     enabled,
-					Tenant:      isTenant,
-					LastRunTS:   s.LastRunTS,
-					Description: L.Description,
-					Engine:      engine,
-					StepCount:   len(L.Steps),
-					RunSpark:    buildRunSpark(filepath.Join(appDir, "data", "journal.jsonl"), L.Name, 14),
+					Slug:         e.Name() + ":" + L.Name,
+					Kind:         "scheduled",
+					Name:         L.Name,
+					App:          e.Name(),
+					Trigger:      L.Schedule,
+					Enabled:      enabled,
+					Tenant:       isTenant,
+					LastRunTS:    s.LastRunTS,
+					Description:  L.Description,
+					Engine:       engine,
+					StepCount:    len(L.Steps),
+					RunSpark:     buildRunSpark(filepath.Join(appDir, "data", "journal.jsonl"), L.Name, 14),
+					CostCentsMTD: costMap[e.Name()+"."+L.Name],
 				}
 				if s.LastOk != nil {
 					b := *s.LastOk
 					row.LastRunOK = &b
 				}
+				// The scheduler state file is operator-scoped and goes stale
+				// for tenant loops (frozen at the last operator run). The
+				// per-app journal is the real run log — prefer it so
+				// last-run reflects what actually ran.
+				if jts, jok, ok := lastRunFromJournal(filepath.Join(appDir, "data", "journal.jsonl"), L.Name); ok {
+					row.LastRunTS = jts
+					row.LastRunOK = &jok
+				}
+				row.Running = loopRunning(appDir, L.Name, row.LastRunTS)
+				row.LastRunRecovered = lastRunRecovered(filepath.Join(appDir, "data", "journal.jsonl"), L.Name)
 				out = append(out, row)
 			}
 		}
@@ -208,10 +237,142 @@ func visualWorkflows(ctx context.Context, c *gin.Context) []WorkflowRow {
 	return out
 }
 
+// fetchCostsByEndpoint returns a map of "<app>.<loop>" → month-to-date
+// cost in cents for one user. One SQL aggregation. Empty map on error
+// (don't fail the whole /me/workflows response on a missing usage_events
+// table or no rows).
+func fetchCostsByEndpoint(userSub string) map[string]int {
+	out := map[string]int{}
+	if common.DB == nil {
+		return out
+	}
+	now := time.Now().UTC()
+	mtd := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	rows := []struct {
+		Endpoint string
+		Cents    int
+	}{}
+	err := common.DB.Raw(`
+		SELECT endpoint AS endpoint,
+		       COALESCE(SUM(cost_cents), 0) AS cents
+		FROM   usage_events
+		WHERE  user_sub = ?
+		  AND  ts >= ?
+		  AND  kind = 'cycle_llm'
+		  AND  endpoint IS NOT NULL
+		  AND  endpoint <> ''
+		GROUP  BY endpoint`, userSub, mtd).Scan(&rows).Error
+	if err != nil {
+		return out
+	}
+	for _, r := range rows {
+		out[r.Endpoint] = r.Cents
+	}
+	return out
+}
+
 // buildRunSpark scans the per-app journal for entries matching `loop`,
 // and returns a compact string (oldest→newest, max `limit` chars) where
 // each character encodes one run's state. The UI renders this as a row
 // of state-colored squares (a sparkline) for "how has this gone lately".
+// lastRunFromJournal returns the unix ts + ok of the most recent journal
+// entry for `loop`, and whether any was found. Source of truth for "when
+// did this actually last run" (the scheduler state file is operator-scoped
+// and stale for tenant loops).
+// loopRunning reports whether a cycle is in-progress: the loop's newest
+// cycle dir (created at cycle start) is newer than its last completed
+// journal entry (written at cycle end). The recency cap avoids reporting
+// a crashed-cycle leftover dir as "running" forever.
+func loopRunning(appDir, loop string, lastJTS float64) bool {
+	ents, err := os.ReadDir(filepath.Join(appDir, "data", "cycles", loop))
+	if err != nil {
+		return false
+	}
+	var newest float64
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			if m := float64(info.ModTime().Unix()); m > newest {
+				newest = m
+			}
+		}
+	}
+	if newest == 0 {
+		return false
+	}
+	now := float64(time.Now().Unix())
+	return newest > lastJTS+5 && now-newest < 1800
+}
+
+// lastRunRecovered reports whether the most recent COMPLETED run of loop
+// self-healed (recovered=true) — succeeded only via a retry/fallback. Drives
+// the amber "recovered" dot, distinct from clean green.
+func lastRunRecovered(journalPath, loop string) bool {
+	f, err := os.Open(journalPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	rec := false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row map[string]any
+		if json.Unmarshal([]byte(line), &row) != nil {
+			continue
+		}
+		if lp, _ := row["loop"].(string); lp != loop {
+			continue
+		}
+		if _, hasOk := row["ok"]; !hasOk {
+			continue // intermediate/stage entry, not a completed run
+		}
+		r, _ := row["recovered"].(bool)
+		rec = r // keep the last completed run's flag
+	}
+	return rec
+}
+
+func lastRunFromJournal(journalPath, loop string) (float64, bool, bool) {
+	f, err := os.Open(journalPath)
+	if err != nil {
+		return 0, false, false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	var bestTs float64
+	var bestOk bool
+	found := false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row map[string]any
+		if json.Unmarshal([]byte(line), &row) != nil {
+			continue
+		}
+		if lp, _ := row["loop"].(string); lp != loop {
+			continue
+		}
+		ts := rowUnixTs(row)
+		if ts >= bestTs {
+			bestTs = ts
+			ok, _ := row["ok"].(bool)
+			bestOk = ok
+			found = true
+		}
+	}
+	return bestTs, bestOk, found
+}
+
 func buildRunSpark(journalPath, loop string, limit int) string {
 	f, err := os.Open(journalPath)
 	if err != nil {
@@ -236,8 +397,14 @@ func buildRunSpark(journalPath, loop string, limit int) string {
 		}
 		ts := rowUnixTs(row)
 		var ch byte = '.'
+		rec, _ := row["recovered"].(bool)
 		if skipped, _ := row["skipped"].(bool); skipped {
 			ch = '_'
+		} else if rec {
+			// amber: self-fix / transient class — a run that succeeded via
+			// retry/fallback, OR a past transient failure (504/no_output/
+			// network) backfilled as "would-self-heal-now".
+			ch = 'r'
 		} else if ok, _ := row["ok"].(bool); ok {
 			ch = 'o'
 		} else {
@@ -252,6 +419,21 @@ func buildRunSpark(journalPath, loop string, limit int) string {
 	}
 	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 		rows[i], rows[j] = rows[j], rows[i]
+	}
+	// Resolved-failure → amber: a failure the loop later recovered from (a
+	// success exists after it in the window) is past history, not a current
+	// problem — show it amber ('r'), not red. Only an UNRESOLVED trailing
+	// failure (no later success) stays red ('x'). Walk newest→oldest.
+	seenOk := false
+	for i := len(rows) - 1; i >= 0; i-- {
+		switch rows[i].ch {
+		case 'o', 'r':
+			seenOk = true
+		case 'x':
+			if seenOk {
+				rows[i].ch = 'r'
+			}
+		}
 	}
 	out := make([]byte, len(rows))
 	for i, p := range rows {

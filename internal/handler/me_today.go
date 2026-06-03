@@ -49,6 +49,11 @@ type todayCycleRow struct {
 	Skipped     bool    `json:"skipped,omitempty"`
 	SkipReason  string  `json:"skip_reason,omitempty"`
 	LastError   string  `json:"last_error,omitempty"`
+	// Engine-revamp observability (B0): the cycle's outcome + how many
+	// items are held for human review / offered as compound recall.
+	Outcome     string  `json:"outcome,omitempty"`      // ran | no_change | awaiting_review | no_setup
+	ReviewCount int     `json:"review_count,omitempty"`
+	OffersCount int     `json:"offers_count,omitempty"`
 }
 
 // MeToday serves GET /api/v1/me/today.
@@ -104,6 +109,9 @@ func MeToday(c *gin.Context) {
 			row := todayCycleRow{App: appName, Loop: loop}
 			row.OK, _ = r["ok"].(bool)
 			row.Ts, _ = r["iso"].(string)
+			if row.Ts == "" {
+				row.Ts, _ = r["ts"].(string) // app_runner journal shape
+			}
 			if v, exists := r["duration_s"].(float64); exists {
 				row.DurationS = v
 			}
@@ -113,6 +121,17 @@ func MeToday(c *gin.Context) {
 			}
 			if v, exists := r["error"].(string); exists {
 				row.LastError = v
+			}
+			// B0 observability fields (present on cycles run by the
+			// revamped engine; absent on older journal lines).
+			if v, exists := r["outcome"].(string); exists {
+				row.Outcome = v
+			}
+			if v, exists := r["review_queue"].(float64); exists {
+				row.ReviewCount = int(v)
+			}
+			if v, exists := r["offers"].(float64); exists {
+				row.OffersCount = int(v)
 			}
 			cycles = append(cycles, row)
 
@@ -218,6 +237,14 @@ func readTodayJournal(path string, todayStart time.Time) []map[string]any {
 		}
 		if iso, ok := row["iso"].(string); ok {
 			if strings.HasPrefix(iso, todayPrefix) {
+				out = append(out, row)
+				continue
+			}
+		}
+		// app_runner journals write `ts` as an ISO8601 STRING (not a unix
+		// float and not under an `iso` key). Match those too.
+		if tss, ok := row["ts"].(string); ok {
+			if strings.HasPrefix(tss, todayPrefix) {
 				out = append(out, row)
 				continue
 			}

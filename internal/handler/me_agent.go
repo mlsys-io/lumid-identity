@@ -53,16 +53,387 @@ const (
 	maxTokensPerTurn     = 4096
 )
 
+// llmProvider describes an upstream LLM endpoint that speaks
+// Anthropic's /v1/messages wire format (including streaming SSE
+// events). New options just need an entry here — the tool-use loop
+// + stream parser don't change.
+type llmProvider struct {
+	id            string // stable id passed from the frontend
+	displayName   string // human label (e.g. "Claude Haiku 4.5")
+	endpoint      string // upstream URL
+	upstreamModel string // the model name sent to the upstream API
+	authHeader    string // "x-api-key" (Anthropic) | "Authorization" (kv.run)
+	authPrefix    string // "" (Anthropic) | "Bearer " (kv.run)
+	keyFn         func() (string, error)
+	// addAnthropicVersion — Anthropic's API needs the "anthropic-version"
+	// header; kv.run's /v1/messages does not. Set to true for Anthropic.
+	addAnthropicVersion bool
+	// supportsVision — can read `image` content blocks. gemma4 (verified
+	// through the kv.run gateway) + Anthropic do; MiniMax is text-only.
+	supportsVision bool
+	// minRole — minimum role allowed to SELECT this provider in the panel.
+	// "" / "user" = everyone; "admin"; "super_admin". Policy: gemma4 for
+	// all, minimax for admin+, claude (Anthropic) for super_admin only.
+	minRole string
+}
+
+// First entry is the default (defaultProvider() returns llmProviders[0]).
+// Order: in-cluster GPU first (no per-call API charge to Anthropic, the
+// fleet is already paid for), Anthropic as the hosted fallback.
+var llmProviders = []llmProvider{
+	{
+		// kv.run:5000 gemma4 — default. Same Anthropic /v1/messages
+		// gateway, model id from GET kv.run:5000/v1/models. Reasoning
+		// model (emits thinking deltas, handled by the SSE parser).
+		id:                  "kvrun-gemma4",
+		displayName:         "Gemma-4-26B-A4B (kv.run GPU)",
+		endpoint:            "https://kv.run:5000/v1/messages",
+		upstreamModel:       "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+		supportsVision:      true, // multimodal; image blocks verified via kv.run
+		minRole:             "user", // everyone
+	},
+	{
+		// kv.run:5000 in-cluster inference gateway. Speaks Anthropic
+		// /v1/messages including SSE streaming — drop-in for the
+		// existing parser. See /proj/CLAUDE.md "Cloud LLM inference".
+		id:                  "kvrun-minimax",
+		displayName:         "MiniMax-M2.7 (kv.run GPU)",
+		endpoint:            "https://kv.run:5000/v1/messages",
+		upstreamModel:       "cyankiwi/MiniMax-M2.7-AWQ-4bit",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+		supportsVision:      false, // MiniMax is text-only
+		minRole:             "admin", // admin + super_admin
+	},
+	{
+		id:                  "claude-haiku",
+		displayName:         "Claude Haiku 4.5",
+		endpoint:            anthropicEndpoint,
+		upstreamModel:       anthropicModel,
+		authHeader:          "x-api-key",
+		authPrefix:          "",
+		keyFn:               anthropicKey,
+		addAnthropicVersion: true,
+		supportsVision:      true,
+		minRole:             "super_admin", // super_admin only (Claude Code / all models)
+	},
+}
+
+// roleRank ranks the role hierarchy for provider gating.
+func roleRank(role string) int {
+	switch role {
+	case "super_admin":
+		return 2
+	case "admin":
+		return 1
+	default:
+		return 0 // user / unknown
+	}
+}
+
+// providerAllowed reports whether a caller of the given role may select p.
+func providerAllowed(userRole string, p llmProvider) bool {
+	return roleRank(userRole) >= roleRank(p.minRole)
+}
+
+// currentUserRole resolves the caller's role from the JWT claim, falling
+// back to a DB lookup for PAT-authed callers (whose token carries no role).
+// Defaults to "user" so gating fails closed to the least privilege.
+func currentUserRole(c *gin.Context) string {
+	if tok := bearerToken(c); tok != "" {
+		if claims, err := common.VerifyJWT(tok); err == nil && claims.Role != "" {
+			return claims.Role
+		}
+	}
+	if uid, ok := currentUserID(c); ok {
+		var u models.User
+		if err := common.DB.Select("role").Where("id = ?", uid).First(&u).Error; err == nil && u.Role != "" {
+			return u.Role
+		}
+	}
+	return "user"
+}
+
+// defaultProviderFor returns the highest-listed provider the role may use.
+// gemma4 is first and allowed to everyone, so this is gemma4 for all roles
+// unless the registry changes.
+func defaultProviderFor(role string) llmProvider {
+	for _, p := range llmProviders {
+		if providerAllowed(role, p) {
+			return p
+		}
+	}
+	return defaultProvider()
+}
+
+func defaultProvider() llmProvider { return llmProviders[0] }
+
+// MeAgentModels — GET /api/v1/me/agent/models.
+// Lists the LLM backends StudioChat can target. Public-shape only —
+// no keys, no endpoints. Reflects the llmProviders registry; new
+// entries auto-surface in the UI dropdown without frontend changes.
+func MeAgentModels(c *gin.Context) {
+	type item struct {
+		ID          string `json:"id"`
+		DisplayName string `json:"display_name"`
+		Default     bool   `json:"default"`
+	}
+	role := currentUserRole(c)
+	out := make([]item, 0, len(llmProviders))
+	def := defaultProviderFor(role).id
+	for _, p := range llmProviders {
+		if !providerAllowed(role, p) {
+			continue // policy: hide providers above the caller's role
+		}
+		out = append(out, item{ID: p.id, DisplayName: p.displayName, Default: p.id == def})
+	}
+	c.JSON(http.StatusOK, gin.H{"models": out})
+}
+
+// providerSupportsVision returns true for providers that can read
+// `image` content blocks. Only Anthropic-shape endpoints in our
+// registry today — kv.run/MiniMax-M2.7 is text-only ("is not a
+// multimodal model" error from the upstream). If we add new
+// providers later, gate on this flag rather than ad-hoc matching.
+func providerSupportsVision(p llmProvider) bool {
+	return p.supportsVision
+}
+
+// containsImageAttachment scans every message in the request for an
+// image attachment. Used to auto-route to a vision-capable provider
+// when the user's selected model can't read images.
+func containsImageAttachment(msgs []chatMessage) bool {
+	for _, m := range msgs {
+		for _, a := range m.Attachments {
+			if a.Kind == "image" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// autoRouteForTurn — if the resolved provider can't handle the
+// content in the current request, override to claude-haiku (the only
+// vision-capable provider today). Returns (provider, autoRouted)
+// where autoRouted is true when we overrode. Used to surface the
+// override in the usage event so the UI can show "answered by
+// Claude (auto)" instead of pretending the user's selection ran.
+func autoRouteForTurn(req []chatMessage, picked llmProvider, role string) (llmProvider, bool) {
+	if containsImageAttachment(req) && !providerSupportsVision(picked) {
+		// Route to the first vision-capable provider the caller's role
+		// allows. gemma4 is first + allowed to everyone + multimodal, so
+		// this lands on gemma4 for all roles (no policy escalation).
+		for _, p := range llmProviders {
+			if providerSupportsVision(p) && providerAllowed(role, p) {
+				return p, true
+			}
+		}
+	}
+	return picked, false
+}
+
+// resolveProvider picks the provider for a chat request. Falls back
+// to the default (Claude) on empty or unrecognized model strings so
+// clients that don't pass `model` keep working.
+func resolveProvider(modelID, role string) llmProvider {
+	if modelID != "" {
+		for _, p := range llmProviders {
+			if p.id == modelID {
+				if providerAllowed(role, p) {
+					return p
+				}
+				// Requested a provider above the caller's role → fall back
+				// to their default (gemma4) rather than 403, so the panel
+				// degrades gracefully if a stale id is sent.
+				return defaultProviderFor(role)
+			}
+		}
+	}
+	return defaultProviderFor(role)
+}
+
 type chatMessage struct {
 	Role    string `json:"role"`              // "user" | "assistant"
 	Content string `json:"content,omitempty"` // for the simple text-only frontend
 	// content_blocks (Anthropic's structured form) is what we use
 	// internally during the tool-use loop. The frontend sends only
 	// flat `content` text; we promote to blocks server-side.
+	//
+	// Optional file attachments — the chat footer's paperclip lets
+	// users drop images + small text files into a turn. Images turn
+	// into an Anthropic `image` content block (Claude vision); text
+	// files are inlined as a fenced code block in front of the user
+	// text so the LLM sees them as context.
+	Attachments []chatAttachment `json:"attachments,omitempty"`
+}
+
+// chatAttachment — one file the user dropped into the chat input.
+//
+//   - kind=image:    Mime + DataB64. Anthropic source.media_type expects
+//                    "image/png" | "image/jpeg" | "image/gif" | "image/webp".
+//   - kind=text:     Text carries the raw content (txt, md, csv, json, yaml,
+//                    log, etc — anything the frontend can read as a string).
+//   - kind=document: Mime + DataB64 for binary documents. Server routes
+//                    by Mime through extractDocumentText():
+//                      application/pdf                   → pdftotext
+//                      application/vnd.openxmlformats-...
+//                                          .wordprocess  → pandoc (docx)
+//                      application/vnd.openxmlformats-...
+//                                          .spreadsheet  → openpyxl (xlsx)
+//                      application/vnd.openxmlformats-...
+//                                          .presentation → pandoc (pptx)
+//                      application/rtf, application/vnd.oasis.opendocument.*,
+//                      application/epub+zip              → pandoc
+//                    On Claude (Anthropic) provider, PDFs ship as a native
+//                    `document` content block instead of going through
+//                    extraction — preserves tables, layout, embedded images.
+type chatAttachment struct {
+	Kind     string `json:"kind"`               // "image" | "text" | "document"
+	Name     string `json:"name,omitempty"`     // filename hint
+	Mime     string `json:"mime,omitempty"`     // image + document
+	DataB64  string `json:"data_b64,omitempty"` // image + document — base64-encoded bytes
+	Text     string `json:"text,omitempty"`     // text-files only — raw content
 }
 
 type meAgentChatBody struct {
 	Messages []chatMessage `json:"messages" binding:"required"`
+	// Optional: id from llmProviders. Empty → default (Claude).
+	Model string `json:"model,omitempty"`
+	// Optional UI hint: "search" | "deep_research" | "".
+	// When set, an extra line is appended to the system prompt asking
+	// the agent to call the matching tool for this turn. The agent
+	// can still skip if the question genuinely doesn't need search,
+	// but the strong nudge mirrors what ChatGPT/Claude do with their
+	// "Search" buttons.
+	Mode string `json:"mode,omitempty"`
+	// Independent toggle: enable extended thinking on Anthropic
+	// providers (Claude shows its reasoning before the answer).
+	// kv.run/MiniMax always emits thinking deltas by default; this
+	// flag is a no-op there. Combinable with Mode.
+	Think bool `json:"think,omitempty"`
+	// Optional: id of an installed xpio agent. When set,
+	// buildSystemPrompt swaps the me-prefs context for that agent's
+	// most-recent bank entries; the chat acts as that agent's
+	// spokesperson. See me_agent_agents.go.
+	AgentID string `json:"agent_id,omitempty"`
+	// Optional: id of a user-defined persona. When set, the persona's
+	// system_prompt REPLACES the LumidOS assistant base, allowed_tools[]
+	// filters the tool catalog, and preferred_model overrides the
+	// picker if no explicit model was passed. Mutually exclusive with
+	// agent_id — persona_id wins when both are set. See
+	// me_agent_personas.go.
+	PersonaID string `json:"persona_id,omitempty"`
+}
+
+// thinkingBudgetTokens — Anthropic's extended thinking budget. Pulled
+// out so we can adjust per-provider later if needed. Must leave room
+// in max_tokens for the actual response.
+const thinkingBudgetTokens = 4000
+const thinkingMaxTokens = 8192 // max_tokens when thinking is enabled
+
+// chatMessageToAnthropic promotes one chatMessage into the Anthropic
+// /v1/messages content shape. With no attachments it stays as a plain
+// `content: "<text>"`. With attachments it becomes a list of content
+// blocks — text-files inlined as fenced code, images as image blocks,
+// PDFs as document blocks (Claude) or pdftotext-extracted fenced
+// text (non-Claude providers).
+// Returns the {role, content} map suitable for direct append.
+func chatMessageToAnthropic(m chatMessage, provider llmProvider) map[string]any {
+	if len(m.Attachments) == 0 {
+		return map[string]any{"role": m.Role, "content": m.Content}
+	}
+	blocks := make([]map[string]any, 0, len(m.Attachments)+1)
+	for _, a := range m.Attachments {
+		switch a.Kind {
+		case "image":
+			if a.DataB64 == "" || a.Mime == "" {
+				continue
+			}
+			blocks = append(blocks, map[string]any{
+				"type": "image",
+				"source": map[string]any{
+					"type":       "base64",
+					"media_type": a.Mime,
+					"data":       a.DataB64,
+				},
+			})
+		case "document":
+			if a.DataB64 == "" {
+				continue
+			}
+			name := a.Name
+			if name == "" {
+				name = "document"
+			}
+			// Claude path + PDF: ship as a native document content
+			// block. Preserves layout, tables, and embedded images
+			// for vision. Other doc formats still go through text
+			// extraction even on Claude.
+			if provider.addAnthropicVersion && a.Mime == "application/pdf" {
+				blocks = append(blocks, map[string]any{
+					"type": "document",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "application/pdf",
+						"data":       a.DataB64,
+					},
+					"title": name,
+				})
+				continue
+			}
+			// Everything else: server-side text extraction routed by mime.
+			text, extractor, err := extractDocumentText(a.Mime, a.DataB64)
+			if err != nil {
+				blocks = append(blocks, map[string]any{
+					"type": "text",
+					"text": "Attached document `" + name + "` (" + a.Mime + ") — extraction failed: " + err.Error(),
+				})
+				continue
+			}
+			blocks = append(blocks, map[string]any{
+				"type": "text",
+				"text": "Attached document `" + name + "` (extracted via " + extractor + "):\n```\n" + text + "\n```",
+			})
+		case "text":
+			if a.Text == "" {
+				continue
+			}
+			name := a.Name
+			if name == "" {
+				name = "attachment"
+			}
+			fence := "```\n"
+			blocks = append(blocks, map[string]any{
+				"type": "text",
+				"text": "Attached file `" + name + "`:\n" + fence + a.Text + "\n```",
+			})
+		}
+	}
+	if m.Content != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": m.Content})
+	}
+	return map[string]any{"role": m.Role, "content": blocks}
+}
+
+// modeSystemSuffix returns the line to append to the system prompt
+// when the user has flipped a tool-forcing toggle in the chat UI.
+// Empty string for "" / unknown modes (no-op).
+func modeSystemSuffix(mode string) string {
+	citationRules := "\n\nCITATIONS: cite every fact that came from a web tool using GitHub-flavored markdown footnotes. This is mandatory — a reply with sourced facts and no inline citations is broken. EXACT SHAPE:\n\n  The S&P 500 closed at 6420 yesterday[^1], up 0.4% on the week[^2].\n\n  [^1]: https://example.com/markets-page\n  [^2]: https://other.com/weekly-recap\n\nRules:\n- One `[^n]` marker per claim, attached without a space to the word it cites.\n- Define every `[^n]` you reference at the very end of the reply, one per line.\n- URLs verbatim from the tool — never paraphrase or invent.\n- Reuse the same number for repeated sources; don't duplicate definitions.\n- Skip footnotes entirely only if you didn't actually use a source.\n- Do NOT add a `## Sources` heading — the frontend builds the footnotes block automatically from the `[^n]:` definitions."
+	switch mode {
+	case "search":
+		return "\n\nFor this turn, the user has explicitly enabled web search. Call the `web_search` tool to ground your answer in current web sources before replying. If the question is purely about the user's own knowledge or tenant state and search would be irrelevant, you may skip it — but err on the side of searching." + citationRules
+	case "deep_research":
+		return "\n\nFor this turn, the user has explicitly enabled deep research. Call the `deep_research` tool with a focused question derived from the user's message, then synthesize a brief from the returned sources." + citationRules
+	}
+	return ""
 }
 
 type toolCallResult struct {
@@ -93,11 +464,14 @@ func MeAgentChat(c *gin.Context) {
 		return
 	}
 
-	apiKey, err := anthropicKey()
+	role := currentUserRole(c)
+	provider := resolveProvider(body.Model, role)
+	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role)
+	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
+	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503,
-			"chat unavailable: "+err.Error()+
-				". Operator must set ANTHROPIC_API_KEY or place key at /home/webmaster/.api_keys/anthropic.")
+			"chat unavailable: "+err.Error())
 		return
 	}
 
@@ -122,14 +496,11 @@ func MeAgentChat(c *gin.Context) {
 	// list as it iterates.
 	anthMsgs := make([]map[string]any, 0, len(body.Messages))
 	for _, m := range body.Messages {
-		anthMsgs = append(anthMsgs, map[string]any{
-			"role":    m.Role,
-			"content": m.Content,
-		})
+		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
-	systemPrompt := buildSystemPrompt(userID)
-	tools := buildToolDefs()
+	basePrompt, tools, _ := resolvePromptAndTools(userID, body)
+	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
 	toolCalls := []toolCallResult{}
 	totalInputTokens := 0
 	totalOutputTokens := 0
@@ -140,16 +511,26 @@ func MeAgentChat(c *gin.Context) {
 
 	// Tool-use loop.
 	for i := 0; i < maxToolLoopIterations; i++ {
+		maxTok := maxTokensPerTurn
+		if body.Think && provider.addAnthropicVersion {
+			maxTok = thinkingMaxTokens
+		}
 		req := map[string]any{
-			"model":      anthropicModel,
-			"max_tokens": maxTokensPerTurn,
+			"model":      provider.upstreamModel,
+			"max_tokens": maxTok,
 			"system":     systemPrompt,
 			"messages":   anthMsgs,
 			"tools":      tools,
 		}
-		resp, err := callAnthropic(ctx, apiKey, req)
+		if body.Think && provider.addAnthropicVersion {
+			req["thinking"] = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": thinkingBudgetTokens,
+			}
+		}
+		resp, err := callLLM(ctx, provider, apiKey, req)
 		if err != nil {
-			fail(c, http.StatusBadGateway, 1502, "anthropic call: "+err.Error())
+			fail(c, http.StatusBadGateway, 1502, "llm call: "+err.Error())
 			return
 		}
 		if usage, ok := resp["usage"].(map[string]any); ok {
@@ -229,7 +610,7 @@ func MeAgentChat(c *gin.Context) {
 	// Record usage for the daily-budget cap. Best-effort — a DB write
 	// failure shouldn't fail the chat response.
 	if totalInputTokens+totalOutputTokens > 0 {
-		_ = recordUsage(userID, "chat", "/me/agent/chat", anthropicModel,
+		_ = recordUsage(userID, "chat", "/me/agent/chat", provider.upstreamModel,
 			totalInputTokens, totalOutputTokens)
 	}
 
@@ -238,6 +619,8 @@ func MeAgentChat(c *gin.Context) {
 		"data": gin.H{
 			"reply":      finalText,
 			"tool_calls": toolCalls,
+			"model_used": provider.id,
+			"auto_routed": autoRouted,
 			"usage": gin.H{
 				"input_tokens":  totalInputTokens,
 				"output_tokens": totalOutputTokens,
@@ -314,20 +697,40 @@ func anthropicKey() (string, error) {
 	return "", fmt.Errorf("no ANTHROPIC_API_KEY set")
 }
 
-// callAnthropic POSTs to the Messages API. Returns the parsed JSON body
-// on 2xx, or an error otherwise (including the response body for debug).
-func callAnthropic(ctx context.Context, apiKey string, body map[string]any) (map[string]any, error) {
+// kvrunPAT resolves the operator's Lumid PAT used to authenticate
+// against kv.run:5000/v1/*. Env first (KVRUN_LLM_TOKEN), then
+// /home/webmaster/.lumilake/pat on disk.
+func kvrunPAT() (string, error) {
+	if k := strings.TrimSpace(os.Getenv("KVRUN_LLM_TOKEN")); k != "" {
+		return k, nil
+	}
+	if b, err := os.ReadFile("/home/webmaster/.lumilake/pat"); err == nil {
+		tok := strings.TrimSpace(strings.Split(string(b), "\n")[0])
+		if tok != "" {
+			return tok, nil
+		}
+	}
+	return "", fmt.Errorf("no KVRUN_LLM_TOKEN set")
+}
+
+// callLLM POSTs to the provider's /v1/messages endpoint with
+// Anthropic-shaped JSON. Provider determines auth header + key source.
+// Returns the parsed JSON body on 2xx, or an error otherwise
+// (including the response body for debug).
+func callLLM(ctx context.Context, p llmProvider, apiKey string, body map[string]any) (map[string]any, error) {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicEndpoint, bytes.NewReader(buf))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
+	req.Header.Set(p.authHeader, p.authPrefix+apiKey)
+	if p.addAnthropicVersion {
+		req.Header.Set("anthropic-version", anthropicVersion)
+	}
 
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -336,7 +739,7 @@ func callAnthropic(ctx context.Context, apiKey string, body map[string]any) (map
 	defer r.Body.Close()
 	respBody, _ := io.ReadAll(r.Body)
 	if r.StatusCode >= 300 {
-		return nil, fmt.Errorf("anthropic %d: %s", r.StatusCode, string(respBody[:min(400, len(respBody))]))
+		return nil, fmt.Errorf("%s %d: %s", p.id, r.StatusCode, string(respBody[:min(400, len(respBody))]))
 	}
 	var out map[string]any
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -354,7 +757,43 @@ func min(a, b int) int {
 
 // buildSystemPrompt — the agent's persona + a snapshot of the user's
 // current app inventory so it has context without an extra tool call.
-func buildSystemPrompt(userID string) string {
+// resolvePromptAndTools — single decision point for the chat's
+// system prompt + tool catalog. Three modes, in priority order:
+//
+//  1. PersonaID set → persona's system_prompt + allowed_tools filter
+//     (mutually exclusive with agent_id).
+//  2. AgentID set   → standard LumidOS prompt + agent-bank block
+//     replacing me-prefs.
+//  3. Default       → standard LumidOS prompt + me-prefs block.
+//
+// Returns (systemPrompt, tools, preferredModel). preferredModel is
+// honored only when the request didn't set Model explicitly (handler-
+// level concern, not done here).
+func resolvePromptAndTools(userID string, body meAgentChatBody) (string, []map[string]any, string) {
+	tools := buildToolDefs()
+	if body.PersonaID != "" {
+		p, _ := loadPersona(userID, body.PersonaID)
+		if p != nil {
+			if len(p.AllowedTools) > 0 {
+				allow := map[string]bool{}
+				for _, t := range p.AllowedTools {
+					allow[t] = true
+				}
+				tools = filterTools(tools, allow)
+			}
+			return p.SystemPrompt, tools, p.PreferredModel
+		}
+		// Fall through if persona id is invalid — chat still works.
+	}
+	return buildSystemPrompt(userID, body.AgentID), tools, ""
+}
+
+// buildSystemPrompt assembles the assistant's persona + a snapshot
+// of the user's current tenant. When agentID is set, the trailing
+// memory block swaps from the user's me-prefs to that agent's bank
+// (see renderAgentBankBlock); empty agentID falls through to the
+// default me-prefs path.
+func buildSystemPrompt(userID, agentID string) string {
 	apps := []string{}
 	// Caller's tenant first.
 	if entries, err := os.ReadDir(tenantAppsDir(userID)); err == nil {
@@ -376,6 +815,9 @@ You have tools to:
   - start, stop, or fire one-shot cycles on loops
   - record the user's feedback on cycles (Hook 2 — what worked, what to change)
   - query recent cycle results
+  - search the web (web_search), fetch one URL (web_fetch), or run deep research (deep_research)
+  - look up financial data by symbol (query_findata)
+  - remember things about the user long-term (remember_about_me) — call this whenever the user shares a preference, fact about themselves, or a working style hint that should persist
 
 When the user expresses an intent, prefer doing the work via tools over describing how they could do it themselves. Confirm what you did in 1-2 sentences after each action.
 
@@ -383,7 +825,12 @@ The user already has these apps installed in their tenant: ` + tenantList + `
 
 When you don't know an app's slug, call list_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent cycle of the most likely loop and tell them you did so — they can refine later.
 
-Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.`
+Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.` + func() string {
+		if agentID != "" {
+			return renderAgentBankBlock(userID, agentID)
+		}
+		return renderPrefsBlock(userID)
+	}()
 }
 
 // buildToolDefs — the Anthropic-format tool schema.
@@ -445,6 +892,20 @@ func buildToolDefs() []map[string]any {
 					"note":   map[string]any{"type": "string", "description": "The user's natural-language feedback. Quote them when possible."},
 				},
 				"required": []string{"app", "loop", "ts", "note"},
+			},
+		},
+		{
+			"name":        "intent_audit",
+			"description": "Show what's changed about an intent over a time window — across the six improvement axes (examples=cases learned from, standard=metrics & rubric, recipe=workflow steps, pieces=skills, memory=banks, rules=patterns figured out). Use when the user asks 'what changed this week?', 'why did the metric move?', 'show me the audit', or when explaining how the AI is adapting. Returns events newest-first + a per-axis movement summary.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":   map[string]any{"type": "string", "description": "intent id (xpio app name, e.g. personal-agent)"},
+					"loop":  map[string]any{"type": "string", "description": "optional: scope to one loop"},
+					"since": map[string]any{"type": "string", "description": "either 'Nd' (last N days) or an RFC3339 timestamp. Default: last 7d."},
+					"limit": map[string]any{"type": "integer", "default": 30, "description": "max events to return"},
+				},
+				"required": []string{"app"},
 			},
 		},
 		{
@@ -710,6 +1171,139 @@ func buildToolDefs() []map[string]any {
 				"required": []string{"slug"},
 			},
 		},
+		{
+			"name":        "web_search",
+			"description": "Search the open web for a short query. Returns 5-10 result snippets with URLs. Use for current events, factual lookups, or to find authoritative sources to follow up with web_fetch. For multi-source synthesis with a written-up answer, prefer deep_research instead.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":       map[string]any{"type": "string", "description": "Search terms — natural language is fine."},
+					"num_results": map[string]any{"type": "integer", "description": "Optional, default 5, max 10."},
+				},
+				"required": []string{"query"},
+			},
+		},
+		{
+			"name":        "web_fetch",
+			"description": "Fetch one URL and return its readable content as markdown. Use after web_search when the user wants the actual content of a specific page, not just snippets.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url": map[string]any{"type": "string", "description": "Absolute URL (https://…)."},
+				},
+				"required": []string{"url"},
+			},
+		},
+		{
+			"name":        "deep_research",
+			"description": "Multi-source web research with a synthesized answer. Returns a written brief plus the supporting result list. Use when the user asks a question that needs research across multiple sources (e.g. 'what's the current state of X?', 'compare A and B', 'summarize recent developments on Z'). Slower (10-30s) than web_search; choose web_search for simple lookups.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"question":    map[string]any{"type": "string", "description": "The research question, in natural language."},
+					"max_results": map[string]any{"type": "integer", "description": "Optional, default 8, max 10. Lower is faster."},
+				},
+				"required": []string{"question"},
+			},
+		},
+		{
+			"name":        "query_findata",
+			"description": "Look up financial data for a stock/ETF symbol via the kv.run:5000 warehouse. Faster + cheaper than web_search for price + corporate-action queries. Kinds: quote (current price + volume), news (recent headlines), earnings (calendar + results), peers (similar tickers), filings (SEC filings), ohlc (30-day daily bars).",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"kind":   map[string]any{"type": "string", "enum": []string{"quote", "news", "earnings", "peers", "filings", "ohlc"}, "description": "What to fetch."},
+					"symbol": map[string]any{"type": "string", "description": "Ticker symbol, e.g. AAPL, NVDA, BTCUSD."},
+					"limit":  map[string]any{"type": "integer", "description": "Optional row cap (for news/earnings/filings). Default 10, max 50."},
+				},
+				"required": []string{"kind", "symbol"},
+			},
+		},
+		{
+			"name":        "remember_about_me",
+			"description": "Save a fact, preference, or working-style note about the user to long-term memory. Use whenever the user explicitly shares something they want you to remember (\"I prefer terse summaries\", \"my main symbol is NVDA\", \"never ping me before 9am\"). Each call appends one row to the me-prefs knowledge bank; recent rows are injected into your system prompt on every subsequent chat, so saved facts shape future replies automatically. Do NOT use for ephemeral session state.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"note": map[string]any{"type": "string", "description": "The fact or preference, in the user's own framing when possible. One sentence ideal."},
+					"tags": map[string]any{"type": "string", "description": "Optional comma-separated retrieval hints, e.g. 'preference,style' or 'fact,trading'."},
+				},
+				"required": []string{"note"},
+			},
+		},
+		{
+			"name":        "code_run",
+			"description": "Run a short Python 3 snippet in a sandboxed environment and return stdout/stderr/exit_code. Use for math/data calculations, CSV/JSON parsing, quick chart-style aggregation, or any task that's easier to compute than describe. The sandbox is network-isolated, capped at 30s CPU + 512MB memory + 10MB file output, and runs as 'nobody' with no host filesystem access. The standard library is available; no third-party packages.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"code":        map[string]any{"type": "string", "description": "Python 3 source. Use print() to emit results — only stdout/stderr are returned."},
+					"timeout_sec": map[string]any{"type": "integer", "description": "Optional wall-clock timeout, default 30, max 60."},
+				},
+				"required": []string{"code"},
+			},
+		},
+		{
+			"name":        "send_email",
+			"description": "Send an email from the user's connected Gmail account. The user must have linked Google at /dashboard/account/connect/google (the same OAuth grant that powers personal-agent); if not, the tool returns a clean error pointing them there. ALWAYS read back the subject + recipients in your reply so the user can confirm what was sent. Use plain text bodies — markdown won't render in email.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"to":      map[string]any{"type": "string", "description": "Comma-separated recipient(s). Required."},
+					"subject": map[string]any{"type": "string", "description": "Email subject line. Required, max ~80 chars ideal."},
+					"body":    map[string]any{"type": "string", "description": "Plain text body. Required."},
+					"cc":      map[string]any{"type": "string", "description": "Optional comma-separated CC recipients."},
+					"bcc":     map[string]any{"type": "string", "description": "Optional comma-separated BCC recipients."},
+				},
+				"required": []string{"to", "subject", "body"},
+			},
+		},
+		{
+			"name":        "create_calendar_event",
+			"description": "Create an event on the user's primary Google Calendar. Requires Google connected at /dashboard/account/connect/google. Use ISO-8601 datetimes with offsets (2026-06-01T14:00:00-07:00) for timed events, or YYYY-MM-DD strings for all-day events. Confirm details (title, when, who) back to the user in your reply.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"title":       map[string]any{"type": "string", "description": "Event title. Required."},
+					"start":       map[string]any{"type": "string", "description": "ISO 8601 datetime OR YYYY-MM-DD for all-day. Required."},
+					"end":         map[string]any{"type": "string", "description": "ISO 8601 datetime OR YYYY-MM-DD. Required."},
+					"description": map[string]any{"type": "string", "description": "Optional details. Plain text."},
+					"location":    map[string]any{"type": "string", "description": "Optional location or videoconf URL."},
+					"attendees":   map[string]any{"type": "string", "description": "Optional comma-separated email list. Invitations are sent automatically."},
+					"timezone":    map[string]any{"type": "string", "description": "Optional IANA timezone for timed events, e.g. 'America/Los_Angeles'. Defaults to America/Los_Angeles."},
+				},
+				"required": []string{"title", "start", "end"},
+			},
+		},
+		{
+			"name":        "spawn_agent",
+			"description": "Delegate a focused job to a sub-agent. The sub-agent runs its own short tool-use loop (max 5 iterations, 45s) with a curated tool subset, and returns its final reply. Use this when a research-heavy or analysis-heavy sub-task would otherwise clutter your own context with many tool calls — e.g. 'spawn a sub-agent to investigate X across 5 sources and return a 3-paragraph brief'. The sub-agent gets a fresh message history; it doesn't see this conversation. By default the sub-agent gets read-only + research tools (web_search, web_fetch, deep_research, query_findata, query_my_knowledge, code_run, list_*, today_summary). To restrict further, pass tools=[...].",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task":     map[string]any{"type": "string", "description": "The focused job, in natural language. Include enough context for a fresh agent to understand."},
+					"tools":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional whitelist of tool names the sub-agent may use. Defaults to a read-only + research subset."},
+					"agent_id": map[string]any{"type": "string", "description": "Optional xpio agent id to ground the sub-agent in (same effect as the user's agent picker — see /me/agents)."},
+					"max_iter": map[string]any{"type": "integer", "description": "Optional cap on tool-use iterations, default 5, max 5."},
+				},
+				"required": []string{"task"},
+			},
+		},
+		{
+			"name":        "save_artifact",
+			"description": "Save a piece of output (markdown brief, code listing, JSON dataset, plain text) as a persistent artifact in the user's tenant. The artifact appears in the Studio artifact panel and survives across sessions. Use this when the chat produces a long-form deliverable the user is likely to revisit: a research brief from deep_research, a generated script from code_run, a structured summary they asked you to compile. Always set a clear `title` (e.g. 'AAPL Q1 earnings brief' — not 'untitled'). The returned `id` + `url` can be referenced in follow-up turns.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"title":       map[string]any{"type": "string", "description": "Human-readable name for the artifact, max ~80 chars ideal."},
+					"content":     map[string]any{"type": "string", "description": "Body of the artifact. Plain text, markdown, code, or JSON — match the `kind`."},
+					"kind":        map[string]any{"type": "string", "enum": []string{"markdown", "code", "json", "text"}, "description": "Rendering hint. Default: markdown."},
+					"language":    map[string]any{"type": "string", "description": "For kind=code: source language (python, go, js, sql, …)."},
+					"source_tool": map[string]any{"type": "string", "description": "Optional — which prior tool produced this content (e.g. deep_research, code_run). Surfaces as a badge in the panel."},
+				},
+				"required": []string{"title", "content"},
+			},
+		},
 	}
 }
 
@@ -790,6 +1384,33 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 			limit = int(v)
 		}
 		return map[string]any{"cycles": agentListCycles(userID, app, loop, limit)}, true
+
+	case "intent_audit":
+		app, _ := args["app"].(string)
+		if app == "" {
+			return map[string]any{"error": "app required"}, false
+		}
+		loop, _ := args["loop"].(string)
+		since, _ := args["since"].(string)
+		if since == "" {
+			since = "7d"
+		}
+		limit := 30
+		if v, ok := args["limit"].(float64); ok && int(v) > 0 {
+			limit = int(v)
+		}
+		events, err := readImprovements(userID, app, loop, since, limit)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		return map[string]any{
+			"intent_id":      app,
+			"loop":           loop,
+			"since":          since,
+			"event_count":    len(events),
+			"axis_movements": summarizeImprovements(events),
+			"events":         events,
+		}, true
 
 	case "list_marketplace":
 		q, _ := args["q"].(string)
@@ -985,6 +1606,59 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 			return map[string]any{"error": "slug required"}, false
 		}
 		return toolSuggestImprovement(c, userID, slug), true
+
+	case "web_search":
+		query, _ := args["query"].(string)
+		num := 0
+		if v, ok := args["num_results"].(float64); ok {
+			num = int(v)
+		}
+		return toolWebSearch(query, num)
+
+	case "web_fetch":
+		url, _ := args["url"].(string)
+		return toolWebFetch(url)
+
+	case "deep_research":
+		question, _ := args["question"].(string)
+		maxResults := 0
+		if v, ok := args["max_results"].(float64); ok {
+			maxResults = int(v)
+		}
+		return toolDeepResearch(question, maxResults)
+
+	case "query_findata":
+		kind, _ := args["kind"].(string)
+		symbol, _ := args["symbol"].(string)
+		limit := 0
+		if v, ok := args["limit"].(float64); ok {
+			limit = int(v)
+		}
+		return toolQueryFindata(kind, symbol, limit)
+
+	case "remember_about_me":
+		note, _ := args["note"].(string)
+		return toolRememberAboutMe(userID, note, args["tags"])
+
+	case "code_run":
+		code, _ := args["code"].(string)
+		timeout := 0
+		if v, ok := args["timeout_sec"].(float64); ok {
+			timeout = int(v)
+		}
+		return toolCodeRun(code, timeout)
+
+	case "save_artifact":
+		return toolSaveArtifact(userID, args)
+
+	case "spawn_agent":
+		return toolSpawnAgent(c, userID, args)
+
+	case "send_email":
+		return toolSendEmail(userID, args)
+
+	case "create_calendar_event":
+		return toolCreateCalendarEvent(userID, args)
 	}
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

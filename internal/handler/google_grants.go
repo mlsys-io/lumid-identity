@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -282,33 +285,41 @@ func GoogleAccessToken(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
+	body, status, err := mintGoogleAccessTokenRaw(c.Request.Context(), userID)
+	if err != nil {
+		fail(c, status, 1500, err.Error())
+		return
+	}
+	c.Data(status, "application/json", body)
+}
 
+// mintGoogleAccessTokenRaw is the in-process helper behind both the
+// HTTP handler above and the me_agent Gmail/Calendar tools. Returns
+// Google's verbatim token payload as JSON bytes alongside the HTTP
+// status code we'd surface to a caller (200 on success, 404/410/etc.
+// on grant-lookup failures, 502 on Google's end). Useful so the
+// agent-tool helpers don't have to make a self-HTTP-call.
+func mintGoogleAccessTokenRaw(ctx context.Context, userID string) ([]byte, int, error) {
 	var grant models.GoogleGrant
 	err := common.DB.Where("user_sub = ?", userID).First(&grant).Error
 	if err == gorm.ErrRecordNotFound {
-		fail(c, http.StatusNotFound, 1404, "no google grant — connect at /dashboard/account/connect/google")
-		return
+		return nil, http.StatusNotFound, fmt.Errorf("no google grant — connect at /dashboard/account/connect/google")
 	}
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "lookup: "+err.Error())
-		return
+		return nil, http.StatusInternalServerError, fmt.Errorf("lookup: %w", err)
 	}
 	if grant.RevokedAt != nil {
-		fail(c, http.StatusGone, 1410, "google grant revoked; reconnect to mint a new one")
-		return
+		return nil, http.StatusGone, fmt.Errorf("google grant revoked; reconnect to mint a new one")
 	}
 
 	rt, err := common.DecryptGrant(grant.RefreshTokenEncrypted)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "decrypt: "+err.Error())
-		return
+		return nil, http.StatusInternalServerError, fmt.Errorf("decrypt: %w", err)
 	}
 
 	cfg := config.G.OAuth.Google
 	if cfg.ClientID == "" || cfg.ClientSecret == "" {
-		fail(c, http.StatusServiceUnavailable, 1500,
-			"GOOGLE_CLIENT_ID/SECRET unset on lumid-identity")
-		return
+		return nil, http.StatusServiceUnavailable, fmt.Errorf("GOOGLE_CLIENT_ID/SECRET unset on lumid-identity")
 	}
 
 	form := url.Values{
@@ -317,29 +328,43 @@ func GoogleAccessToken(c *gin.Context) {
 		"client_id":     {cfg.ClientID},
 		"client_secret": {cfg.ClientSecret},
 	}
-	req, _ := http.NewRequestWithContext(c.Request.Context(), "POST",
+	req, _ := http.NewRequestWithContext(ctx, "POST",
 		"https://oauth2.googleapis.com/token",
 		strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		fail(c, http.StatusBadGateway, 1502, "google: "+err.Error())
-		return
+		return nil, http.StatusBadGateway, fmt.Errorf("google: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := readAll(resp.Body)
 	if resp.StatusCode != 200 {
-		c.Data(http.StatusBadGateway, "application/json", body)
-		return
+		return body, http.StatusBadGateway, fmt.Errorf("google %d", resp.StatusCode)
 	}
-
 	now := time.Now().UTC()
 	common.DB.Model(&grant).Update("last_used_at", now)
+	return body, http.StatusOK, nil
+}
 
-	// Pass Google's payload through verbatim (access_token, expires_in,
-	// scope, token_type) plus the scope list we have stored.
-	c.Data(http.StatusOK, "application/json", body)
+// mintGoogleAccessToken is a convenience wrapper for me_agent tools —
+// returns just the access_token string. Errors propagate cleanly so
+// the tool can surface them.
+func mintGoogleAccessToken(ctx context.Context, userID string) (string, error) {
+	body, _, err := mintGoogleAccessTokenRaw(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("parse token: %w", err)
+	}
+	if payload.AccessToken == "" {
+		return "", fmt.Errorf("token: empty access_token in google response")
+	}
+	return payload.AccessToken, nil
 }
 
 // readAll reads an http.Response.Body without pulling in extra deps.

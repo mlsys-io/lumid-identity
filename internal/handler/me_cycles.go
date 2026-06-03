@@ -109,6 +109,36 @@ func MeCycleFeedback(c *gin.Context) {
 	appDir := strings.TrimSuffix(strings.TrimSuffix(cycleDir, body.Ts), "/")
 	appDir = strings.TrimSuffix(appDir, body.Loop)
 	appDir = strings.TrimSuffix(appDir, "/data/cycles/")
+	// 2b. Mirror into the improvement ledger so the Intent detail
+	//     page can render this as an axis="examples" event without
+	//     scanning every cycle dir. Non-fatal; the canonical record
+	//     lives in feedback.jsonl above.
+	{
+		var verb string
+		switch {
+		case body.Rating > 0:
+			verb = "good"
+		case body.Rating < 0:
+			verb = "wrong"
+		default:
+			verb = "edit"
+		}
+		label := body.Note
+		if label == "" {
+			label = fmt.Sprintf("user %s on %s/%s @ %s", verb, body.App, body.Loop, body.Ts)
+		}
+		_ = appendImprovement(userID, &improvementEvent{
+			App:       body.App,
+			Loop:      body.Loop,
+			CycleTs:   body.Ts,
+			Axis:      "examples",
+			Verb:      verb,
+			Label:     label,
+			Rationale: body.Note,
+			Source:    "user",
+		})
+	}
+
 	if err := appendJSONL(filepath.Join(appDir, "data", "journal.jsonl"), entry); err != nil {
 		// Non-fatal — the primary record is in feedback.jsonl.
 		// We still log via the response.

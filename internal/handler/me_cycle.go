@@ -279,6 +279,116 @@ func MeCycleDetail(c *gin.Context) {
 	})
 }
 
+// kpiPair is one named numeric extracted from a cycle, in stable order.
+type kpiPair struct {
+	Label string
+	V     float64
+}
+
+// cycleKpis pulls the loop's headline numeric KPIs from one cycle dir:
+// observations.json (best accuracy, variants tried) + cycle.json metrics.
+// Stable order so a trajectory series stays consistent across cycles.
+func cycleKpis(dir string) []kpiPair {
+	out := []kpiPair{}
+	if b, err := os.ReadFile(filepath.Join(dir, "observations.json")); err == nil {
+		var o map[string]any
+		if json.Unmarshal(b, &o) == nil {
+			if v, ok := o["best_accuracy_so_far"].(float64); ok {
+				out = append(out, kpiPair{"best accuracy", v})
+			}
+			if v, ok := o["history_size"].(float64); ok {
+				out = append(out, kpiPair{"variants tried", v})
+			}
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "cycle.json")); err == nil {
+		var cj map[string]any
+		if json.Unmarshal(b, &cj) == nil {
+			if m, ok := cj["metrics"].(map[string]any); ok {
+				keys := make([]string, 0, len(m))
+				for k := range m {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				for _, k := range keys {
+					if strings.HasPrefix(k, "xpio_ingested") || strings.HasPrefix(k, "auto_reflect") {
+						continue
+					}
+					if v, ok := m[k].(float64); ok && v != 0 {
+						out = append(out, kpiPair{strings.ReplaceAll(k, "_", " "), v})
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// MeLoopMetricSeries serves GET /me/apps/:app/loops/:loop/metric-series
+// Walks the loop's recent cycle dirs (oldest→newest) and returns, per metric,
+// its trajectory [{ts, v}] — drives the goal-metric sparkline.
+func MeLoopMetricSeries(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	loop := c.Param("loop")
+	if !slugRe.MatchString(app) || !slugRe.MatchString(loop) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app or loop")
+		return
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		fail(c, http.StatusNotFound, 1404, "app not found")
+		return
+	}
+	cyclesDir := filepath.Join(appDir, "data", "cycles", loop)
+	ents, _ := os.ReadDir(cyclesDir)
+	type dirT struct {
+		ts    string
+		start float64
+	}
+	dirs := []dirT{}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		if t, err := time.Parse("20060102T150405Z", e.Name()); err == nil {
+			dirs = append(dirs, dirT{e.Name(), float64(t.Unix())})
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].start < dirs[j].start })
+	if len(dirs) > 40 {
+		dirs = dirs[len(dirs)-40:]
+	}
+	type pt struct {
+		Ts string  `json:"ts"`
+		V  float64 `json:"v"`
+	}
+	series := map[string][]pt{}
+	order := []string{}
+	for _, d := range dirs {
+		for _, kp := range cycleKpis(filepath.Join(cyclesDir, d.ts)) {
+			if _, seen := series[kp.Label]; !seen {
+				order = append(order, kp.Label)
+			}
+			series[kp.Label] = append(series[kp.Label], pt{d.ts, kp.V})
+		}
+	}
+	out := []gin.H{}
+	for _, label := range order {
+		if len(series[label]) >= 2 { // a line needs at least two points
+			out = append(out, gin.H{"label": label, "points": series[label]})
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{"app": app, "loop": loop, "series": out},
+	})
+}
+
 // summarizeOutput picks a few interesting fields from a step's
 // output and renders them as one short line. The UI shows this in
 // the collapsed view; expanding reveals the full output dict.

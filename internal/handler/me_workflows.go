@@ -58,6 +58,11 @@ type WorkflowRow struct {
 	// usage this month (visual workflows that run entirely client-side
 	// will be 0 here). Omitted from JSON when 0 for clean responses.
 	CostCentsMTD int `json:"cost_cents_mtd,omitempty"`
+	// Running — a cycle is in-progress right now: the loop's newest cycle
+	// dir is newer than its last completed journal entry (a cycle creates
+	// its dir at start, journals on completion). Lets the dashboard show a
+	// live "running" indicator so long loops don't look frozen/stale.
+	Running bool `json:"running,omitempty"`
 }
 
 // MeWorkflows — GET /me/workflows[?kind=scheduled|visual]
@@ -174,6 +179,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.LastRunTS = jts
 					row.LastRunOK = &jok
 				}
+				row.Running = loopRunning(appDir, L.Name, row.LastRunTS)
 				out = append(out, row)
 			}
 		}
@@ -268,6 +274,33 @@ func fetchCostsByEndpoint(userSub string) map[string]int {
 // entry for `loop`, and whether any was found. Source of truth for "when
 // did this actually last run" (the scheduler state file is operator-scoped
 // and stale for tenant loops).
+// loopRunning reports whether a cycle is in-progress: the loop's newest
+// cycle dir (created at cycle start) is newer than its last completed
+// journal entry (written at cycle end). The recency cap avoids reporting
+// a crashed-cycle leftover dir as "running" forever.
+func loopRunning(appDir, loop string, lastJTS float64) bool {
+	ents, err := os.ReadDir(filepath.Join(appDir, "data", "cycles", loop))
+	if err != nil {
+		return false
+	}
+	var newest float64
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			if m := float64(info.ModTime().Unix()); m > newest {
+				newest = m
+			}
+		}
+	}
+	if newest == 0 {
+		return false
+	}
+	now := float64(time.Now().Unix())
+	return newest > lastJTS+5 && now-newest < 1800
+}
+
 func lastRunFromJournal(journalPath, loop string) (float64, bool, bool) {
 	f, err := os.Open(journalPath)
 	if err != nil {

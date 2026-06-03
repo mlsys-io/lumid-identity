@@ -81,6 +81,11 @@ type WorkflowRow struct {
 	Goal *WorkflowGoal `json:"goal,omitempty"`
 	// Datasets — dataset ids/refs the loop runs against (xpcloud.yaml).
 	Datasets []string `json:"datasets,omitempty"`
+	// MemoryAgents — the app's knowledge agents (xpcloud.yaml top-level
+	// memory_agents + roles[].memory_agent). Powers the learning-history
+	// timeline (what the app has banked over time). App-level, repeated on
+	// each of the app's loop rows for the UI's convenience.
+	MemoryAgents []string `json:"memory_agents,omitempty"`
 }
 
 // WorkflowGoal mirrors xpcloud.yaml loops[].goal.
@@ -164,6 +169,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			if len(loops) == 0 {
 				continue
 			}
+			memAgents := readYamlMemoryAgents(filepath.Join(appDir, "xpcloud.yaml"))
 			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			for _, L := range loops {
 				if L.Name == "" {
@@ -204,6 +210,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.Goal = &WorkflowGoal{Primary: L.Goal.Primary, Tracked: L.Goal.Tracked}
 				}
 				row.Datasets = L.Datasets
+				row.MemoryAgents = memAgents
 				if s.LastOk != nil {
 					b := *s.LastOk
 					row.LastRunOK = &b

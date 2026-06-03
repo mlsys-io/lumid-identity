@@ -245,6 +245,27 @@ func MeCycleDetail(c *gin.Context) {
 		return steps[i].StepID < steps[j].StepID
 	})
 
+	// Sidecar artifacts — some apps (e.g. auto-sysresearch) write the real
+	// per-stage content as standalone files instead of into cycle.json:
+	// observations.json (observe), proposal.json (hypothesize), result(s)/
+	// patterns/analysis (act/analyze), improvement (learn). Surface them as a
+	// map so the per-stage inspector can render the actual artifact.
+	files := map[string]any{}
+	for _, name := range []string{
+		"observations", "proposal", "result", "results", "patterns",
+		"analysis", "improvement", "plan", "variant", "benchmark",
+	} {
+		p := filepath.Join(cycleDir, name+".json")
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Size() < 256*1024 {
+			if b, err := os.ReadFile(p); err == nil {
+				var v any
+				if json.Unmarshal(b, &v) == nil {
+					files[name] = v
+				}
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
@@ -253,6 +274,7 @@ func MeCycleDetail(c *gin.Context) {
 			"ts":      ts,
 			"summary": cycleSummary,
 			"steps":   steps,
+			"files":   files,
 		},
 	})
 }

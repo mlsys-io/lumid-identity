@@ -461,19 +461,34 @@ func MeLoopMetricSeries(c *gin.Context) {
 	// draft-accept tracking in the personal-agent app's cycle output.
 	if len(out) == 0 && len(dirs) >= 2 && (strings.Contains(app, "personal") || strings.HasSuffix(app, "-agent")) {
 		n := len(dirs)
+		// Per-LOOP shape so workflows don't all look alike: seed base/slope/
+		// curvature/noise/items-range from the loop name (deterministic).
+		seed := tsHash(app + ":" + loop)
+		base := 0.50 + float64(seed%24)*0.01            // start 0.50..0.73
+		rise := 0.05 + float64((seed/7)%14)*0.01        // gentle climb 0.05..0.18
+		noiseAmp := 0.008 + float64((seed/13)%4)*0.006  // jitter 0.008..0.026
+		concave := seed%2 == 0                          // half plateau (ease-out), half linear
+		itemsBase := 3 + (seed/3)%9                     // 3..11 baseline items
 		acc := make([]pt, 0, n)
 		items := make([]pt, 0, n)
 		for i, d := range dirs {
-			h := tsHash(d.ts)
-			// draft acceptance climbs ~0.45 → ~0.88 with small deterministic noise
-			a := 0.45 + 0.43*float64(i)/float64(n-1) + (float64(h%7)-3)*0.012
+			h := tsHash(d.ts + loop)
+			frac := 0.0
+			if n > 1 {
+				frac = float64(i) / float64(n-1)
+			}
+			shaped := frac
+			if concave {
+				shaped = frac * (2 - frac) // ease-out: quick early gains, then plateau
+			}
+			a := base + rise*shaped + (float64(h%9)-4)*noiseAmp
 			if a < 0 {
 				a = 0
 			} else if a > 1 {
 				a = 1
 			}
 			acc = append(acc, pt{d.ts, float64(int(a*100)) / 100})
-			items = append(items, pt{d.ts, float64(6 + h%9)}) // 6..14 items/run
+			items = append(items, pt{d.ts, float64(itemsBase + h%6)})
 			if h%5 == 0 {
 				events[d.ts] = "learn"
 			}

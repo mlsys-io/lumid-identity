@@ -239,22 +239,22 @@ func MeIntentGet(c *gin.Context) {
 }
 
 // writeIntent atomically writes <uuid>.json into ~/.lumilake/me-intents/
-// and returns the uuid. Sets ownership to the operator-host webmaster
-// user (uid/gid 1001) so the lumid-scheduler (which runs as 1001) can
-// later write the .result.json file next to it. On write failure it
-// writes a fail() response to c and returns "".
+// and returns the uuid. The dir is made WORLD-WRITABLE (0o777) so the
+// lumid-scheduler can write its .result.json next to the intent regardless
+// of which uid it runs as — identity-in-container and the scheduler map to
+// DIFFERENT host uids (the old code chmod'd 0o775 + chown 1001, but the
+// scheduler now runs as 1000, so it lost write and every install stalled
+// with a PermissionError on the result file). UID-agnostic perms avoid that.
+// On write failure it writes a fail() response to c and returns "".
 func writeIntent(c *gin.Context, action, userSub string, payload map[string]any) string {
 	dir := intentDir()
-	// 0o775 so the scheduler user can write new files into this dir
-	// even though the dir was created by root-in-container.
-	if err := os.MkdirAll(dir, 0o775); err != nil {
+	if err := os.MkdirAll(dir, 0o777); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "mkdir intents: "+err.Error())
 		return ""
 	}
-	// First-time creation may have been 0o755 from an earlier deploy;
-	// idempotent re-chmod fixes that. Ignore error — non-fatal.
-	_ = os.Chmod(dir, 0o775)
-	_ = os.Chown(dir, 1001, 1001)
+	// Idempotently force 0o777 — earlier deploys / this same function used to
+	// set 0o775, which locked out the scheduler's result write. Ignore error.
+	_ = os.Chmod(dir, 0o777)
 
 	id := uuid.New().String()
 	envelope := map[string]any{
@@ -268,7 +268,8 @@ func writeIntent(c *gin.Context, action, userSub string, payload map[string]any)
 	// tmp+rename for atomic visibility — the scheduler may scan mid-write.
 	tmp := filepath.Join(dir, id+".json.tmp")
 	final := filepath.Join(dir, id+".json")
-	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+	// 0o666 so the scheduler (any uid) can rewrite/replace if needed.
+	if err := os.WriteFile(tmp, body, 0o666); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "write intent: "+err.Error())
 		return ""
 	}
@@ -276,7 +277,6 @@ func writeIntent(c *gin.Context, action, userSub string, payload map[string]any)
 		fail(c, http.StatusInternalServerError, 1500, "rename intent: "+err.Error())
 		return ""
 	}
-	// Chown to webmaster so the scheduler can rewrite/delete if needed.
-	_ = os.Chown(final, 1001, 1001)
+	_ = os.Chmod(final, 0o666)
 	return id
 }

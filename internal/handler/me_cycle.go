@@ -324,6 +324,53 @@ func cycleKpis(dir string) []kpiPair {
 	return out
 }
 
+// cycleEvent classifies a cycle into a discrete, notable event for the curve
+// overlay — "" when nothing stands out (the line itself is the analysis).
+// Priority: bug > fix > learn > analyze.
+func cycleEvent(dir string) string {
+	var cj map[string]any
+	if b, err := os.ReadFile(filepath.Join(dir, "cycle.json")); err == nil {
+		_ = json.Unmarshal(b, &cj)
+	}
+	if cj != nil {
+		if ok, has := cj["ok"].(bool); has && !ok {
+			return "bug"
+		}
+	}
+	// step_errors sidecar with entries → a bug surfaced this cycle.
+	if b, err := os.ReadFile(filepath.Join(dir, "step_errors.json")); err == nil {
+		var arr []any
+		if json.Unmarshal(b, &arr) == nil && len(arr) > 0 {
+			return "bug"
+		}
+	}
+	if cj != nil {
+		if rec, _ := cj["recovered"].(bool); rec {
+			return "fix"
+		}
+		if offers, ok := cj["offers"].([]any); ok && len(offers) > 0 {
+			return "learn"
+		}
+		if ap, ok := cj["auto_publish"].(map[string]any); ok {
+			if mem, ok := ap["memories"].(map[string]any); ok {
+				for _, v := range mem {
+					if m, ok := v.(map[string]any); ok {
+						if p, _ := m["pushed"].(float64); p > 0 {
+							return "learn"
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, f := range []string{"patterns.json", "analysis.json"} {
+		if st, err := os.Stat(filepath.Join(dir, f)); err == nil && !st.IsDir() {
+			return "analyze"
+		}
+	}
+	return ""
+}
+
 // MeLoopMetricSeries serves GET /me/apps/:app/loops/:loop/metric-series
 // Walks the loop's recent cycle dirs (oldest→newest) and returns, per metric,
 // its trajectory [{ts, v}] — drives the goal-metric sparkline.
@@ -369,12 +416,17 @@ func MeLoopMetricSeries(c *gin.Context) {
 	}
 	series := map[string][]pt{}
 	order := []string{}
+	events := map[string]string{} // cycle dir-id → discrete event kind
 	for _, d := range dirs {
-		for _, kp := range cycleKpis(filepath.Join(cyclesDir, d.ts)) {
+		cdir := filepath.Join(cyclesDir, d.ts)
+		for _, kp := range cycleKpis(cdir) {
 			if _, seen := series[kp.Label]; !seen {
 				order = append(order, kp.Label)
 			}
 			series[kp.Label] = append(series[kp.Label], pt{d.ts, kp.V})
+		}
+		if ev := cycleEvent(cdir); ev != "" {
+			events[d.ts] = ev
 		}
 	}
 	out := []gin.H{}
@@ -385,7 +437,7 @@ func MeLoopMetricSeries(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
-		"data": gin.H{"app": app, "loop": loop, "series": out},
+		"data": gin.H{"app": app, "loop": loop, "series": out, "events": events},
 	})
 }
 

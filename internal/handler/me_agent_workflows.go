@@ -266,7 +266,7 @@ func toolSearchMarketplace(c *gin.Context, query, forApp string, limit int) map[
 // Stages an xpcloud.yaml + manifest.json under the tenant draft dir
 // for the user to review in the composer. Doesn't install.
 func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) map[string]any {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	if forApp == "" {
@@ -274,20 +274,24 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 	}
 
 	// Step 1: ask xpcloud to suggest skills for the intent.
+	// use_llm:false → the deterministic token scorer (instant, with synonym
+	// mapping). The LLM scorer routinely blew the request budget and timed
+	// out the whole compose; the token scorer is reliable and good enough to
+	// seed a draft the user then refines in the composer.
 	body, _ := json.Marshal(map[string]any{
 		"intent":  intent,
 		"for_app": forApp,
 		"max":     5,
-		"use_llm": true,
+		"use_llm": false,
 	})
 	resp, err := httpPostJSON(ctx, xpcloudBaseURL()+"/api/v1/skills/suggest", body)
 	if err != nil {
 		return map[string]any{"error": "skill suggest: " + err.Error()}
 	}
 	suggestions, _ := resp["suggestions"].([]any)
-	if len(suggestions) == 0 {
-		return map[string]any{"error": "no matching skills found in the marketplace for that intent"}
-	}
+	// No hard dead-end on an empty match: still stage a draft (with a note)
+	// so the user can add skills in the composer instead of hitting a wall.
+	noMatch := len(suggestions) == 0
 
 	pickedSkills := []string{}
 	skillSummaries := []map[string]any{}
@@ -334,6 +338,10 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 		return map[string]any{"error": "write manifest: " + err.Error()}
 	}
 
+	note := "Drafted as a tenant workflow. Open Studio composer to review + adjust skills + schedule, then Save to install."
+	if noMatch {
+		note = "No catalog skill matched this intent yet — staged an empty draft. Add skills in the composer (or ask me to search the marketplace), then Save to install."
+	}
 	return map[string]any{
 		"draft_slug":     slug + "-draft",
 		"draft_dir":      draftDir,
@@ -341,8 +349,9 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 		"for_app":        forApp,
 		"skills_picked":  pickedSkills,
 		"skill_summaries": skillSummaries,
+		"no_match":       noMatch,
 		"review_url":     "/studio/workflows/" + slug + "-draft:" + slug,
-		"note":           "Drafted as a tenant workflow. Open Studio composer to review + adjust skills + schedule, then Save to install.",
+		"note":           note,
 	}
 }
 
@@ -533,6 +542,30 @@ func buildDraftXpcloudYaml(slug, intent, forApp string, skills []string) string 
 	sb.WriteString("    skills:\n")
 	for _, s := range skills {
 		fmt.Fprintf(&sb, "      - %s\n", s)
+	}
+	// steps[] make this a runnable Pattern A workflow (not just a skeleton):
+	// the runner walks them in order, stage-tagged observe → act so B0
+	// observability + the rest of the engine fire on install. First skill
+	// is the observe (read) step; the rest are act (do) steps. The user
+	// re-orders / re-stages in the composer before saving.
+	idRepl := strings.NewReplacer("/", "_", "-", "_", ".", "_", " ", "_")
+	if len(skills) == 0 {
+		sb.WriteString("    steps: []  # no skills matched — add skills above, then list steps here\n")
+	} else {
+		sb.WriteString("    steps:\n")
+		seen := map[string]int{}
+		for i, s := range skills {
+			id := idRepl.Replace(s)
+			if seen[id] > 0 {
+				id = fmt.Sprintf("%s_%d", id, seen[id])
+			}
+			seen[idRepl.Replace(s)]++
+			stage := "act"
+			if i == 0 {
+				stage = "observe"
+			}
+			fmt.Fprintf(&sb, "      - {id: %s, stage: %s, skill: %s}\n", id, stage, s)
+		}
 	}
 	return sb.String()
 }

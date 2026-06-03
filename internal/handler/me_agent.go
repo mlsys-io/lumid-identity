@@ -68,12 +68,34 @@ type llmProvider struct {
 	// addAnthropicVersion — Anthropic's API needs the "anthropic-version"
 	// header; kv.run's /v1/messages does not. Set to true for Anthropic.
 	addAnthropicVersion bool
+	// supportsVision — can read `image` content blocks. gemma4 (verified
+	// through the kv.run gateway) + Anthropic do; MiniMax is text-only.
+	supportsVision bool
+	// minRole — minimum role allowed to SELECT this provider in the panel.
+	// "" / "user" = everyone; "admin"; "super_admin". Policy: gemma4 for
+	// all, minimax for admin+, claude (Anthropic) for super_admin only.
+	minRole string
 }
 
 // First entry is the default (defaultProvider() returns llmProviders[0]).
 // Order: in-cluster GPU first (no per-call API charge to Anthropic, the
 // fleet is already paid for), Anthropic as the hosted fallback.
 var llmProviders = []llmProvider{
+	{
+		// kv.run:5000 gemma4 — default. Same Anthropic /v1/messages
+		// gateway, model id from GET kv.run:5000/v1/models. Reasoning
+		// model (emits thinking deltas, handled by the SSE parser).
+		id:                  "kvrun-gemma4",
+		displayName:         "Gemma-4-26B-A4B (kv.run GPU)",
+		endpoint:            "https://kv.run:5000/v1/messages",
+		upstreamModel:       "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+		supportsVision:      true, // multimodal; image blocks verified via kv.run
+		minRole:             "user", // everyone
+	},
 	{
 		// kv.run:5000 in-cluster inference gateway. Speaks Anthropic
 		// /v1/messages including SSE streaming — drop-in for the
@@ -86,6 +108,8 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
+		supportsVision:      false, // MiniMax is text-only
+		minRole:             "admin", // admin + super_admin
 	},
 	{
 		id:                  "claude-haiku",
@@ -96,7 +120,56 @@ var llmProviders = []llmProvider{
 		authPrefix:          "",
 		keyFn:               anthropicKey,
 		addAnthropicVersion: true,
+		supportsVision:      true,
+		minRole:             "super_admin", // super_admin only (Claude Code / all models)
 	},
+}
+
+// roleRank ranks the role hierarchy for provider gating.
+func roleRank(role string) int {
+	switch role {
+	case "super_admin":
+		return 2
+	case "admin":
+		return 1
+	default:
+		return 0 // user / unknown
+	}
+}
+
+// providerAllowed reports whether a caller of the given role may select p.
+func providerAllowed(userRole string, p llmProvider) bool {
+	return roleRank(userRole) >= roleRank(p.minRole)
+}
+
+// currentUserRole resolves the caller's role from the JWT claim, falling
+// back to a DB lookup for PAT-authed callers (whose token carries no role).
+// Defaults to "user" so gating fails closed to the least privilege.
+func currentUserRole(c *gin.Context) string {
+	if tok := bearerToken(c); tok != "" {
+		if claims, err := common.VerifyJWT(tok); err == nil && claims.Role != "" {
+			return claims.Role
+		}
+	}
+	if uid, ok := currentUserID(c); ok {
+		var u models.User
+		if err := common.DB.Select("role").Where("id = ?", uid).First(&u).Error; err == nil && u.Role != "" {
+			return u.Role
+		}
+	}
+	return "user"
+}
+
+// defaultProviderFor returns the highest-listed provider the role may use.
+// gemma4 is first and allowed to everyone, so this is gemma4 for all roles
+// unless the registry changes.
+func defaultProviderFor(role string) llmProvider {
+	for _, p := range llmProviders {
+		if providerAllowed(role, p) {
+			return p
+		}
+	}
+	return defaultProvider()
 }
 
 func defaultProvider() llmProvider { return llmProviders[0] }
@@ -111,9 +184,13 @@ func MeAgentModels(c *gin.Context) {
 		DisplayName string `json:"display_name"`
 		Default     bool   `json:"default"`
 	}
+	role := currentUserRole(c)
 	out := make([]item, 0, len(llmProviders))
-	def := defaultProvider().id
+	def := defaultProviderFor(role).id
 	for _, p := range llmProviders {
+		if !providerAllowed(role, p) {
+			continue // policy: hide providers above the caller's role
+		}
 		out = append(out, item{ID: p.id, DisplayName: p.displayName, Default: p.id == def})
 	}
 	c.JSON(http.StatusOK, gin.H{"models": out})
@@ -125,7 +202,7 @@ func MeAgentModels(c *gin.Context) {
 // multimodal model" error from the upstream). If we add new
 // providers later, gate on this flag rather than ad-hoc matching.
 func providerSupportsVision(p llmProvider) bool {
-	return p.addAnthropicVersion
+	return p.supportsVision
 }
 
 // containsImageAttachment scans every message in the request for an
@@ -148,10 +225,13 @@ func containsImageAttachment(msgs []chatMessage) bool {
 // where autoRouted is true when we overrode. Used to surface the
 // override in the usage event so the UI can show "answered by
 // Claude (auto)" instead of pretending the user's selection ran.
-func autoRouteForTurn(req []chatMessage, picked llmProvider) (llmProvider, bool) {
+func autoRouteForTurn(req []chatMessage, picked llmProvider, role string) (llmProvider, bool) {
 	if containsImageAttachment(req) && !providerSupportsVision(picked) {
+		// Route to the first vision-capable provider the caller's role
+		// allows. gemma4 is first + allowed to everyone + multimodal, so
+		// this lands on gemma4 for all roles (no policy escalation).
 		for _, p := range llmProviders {
-			if p.id == "claude-haiku" {
+			if providerSupportsVision(p) && providerAllowed(role, p) {
 				return p, true
 			}
 		}
@@ -162,15 +242,21 @@ func autoRouteForTurn(req []chatMessage, picked llmProvider) (llmProvider, bool)
 // resolveProvider picks the provider for a chat request. Falls back
 // to the default (Claude) on empty or unrecognized model strings so
 // clients that don't pass `model` keep working.
-func resolveProvider(modelID string) llmProvider {
+func resolveProvider(modelID, role string) llmProvider {
 	if modelID != "" {
 		for _, p := range llmProviders {
 			if p.id == modelID {
-				return p
+				if providerAllowed(role, p) {
+					return p
+				}
+				// Requested a provider above the caller's role → fall back
+				// to their default (gemma4) rather than 403, so the panel
+				// degrades gracefully if a stale id is sent.
+				return defaultProviderFor(role)
 			}
 		}
 	}
-	return defaultProvider()
+	return defaultProviderFor(role)
 }
 
 type chatMessage struct {
@@ -378,8 +464,9 @@ func MeAgentChat(c *gin.Context) {
 		return
 	}
 
-	provider := resolveProvider(body.Model)
-	provider, autoRouted := autoRouteForTurn(body.Messages, provider)
+	role := currentUserRole(c)
+	provider := resolveProvider(body.Model, role)
+	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role)
 	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
 	apiKey, err := provider.keyFn()
 	if err != nil {

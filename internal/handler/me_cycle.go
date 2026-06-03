@@ -451,11 +451,14 @@ func MeLoopMetricSeries(c *gin.Context) {
 		}
 	}
 
-	// DEMO MINT (temporary): personal-agent loops are qualitative and emit no
-	// numeric metrics, so their curve would be empty. Synthesize a plausible
-	// IMPROVING trajectory (draft-accept-rate climbing, items-handled
-	// fluctuating) deterministically from each cycle ts — stable across
-	// reloads, not random. Remove once these loops emit real metrics.
+	// TODO(demo-mint): REMOVE THIS BLOCK once personal-agent loops emit real
+	// numeric metrics. It SYNTHESIZES fake data (a plausible improving
+	// draft-accept-rate + items-handled trajectory) so qualitative loops show a
+	// non-empty curve for the demo. Values are deterministic from the cycle ts
+	// (stable across reloads, not random) and gated to personal/-agent apps
+	// with no real metrics — research apps are untouched. This is NOT real
+	// telemetry; do not surface it as such. Tracked: replace with real
+	// draft-accept tracking in the personal-agent app's cycle output.
 	if len(out) == 0 && len(dirs) >= 2 && (strings.Contains(app, "personal") || strings.HasSuffix(app, "-agent")) {
 		n := len(dirs)
 		acc := make([]pt, 0, n)

@@ -170,6 +170,9 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				continue
 			}
 			memAgents := readYamlMemoryAgents(filepath.Join(appDir, "xpcloud.yaml"))
+			// Tolerant goal read — survives loops whose other fields break the
+			// full rawLoop parse (object-typed datasets/skills_invoked).
+			goalsByLoop := readYamlLoopGoals(filepath.Join(appDir, "xpcloud.yaml"))
 			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			for _, L := range loops {
 				if L.Name == "" {
@@ -206,7 +209,9 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					filepath.Join(appDir, "data", "journal.jsonl"),
 					filepath.Join(appDir, "data", "cycles", L.Name),
 					L.Name, 14)
-				if L.Goal.Primary != "" || len(L.Goal.Tracked) > 0 {
+				if g, ok := goalsByLoop[L.Name]; ok {
+					row.Goal = &WorkflowGoal{Primary: g.Primary, Tracked: g.Tracked}
+				} else if L.Goal.Primary != "" || len(L.Goal.Tracked) > 0 {
 					row.Goal = &WorkflowGoal{Primary: L.Goal.Primary, Tracked: L.Goal.Tracked}
 				}
 				row.Datasets = L.Datasets

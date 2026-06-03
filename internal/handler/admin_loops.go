@@ -747,6 +747,34 @@ func readYamlLoops(p string) ([]rawLoop, error) {
 	return doc.Loops, nil
 }
 
+// readYamlLoopGoals returns loop-name → goal from xpcloud.yaml using a MINIMAL
+// struct that ignores every other loop field. readYamlLoops unmarshals the
+// full rawLoop and errors out when a loop carries object-typed datasets/
+// skills_invoked (then me_workflows falls back to manifest.json, which has no
+// goal) — this tolerant reader recovers the goal regardless.
+func readYamlLoopGoals(p string) map[string]rawGoal {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Loops []struct {
+			Name string  `yaml:"name"`
+			Goal rawGoal `yaml:"goal"`
+		} `yaml:"loops"`
+	}
+	if yaml.Unmarshal(b, &doc) != nil {
+		return nil
+	}
+	out := map[string]rawGoal{}
+	for _, l := range doc.Loops {
+		if l.Name != "" && (l.Goal.Primary != "" || len(l.Goal.Tracked) > 0) {
+			out[l.Name] = l.Goal
+		}
+	}
+	return out
+}
+
 // readYamlMemoryAgents returns the app's knowledge agents — the top-level
 // memory_agents list unioned with roles[].memory_agent — from xpcloud.yaml.
 func readYamlMemoryAgents(p string) []string {

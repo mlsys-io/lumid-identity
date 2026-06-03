@@ -56,11 +56,12 @@ func toolListApps(userID string) map[string]any {
 // Returns the intent UUID or "" on error.
 func writeIntentDirect(userSub, action string, payload map[string]any) string {
 	dir := intentDir()
-	if err := os.MkdirAll(dir, 0o775); err != nil {
+	// World-writable so the scheduler can write results regardless of its uid
+	// (see writeIntent for the full rationale — uid mismatch broke 0o775).
+	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return ""
 	}
-	_ = os.Chmod(dir, 0o775)
-	_ = os.Chown(dir, 1001, 1001)
+	_ = os.Chmod(dir, 0o777)
 
 	id := uuid.New().String()
 	envelope := map[string]any{
@@ -73,13 +74,13 @@ func writeIntentDirect(userSub, action string, payload map[string]any) string {
 	body, _ := json.MarshalIndent(envelope, "", "  ")
 	tmp := filepath.Join(dir, id+".json.tmp")
 	final := filepath.Join(dir, id+".json")
-	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+	if err := os.WriteFile(tmp, body, 0o666); err != nil {
 		return ""
 	}
 	if err := os.Rename(tmp, final); err != nil {
 		return ""
 	}
-	_ = os.Chown(final, 1001, 1001)
+	_ = os.Chmod(final, 0o666)
 	return id
 }
 

@@ -407,8 +407,11 @@ func MeLoopMetricSeries(c *gin.Context) {
 		}
 	}
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i].start < dirs[j].start })
-	if len(dirs) > 40 {
-		dirs = dirs[len(dirs)-40:]
+	// Keep a wide window: a converged/plateaued loop's recent cycles can all
+	// carry the same flat running-max, while the genuinely-varying per-run
+	// metrics live in earlier cycles — a small window hides the real movement.
+	if len(dirs) > 200 {
+		dirs = dirs[len(dirs)-200:]
 	}
 	type pt struct {
 		Ts string  `json:"ts"`

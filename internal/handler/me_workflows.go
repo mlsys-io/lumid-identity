@@ -67,6 +67,20 @@ type WorkflowRow struct {
 	// retry/fallback self-healed an LLM call. Dashboard shows an amber dot
 	// (flaky-but-recovering) instead of clean green.
 	LastRunRecovered bool `json:"last_run_recovered,omitempty"`
+	// RunsRecent — per-dot addressing for the sparkline. One entry per
+	// run_spark char, SAME order (oldest→newest), so the UI can make each
+	// dot clickable: hover/click → open that cycle's detail. `Ts` is the
+	// cycle dir-id (matches GET /me/cycles/:app/:loop/:ts) resolved by
+	// nearest-start match (the journal logs completion, the dir is named
+	// from cycle start ~seconds earlier). Empty `Ts` = no cycle dir found
+	// (e.g. a skipped run) → that dot stays non-clickable.
+	RunsRecent []SparkRun `json:"runs_recent,omitempty"`
+}
+
+// SparkRun is one addressable dot in a workflow's run sparkline.
+type SparkRun struct {
+	Ts string `json:"ts"` // cycle dir-id, "" when unmatched
+	St string `json:"st"` // state char: o|r|x|_|.  (mirrors run_spark)
 }
 
 // MeWorkflows — GET /me/workflows[?kind=scheduled|visual]
@@ -168,9 +182,12 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					Description:  L.Description,
 					Engine:       engine,
 					StepCount:    len(L.Steps),
-					RunSpark:     buildRunSpark(filepath.Join(appDir, "data", "journal.jsonl"), L.Name, 14),
 					CostCentsMTD: costMap[e.Name()+"."+L.Name],
 				}
+				row.RunSpark, row.RunsRecent = buildRunSparkDetailed(
+					filepath.Join(appDir, "data", "journal.jsonl"),
+					filepath.Join(appDir, "data", "cycles", L.Name),
+					L.Name, 14)
 				if s.LastOk != nil {
 					b := *s.LastOk
 					row.LastRunOK = &b
@@ -373,10 +390,23 @@ func lastRunFromJournal(journalPath, loop string) (float64, bool, bool) {
 	return bestTs, bestOk, found
 }
 
+// buildRunSpark returns just the char string (back-compat shim).
 func buildRunSpark(journalPath, loop string, limit int) string {
+	spark, _ := buildRunSparkDetailed(journalPath, "", loop, limit)
+	return spark
+}
+
+// buildRunSparkDetailed returns the char string AND a per-dot SparkRun
+// slice (same order) carrying each run's cycle dir-id, so the UI can make
+// dots clickable. `cyclesLoopDir` is data/cycles/<loop> (pass "" to skip
+// dir resolution — runs[] then carry empty Ts). Matching: the journal logs
+// completion ts; the cycle dir is named from start (~seconds earlier), so
+// each run maps to the dir with the largest start ≤ completion within a 6h
+// window.
+func buildRunSparkDetailed(journalPath, cyclesLoopDir, loop string, limit int) (string, []SparkRun) {
 	f, err := os.Open(journalPath)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
@@ -439,7 +469,42 @@ func buildRunSpark(journalPath, loop string, limit int) string {
 	for i, p := range rows {
 		out[i] = p.ch
 	}
-	return string(out)
+
+	// Resolve each dot to its cycle dir-id (for clickable dots). Read the
+	// loop's cycle dirs once, parse names → start unix, sort ascending,
+	// then for each run pick the dir with the largest start ≤ completion.
+	runs := make([]SparkRun, len(rows))
+	type cdir struct{ start float64; id string }
+	var dirs []cdir
+	if cyclesLoopDir != "" {
+		if ents, err := os.ReadDir(cyclesLoopDir); err == nil {
+			for _, e := range ents {
+				if !e.IsDir() {
+					continue
+				}
+				if t, err := time.Parse("20060102T150405Z", e.Name()); err == nil {
+					dirs = append(dirs, cdir{start: float64(t.Unix()), id: e.Name()})
+				}
+			}
+			sort.Slice(dirs, func(i, j int) bool { return dirs[i].start < dirs[j].start })
+		}
+	}
+	for i, p := range rows {
+		runs[i].St = string(p.ch)
+		// largest start ≤ completion, within a 6h window (skip stale mismatch).
+		best := -1
+		for d := range dirs {
+			if dirs[d].start <= p.ts+1 {
+				best = d
+			} else {
+				break
+			}
+		}
+		if best >= 0 && p.ts-dirs[best].start < 6*3600 {
+			runs[i].Ts = dirs[best].id
+		}
+	}
+	return string(out), runs
 }
 
 // readEnabledOverrides — read just the per-loop `enabled` flag from

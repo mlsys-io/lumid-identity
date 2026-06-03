@@ -142,47 +142,59 @@ func toolListRuns(c *gin.Context, userID, stateFilter, workflowFilter string, li
 }
 
 func toolRunDetail(c *gin.Context, userID, runID string) map[string]any {
-	parts := splitN(runID, ":", 3)
-	if len(parts) < 3 {
+	head := splitN(runID, ":", 2)
+	if len(head) < 2 {
 		return map[string]any{"error": "invalid run id"}
 	}
-	if parts[0] == "visual" {
+	switch head[0] {
+	case "visual":
+		// "visual:n8n:<execID>"
+		vp := splitN(runID, ":", 3)
+		if len(vp) < 3 {
+			return map[string]any{"error": "invalid run id (expected visual:n8n:<id>)"}
+		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
 		defer cancel()
 		cli := common.NewN8nClient()
 		cookie, _ := c.Cookie("n8n-auth")
-		exec, err := cli.GetExecution(ctx, parts[2], cookie)
+		exec, err := cli.GetExecution(ctx, vp[2], cookie)
 		if err != nil {
 			return map[string]any{"error": "n8n: " + err.Error()}
 		}
 		return map[string]any{
-			"run_id":   runID,
-			"kind":     "visual",
-			"state":    n8nStateToOurs(exec.Status, exec.Finished),
-			"started":  exec.StartedAt,
-			"stopped":  exec.StoppedAt,
+			"run_id":  runID,
+			"kind":    "visual",
+			"state":   n8nStateToOurs(exec.Status, exec.Finished),
+			"started": exec.StartedAt,
+			"stopped": exec.StoppedAt,
 		}
-	}
-	wfParts := splitN(parts[1], ":", 2)
-	if len(wfParts) != 2 {
-		return map[string]any{"error": "invalid workflow slug in run id"}
-	}
-	app, loop, ts := wfParts[0], wfParts[1], parts[2]
-	cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
-	if cycleDir == "" {
-		return map[string]any{"error": "cycle not found"}
-	}
-	// Return a slim summary suitable for a chat bubble.
-	summary := readJSONFile(cycleDir + "/summary.json")
-	stepErrs := readJSONFile(cycleDir + "/step_errors.json")
-	return map[string]any{
-		"run_id":      runID,
-		"kind":        "scheduled",
-		"app":         app,
-		"loop":        loop,
-		"ts":          ts,
-		"summary":     summary,
-		"step_errors": stepErrs,
+	case "scheduled":
+		// "scheduled:<app>:<loop>:<ts>" — 4 segments (matches MeRuns RunID).
+		parts := splitN(runID, ":", 4)
+		if len(parts) != 4 {
+			return map[string]any{"error": "invalid run id (expected scheduled:<app>:<loop>:<ts>)"}
+		}
+		app, loop, ts := parts[1], parts[2], parts[3]
+		cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
+		if cycleDir == "" {
+			return map[string]any{"error": "cycle not found"}
+		}
+		// The per-cycle summary is cycle.json (NOT summary.json). step_errors
+		// is a top-level field of cycle.json for most apps, or a sidecar file
+		// for a few — surface both so the agent can explain failures.
+		summary := readJSONFile(cycleDir + "/cycle.json")
+		stepErrs := readJSONFile(cycleDir + "/step_errors.json")
+		return map[string]any{
+			"run_id":      runID,
+			"kind":        "scheduled",
+			"app":         app,
+			"loop":        loop,
+			"ts":          ts,
+			"summary":     summary,
+			"step_errors": stepErrs,
+		}
+	default:
+		return map[string]any{"error": "invalid run id"}
 	}
 }
 

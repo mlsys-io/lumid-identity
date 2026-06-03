@@ -747,6 +747,39 @@ func readYamlLoops(p string) ([]rawLoop, error) {
 	return doc.Loops, nil
 }
 
+// readYamlMemoryAgents returns the app's knowledge agents — the top-level
+// memory_agents list unioned with roles[].memory_agent — from xpcloud.yaml.
+func readYamlMemoryAgents(p string) []string {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		MemoryAgents []string `yaml:"memory_agents"`
+		Roles        []struct {
+			MemoryAgent string `yaml:"memory_agent"`
+		} `yaml:"roles"`
+	}
+	if yaml.Unmarshal(b, &doc) != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, a := range doc.MemoryAgents {
+		if a != "" && !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	for _, r := range doc.Roles {
+		if r.MemoryAgent != "" && !seen[r.MemoryAgent] {
+			seen[r.MemoryAgent] = true
+			out = append(out, r.MemoryAgent)
+		}
+	}
+	return out
+}
+
 func readAutoresearchYaml(p string) (string, string, error) {
 	b, err := os.ReadFile(p)
 	if err != nil {

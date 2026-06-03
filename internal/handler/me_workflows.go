@@ -63,6 +63,10 @@ type WorkflowRow struct {
 	// its dir at start, journals on completion). Lets the dashboard show a
 	// live "running" indicator so long loops don't look frozen/stale.
 	Running bool `json:"running,omitempty"`
+	// LastRunRecovered — the last completed run succeeded but only after a
+	// retry/fallback self-healed an LLM call. Dashboard shows an amber dot
+	// (flaky-but-recovering) instead of clean green.
+	LastRunRecovered bool `json:"last_run_recovered,omitempty"`
 }
 
 // MeWorkflows — GET /me/workflows[?kind=scheduled|visual]
@@ -180,6 +184,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.LastRunOK = &jok
 				}
 				row.Running = loopRunning(appDir, L.Name, row.LastRunTS)
+				row.LastRunRecovered = lastRunRecovered(filepath.Join(appDir, "data", "journal.jsonl"), L.Name)
 				out = append(out, row)
 			}
 		}
@@ -301,6 +306,39 @@ func loopRunning(appDir, loop string, lastJTS float64) bool {
 	return newest > lastJTS+5 && now-newest < 1800
 }
 
+// lastRunRecovered reports whether the most recent COMPLETED run of loop
+// self-healed (recovered=true) — succeeded only via a retry/fallback. Drives
+// the amber "recovered" dot, distinct from clean green.
+func lastRunRecovered(journalPath, loop string) bool {
+	f, err := os.Open(journalPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	rec := false
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var row map[string]any
+		if json.Unmarshal([]byte(line), &row) != nil {
+			continue
+		}
+		if lp, _ := row["loop"].(string); lp != loop {
+			continue
+		}
+		if _, hasOk := row["ok"]; !hasOk {
+			continue // intermediate/stage entry, not a completed run
+		}
+		r, _ := row["recovered"].(bool)
+		rec = r // keep the last completed run's flag
+	}
+	return rec
+}
+
 func lastRunFromJournal(journalPath, loop string) (float64, bool, bool) {
 	f, err := os.Open(journalPath)
 	if err != nil {
@@ -359,8 +397,14 @@ func buildRunSpark(journalPath, loop string, limit int) string {
 		}
 		ts := rowUnixTs(row)
 		var ch byte = '.'
+		rec, _ := row["recovered"].(bool)
 		if skipped, _ := row["skipped"].(bool); skipped {
 			ch = '_'
+		} else if rec {
+			// amber: self-fix / transient class — a run that succeeded via
+			// retry/fallback, OR a past transient failure (504/no_output/
+			// network) backfilled as "would-self-heal-now".
+			ch = 'r'
 		} else if ok, _ := row["ok"].(bool); ok {
 			ch = 'o'
 		} else {
@@ -375,6 +419,21 @@ func buildRunSpark(journalPath, loop string, limit int) string {
 	}
 	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 		rows[i], rows[j] = rows[j], rows[i]
+	}
+	// Resolved-failure → amber: a failure the loop later recovered from (a
+	// success exists after it in the window) is past history, not a current
+	// problem — show it amber ('r'), not red. Only an UNRESOLVED trailing
+	// failure (no later success) stays red ('x'). Walk newest→oldest.
+	seenOk := false
+	for i := len(rows) - 1; i >= 0; i-- {
+		switch rows[i].ch {
+		case 'o', 'r':
+			seenOk = true
+		case 'x':
+			if seenOk {
+				rows[i].ch = 'r'
+			}
+		}
 	}
 	out := make([]byte, len(rows))
 	for i, p := range rows {

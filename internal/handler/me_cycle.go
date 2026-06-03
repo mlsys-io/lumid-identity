@@ -140,16 +140,23 @@ func MeCycleDetail(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app or loop")
 		return
 	}
-	// Anchor ts to the per-tenant tree; path-walks below resolve only
-	// inside this base so a malicious ts can't escape.
-	cycleDir := filepath.Join(tenantAppsDir(userID), app, "data", "cycles", loop, ts)
-	abs, err := filepath.Abs(cycleDir)
-	if err != nil || !strings.HasPrefix(abs, tenantAppsDir(userID)+string(os.PathSeparator)) {
-		fail(c, http.StatusBadRequest, 1400, "invalid path")
-		return
+	// Resolve against the caller's tenant tree first, then operator-shared
+	// (~/.xp/apps) — /me/workflows surfaces both, so the detail (and its
+	// clickable sparkline dots) must too. Each candidate is anchored to its
+	// own root with a prefix guard so a crafted ts can't escape either base.
+	var cycleDir string
+	for _, root := range []string{tenantAppsDir(userID), filepath.Join(operatorHome(), ".xp", "apps")} {
+		cand := filepath.Join(root, app, "data", "cycles", loop, ts)
+		abs, err := filepath.Abs(cand)
+		if err != nil || !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
+			continue
+		}
+		if st, err := os.Stat(cand); err == nil && st.IsDir() {
+			cycleDir = cand
+			break
+		}
 	}
-	st, err := os.Stat(cycleDir)
-	if err != nil || !st.IsDir() {
+	if cycleDir == "" {
 		fail(c, http.StatusNotFound, 1404, "cycle not found")
 		return
 	}

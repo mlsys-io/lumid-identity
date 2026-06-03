@@ -75,6 +75,18 @@ type WorkflowRow struct {
 	// from cycle start ~seconds earlier). Empty `Ts` = no cycle dir found
 	// (e.g. a skipped run) → that dot stays non-clickable.
 	RunsRecent []SparkRun `json:"runs_recent,omitempty"`
+	// Goal — the loop's declared objective from xpcloud.yaml (goal.primary +
+	// tracked metric names). Drives the app-overview goal header so users see
+	// what the loop is chasing, not just a generic description.
+	Goal *WorkflowGoal `json:"goal,omitempty"`
+	// Datasets — dataset ids/refs the loop runs against (xpcloud.yaml).
+	Datasets []string `json:"datasets,omitempty"`
+}
+
+// WorkflowGoal mirrors xpcloud.yaml loops[].goal.
+type WorkflowGoal struct {
+	Primary string   `json:"primary"`
+	Tracked []string `json:"tracked,omitempty"`
 }
 
 // SparkRun is one addressable dot in a workflow's run sparkline.
@@ -188,6 +200,10 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					filepath.Join(appDir, "data", "journal.jsonl"),
 					filepath.Join(appDir, "data", "cycles", L.Name),
 					L.Name, 14)
+				if L.Goal.Primary != "" || len(L.Goal.Tracked) > 0 {
+					row.Goal = &WorkflowGoal{Primary: L.Goal.Primary, Tracked: L.Goal.Tracked}
+				}
+				row.Datasets = L.Datasets
 				if s.LastOk != nil {
 					b := *s.LastOk
 					row.LastRunOK = &b

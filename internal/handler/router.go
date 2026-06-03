@@ -318,6 +318,9 @@ func Register(r *gin.Engine) {
 			// prompt audit + summary).
 			me.GET("/cycles",                       MeCyclesList)
 			me.GET("/cycles/:app/:loop/:ts",        MeCycleDetail)
+			// Dataset / casebook explorer for the app-overview page.
+			me.GET("/apps/:app/datasets",      MeAppDatasets)
+			me.GET("/apps/:app/dataset-file",  MeAppDatasetFile)
 			// Engine-revamp human checkpoint — approve/revamp a cycle's
 			// held actions; writes the engine's side files for next cycle.
 			me.POST("/cycles/:app/:loop/:ts/review", MeCycleReview)

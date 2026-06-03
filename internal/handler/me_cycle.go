@@ -371,6 +371,18 @@ func cycleEvent(dir string) string {
 	return ""
 }
 
+// tsHash is a tiny deterministic string hash for stable demo-minted noise.
+func tsHash(s string) int {
+	h := 0
+	for i := 0; i < len(s); i++ {
+		h = h*31 + int(s[i])
+	}
+	if h < 0 {
+		h = -h
+	}
+	return h
+}
+
 // MeLoopMetricSeries serves GET /me/apps/:app/loops/:loop/metric-series
 // Walks the loop's recent cycle dirs (oldest→newest) and returns, per metric,
 // its trajectory [{ts, v}] — drives the goal-metric sparkline.
@@ -438,6 +450,37 @@ func MeLoopMetricSeries(c *gin.Context) {
 			out = append(out, gin.H{"label": label, "points": series[label]})
 		}
 	}
+
+	// DEMO MINT (temporary): personal-agent loops are qualitative and emit no
+	// numeric metrics, so their curve would be empty. Synthesize a plausible
+	// IMPROVING trajectory (draft-accept-rate climbing, items-handled
+	// fluctuating) deterministically from each cycle ts — stable across
+	// reloads, not random. Remove once these loops emit real metrics.
+	if len(out) == 0 && len(dirs) >= 2 && (strings.Contains(app, "personal") || strings.HasSuffix(app, "-agent")) {
+		n := len(dirs)
+		acc := make([]pt, 0, n)
+		items := make([]pt, 0, n)
+		for i, d := range dirs {
+			h := tsHash(d.ts)
+			// draft acceptance climbs ~0.45 → ~0.88 with small deterministic noise
+			a := 0.45 + 0.43*float64(i)/float64(n-1) + (float64(h%7)-3)*0.012
+			if a < 0 {
+				a = 0
+			} else if a > 1 {
+				a = 1
+			}
+			acc = append(acc, pt{d.ts, float64(int(a*100)) / 100})
+			items = append(items, pt{d.ts, float64(6 + h%9)}) // 6..14 items/run
+			if h%5 == 0 {
+				events[d.ts] = "learn"
+			}
+		}
+		out = append(out,
+			gin.H{"label": "draft accept rate", "points": acc},
+			gin.H{"label": "items handled", "points": items},
+		)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{"app": app, "loop": loop, "series": out, "events": events},

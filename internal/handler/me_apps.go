@@ -116,7 +116,11 @@ func MeAppsUninstall(c *gin.Context) {
 		return
 	}
 	app := c.Param("app")
-	if !slugRe.MatchString(app) {
+	// Uninstall targets a single directory name under the caller's tenant app
+	// tree. Be PERMISSIVE on charset (legacy drafts composed before slugs were
+	// enforced can carry spaces / uppercase, e.g. "Musk X Trade Monitor-draft")
+	// so the user can always clean them up — but hard-block path traversal.
+	if app == "" || len(app) > 160 || strings.ContainsAny(app, "/\\") || strings.Contains(app, "..") || strings.HasPrefix(app, ".") {
 		fail(c, http.StatusBadRequest, 1400, "invalid app name")
 		return
 	}

@@ -28,9 +28,160 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 
 	"lumid_identity/internal/common"
 )
+
+// MeLoopDelete hard-removes a single workflow (loop) from one of the caller's
+// OWN apps — drops it from xpcloud.yaml::loops[] (and manifest.json::loops[]
+// if present) and deletes its cycle history. The lumid-scheduler unregisters
+// the apscheduler job on its next discovery pass. Synchronous (identity runs
+// as the operator uid and writes the tenant tree directly — no intent queue).
+//
+// Guards: tenant apps only (operator-shared xpcloud.yaml lives in the operator
+// home and must not be edited per-user); refuses to remove the LAST loop (an
+// app with zero workflows is meaningless — delete the app instead).
+func MeLoopDelete(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	loop := c.Param("loop")
+	if !slugRe.MatchString(app) || loop == "" {
+		fail(c, http.StatusBadRequest, 1400, "invalid app or loop")
+		return
+	}
+	appDir := filepath.Join(tenantAppsDir(userID), app)
+	xpPath := filepath.Join(appDir, "xpcloud.yaml")
+	b, err := os.ReadFile(xpPath)
+	if err != nil {
+		fail(c, http.StatusNotFound, 1404,
+			"app not found in your account (operator-shared apps can't be edited)")
+		return
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "parse xpcloud.yaml: "+err.Error())
+		return
+	}
+	rawLoops, _ := doc["loops"].([]any)
+	kept := make([]any, 0, len(rawLoops))
+	found := false
+	for _, l := range rawLoops {
+		lm, _ := l.(map[string]any)
+		name, _ := lm["name"].(string)
+		if name == loop {
+			found = true
+			continue
+		}
+		kept = append(kept, l)
+	}
+	if !found {
+		fail(c, http.StatusNotFound, 1404, "workflow '"+loop+"' not found in "+app)
+		return
+	}
+	if len(kept) == 0 {
+		fail(c, http.StatusBadRequest, 1409,
+			"can't remove the last workflow — delete the app instead")
+		return
+	}
+	doc["loops"] = kept
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "marshal: "+err.Error())
+		return
+	}
+	if err := os.WriteFile(xpPath, out, 0o644); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "write xpcloud.yaml: "+err.Error())
+		return
+	}
+	// Mirror into manifest.json::loops[] if it carries them (legacy shape).
+	if mb, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+		var mj map[string]any
+		if json.Unmarshal(mb, &mj) == nil {
+			if ml, ok := mj["loops"].([]any); ok {
+				keptM := make([]any, 0, len(ml))
+				for _, l := range ml {
+					lm, _ := l.(map[string]any)
+					if n, _ := lm["name"].(string); n == loop {
+						continue
+					}
+					keptM = append(keptM, l)
+				}
+				mj["loops"] = keptM
+				if nb, e := json.MarshalIndent(mj, "", "  "); e == nil {
+					_ = os.WriteFile(filepath.Join(appDir, "manifest.json"), nb, 0o644)
+				}
+			}
+		}
+	}
+	// ARCHIVE the loop's cycle history (don't destroy) so "walk me through
+	// run X" stays answerable after a workflow delete. Move it into
+	// .xp/.trash/<app>/<loop>-<ts>/ (dot-dir → skipped by the apps scan).
+	srcCycles := filepath.Join(appDir, "data", "cycles", loop)
+	if _, err := os.Stat(srcCycles); err == nil {
+		trashDir := filepath.Join(tenantAppsDir(userID), "..", ".trash", app)
+		_ = os.MkdirAll(trashDir, 0o755)
+		dest := filepath.Join(trashDir, fmt.Sprintf("%s-%d", loop, time.Now().Unix()))
+		if err := os.Rename(srcCycles, dest); err != nil {
+			_ = os.RemoveAll(srcCycles) // fallback: still remove from the live tree
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"app": app, "removed_loop": loop, "remaining": len(kept),
+			"note": "scheduler unregisters this workflow within a few minutes",
+		},
+	})
+}
+
+// readAppVersion reads an app's version from manifest.json (preferred) or
+// xpcloud.yaml. Used so EVERY card carries a version badge — loadAppGitStatus
+// only reads the operator home, so tenant apps were version-less without this.
+func readAppVersion(appDir string) string {
+	if b, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+		var m struct {
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(b, &m) == nil && m.Version != "" {
+			return m.Version
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+		var m struct {
+			Version string `yaml:"version"`
+		}
+		if yaml.Unmarshal(b, &m) == nil {
+			return m.Version
+		}
+	}
+	return ""
+}
+
+// showcaseApps returns the set of operator-shared app slugs that should
+// appear on the home grid for every user (the curated demo set). Backend-
+// driven so the list can change WITHOUT a frontend rebuild — the old
+// RUNNING_APPS constant was baked into the JS bundle. Override via the
+// LUMID_SHOWCASE_APPS env var (comma-separated); defaults to the canonical
+// showcase. A user's OWN tenant apps always show regardless of this list.
+func showcaseApps() map[string]bool {
+	raw := os.Getenv("LUMID_SHOWCASE_APPS")
+	if strings.TrimSpace(raw) == "" {
+		raw = "personal-agent,mbb-ai,auto-sysresearch,auto-quant"
+	}
+	out := map[string]bool{}
+	for _, s := range strings.Split(raw, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out[s] = true
+		}
+	}
+	return out
+}
 
 // WorkflowRow is the unified per-workflow record the UI consumes.
 type WorkflowRow struct {
@@ -41,6 +192,8 @@ type WorkflowRow struct {
 	Trigger      string `json:"trigger"`        // human-readable
 	Enabled      bool   `json:"enabled"`
 	Tenant       bool   `json:"tenant"`         // true = tenant-installed; false = operator-shared
+	Showcase     bool   `json:"showcase"`       // operator-shared app on the backend showcase list (curates the home grid without a frontend rebuild)
+	Version      string `json:"version,omitempty"` // app version (manifest.json/xpcloud.yaml) — surfaced so EVERY card shows a version badge, incl. tenant apps loadAppGitStatus can't see
 	LastRunTS    float64 `json:"last_run_ts,omitempty"`
 	LastRunOK    *bool   `json:"last_run_ok,omitempty"`
 	NextRunTS    float64 `json:"next_run_ts,omitempty"`
@@ -150,6 +303,9 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 	// row-build loop below.
 	costMap := fetchCostsByEndpoint(userID)
 
+	showcase := showcaseApps()        // backend-driven home-grid curation
+	seenTenantApps := map[string]bool{} // dedupe: tenant app shadows operator-shared
+
 	scan := func(appsRoot string, isTenant bool) {
 		entries, err := os.ReadDir(appsRoot)
 		if err != nil {
@@ -158,6 +314,15 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 		state := readSchedulerState(operatorHome())
 		for _, e := range entries {
 			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
+			// Dedupe: when the caller's tenant has an app of the same name as
+			// an operator-shared one, the tenant copy wins — skip the operator
+			// dup so the UI doesn't merge both into one card (the auto-quant
+			// collision). Tenant pass runs first and records names.
+			if isTenant {
+				seenTenantApps[e.Name()] = true
+			} else if seenTenantApps[e.Name()] {
 				continue
 			}
 			appDir := filepath.Join(appsRoot, e.Name())
@@ -170,6 +335,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				continue
 			}
 			memAgents := readYamlMemoryAgents(filepath.Join(appDir, "xpcloud.yaml"))
+			appVersion := readAppVersion(appDir)
 			// Tolerant goal read — survives loops whose other fields break the
 			// full rawLoop parse (object-typed datasets/skills_invoked).
 			goalsByLoop := readYamlLoopGoals(filepath.Join(appDir, "xpcloud.yaml"))
@@ -199,6 +365,8 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					Trigger:      L.Schedule,
 					Enabled:      enabled,
 					Tenant:       isTenant,
+					Showcase:     showcase[e.Name()],
+					Version:      appVersion,
 					LastRunTS:    s.LastRunTS,
 					Description:  L.Description,
 					Engine:       engine,

@@ -323,6 +323,8 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/dataset-file",  MeAppDatasetFile)
 			// Goal-metric trajectory across cycles (improvement over iterations).
 			me.GET("/apps/:app/loops/:loop/metric-series", MeLoopMetricSeries)
+			// Hard-remove a single workflow (loop) from one of the caller's apps.
+			me.DELETE("/apps/:app/loops/:loop", MeLoopDelete)
 			// Direct workflow compose (composer wizard — instant, no chat LLM).
 			me.POST("/workflows/compose", MeComposeWorkflow)
 			// Engine-revamp human checkpoint — approve/revamp a cycle's

@@ -344,6 +344,14 @@ func journalRowToRun(app string, r map[string]any) RunRow {
 		return RunRow{}
 	}
 	tsStr := time.Unix(int64(startedUnix), 0).UTC().Format("20060102T150405Z")
+	// Prefer the authoritative cycle-dir name the runtime stamped on the row
+	// (the journal clock and the dir name can differ by seconds, which made
+	// the derived run_id un-resolvable — the "cycle not found" drill failures).
+	// `cycle_dir` is sometimes a bare name ("2026…Z") and sometimes a full
+	// absolute path — take the basename so the run_id carries just the ts.
+	if cd, ok := r["cycle_dir"].(string); ok && cd != "" {
+		tsStr = filepath.Base(cd)
+	}
 	state := "succeeded"
 	if skipped, _ := r["skipped"].(bool); skipped {
 		state = "skipped"

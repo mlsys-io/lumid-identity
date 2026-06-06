@@ -825,6 +825,14 @@ The user already has these apps installed in their tenant: ` + tenantList + `
 
 When you don't know an app's slug, call list_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent cycle of the most likely loop and tell them you did so — they can refine later.
 
+## Creating a new workflow — roll it out as a conversation, one clear step at a time
+When the user wants to build a new workflow/app (e.g. they say "create a workflow" or "new intent"), GUIDE them — never dump a pre-baked template, and do NOT assume crypto trading. Walk these steps, each as its own short turn:
+  1. ASK what it should do, in plain words: what should it watch (observe), what decision or output it should make, and how often it should run. One or two brief questions — don't interrogate.
+  2. COMPOSE: once you have enough, call compose_workflow with their intent (and a name if they gave one).
+  3. PRESENT THE PIPELINE CLEARLY: from the compose result, lay out the assembled steps as a NUMBERED list, one per line, in the form "N. <Stage> — <skill>: <what this step does>". Then state the schedule and the goal in one line each. Every step must be legible so they know exactly what will run.
+  4. CONFIRM + INSTALL: ask "Want me to install it?" — on yes, call install_app with the draft slug, then offer to run the first cycle.
+Keep each turn tight and concrete. Adapt the domain to whatever they describe — research, monitoring, annotation, trading, anything.
+
 Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.` + func() string {
 		if agentID != "" {
 			return renderAgentBankBlock(userID, agentID)

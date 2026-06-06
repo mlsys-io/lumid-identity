@@ -183,6 +183,187 @@ func resolveCycleDir(userSub, app, loop, ts string) (string, string) {
 	return "", ""
 }
 
+// nearestCycleDir resolves the cycle dir CLOSEST in time to `wantTs` for an
+// app/loop, across tenant + operator trees. Drilling into a run must not
+// dead-end just because the caller's ts is approximate — list_runs derives a
+// ts from the journal clock, which for Pattern-B loops (two dirs per fire: a
+// `…Z` wrapper + a `…Z` work dir seconds later) won't byte-match the dir. We
+// pick the dir with the smallest absolute time difference (ties → latest).
+// Returns (absPath, actualTs); "" if the loop has no cycles at all.
+func nearestCycleDir(userSub, app, loop, wantTs string) (string, string) {
+	const layout = "20060102T150405Z"
+	want, werr := time.Parse(layout, wantTs)
+	var bestDir, bestTs string
+	var bestDiff time.Duration = 1<<62 - 1
+	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
+		root := filepath.Join(base, app, "data", "cycles", loop)
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			dir := filepath.Join(root, name)
+			// No parseable want-ts → just take the latest dir overall.
+			if werr != nil {
+				if name > bestTs {
+					bestTs, bestDir = name, dir
+				}
+				continue
+			}
+			got, perr := time.Parse(layout, name)
+			if perr != nil {
+				continue
+			}
+			diff := got.Sub(want)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < bestDiff || (diff == bestDiff && name > bestTs) {
+				bestDiff, bestDir, bestTs = diff, dir, name
+			}
+		}
+	}
+	return bestDir, bestTs
+}
+
+// nearestSummaryDir finds the cycle dir closest in time to `ts` (excluding ts
+// itself) that actually has a cycle.json. Pattern-B loops write a wrapper dir
+// (has cycle.json) + a work dir seconds later (observations/proposal only) — a
+// drill into the WORK dir has no summary, so we pull it from the nearest
+// wrapper. Returns "" if none found.
+func nearestSummaryDir(userSub, app, loop, ts string) string {
+	const layout = "20060102T150405Z"
+	want, werr := time.Parse(layout, ts)
+	best, bestDiff := "", time.Duration(1<<62-1)
+	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
+		root := filepath.Join(base, app, "data", "cycles", loop)
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() || e.Name() == ts {
+				continue
+			}
+			dir := filepath.Join(root, e.Name())
+			if _, err := os.Stat(filepath.Join(dir, "cycle.json")); err != nil {
+				continue // only dirs that carry a summary
+			}
+			if werr != nil {
+				if best == "" {
+					best = dir
+				}
+				continue
+			}
+			got, perr := time.Parse(layout, e.Name())
+			if perr != nil {
+				continue
+			}
+			diff := got.Sub(want)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < bestDiff {
+				bestDiff, best = diff, dir
+			}
+		}
+	}
+	return best
+}
+
+// memoriesLearnedInCycle returns the KG memories a cycle's learn stage wrote,
+// correlated by TIME WINDOW: a memory belongs to cycle <ts> if its created_at
+// falls in [ts, next_cycle_ts) for one of the app's memory_agents. This needs
+// no producer-side changes and works for BOTH Pattern A (app_runner learn) and
+// Pattern B (a verb's own bank writes) — and retroactively for existing banks.
+// It's what turns "what it learned" from empty into the actual synthesized
+// insight (e.g. "avoid with_sample_values (-15pp)"), since learning lands in
+// the agent banks, not the cycle dir.
+func memoriesLearnedInCycle(userSub, app, loop, ts string) []map[string]any {
+	const layout = "20060102T150405Z"
+	start, err := time.Parse(layout, ts)
+	if err != nil {
+		return nil
+	}
+	// Window end = the next cycle dir after ts (across both trees); else +24h.
+	end := start.Add(24 * time.Hour)
+	nextTs := ""
+	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
+		entries, derr := os.ReadDir(filepath.Join(base, app, "data", "cycles", loop))
+		if derr != nil {
+			continue
+		}
+		for _, e := range entries {
+			n := e.Name()
+			if e.IsDir() && n > ts && (nextTs == "" || n < nextTs) {
+				nextTs = n
+			}
+		}
+	}
+	if nextTs != "" {
+		if nt, e := time.Parse(layout, nextTs); e == nil {
+			end = nt
+		}
+	}
+	startU, endU := float64(start.Unix()), float64(end.Unix())
+
+	// Memory agents from xpcloud.yaml (tenant copy first, then operator-shared).
+	var agents []string
+	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
+		if a := readYamlMemoryAgents(filepath.Join(base, app, "xpcloud.yaml")); len(a) > 0 {
+			agents = a
+			break
+		}
+	}
+
+	out := []map[string]any{}
+	seen := map[string]bool{}
+	kgRoots := []string{
+		filepath.Join(tenantRoot(userSub), ".xp", "kg", "agents"),
+		filepath.Join(operatorHome(), ".xp", "kg", "agents"),
+	}
+	for _, ag := range agents {
+		for _, kg := range kgRoots {
+			b, rerr := os.ReadFile(filepath.Join(kg, ag, "bank.jsonl"))
+			if rerr != nil {
+				continue
+			}
+			for _, line := range strings.Split(string(b), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				var m map[string]any
+				if json.Unmarshal([]byte(line), &m) != nil {
+					continue
+				}
+				ca, _ := m["created_at"].(float64)
+				if ca < startU || ca >= endU {
+					continue
+				}
+				id, _ := m["id"].(string)
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+				content, _ := m["content"].(string)
+				if len(content) > 240 {
+					content = content[:240] + "…"
+				}
+				out = append(out, map[string]any{
+					"agent": ag, "id": id, "title": m["title"],
+					"content": content, "created_at": ca,
+				})
+			}
+		}
+	}
+	return out
+}
+
 // appendJSONL appends one JSON-encoded entry as a line. Creates parent
 // dirs as needed. Uses O_APPEND so concurrent writers don't tear.
 func appendJSONL(path string, row map[string]any) error {

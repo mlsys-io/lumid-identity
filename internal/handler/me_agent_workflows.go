@@ -176,23 +176,56 @@ func toolRunDetail(c *gin.Context, userID, runID string) map[string]any {
 		}
 		app, loop, ts := parts[1], parts[2], parts[3]
 		cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
+		resolvedTs := ts
+		approximate := false
 		if cycleDir == "" {
-			return map[string]any{"error": "cycle not found"}
+			// Tolerant drill: the caller's ts is often approximate (list_runs
+			// derives it from the journal clock; Pattern-B loops write a
+			// wrapper + a work dir seconds apart). Resolve to the nearest real
+			// cycle so "walk me through run X" never dead-ends.
+			cycleDir, resolvedTs = nearestCycleDir(userID, app, loop, ts)
+			approximate = cycleDir != "" && resolvedTs != ts
+		}
+		if cycleDir == "" {
+			return map[string]any{"error": "no cycles found for " + app + ":" + loop +
+				" — check the app/loop name (list_workflows shows valid ones)"}
 		}
 		// The per-cycle summary is cycle.json (NOT summary.json). step_errors
 		// is a top-level field of cycle.json for most apps, or a sidecar file
-		// for a few — surface both so the agent can explain failures.
+		// for a few — surface both so the agent can explain failures. For
+		// Pattern-B two-dir cycles the summary may live in a sibling wrapper
+		// dir; fall back to the nearest dir that actually has a cycle.json.
 		summary := readJSONFile(cycleDir + "/cycle.json")
+		if summary == nil {
+			// Pattern-B work dir (no cycle.json) → pull the summary from the
+			// nearest dir that actually has one (the wrapper). nearestCycleDir
+			// would return THIS dir (diff 0, it exists), so use the dedicated
+			// summary-bearing search instead.
+			if wrap := nearestSummaryDir(userID, app, loop, resolvedTs); wrap != "" {
+				if s := readJSONFile(wrap + "/cycle.json"); s != nil {
+					summary = s
+				}
+			}
+		}
 		stepErrs := readJSONFile(cycleDir + "/step_errors.json")
-		return map[string]any{
-			"run_id":      runID,
+		out := map[string]any{
+			"run_id":      "scheduled:" + app + ":" + loop + ":" + resolvedTs,
 			"kind":        "scheduled",
 			"app":         app,
 			"loop":        loop,
-			"ts":          ts,
+			"ts":          resolvedTs,
 			"summary":     summary,
 			"step_errors": stepErrs,
+			// "what it LEARNED" — the memories this cycle's learn stage wrote
+			// (correlated by time window). Learning lands in the agent banks,
+			// not the cycle dir, so without this the agent can only report what
+			// HAPPENED, never what was figured out.
+			"memories_learned": memoriesLearnedInCycle(userID, app, loop, resolvedTs),
 		}
+		if approximate {
+			out["note"] = "requested ts " + ts + " had no exact cycle; resolved to nearest run " + resolvedTs
+		}
+		return out
 	default:
 		return map[string]any{"error": "invalid run id"}
 	}
@@ -312,8 +345,13 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 		forApp = guessForApp(intent)
 	}
 
-	slug := name
-	if slug == "" {
+	// Always slugify — a name the chat agent supplies can carry spaces /
+	// uppercase / punctuation (e.g. "RAG Research Digest"), and a long intent
+	// can blow the 128-char install limit. slugify() lowercases, hyphenates,
+	// and caps length, so the staged draft dir + the slug we hand to install
+	// are always valid. (Install rejects anything non-[a-z0-9._/-] / >128.)
+	slug := slugify(name)
+	if slug == "" || slug == "new-workflow" {
 		slug = slugify(intent)
 	}
 
@@ -383,6 +421,7 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 	if err := os.WriteFile(filepath.Join(draftDir, "manifest.json"), manifestBytes, 0o644); err != nil {
 		return map[string]any{"error": "write manifest: " + err.Error()}
 	}
+	makeDraftWritable(draftDir)
 
 	note := "Drafted as a tenant workflow. Open Studio composer to review + adjust skills + schedule, then Save to install."
 	if noMatch {
@@ -418,12 +457,16 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 		return strings.Join(w, " ")
 	}
 	for _, st := range steps {
-		stepOut = append(stepOut, map[string]any{"id": st.ID, "stage": st.Stage, "skill": st.Skill, "why": st.Why})
+		stepOut = append(stepOut, map[string]any{
+			"id": st.ID, "stage": st.Stage, "skill": st.Skill, "why": st.Why,
+			"query": st.Query, "source": st.Source, "score": st.Score,
+		})
 		if !seen[st.Skill] {
 			seen[st.Skill] = true
 			skills = append(skills, st.Skill)
 			summaries = append(summaries, map[string]any{
 				"name": st.Skill, "display_name": humanize(st.Skill), "summary": st.Why, "why": st.Why,
+				"query": st.Query, "source": st.Source, "score": st.Score,
 			})
 		}
 	}
@@ -438,6 +481,17 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 	manifest := map[string]any{"name": slug, "kind": "app", "version": "0.1.0", "description": intent, "status": "draft", "fork_of": "auto-quant"}
 	mb, _ := json.MarshalIndent(manifest, "", "  ")
 	_ = os.WriteFile(filepath.Join(draftDir, "manifest.json"), mb, 0o644)
+	makeDraftWritable(draftDir)
+
+	// Run the REAL search → match → verify procedure against live xp.io:
+	// resolve each pipeline skill to its repo+path+sha (fork parent first,
+	// then skill_imports — the runtime's own order) and produce a verify
+	// checklist. Best-effort; on any xp.io hiccup the steps keep their
+	// curated source and the trace is simply thinner.
+	traceCtx, traceCancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer traceCancel()
+	trace, enrichedSteps := buildAssemblyTrace(traceCtx, intent, stepOut)
+	stepOut = enrichedSteps
 
 	return map[string]any{
 		"draft_slug":      slug + "-draft",
@@ -448,6 +502,7 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 		"skills_picked":   skills,
 		"skill_summaries": summaries,
 		"steps":           stepOut,
+		"assembly_trace":  trace,
 		"schedule":        "0 */12 * * *",
 		"schedule_human":  "every 12 hours",
 		"mode":            "paper",
@@ -459,6 +514,32 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 		"no_match":   false,
 		"review_url": "/studio/workflows/" + slug + "-draft:" + slug,
 		"note":       "Drafted a paper-mode momentum trading bot — review the pipeline + schedule, then install.",
+	}
+}
+
+// makeDraftWritable makes a composed draft tree writable by the lumid-scheduler.
+// identity runs as root in-container; the scheduler runs as a DIFFERENT uid and
+// must rename `<slug>-draft` → `<slug>` on promote AND rewrite the manifests /
+// copy skills into it. Root-owned 0o775 dirs + 0o644 files lock it out (the
+// promote failed with EACCES on rename). Make the draft dir + files and the
+// tenant app-tree ancestors world-writable — uid-agnostic, same rationale as
+// writeIntent's 0o777 me-intents dir. rename needs write on the PARENT dir, so
+// the ancestors up to (but not including) .tenants are chmod'd too.
+func makeDraftWritable(draftDir string) {
+	_ = os.Chmod(draftDir, 0o777)
+	if entries, err := os.ReadDir(draftDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				_ = os.Chmod(filepath.Join(draftDir, e.Name()), 0o666)
+			}
+		}
+	}
+	// Walk ancestors (.xp/apps, .xp, <tenant-sub>) so the scheduler can create
+	// the promoted dir + rename within them. Stop at the shared .tenants root.
+	d := filepath.Dir(draftDir)
+	for i := 0; i < 4 && d != "/" && d != "." && filepath.Base(d) != ".tenants"; i++ {
+		_ = os.Chmod(d, 0o777)
+		d = filepath.Dir(d)
 	}
 }
 
@@ -686,16 +767,45 @@ func buildDraftXpcloudYaml(slug, intent, forApp string, skills []string) string 
 
 type composeStep struct {
 	ID, Stage, Skill, Why string
+	// Substage drives the runner's auto-wiring of canonical kwargs
+	// (sdk/apps/app_runner.py:_auto_wire_kwargs): `pre-flight` maps the
+	// step's output to `backtest`, `risk-gate` maps it to `risk_decision`.
+	// Without these, journal_trade fails with "missing risk_decision".
+	Substage string
+	// Args is an inline-YAML object string appended as `args: {...}` —
+	// e.g. journal_trade's paper-mode `fill` (there's no live order step,
+	// so the runner can't auto-wire `fill`; supply it explicitly).
+	Args string
+	// Provenance — surfaced by the inline assembly UI so the user watches
+	// the AI actually *search* for each skill and see where it resolves
+	// from. Query = the catalog search phrase; Source = the repo the skill
+	// is published in (real: auto-quant fork + the lumid-lqa import);
+	// Score = match confidence (curated for the deterministic showcase).
+	Query  string
+	Source string
+	Score  float64
 }
 
 func tradingSteps() []composeStep {
 	return []composeStep{
-		{"observe_market", "observe", "observe_market", "Pulls live crypto OHLC + features so it trades on the current market state."},
-		{"observe_holdings", "observe", "fetch_holdings", "Reads your paper portfolio so sizing respects current exposure."},
-		{"propose_setup", "hypothesize", "propose_trade", "The momentum signal — proposes a sized entry with a target and a stop."},
-		{"preflight", "act", "backtest_strategy", "Backtests the proposed setup before risking any capital."},
-		{"risk_gate", "act", "score_proposal", "The risk officer — vets size, drawdown and regime-fit; can veto the trade."},
-		{"journal", "analyze", "journal_trade", "Records the decision + outcome so it learns which setups actually pay."},
+		// observe_crypto_market (NOT observe_market) — observe_market defaults
+		// to the equity Mag7 universe and hits kv.run OHLC (401 / no crypto);
+		// observe_crypto_market tracks BTCUSD/ETHUSD via the QA trading API,
+		// which is what a crypto momentum bot needs.
+		{ID: "observe_market", Stage: "observe", Skill: "observe_crypto_market", Why: "Pulls live BTC/ETH prices + momentum features so it trades on the current market state.",
+			Query: "live crypto price + momentum features", Source: "lumid-lqa", Score: 0.95},
+		{ID: "observe_holdings", Stage: "observe", Skill: "fetch_holdings", Why: "Reads your paper portfolio so sizing respects current exposure.",
+			Query: "current paper portfolio + open positions", Source: "auto-quant", Score: 0.91},
+		{ID: "propose_setup", Stage: "hypothesize", Skill: "propose_trade", Why: "The momentum signal — proposes a sized entry with a target and a stop.",
+			Query: "momentum entry signal with target + stop", Source: "auto-quant", Score: 0.93},
+		{ID: "preflight", Stage: "act", Substage: "pre-flight", Skill: "backtest_strategy", Why: "Backtests the proposed setup before risking any capital.",
+			Query: "backtest a proposed setup before risking capital", Source: "auto-quant", Score: 0.90},
+		{ID: "risk_gate", Stage: "act", Substage: "risk-gate", Skill: "score_proposal", Why: "The risk officer — vets size, drawdown and regime-fit; can veto the trade.",
+			Query: "risk officer: size, drawdown, regime veto", Source: "auto-quant", Score: 0.96},
+		{ID: "journal", Stage: "analyze", Skill: "journal_trade", Args: `{fill: {status: not_filled, mode: paper, note: "paper mode — proposal journaled, no live order placed"}}`, Why: "Records the decision + outcome so it learns which setups actually pay.",
+			Query: "journal the decision + outcome to learn", Source: "auto-quant", Score: 0.89},
+		{ID: "mark_to_market", Stage: "analyze", Skill: "mark_to_market", Why: "Marks paper positions to market and books realized PnL — emits the real alpha-vs-buy-hold + hit-rate curves.",
+			Query: "mark paper positions, realized alpha vs buy-hold", Source: "auto-quant", Score: 0.92},
 	}
 }
 
@@ -756,7 +866,15 @@ func buildTradingXpcloudYaml(slug, intent string) string {
 	}
 	sb.WriteString("    steps:\n")
 	for _, st := range tradingSteps() {
-		fmt.Fprintf(&sb, "      - {id: %s, stage: %s, skill: %s}\n", st.ID, st.Stage, st.Skill)
+		sb.WriteString("      - {id: " + st.ID + ", stage: " + st.Stage)
+		if st.Substage != "" {
+			sb.WriteString(", substage: " + st.Substage)
+		}
+		sb.WriteString(", skill: " + st.Skill)
+		if st.Args != "" {
+			sb.WriteString(", args: " + st.Args)
+		}
+		sb.WriteString("}\n")
 	}
 	return sb.String()
 }

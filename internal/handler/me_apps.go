@@ -150,7 +150,8 @@ func MeAppsList(c *gin.Context) {
 		HasMfst   bool   `json:"has_manifest"`
 		HasXPCld  bool   `json:"has_xpcloud"`
 		HasOverr  bool   `json:"has_user_overrides"`
-		Tenant    bool   `json:"tenant"`  // true = this user's tenant root; false = operator-shared
+		Tenant    bool   `json:"tenant"`         // true = this user's tenant root; false = operator-shared
+		UI        *appUI `json:"ui,omitempty"`   // optional Studio sidebar + surface declaration (xpcloud.yaml::ui)
 	}
 	out := make([]appCard, 0, 16)
 
@@ -167,12 +168,20 @@ func MeAppsList(c *gin.Context) {
 			_, mfstErr := os.Stat(filepath.Join(dir, "manifest.json"))
 			_, xpErr := os.Stat(filepath.Join(dir, "xpcloud.yaml"))
 			_, ovErr := os.Stat(filepath.Join(dir, ".user-overrides.yaml"))
+			// Best-effort parse of the optional ui: block (nil when absent
+			// or unparseable) so the Studio sidebar can render app-declared
+			// entries + surfaces. readAppUI lives in me_app_ui.go.
+			var ui *appUI
+			if xpErr == nil {
+				ui = readAppUI(dir)
+			}
 			out = append(out, appCard{
 				Name:     e.Name(),
 				HasMfst:  mfstErr == nil,
 				HasXPCld: xpErr == nil,
 				HasOverr: ovErr == nil,
 				Tenant:   isTenant,
+				UI:       ui,
 			})
 		}
 	}

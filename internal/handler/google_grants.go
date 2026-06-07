@@ -66,6 +66,18 @@ func GoogleConnectInit(c *gin.Context) {
 	}
 	connectRedirect := connectRedirectURL(cfg.RedirectURI)
 
+	// Optional return_to — where to send the browser after consent. Validate
+	// server-side and pack it into `state` alongside the sub so it survives
+	// the Google round-trip (Google only echoes `state`).
+	var body struct {
+		ReturnTo string `json:"return_to"`
+	}
+	_ = c.ShouldBindJSON(&body) // body is optional
+	rt := ""
+	if isSafeReturnPath(body.ReturnTo) {
+		rt = body.ReturnTo
+	}
+
 	q := url.Values{
 		"client_id":              {cfg.ClientID},
 		"redirect_uri":           {connectRedirect},
@@ -76,7 +88,7 @@ func GoogleConnectInit(c *gin.Context) {
 		"access_type":            {"offline"},
 		"prompt":                 {"consent"},
 		"include_granted_scopes": {"true"},
-		"state":                  {claims.Subject},
+		"state":                  {encodeConnectState(claims.Subject, rt)},
 	}
 
 	ok(c, "connect init", gin.H{
@@ -94,29 +106,41 @@ func GoogleConnectCallback(c *gin.Context) {
 	code := c.Query("code")
 	state := c.Query("state")
 	errParam := c.Query("error")
+	// Decode {sub, return_to} from state up front so every redirect can carry
+	// the (server-validated) return_to back to the launching page.
+	sub, rt := decodeConnectState(state)
+	if !isSafeReturnPath(rt) {
+		rt = ""
+	}
+	redir := func(status, detail string) {
+		u := "/dashboard/account/connect/google?google_status=" + url.QueryEscape(status)
+		if detail != "" {
+			u += "&detail=" + url.QueryEscape(detail)
+		}
+		if rt != "" {
+			u += "&return_to=" + url.QueryEscape(rt)
+		}
+		c.Redirect(http.StatusSeeOther, u)
+	}
+
 	if errParam != "" {
-		c.Redirect(http.StatusSeeOther,
-			"/dashboard/account/connect/google?google_status=denied&detail="+
-				url.QueryEscape(errParam))
+		redir("denied", errParam)
 		return
 	}
 	if code == "" || state == "" {
-		c.Redirect(http.StatusSeeOther,
-			"/dashboard/account/connect/google?google_status=invalid")
+		redir("invalid", "")
 		return
 	}
 
 	var u models.User
-	if err := common.DB.Where("id = ?", state).First(&u).Error; err != nil {
-		c.Redirect(http.StatusSeeOther,
-			"/dashboard/account/connect/google?google_status=unknown_user")
+	if err := common.DB.Where("id = ?", sub).First(&u).Error; err != nil {
+		redir("unknown_user", "")
 		return
 	}
 
 	cfg := config.G.OAuth.Google
 	if cfg.ClientID == "" || cfg.ClientSecret == "" {
-		c.Redirect(http.StatusSeeOther,
-			"/dashboard/account/connect/google?google_status=server_misconfigured")
+		redir("server_misconfigured", "")
 		return
 	}
 	connectRedirect := connectRedirectURL(cfg.RedirectURI)
@@ -124,8 +148,7 @@ func GoogleConnectCallback(c *gin.Context) {
 	tok, err := exchangeGoogleCode(c.Request.Context(), code, connectRedirect,
 		cfg.ClientID, cfg.ClientSecret)
 	if err != nil {
-		c.Redirect(http.StatusSeeOther,
-			"/dashboard/account/connect/google?google_status=exchange_failed")
+		redir("exchange_failed", "")
 		return
 	}
 	if tok.RefreshToken == "" {
@@ -133,15 +156,13 @@ func GoogleConnectCallback(c *gin.Context) {
 		// prompt=consent forces re-issue (which we set above). If we
 		// still get nothing, the user already had a grant and reused
 		// it — in that case keep the existing row.
-		c.Redirect(http.StatusSeeOther,
-			"/dashboard/account/connect/google?google_status=already_connected")
+		redir("already_connected", "")
 		return
 	}
 
 	enc, err := common.EncryptGrant(tok.RefreshToken)
 	if err != nil {
-		c.Redirect(http.StatusSeeOther,
-			"/dashboard/account/connect/google?google_status=encrypt_failed")
+		redir("encrypt_failed", "")
 		return
 	}
 
@@ -155,8 +176,7 @@ func GoogleConnectCallback(c *gin.Context) {
 	}
 	common.DB.Save(&grant)
 
-	c.Redirect(http.StatusSeeOther,
-		"/dashboard/account/connect/google?google_status=connected")
+	redir("connected", "")
 }
 
 // GET /api/v1/identity/google-token — bearer-gated (accepts JWT

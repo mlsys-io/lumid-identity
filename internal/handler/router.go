@@ -212,6 +212,8 @@ func Register(r *gin.Engine) {
 			me.GET("/apps",                   MeAppsList)
 			me.POST("/apps",                  MeAppsInstall)
 			me.DELETE("/apps/:app",           MeAppsUninstall)
+			me.GET("/apps/:app/ui",           MeAppUI)          // app-declared Studio surface (markdown)
+			me.GET("/apps/:app/ui/:surface",  MeAppUISurface)
 			me.GET("/intents/:id",            MeIntentGet)
 
 			// Per-loop control.

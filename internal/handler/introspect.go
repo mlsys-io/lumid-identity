@@ -211,23 +211,11 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 }
 
 // introspectNative — native lm_* token lookup against lumid_identity.tokens.
+// Uses the dual-path lookup (argon2id for new tokens, SHA-256 for legacy).
 // Bumps last_used_at on hit so the dashboard can show stale tokens.
 func introspectNative(token string) *IntrospectResponse {
-	sum := sha256.Sum256([]byte(token))
-	hash := hex.EncodeToString(sum[:])
-
-	var row struct {
-		ID        string
-		UserID    string
-		Prefix    string
-		Scopes    string
-		ExpiresAt *time.Time
-		RevokedAt *time.Time
-	}
-	err := common.DB.Raw(`
-		SELECT id, user_id, prefix, scopes, expires_at, revoked_at
-		FROM tokens WHERE hash = ? LIMIT 1`, hash).Scan(&row).Error
-	if err != nil || row.ID == "" {
+	row, ok := findPATRow(token)
+	if !ok {
 		return &IntrospectResponse{Active: false, Reason: "no such token"}
 	}
 	now := time.Now()

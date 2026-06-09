@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -32,6 +33,8 @@ const (
 	subAgentMaxIterations = 5
 	subAgentTimeout       = 45 * time.Second
 	subAgentMaxTokens     = 4096
+	maxParallelAgents     = 4 // concurrent sub-agents in spawn_agents
+	maxAgentTasks         = 6 // total tasks accepted per spawn_agents call
 )
 
 // subAgentDefaultTools — sane read-only + research subset for a
@@ -165,6 +168,130 @@ func toolSpawnAgent(c *gin.Context, userID string, args map[string]any) (map[str
 	}, true
 }
 
+// toolSpawnAgents — run several sub-agents concurrently and return all
+// replies. Each task mirrors a spawn_agent call (fresh history, read-only +
+// research tools by default, user-role tool dispatch inside runSubAgentLoop).
+// Concurrency is capped at maxParallelAgents; tasks beyond maxAgentTasks are
+// dropped (reported via `dropped`). Sub-agent tool calls don't mutate the
+// gin.Context, so sharing it across goroutines is safe (read-only use).
+func toolSpawnAgents(c *gin.Context, userID string, args map[string]any) (map[string]any, bool) {
+	raw, ok := args["tasks"].([]any)
+	if !ok || len(raw) == 0 {
+		return map[string]any{"error": "tasks[] required (list of task strings or {task, tools, agent_id} objects)"}, false
+	}
+	dropped := 0
+	if len(raw) > maxAgentTasks {
+		dropped = len(raw) - maxAgentTasks
+		raw = raw[:maxAgentTasks]
+	}
+
+	type spec struct {
+		task    string
+		allowed map[string]bool
+		agentID string
+	}
+	specs := []spec{}
+	for _, r := range raw {
+		s := spec{allowed: map[string]bool{}}
+		switch v := r.(type) {
+		case string:
+			s.task = strings.TrimSpace(v)
+		case map[string]any:
+			s.task, _ = v["task"].(string)
+			s.task = strings.TrimSpace(s.task)
+			s.agentID, _ = v["agent_id"].(string)
+			if tl, ok := v["tools"].([]any); ok {
+				for _, x := range tl {
+					if str, ok := x.(string); ok {
+						s.allowed[str] = true
+					}
+				}
+			}
+		}
+		if s.task == "" {
+			continue
+		}
+		if len(s.allowed) == 0 {
+			for k, val := range subAgentDefaultTools {
+				s.allowed[k] = val
+			}
+		}
+		delete(s.allowed, "spawn_agent")
+		delete(s.allowed, "spawn_agents")
+		specs = append(specs, s)
+	}
+	if len(specs) == 0 {
+		return map[string]any{"error": "no valid tasks (each needs a non-empty task)"}, false
+	}
+
+	provider := defaultProvider()
+	apiKey, err := provider.keyFn()
+	if err != nil {
+		return map[string]any{"error": "spawn: " + err.Error()}, false
+	}
+
+	results := make([]map[string]any, len(specs))
+	sem := make(chan struct{}, maxParallelAgents)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	totalIn, totalOut := 0, 0
+
+	for i, sp := range specs {
+		wg.Add(1)
+		go func(i int, sp spec) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			tools := filterTools(buildToolDefs(), sp.allowed)
+			if len(tools) == 0 {
+				results[i] = map[string]any{"task": sp.task, "error": "no tools in filter"}
+				return
+			}
+			sysPrompt := "You are one of several parallel sub-agents dispatched by the parent chat assistant. Handle ONLY your task.\n\n" +
+				"## Your task\n" + sp.task + "\n\n" +
+				"## Rules\n" +
+				"- Stay narrowly on task; don't broaden scope.\n" +
+				"- Use your tools to do the actual work (don't just describe it).\n" +
+				"- Return a concise written answer (1-4 paragraphs or a small table).\n" +
+				"- Don't ask follow-up questions; make reasonable assumptions and note them.\n"
+			if sp.agentID != "" {
+				sysPrompt += renderAgentBankBlock(userID, sp.agentID)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), subAgentTimeout)
+			defer cancel()
+			finalText, toolCalls, inTok, outTok, runErr := runSubAgentLoop(
+				ctx, c, userID, provider, apiKey, sysPrompt, sp.task, tools, subAgentMaxIterations,
+			)
+			mu.Lock()
+			totalIn += inTok
+			totalOut += outTok
+			mu.Unlock()
+			r := map[string]any{"task": sp.task, "reply": finalText, "tool_calls": len(toolCalls)}
+			if runErr != nil {
+				r["error"] = runErr.Error()
+			}
+			results[i] = r
+		}(i, sp)
+	}
+	wg.Wait()
+
+	if totalIn+totalOut > 0 {
+		_ = recordUsage(userID, "sub_agent", "/me/agent/chat/spawn-parallel", provider.upstreamModel, totalIn, totalOut)
+	}
+	out := map[string]any{
+		"agents":        results,
+		"count":         len(results),
+		"input_tokens":  totalIn,
+		"output_tokens": totalOut,
+	}
+	if dropped > 0 {
+		out["dropped"] = dropped
+		out["note"] = fmt.Sprintf("%d task(s) beyond the %d-task limit were dropped", dropped, maxAgentTasks)
+	}
+	return out, true
+}
+
 // runSubAgentLoop — the inner tool-use loop. Mirrors the loop in
 // MeAgentChat but with sub-agent-specific defaults (no thinking, no
 // budget pre-check, capped iterations). Returns final text +
@@ -239,7 +366,7 @@ func runSubAgentLoop(
 			toolName, _ := tu["name"].(string)
 			toolID, _ := tu["id"].(string)
 			args, _ := tu["input"].(map[string]any)
-			result, callOK := dispatchTool(c, userID, toolName, args)
+			result, callOK := dispatchTool(c, userID, "user", toolName, args)
 			toolCalls = append(toolCalls, toolCallResult{
 				Name: toolName, Args: args, Result: result, OK: callOK,
 			})

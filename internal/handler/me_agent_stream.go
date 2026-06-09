@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // MeAgentChatStream is the streaming sibling of MeAgentChat. Same
@@ -64,7 +65,7 @@ func MeAgentChatStream(c *gin.Context) {
 		return
 	}
 
-	budget := dailyTokenBudget()
+	budget := effectiveDailyBudget(provider)
 	if budget > 0 {
 		used := tokensUsedLast24h(userID)
 		if used >= budget {
@@ -104,12 +105,14 @@ func MeAgentChatStream(c *gin.Context) {
 		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
-	basePrompt, tools, _ := resolvePromptAndTools(userID, body)
+	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body)
 	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
 	totalInputTokens := 0
 	totalOutputTokens := 0
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 120*time.Second)
+	// 300s — deep agentic loops (20 iterations) and long claude-code Opus
+	// runs need headroom; SSE keeps the connection alive with deltas.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 300*time.Second)
 	defer cancel()
 
 	// Surface the routing decision immediately. When auto_routed=true,
@@ -121,8 +124,23 @@ func MeAgentChatStream(c *gin.Context) {
 		"auto_routed": autoRouted,
 	})
 
+	// claude-code-* delegates to the local claude CLI via the host proxy.
+	// Claude's own built-in tools (Bash, Read, Write, WebSearch) replace the
+	// me_agent tool list; the system prompt is passed as context only.
+	if isClaudeCodeProvider(provider) {
+		_ = tools // not used for this provider
+		if err := streamClaudeCodeViaProxy(ctx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, emit); err != nil {
+			emit(map[string]any{"type": "error", "message": err.Error()})
+		}
+		emit(map[string]any{"type": "done"})
+		return
+	}
+
 	for i := 0; i < maxToolLoopIterations; i++ {
 		maxTok := maxTokensPerTurn
+		if provider.maxOutputTokens > 0 {
+			maxTok = provider.maxOutputTokens
+		}
 		if body.Think && provider.addAnthropicVersion {
 			maxTok = thinkingMaxTokens
 		}
@@ -160,7 +178,35 @@ func MeAgentChatStream(c *gin.Context) {
 		// Execute tools + emit + append tool_result blocks.
 		toolResultBlocks := []map[string]any{}
 		for _, tu := range toolUses {
-			result, callOK := dispatchTool(c, userID, tu.name, tu.input)
+			// For destructive tools: pause and wait for user approval (30s).
+			if destructiveTools[tu.name] {
+				approvalID := uuid.New().String()
+				ch := requestApproval(approvalID)
+				emit(map[string]any{
+					"type":        "tool_approval_required",
+					"id":          tu.id,
+					"approval_id": approvalID,
+					"name":        tu.name,
+					"args":        tu.input,
+				})
+				approved := false
+				select {
+				case approved = <-ch:
+				case <-time.After(30 * time.Second):
+					toolApprovals.Delete(approvalID)
+				}
+				if !approved {
+					result := map[string]any{"error": "user denied permission for " + tu.name}
+					emit(map[string]any{"type": "tool_call", "name": tu.name, "args": tu.input, "result": result, "ok": false})
+					payload, _ := json.Marshal(result)
+					toolResultBlocks = append(toolResultBlocks, map[string]any{
+						"type": "tool_result", "tool_use_id": tu.id,
+						"content": string(payload), "is_error": true,
+					})
+					continue
+				}
+			}
+			result, callOK := dispatchTool(c, userID, role, tu.name, tu.input)
 			emit(map[string]any{
 				"type":   "tool_call",
 				"name":   tu.name,

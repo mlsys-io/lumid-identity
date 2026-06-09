@@ -23,6 +23,7 @@ var AllTables = []interface{}{
 	&PowerAutomateToken{},
 	&MicrosoftGrant{},
 	&MicrosoftGrantPending{},
+	&GpuRental{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

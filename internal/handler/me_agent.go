@@ -35,8 +35,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -49,9 +52,499 @@ const (
 	anthropicEndpoint    = "https://api.anthropic.com/v1/messages"
 	anthropicVersion     = "2023-06-01"
 	anthropicModel       = "claude-haiku-4-5-20251001"
-	maxToolLoopIterations = 6 // safety bound — agent shouldn't need >6 tool calls per turn
-	maxTokensPerTurn     = 4096
+	maxToolLoopIterations = 20 // Claude Code parity — deep agentic loops need 20+ steps
+	maxTokensPerTurn     = 4096 // default per-turn output cap; providers may override via maxOutputTokens (kv.run GPU models use 16384)
 )
+
+// ── Tool approval registry ──────────────────────────────────────────────────
+// Before dispatching destructive tools, we pause and wait for the user to
+// approve or deny via POST /api/v1/me/agent/chat/tool-approve.
+
+var (
+	toolApprovals    sync.Map            // approval_id → chan bool
+	sandboxSemaphore = make(chan struct{}, 6) // global cap: 6 concurrent bash sandboxes
+	userSandboxMu    sync.Map            // userID → chan struct{} (per-user cap: 1)
+	userExecRateMu   sync.Mutex
+	userExecCounts   = map[string][]int64{} // userID → slice of Unix timestamps (last 60s)
+)
+
+// destructiveTools is the set of tool names that require user approval before
+// execution. Includes both built-in mutating tools and LumidOS ops that push
+// or run live state.
+var destructiveTools = map[string]bool{
+	"bash_exec":      true,
+	"write_file":     true,
+	"edit_file":      true,
+	"multi_edit":     true,
+	"app_push":       true,
+	"app_install":    true,
+	"run_loop":       true,
+	"submit_workflow": true,
+	"xp_ingest":      true,
+}
+
+// lumidosToolNames is the set of tool names dispatched to the LumidOS schedule
+// server bridge (POST /api/v1/tools/invoke at LUMIDOS_URL).
+var lumidosToolNames = map[string]bool{
+	// Apps
+	"app_marketplace": true, "app_detail": true, "app_new": true, "app_templates": true,
+	"app_install": true, "app_clone": true, "app_update": true, "app_validate": true,
+	"app_list": true, "app_run": true, "app_publish": true, "app_push": true,
+	"app_unpublish": true, "app_add_skill": true, "skill_search": true, "loop_metrics": true,
+	// Knowledge
+	"xp_status": true, "xp_ask": true, "xp_agents": true, "xp_memories": true,
+	"xp_ingest": true, "xp_feedback": true, "xp_new_agent": true, "xp_share": true,
+	"xp_pull": true, "xp_clone": true, "xp_subscribe": true, "xp_remotes": true,
+	"xp_publish": true, "xp_unpublish": true, "xp_marketplace": true,
+	"xp_signals": true, "xp_subscriptions": true, "xp_learn": true,
+	// Research
+	"list_loops": true, "loop_status": true, "run_loop": true,
+	"create_loop": true, "loop_history": true, "squeeze": true,
+	"research_publish_workflow": true, "research_workflows": true,
+	"research_clone_workflow": true, "research_unpublish_workflow": true,
+	// Platform
+	"submit_workflow": true, "list_workers": true, "optimize_workflow": true,
+}
+
+// lumidosURL returns the base URL of the LumidOS schedule server.
+func lumidosURL() string {
+	if u := os.Getenv("LUMIDOS_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return "http://localhost:9100"
+}
+
+// dispatchLumidosTool POSTs to the schedule server's tool bridge and returns
+// the result map. The schedule server runs the actual Python ops function.
+func dispatchLumidosTool(name string, args map[string]any) (map[string]any, bool) {
+	payload, _ := json.Marshal(map[string]any{"tool": name, "args": args})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		lumidosURL()+"/api/v1/tools/invoke", bytes.NewReader(payload))
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return map[string]any{"error": "lumidos unreachable: " + err.Error()}, false
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return map[string]any{"error": "bad response from lumidos"}, false
+	}
+	ok, _ := out["ok"].(bool)
+	return out, ok
+}
+
+// ── Per-user workspace root (path jail) ─────────────────────────────────────
+
+// codebaseRoot() lives in admin_codebase_repos.go — the /proj tree as exposed
+// inside the container (LUMID_CODEBASE_ROOT, /var/lib/lumid-codebase, or /proj).
+
+// ownWorkspace is the caller's personal tenant workspace —
+// /home/<operator>/.tenants/<userID>/ — holding .xp/apps, .xp/kg, .chats,
+// etc. EVERY user (gemma4 or any model) has full read+write here; this is
+// the single, consistent meaning of "your own workspace".
+func ownWorkspace(userID string) string {
+	return tenantRoot(userID)
+}
+
+// readRoot is where file READS are jailed. admin + super_admin can read the
+// whole deployment codebase (/proj) — admin read-only (see writeRoot);
+// everyone else is confined to their own tenant workspace. (admin+ also get
+// an appBundlePath fallback in toolReadFile to read their own app bundles.)
+func readRoot(userID, role string) string {
+	switch role {
+	case "super_admin", "admin":
+		return codebaseRoot()
+	default:
+		return ownWorkspace(userID)
+	}
+}
+
+// writeRoot is where WRITES and bash exec are jailed. Only super_admin may
+// mutate the deployment codebase (/proj). EVERYONE ELSE — admin included —
+// is confined to their OWN tenant workspace and can NEVER touch /proj: that
+// is the "admin = read-only on the deployment workspace" guarantee. (Admins
+// no longer write into the operator-shared ~/.xp/apps; their writes land in
+// their own tenant dir, same as any other user.)
+func writeRoot(userID, role string) string {
+	switch role {
+	case "super_admin":
+		return codebaseRoot()
+	default:
+		return ownWorkspace(userID)
+	}
+}
+
+// appBundlePath resolves a path that names an installed APP bundle (rather
+// than a codebase path) for admin+ callers, so the chatbox agent can read an
+// app's files by name when asked to debug it. Searches the operator-shared
+// apps dir and the caller's own tenant apps dir — never another tenant's, so
+// the workspace-isolation guarantee holds. Returns "" when not applicable.
+func appBundlePath(userID, role, rawPath string) string {
+	if role != "admin" && role != "super_admin" {
+		return ""
+	}
+	roots := []string{
+		filepath.Join(operatorHome(), ".xp", "apps"),
+		tenantAppsDir(userID),
+	}
+	for _, root := range roots {
+		if abs, err := jailPath(root, rawPath); err == nil {
+			if _, statErr := os.Stat(abs); statErr == nil {
+				return abs
+			}
+		}
+	}
+	return ""
+}
+
+// jailPath resolves rawPath relative to the given root and ensures it cannot
+// escape via symlinks or ".." traversal. Callers pick the root (readRoot for
+// reads, writeRoot for writes/exec) so a read-only role can't write where it
+// can read.
+func jailPath(root, rawPath string) (string, error) {
+	abs := filepath.Join(root, rawPath)
+	abs = filepath.Clean(abs)
+	// HasPrefix check needs a trailing separator so "/projfoo" doesn't pass as a
+	// subpath of "/proj".
+	if abs != root && !strings.HasPrefix(abs, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes workspace")
+	}
+	return abs, nil
+}
+
+// ── File tools ───────────────────────────────────────────────────────────────
+
+func toolReadFile(userID, role, rawPath string) (map[string]any, bool) {
+	abs, err := jailPath(readRoot(userID, role), rawPath)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		// Fallback: the path may name an INSTALLED APP bundle (which lives
+		// under ~/.xp/apps or the caller's tenant, not the /proj codebase).
+		// Lets the chatbox agent read an app's xpcloud.yaml / ui / commands
+		// by name (e.g. "lumid-gpu-rentals/xpcloud.yaml") when asked about it.
+		if alt := appBundlePath(userID, role, rawPath); alt != "" {
+			if ai, aerr := os.Stat(alt); aerr == nil {
+				abs, info, err = alt, ai, nil
+			}
+		}
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+	}
+	// When a directory is passed, return a listing instead of failing.
+	if info.IsDir() {
+		entries, err := os.ReadDir(abs)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		lines := make([]string, 0, len(entries))
+		var sampleChild string
+		for _, e := range entries {
+			if e.IsDir() {
+				lines = append(lines, e.Name()+"/")
+			} else {
+				lines = append(lines, e.Name())
+				if sampleChild == "" {
+					sampleChild = e.Name()
+				}
+			}
+		}
+		// Suggest a real child file from this listing rather than a fixed
+		// example, so the hint stays valid at any depth.
+		hint := "This is a directory. Call read_file again with a specific file path inside it."
+		if sampleChild != "" {
+			hint = "This is a directory. Call read_file again with a specific file, e.g. '" +
+				filepath.ToSlash(filepath.Join(rawPath, sampleChild)) + "'."
+		}
+		return map[string]any{
+			"path":    abs,
+			"is_dir":  true,
+			"entries": lines,
+			"hint":    hint,
+		}, true
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	// 200 KB (~50K tokens) — the smallest model context in the registry is
+	// minimax at 196K, so a single large read no longer needs the old 50 KB
+	// cap that was tuned for tighter budgets.
+	const maxBytes = 200 * 1024
+	truncated := false
+	if len(data) > maxBytes {
+		data = data[:maxBytes]
+		truncated = true
+	}
+	return map[string]any{
+		"content":   string(data),
+		"path":      abs,
+		"truncated": truncated,
+		"size":      len(data),
+	}, true
+}
+
+func toolWriteFile(userID, role, rawPath, content string) (map[string]any, bool) {
+	root := writeRoot(userID, role)
+	abs, err := jailPath(root, rawPath)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	// Disk quota: 500 MB per user workspace
+	if err := checkDiskQuota(root, int64(len(content))); err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	return map[string]any{"ok": true, "path": abs, "bytes": len(content)}, true
+}
+
+func toolEditFile(userID, role, rawPath, oldStr, newStr string, replaceAll bool) (map[string]any, bool) {
+	abs, err := jailPath(writeRoot(userID, role), rawPath)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	original := string(data)
+	if !strings.Contains(original, oldStr) {
+		return map[string]any{"error": "old_string not found in file"}, false
+	}
+	n := 1
+	updated := strings.Replace(original, oldStr, newStr, 1)
+	if replaceAll {
+		n = strings.Count(original, oldStr)
+		updated = strings.ReplaceAll(original, oldStr, newStr)
+	}
+	if err := os.WriteFile(abs, []byte(updated), 0o644); err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	return map[string]any{"ok": true, "path": abs, "replacements": n}, true
+}
+
+// checkDiskQuota estimates usage in root and rejects if adding extraBytes would
+// exceed 500 MB. Uses a fast du approximation.
+func checkDiskQuota(root string, extraBytes int64) error {
+	const limitBytes = 500 * 1024 * 1024
+	// Best-effort: walk the directory tree
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d os.DirEntry, _ error) error {
+		if d != nil && !d.IsDir() {
+			if info, err := d.Info(); err == nil {
+				total += info.Size()
+			}
+		}
+		return nil
+	})
+	if total+extraBytes > limitBytes {
+		return fmt.Errorf("disk quota exceeded (%.1f MB used of 500 MB)", float64(total)/(1024*1024))
+	}
+	return nil
+}
+
+// ── Bash sandbox ─────────────────────────────────────────────────────────────
+
+// bashBlockedPhrases are literal substrings we reject before running any command.
+var bashBlockedPhrases = []string{
+	":(){ :|:", // fork bomb (catches : (){ :|:& };: and variants)
+	"rm -rf /", // destructive rm (catches rm -rf /*)
+	"mkfs",
+	"dd if=/dev/zero",
+	"shutdown",
+	"reboot",
+}
+
+func toolBashExec(userID, role, command string, timeoutSec int) (map[string]any, bool) {
+	if timeoutSec <= 0 || timeoutSec > 120 {
+		timeoutSec = 30
+	}
+	for _, phrase := range bashBlockedPhrases {
+		if strings.Contains(command, phrase) {
+			return map[string]any{"error": "command blocked by safety policy"}, false
+		}
+	}
+
+	// Rate limit: 6 executions per user per minute
+	if !checkExecRateLimit(userID) {
+		return map[string]any{"error": "execution rate limit: max 6 per minute"}, false
+	}
+
+	// Per-user concurrency: max 1 concurrent sandbox
+	userSlot := make(chan struct{}, 1)
+	actual, _ := userSandboxMu.LoadOrStore(userID, userSlot)
+	slot := actual.(chan struct{})
+	select {
+	case slot <- struct{}{}:
+		defer func() { <-slot }()
+	default:
+		return map[string]any{"error": "a sandbox is already running for your session"}, false
+	}
+
+	// Global concurrency cap
+	select {
+	case sandboxSemaphore <- struct{}{}:
+		defer func() { <-sandboxSemaphore }()
+	default:
+		return map[string]any{"error": "sandbox slots full, try again shortly"}, false
+	}
+
+	cwd := writeRoot(userID, role)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	if role != "super_admin" {
+		// Non-operator: this container has no docker/sandbox runtime (uid
+		// 1000, userns disabled), so delegate to the host-side sandbox
+		// broker, which runs the command in a Docker sandbox confined to the
+		// caller's own tenant workspace — network-none, read-only rootfs,
+		// only `cwd` mounted at /work. See claude-proxy.py /sandbox/bash.
+		return bashViaSandboxBroker(ctx, cwd, command, timeoutSec)
+	}
+
+	// super_admin (operator): run in this container's process space against
+	// the codebase tree. Alpine ships /bin/sh, not bash — prefer bash when
+	// present, fall back to sh.
+	shell := "bash"
+	if _, err := exec.LookPath("bash"); err != nil {
+		shell = "sh"
+	}
+	cmd := exec.CommandContext(ctx, shell, "-c", command)
+	cmd.Dir = cwd
+
+	out, err := cmd.CombinedOutput()
+	if len(out) > 100*1024 {
+		out = out[:100*1024]
+	}
+	if err != nil {
+		exitCode := -1
+		if ctx.Err() == context.DeadlineExceeded {
+			return map[string]any{"error": "timed out", "output": string(out)}, false
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+			if exitCode == 137 {
+				return map[string]any{"error": "sandbox killed (out of memory)", "output": string(out)}, false
+			}
+		}
+		return map[string]any{"error": err.Error(), "exit_code": exitCode, "output": string(out)}, false
+	}
+	return map[string]any{"output": string(out), "exit_code": 0}, true
+}
+
+// bashViaSandboxBroker runs a non-super bash command on the host-side sandbox
+// broker (claude-proxy.py /sandbox/bash). The broker confines execution to
+// `workspace` (the caller's own tenant dir) in a network-none, read-only
+// Docker sandbox. Returns the same {output, exit_code} shape as the
+// in-container operator path.
+func bashViaSandboxBroker(ctx context.Context, workspace, command string, timeoutSec int) (map[string]any, bool) {
+	payload, _ := json.Marshal(map[string]any{
+		"workspace": workspace,
+		"command":   command,
+		"timeout":   timeoutSec,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		claudeProxyURL()+"/sandbox/bash", bytes.NewReader(payload))
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: time.Duration(timeoutSec+10) * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return map[string]any{"error": "sandbox broker unreachable: " + err.Error()}, false
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return map[string]any{"error": "sandbox broker bad response: " + err.Error()}, false
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := out["error"].(string)
+		if msg == "" {
+			msg = fmt.Sprintf("broker HTTP %d", resp.StatusCode)
+		}
+		return map[string]any{"error": "sandbox: " + msg}, false
+	}
+	if e, _ := out["error"].(string); e != "" {
+		return out, false
+	}
+	ec, _ := out["exit_code"].(float64)
+	return out, ec == 0
+}
+
+func checkExecRateLimit(userID string) bool {
+	userExecRateMu.Lock()
+	defer userExecRateMu.Unlock()
+	now := time.Now().Unix()
+	ts := userExecCounts[userID]
+	// Keep only entries within the last 60 seconds
+	filtered := ts[:0]
+	for _, t := range ts {
+		if now-t < 60 {
+			filtered = append(filtered, t)
+		}
+	}
+	if len(filtered) >= 6 {
+		userExecCounts[userID] = filtered
+		return false
+	}
+	userExecCounts[userID] = append(filtered, now)
+	return true
+}
+
+// ── Approval gate ─────────────────────────────────────────────────────────────
+// For destructive tools: emit tool_approval_required SSE, then block until
+// the user approves or 30 s pass. The approval is delivered via a separate
+// HTTP endpoint (MeAgentToolApprove).
+
+// requestApproval registers a pending approval and returns the channel.
+// The caller must call emit before reading from the channel.
+func requestApproval(approvalID string) chan bool {
+	ch := make(chan bool, 1)
+	toolApprovals.Store(approvalID, ch)
+	return ch
+}
+
+// MeAgentToolApprove — POST /api/v1/me/agent/chat/tool-approve
+// Body: {"approval_id": "...", "approved": true}
+// Unblocks the pending tool dispatch in the SSE stream.
+func MeAgentToolApprove(c *gin.Context) {
+	if _, ok := currentUserID(c); !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	var body struct {
+		ApprovalID string `json:"approval_id"`
+		Approved   bool   `json:"approved"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.ApprovalID == "" {
+		fail(c, http.StatusBadRequest, 1400, "approval_id required")
+		return
+	}
+	ch, ok := toolApprovals.Load(body.ApprovalID)
+	if !ok {
+		fail(c, http.StatusNotFound, 1404, "approval not found (may have timed out)")
+		return
+	}
+	toolApprovals.Delete(body.ApprovalID)
+	ch.(chan bool) <- body.Approved
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
 
 // llmProvider describes an upstream LLM endpoint that speaks
 // Anthropic's /v1/messages wire format (including streaming SSE
@@ -75,6 +568,18 @@ type llmProvider struct {
 	// "" / "user" = everyone; "admin"; "super_admin". Policy: gemma4 for
 	// all, minimax for admin+, claude (Anthropic) for super_admin only.
 	minRole string
+	// maxOutputTokens — per-turn output cap (the `max_tokens` field). 0 →
+	// the global maxTokensPerTurn default. The in-cluster GPU models have
+	// huge context (gemma4 262K, minimax 196K — verified via
+	// GET kv.run:5000/v1/models) and no per-call charge, so they get a far
+	// larger budget than the cost-bounded Anthropic default. A too-small cap
+	// is the main cause of truncated structured output (JSON/YAML cut mid-doc).
+	maxOutputTokens int
+	// dailyBudgetTokens — per-user 24h cap for THIS provider, in input+output
+	// tokens. 0 → the global dailyTokenBudget() default; <0 → no cap. Local
+	// GPU models are free at the margin, so they carry a generous backstop
+	// rather than the tight Anthropic-cost default.
+	dailyBudgetTokens int
 }
 
 // First entry is the default (defaultProvider() returns llmProviders[0]).
@@ -95,6 +600,8 @@ var llmProviders = []llmProvider{
 		addAnthropicVersion: false,
 		supportsVision:      true, // multimodal; image blocks verified via kv.run
 		minRole:             "user", // everyone
+		maxOutputTokens:     16384, // 262K ctx, free local GPU — let answers/structured output run
+		dailyBudgetTokens:   2_000_000, // generous backstop; local GPU has no per-call cost
 	},
 	{
 		// kv.run:5000 in-cluster inference gateway. Speaks Anthropic
@@ -110,19 +617,40 @@ var llmProviders = []llmProvider{
 		addAnthropicVersion: false,
 		supportsVision:      false, // MiniMax is text-only
 		minRole:             "admin", // admin + super_admin
+		maxOutputTokens:     16384, // 196K ctx, free local GPU
+		dailyBudgetTokens:   2_000_000,
 	},
 	{
-		id:                  "claude-haiku",
-		displayName:         "Claude Haiku 4.5",
-		endpoint:            anthropicEndpoint,
-		upstreamModel:       anthropicModel,
-		authHeader:          "x-api-key",
-		authPrefix:          "",
-		keyFn:               anthropicKey,
-		addAnthropicVersion: true,
-		supportsVision:      true,
-		minRole:             "super_admin", // super_admin only (Claude Code / all models)
+		// claude-code-sonnet — operator's Claude Code subscription via the
+		// host proxy, Sonnet tier. Available to admin+ (cheaper/faster than
+		// Opus; admins get a frontier model without the super_admin gate).
+		id:             "claude-code-sonnet",
+		displayName:    "Claude Sonnet 4.6 (Code)",
+		endpoint:       "", // no HTTP endpoint — subprocess via proxy
+		upstreamModel:  "sonnet", // claude CLI --model alias
+		authHeader:     "",
+		authPrefix:     "",
+		keyFn:          claudeCodeKeyFn,
+		supportsVision: false,
+		minRole:        "admin",
 	},
+	{
+		// claude-code-opus — uses the operator's Claude Code subscription
+		// via a host-side proxy (claude-proxy.py on 172.17.0.1:9201).
+		// No ANTHROPIC_API_KEY needed; auth from ~/.claude/ credentials.
+		id:             "claude-code-opus",
+		displayName:    "Claude Opus 4.8 (Code)",
+		endpoint:       "", // no HTTP endpoint — subprocess via proxy
+		upstreamModel:  "opus", // claude CLI --model alias
+		authHeader:     "",
+		authPrefix:     "",
+		keyFn:          claudeCodeKeyFn,
+		supportsVision: false,
+		minRole:        "super_admin",
+	},
+	// claude-opus and claude-haiku (direct Anthropic API) are registered only
+	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.
+	// claude-code-opus covers Opus via the operator's subscription instead.
 }
 
 // roleRank ranks the role hierarchy for provider gating.
@@ -160,10 +688,17 @@ func currentUserRole(c *gin.Context) string {
 	return "user"
 }
 
-// defaultProviderFor returns the highest-listed provider the role may use.
-// gemma4 is first and allowed to everyone, so this is gemma4 for all roles
-// unless the registry changes.
+// defaultProviderFor returns the preferred provider for the caller's role.
+// super_admin defaults to claude-opus (full Anthropic access); everyone
+// else gets gemma4 (in-cluster GPU, no per-call cost).
 func defaultProviderFor(role string) llmProvider {
+	if role == "super_admin" {
+		for _, p := range llmProviders {
+			if p.id == "claude-code-opus" {
+				return p
+			}
+		}
+	}
 	for _, p := range llmProviders {
 		if providerAllowed(role, p) {
 			return p
@@ -179,6 +714,12 @@ func defaultProvider() llmProvider { return llmProviders[0] }
 // no keys, no endpoints. Reflects the llmProviders registry; new
 // entries auto-surface in the UI dropdown without frontend changes.
 func MeAgentModels(c *gin.Context) {
+	// Require auth — the model catalog is role-dependent and shouldn't be
+	// served to anonymous callers (it previously returned 200 to no token).
+	if _, ok := currentUserID(c); !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
 	type item struct {
 		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
@@ -478,7 +1019,7 @@ func MeAgentChat(c *gin.Context) {
 	// Daily token budget — server-funded LLM. Default 50K total
 	// tokens/24h/user. Override via ANTHROPIC_DAILY_TOKEN_BUDGET env;
 	// 0 disables the cap entirely (for operator/super_admin use).
-	budget := dailyTokenBudget()
+	budget := effectiveDailyBudget(provider)
 	if budget > 0 {
 		used := tokensUsedLast24h(userID)
 		if used >= budget {
@@ -499,19 +1040,98 @@ func MeAgentChat(c *gin.Context) {
 		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
-	basePrompt, tools, _ := resolvePromptAndTools(userID, body)
+	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body)
 	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
 	toolCalls := []toolCallResult{}
 	totalInputTokens := 0
 	totalOutputTokens := 0
 	finalText := ""
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	// claude-code-* has no HTTP endpoint — it runs the local claude CLI
+	// via the host proxy, which only speaks the streaming NDJSON protocol.
+	// Reuse that path with a collecting emit callback so the non-streaming
+	// endpoint returns the same {reply, tool_calls, ...} shape. (Without
+	// this, callLLM would POST to an empty URL → "unsupported protocol
+	// scheme".)
+	if isClaudeCodeProvider(provider) {
+		ccCtx, ccCancel := context.WithCancel(c.Request.Context())
+		defer ccCancel()
+		var sb strings.Builder
+		argsByID := map[string]map[string]any{}
+		var streamErr string
+		emit := func(ev map[string]any) bool {
+			switch ev["type"] {
+			case "text":
+				if d, ok := ev["delta"].(string); ok {
+					sb.WriteString(d)
+				}
+			case "tool_start":
+				id, _ := ev["id"].(string)
+				if a, ok := ev["args"].(map[string]any); ok {
+					argsByID[id] = a
+				}
+			case "tool_call":
+				id, _ := ev["id"].(string)
+				name, _ := ev["name"].(string)
+				okv, _ := ev["ok"].(bool)
+				// Claude Code tool results arrive as string or list content,
+				// not the map[string]any our struct expects — wrap uniformly.
+				res, isMap := ev["result"].(map[string]any)
+				if !isMap {
+					res = map[string]any{"content": ev["result"]}
+				}
+				toolCalls = append(toolCalls, toolCallResult{
+					Name:   name,
+					Args:   argsByID[id],
+					Result: res,
+					OK:     okv,
+				})
+			case "error":
+				if m, ok := ev["message"].(string); ok {
+					streamErr = m
+				}
+			}
+			return true
+		}
+		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, emit); err != nil {
+			fail(c, http.StatusBadGateway, 1502, "llm call: "+err.Error())
+			return
+		}
+		finalText = sb.String()
+		if streamErr != "" && finalText == "" {
+			fail(c, http.StatusBadGateway, 1502, "llm call: "+streamErr)
+			return
+		}
+		if finalText == "" && len(toolCalls) > 0 {
+			finalText = "Done."
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"reply":       finalText,
+				"tool_calls":  toolCalls,
+				"model_used":  provider.id,
+				"auto_routed": autoRouted,
+				"usage": gin.H{
+					"input_tokens":  0,
+					"output_tokens": 0,
+					"budget_used":   tokensUsedLast24h(userID),
+					"budget_limit":  dailyTokenBudget(),
+				},
+			},
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 180*time.Second)
 	defer cancel()
 
 	// Tool-use loop.
 	for i := 0; i < maxToolLoopIterations; i++ {
 		maxTok := maxTokensPerTurn
+		if provider.maxOutputTokens > 0 {
+			maxTok = provider.maxOutputTokens
+		}
 		if body.Think && provider.addAnthropicVersion {
 			maxTok = thinkingMaxTokens
 		}
@@ -580,7 +1200,7 @@ func MeAgentChat(c *gin.Context) {
 			toolID, _ := tu["id"].(string)
 			args, _ := tu["input"].(map[string]any)
 
-			result, callOK := dispatchTool(c, userID, toolName, args)
+			result, callOK := dispatchTool(c, userID, role, toolName, args)
 			toolCalls = append(toolCalls, toolCallResult{
 				Name:   toolName,
 				Args:   args,
@@ -629,6 +1249,17 @@ func MeAgentChat(c *gin.Context) {
 			},
 		},
 	})
+}
+
+// effectiveDailyBudget returns the per-user 24h token cap for a given
+// provider: the provider's own override when set (>0), no cap when <0,
+// else the global default. Lets the free in-cluster GPU models carry a
+// generous backstop while paid Anthropic stays on the tight default.
+func effectiveDailyBudget(p llmProvider) int {
+	if p.dailyBudgetTokens != 0 {
+		return p.dailyBudgetTokens
+	}
+	return dailyTokenBudget()
 }
 
 // dailyTokenBudget returns the per-user 24h cap on chat tokens, in
@@ -769,8 +1400,8 @@ func min(a, b int) int {
 // Returns (systemPrompt, tools, preferredModel). preferredModel is
 // honored only when the request didn't set Model explicitly (handler-
 // level concern, not done here).
-func resolvePromptAndTools(userID string, body meAgentChatBody) (string, []map[string]any, string) {
-	tools := buildToolDefs()
+func resolvePromptAndTools(userID, role string, body meAgentChatBody) (string, []map[string]any, string) {
+	tools := buildToolDefsForRole(role)
 	if body.PersonaID != "" {
 		p, _ := loadPersona(userID, body.PersonaID)
 		if p != nil {
@@ -785,7 +1416,18 @@ func resolvePromptAndTools(userID string, body meAgentChatBody) (string, []map[s
 		}
 		// Fall through if persona id is invalid — chat still works.
 	}
-	return buildSystemPrompt(userID, body.AgentID), tools, ""
+	return buildSystemPrompt(userID, role, body.AgentID), tools, ""
+}
+
+// buildToolDefsForRole returns the tool list a caller may use. EVERY role
+// now gets the full catalog — including write_file, edit_file, multi_edit,
+// and bash_exec — because access is scoped structurally by the jail
+// (writeRoot confines writes to the caller's own tenant workspace; bash runs
+// non-super in a network-free Docker sandbox over that same workspace), not
+// by hiding tools per role. "Highest capabilities for all users", with
+// isolation preserved by the sandbox rather than by capability removal.
+func buildToolDefsForRole(role string) []map[string]any {
+	return buildToolDefs()
 }
 
 // buildSystemPrompt assembles the assistant's persona + a snapshot
@@ -793,7 +1435,7 @@ func resolvePromptAndTools(userID string, body meAgentChatBody) (string, []map[s
 // memory block swaps from the user's me-prefs to that agent's bank
 // (see renderAgentBankBlock); empty agentID falls through to the
 // default me-prefs path.
-func buildSystemPrompt(userID, agentID string) string {
+func buildSystemPrompt(userID, role, agentID string) string {
 	apps := []string{}
 	// Caller's tenant first.
 	if entries, err := os.ReadDir(tenantAppsDir(userID)); err == nil {
@@ -834,10 +1476,42 @@ When the user wants to build a new workflow/app (e.g. they say "create a workflo
 Keep each turn tight and concrete. Adapt the domain to whatever they describe — research, monitoring, annotation, trading, anything.
 
 Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.` + func() string {
-		if agentID != "" {
-			return renderAgentBankBlock(userID, agentID)
+		extra := ""
+		if role == "super_admin" || role == "admin" {
+			access := "You can READ any file under /proj/ with read_file. "
+			if role == "super_admin" {
+				access += "You may also write/edit files and run shell commands against /proj/."
+			} else {
+				access += "Access to /proj/ is READ-ONLY — write_file, edit_file, and bash_exec do NOT reach /proj/ for your role (they're confined to your own tenant workspace), so don't attempt to modify the deployment codebase. You CAN freely write within your own workspace."
+			}
+			extra = `
+
+## Codebase access
+` + access + `
+Key services and their locations:
+  lumid_identity  → lumid_identity/          (Go auth service, port 9900)
+  QuantArena      → quantarena/backend/      (Go API, ports 9988/9999)
+  LumidOS SDK     → LumidOS/LumidOS/         (Python orchestration)
+  lumid_ui        → lumid_ui/src/            (React frontend)
+  flowmesh        → flowmesh/                (GPU task dispatcher)
+  runmesh         → runmesh/backend/         (Java cloud service)
+  LQT             → LQT/                     (Rust knowledge app)
+
+To explore a service: call read_file with path like 'lumid_identity/' (returns directory listing), then drill into specific files. Example: read_file('lumid_identity/configs/identity.yaml') or read_file('lumid_identity/internal/handler/router.go').
+
+INSTALLED APPS live outside the codebase — read them by app name and read_file resolves the bundle automatically: read_file('<app>/xpcloud.yaml'), read_file('<app>/ui/home.md'), read_file('<app>/commands/'). Use this when asked to debug an installed app (e.g. a failing widget or loop).
+
+Search the tree with glob_files('**/*.go') / grep_files('pattern', path_glob='**/*.go') instead of guessing paths. For multi-spot edits to one file, prefer multi_edit. Fan out independent investigations with spawn_agents.`
+		} else {
+			extra = `
+
+## Your workspace
+You have a private, isolated workspace. Find files with glob_files('**/*') and grep_files('pattern'); read them with read_file; create/modify them with write_file, edit_file, or multi_edit (these ask for your approval first). bash_exec runs commands in a network-free sandbox with your workspace mounted. Delegate parallel sub-tasks with spawn_agents. Everything is confined to your own space — you can't see or touch anyone else's.`
 		}
-		return renderPrefsBlock(userID)
+		if agentID != "" {
+			return extra + renderAgentBankBlock(userID, agentID)
+		}
+		return extra + renderPrefsBlock(userID)
 	}()
 }
 
@@ -1298,6 +1972,21 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "spawn_agents",
+			"description": "Run several sub-agents IN PARALLEL and get all their replies back together. Use this when you have multiple independent sub-tasks (e.g. research 4 companies, audit 3 files) — they execute concurrently (up to 4 at once, 6 tasks max) instead of one-after-another. Each task is like a spawn_agent call: fresh history, read-only + research tools by default. Returns {agents: [{task, reply, tool_calls, error?}]}.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"tasks": map[string]any{
+						"type":        "array",
+						"description": "Up to 6 tasks. Each item is either a task string, or an object {task, tools?, agent_id?}.",
+						"items":       map[string]any{"type": "object"},
+					},
+				},
+				"required": []string{"tasks"},
+			},
+		},
+		{
 			"name":        "save_artifact",
 			"description": "Save a piece of output (markdown brief, code listing, JSON dataset, plain text) as a persistent artifact in the user's tenant. The artifact appears in the Studio artifact panel and survives across sessions. Use this when the chat produces a long-form deliverable the user is likely to revisit: a research brief from deep_research, a generated script from code_run, a structured summary they asked you to compile. Always set a clear `title` (e.g. 'AAPL Q1 earnings brief' — not 'untitled'). The returned `id` + `url` can be referenced in follow-up turns.",
 			"input_schema": map[string]any{
@@ -1312,13 +2001,390 @@ func buildToolDefs() []map[string]any {
 				"required": []string{"title", "content"},
 			},
 		},
+		// ── File tools (path-jailed per user role) ──────────────────────────
+		{
+			"name":        "read_file",
+			"description": "Read a file. admin/super_admin can read the /proj deployment tree (and their own app bundles); other users read their own tenant workspace. Path is relative to the workspace root.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path": map[string]any{"type": "string", "description": "Relative path within workspace, e.g. 'auto-quant/xpcloud.yaml'."},
+				},
+				"required": []string{"path"},
+			},
+		},
+		{
+			"name":        "write_file",
+			"description": "Write content to a file in your own workspace (super_admin: the /proj tree; everyone else: their own tenant workspace — never /proj). Creates parent directories as needed. Requires approval. Path is relative to the workspace root.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":    map[string]any{"type": "string", "description": "Relative path within workspace."},
+					"content": map[string]any{"type": "string", "description": "File content to write."},
+				},
+				"required": []string{"path", "content"},
+			},
+		},
+		{
+			"name":        "edit_file",
+			"description": "Replace old_string with new_string in an existing file in your workspace. By default replaces the first occurrence; set replace_all=true for every occurrence. Requires approval. Path is relative to the workspace root.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path":        map[string]any{"type": "string"},
+					"old_string":  map[string]any{"type": "string", "description": "Exact text to find (must be unique enough to identify the right location, unless replace_all)."},
+					"new_string":  map[string]any{"type": "string", "description": "Replacement text."},
+					"replace_all": map[string]any{"type": "boolean", "description": "Replace every occurrence instead of just the first. Default false."},
+				},
+				"required": []string{"path", "old_string", "new_string"},
+			},
+		},
+		{
+			"name":        "multi_edit",
+			"description": "Apply several find/replace edits to ONE file atomically — every old_string must match or nothing is written. Use this instead of multiple edit_file calls when changing several spots in the same file. Requires approval. Path is relative to the workspace root.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"path": map[string]any{"type": "string"},
+					"edits": map[string]any{
+						"type":        "array",
+						"description": "Ordered list of edits, each applied to the result of the previous.",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"old_string":  map[string]any{"type": "string"},
+								"new_string":  map[string]any{"type": "string"},
+								"replace_all": map[string]any{"type": "boolean", "description": "Replace every occurrence of this edit's old_string. Default false."},
+							},
+							"required": []string{"old_string", "new_string"},
+						},
+					},
+				},
+				"required": []string{"path", "edits"},
+			},
+		},
+		{
+			"name":        "glob_files",
+			"description": "Find files in your workspace whose path matches a glob pattern. Supports '*.go', '**/*.yaml' (any directory), 'dir/*.py'. Read-only. Returns relative paths.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern":     map[string]any{"type": "string", "description": "Glob, e.g. '**/*.go' or 'configs/*.yaml'."},
+					"max_results": map[string]any{"type": "integer", "description": "Cap on results (default 300, max 1000)."},
+				},
+				"required": []string{"pattern"},
+			},
+		},
+		{
+			"name":        "grep_files",
+			"description": "Search file CONTENTS in your workspace for a regular expression. Read-only. Returns matching lines as {path, line, text}. Optionally restrict to files matching path_glob.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"pattern":     map[string]any{"type": "string", "description": "Go regexp (RE2) to search for, e.g. 'func .*Handler'."},
+					"path_glob":   map[string]any{"type": "string", "description": "Optional glob limiting which files to scan, e.g. '**/*.go'."},
+					"max_results": map[string]any{"type": "integer", "description": "Cap on matching lines (default 100, max 500)."},
+				},
+				"required": []string{"pattern"},
+			},
+		},
+		{
+			"name":        "bash_exec",
+			"description": "Execute a bash command in your workspace. super_admin: runs in the /proj tree. Everyone else: runs in an isolated Docker sandbox — no network, your workspace mounted at /workspace, capped CPU/memory. Requires approval. Max 120s timeout.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command":         map[string]any{"type": "string", "description": "Bash command to run."},
+					"timeout_seconds": map[string]any{"type": "integer", "description": "Timeout 1-120s, default 30."},
+				},
+				"required": []string{"command"},
+			},
+		},
+		// ── LumidOS ops tools (proxied to schedule server :9100) ────────────
+		{
+			"name":        "xp_status",
+			"description": "Return the status of the local XP.io knowledge graph: which agents exist, memory counts, last sync.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "xp_ask",
+			"description": "Query the XP.io knowledge graph with a natural-language question. Returns memories ranked by relevance.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"question": map[string]any{"type": "string"},
+					"agent_id": map[string]any{"type": "string", "description": "Optional: scope to a specific agent."},
+					"strategy": map[string]any{"type": "string", "description": "route | direct | broadcast. Default: route."},
+				},
+				"required": []string{"question"},
+			},
+		},
+		{
+			"name":        "xp_agents",
+			"description": "List all XP.io knowledge agents on this host.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "xp_memories",
+			"description": "Return recent memories for a specific XP.io agent.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"agent_id": map[string]any{"type": "string"}},
+				"required":   []string{"agent_id"},
+			},
+		},
+		{
+			"name":        "xp_ingest",
+			"description": "Add a new memory (action/context/outcome triple) to an XP.io agent's knowledge bank. Requires approval.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent_id": map[string]any{"type": "string"},
+					"context":  map[string]any{"type": "string"},
+					"action":   map[string]any{"type": "string"},
+					"outcome":  map[string]any{"type": "string"},
+				},
+				"required": []string{"agent_id"},
+			},
+		},
+		{
+			"name":        "xp_feedback",
+			"description": "Apply a reward signal to a specific memory to improve retrieval ranking.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent_id":  map[string]any{"type": "string"},
+					"memory_id": map[string]any{"type": "string"},
+					"reward":    map[string]any{"type": "number"},
+				},
+				"required": []string{"agent_id", "memory_id", "reward"},
+			},
+		},
+		{
+			"name":        "xp_new_agent",
+			"description": "Create a new XP.io knowledge agent.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent_id":    map[string]any{"type": "string"},
+					"domain":      map[string]any{"type": "string"},
+					"description": map[string]any{"type": "string"},
+				},
+				"required": []string{"agent_id", "domain", "description"},
+			},
+		},
+		{
+			"name":        "xp_subscribe",
+			"description": "Subscribe a local agent to a remote knowledge agent on xp.io to receive new memories.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"target_agent": map[string]any{"type": "string"},
+					"source_slug":  map[string]any{"type": "string"},
+				},
+				"required": []string{"target_agent", "source_slug"},
+			},
+		},
+		{
+			"name":        "xp_remotes",
+			"description": "List remote knowledge agents this host subscribes to.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "xp_share",
+			"description": "Push a local knowledge agent's bank to xp.io cloud.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"agent_id": map[string]any{"type": "string"}},
+				"required":   []string{"agent_id"},
+			},
+		},
+		{
+			"name":        "xp_pull",
+			"description": "Pull updates from a remote knowledge agent into the local bank.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"agent_id": map[string]any{"type": "string"}},
+				"required":   []string{"agent_id"},
+			},
+		},
+		{
+			"name":        "xp_clone",
+			"description": "Clone a remote knowledge agent from xp.io to this host.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent_id":   map[string]any{"type": "string"},
+					"remote_url": map[string]any{"type": "string"},
+				},
+				"required": []string{"agent_id", "remote_url"},
+			},
+		},
+		{
+			"name":        "xp_learn",
+			"description": "Add a text observation directly to the knowledge bank.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text":     map[string]any{"type": "string"},
+					"agent_id": map[string]any{"type": "string"},
+				},
+				"required": []string{"text"},
+			},
+		},
+		{
+			"name":        "xp_marketplace",
+			"description": "Browse published knowledge agents on xp.io.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"domain": map[string]any{"type": "string"},
+					"q":      map[string]any{"type": "string"},
+				},
+			},
+		},
+		{
+			"name":        "list_loops",
+			"description": "List all scheduled auto-research loops on this host, with last run time and status.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "loop_status",
+			"description": "Get detailed status for a specific research loop, including recent cycle history.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+					"app":  map[string]any{"type": "string", "description": "Optional: parent app name."},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        "run_loop",
+			"description": "Trigger a research loop to run immediately (outside its normal schedule). Requires approval.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":   map[string]any{"type": "string"},
+					"cycles": map[string]any{"type": "integer", "description": "How many cycles to run, default 1."},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        "loop_history",
+			"description": "Return the last N cycle results for a research loop.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+					"last": map[string]any{"type": "integer", "description": "Default 10."},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        "app_list",
+			"description": "List all xpio apps installed on this host.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "app_marketplace",
+			"description": "Browse the xp.io app marketplace.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"q":    map[string]any{"type": "string"},
+					"kind": map[string]any{"type": "string", "description": "app | skill | autoresearch. Default: app."},
+				},
+			},
+		},
+		{
+			"name":        "app_detail",
+			"description": "Get metadata and schema for a specific xpio app from the marketplace.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"slug": map[string]any{"type": "string"}},
+				"required":   []string{"slug"},
+			},
+		},
+		{
+			"name":        "app_install",
+			"description": "Install an xpio app from xp.io to this host.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"slug":     map[string]any{"type": "string"},
+					"new_name": map[string]any{"type": "string"},
+				},
+				"required": []string{"slug"},
+			},
+		},
+		{
+			"name":        "app_push",
+			"description": "Push a local xpio app to xp.io (publish / update). Auto-bumps patch version if content changed. Requires approval.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":    map[string]any{"type": "string"},
+					"message": map[string]any{"type": "string"},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        "app_validate",
+			"description": "Validate an installed xpio app's manifest and config before pushing.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        "app_update",
+			"description": "Pull the latest version of an installed app from xp.io.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        "submit_workflow",
+			"description": "Submit a FlowMesh workflow YAML for execution on the GPU cluster. Requires approval.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"workflow_yaml": map[string]any{"type": "string", "description": "Full workflow YAML string."},
+				},
+				"required": []string{"workflow_yaml"},
+			},
+		},
+		{
+			"name":        "list_workers",
+			"description": "List available FlowMesh compute workers and their current status.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "optimize_workflow",
+			"description": "Run the HALO optimizer on a workflow YAML to get an optimized execution plan (dry run, no execution).",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"workflow_yaml": map[string]any{"type": "string"},
+				},
+				"required": []string{"workflow_yaml"},
+			},
+		},
 	}
 }
 
 // dispatchTool routes the agent's tool calls into local /me/* logic.
 // Returns (result, ok). result is always a JSON-able map; on failure
 // it contains {"error": "..."} and ok is false.
-func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map[string]any, bool) {
+func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any) (map[string]any, bool) {
 	switch name {
 	case "list_apps":
 		return toolListApps(userID), true
@@ -1667,6 +2733,100 @@ func dispatchTool(c *gin.Context, userID, name string, args map[string]any) (map
 
 	case "create_calendar_event":
 		return toolCreateCalendarEvent(userID, args)
+
+	// ── File tools ────────────────────────────────────────────────────────
+	case "read_file":
+		path, _ := args["path"].(string)
+		if path == "" {
+			return map[string]any{"error": "path required"}, false
+		}
+		return toolReadFile(userID, role, path)
+
+	// write_file / edit_file / multi_edit / bash_exec are open to ALL roles.
+	// Isolation is NOT enforced by the role here — it's enforced structurally
+	// by the jail: writeRoot(userID, role) confines writes to the caller's own
+	// tenant workspace (super_admin → /proj), and bash runs non-super in a
+	// network-free Docker sandbox mounting only that workspace. So every user
+	// gets the full toolset, scoped to their own space.
+	case "write_file":
+		path, _ := args["path"].(string)
+		content, _ := args["content"].(string)
+		if path == "" {
+			return map[string]any{"error": "path required"}, false
+		}
+		return toolWriteFile(userID, role, path, content)
+
+	case "edit_file":
+		path, _ := args["path"].(string)
+		oldStr, _ := args["old_string"].(string)
+		newStr, _ := args["new_string"].(string)
+		replaceAll, _ := args["replace_all"].(bool)
+		if path == "" {
+			return map[string]any{"error": "path required"}, false
+		}
+		if oldStr == "" {
+			return map[string]any{"error": "old_string required (empty old_string would prepend to file)"}, false
+		}
+		return toolEditFile(userID, role, path, oldStr, newStr, replaceAll)
+
+	case "multi_edit":
+		path, _ := args["path"].(string)
+		if path == "" {
+			return map[string]any{"error": "path required"}, false
+		}
+		rawEdits, _ := args["edits"].([]any)
+		edits := make([]editOp, 0, len(rawEdits))
+		for _, r := range rawEdits {
+			m, _ := r.(map[string]any)
+			if m == nil {
+				continue
+			}
+			old, _ := m["old_string"].(string)
+			ns, _ := m["new_string"].(string)
+			ra, _ := m["replace_all"].(bool)
+			edits = append(edits, editOp{OldString: old, NewString: ns, ReplaceAll: ra})
+		}
+		return toolMultiEdit(userID, role, path, edits)
+
+	case "glob_files":
+		pattern, _ := args["pattern"].(string)
+		max := 0
+		if v, ok := args["max_results"].(float64); ok {
+			max = int(v)
+		}
+		return toolGlobFiles(userID, role, pattern, max)
+
+	case "grep_files":
+		pattern, _ := args["pattern"].(string)
+		if pattern == "" {
+			return map[string]any{"error": "pattern required"}, false
+		}
+		pathGlob, _ := args["path_glob"].(string)
+		max := 0
+		if v, ok := args["max_results"].(float64); ok {
+			max = int(v)
+		}
+		return toolGrepFiles(userID, role, pattern, pathGlob, max)
+
+	case "bash_exec":
+		command, _ := args["command"].(string)
+		if command == "" {
+			return map[string]any{"error": "command required"}, false
+		}
+		timeout := 30
+		if v, ok := args["timeout_seconds"].(float64); ok {
+			timeout = int(v)
+		}
+		return toolBashExec(userID, role, command, timeout)
+
+	case "spawn_agents":
+		return toolSpawnAgents(c, userID, args)
 	}
+
+	// ── LumidOS bridge ────────────────────────────────────────────────────
+	if lumidosToolNames[name] {
+		return dispatchLumidosTool(name, args)
+	}
+
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

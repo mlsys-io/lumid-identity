@@ -1,15 +1,20 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/argon2"
 	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
@@ -20,26 +25,43 @@ import (
 // session cookie. Tokens returned only at mint time — we hash before
 // storage and never surface cleartext again.
 
+const (
+	patMaxNameLen  = 128
+	patMaxScopes   = 20
+	patMaxScopeLen = 2048 // chars, total scope string
+	patMaxTTLDays  = 3650 // 10 years
+
+	// Per-user PAT mint/rotate limit: 10 per hour.
+	patMintHourlyLimit = 10
+	patMintWindowS     = 3600
+
+	// argon2id KDF parameters for new native tokens.
+	argon2Time    = 2
+	argon2Memory  = 64 * 1024
+	argon2Threads = 4
+	argon2KeyLen  = 32
+	argon2SaltLen = 16
+
+	// Fixed cleartext prefix for native PATs.
+	patCleartextPrefix = "lm_pat_live_"
+)
+
 type patMintReq struct {
-	Name      string   `json:"name"`
-	Scopes    []string `json:"scopes"`
-	TTLDays   int      `json:"ttl_days"` // 0 = no expiry
+	Name    string   `json:"name"`
+	Scopes  []string `json:"scopes"`
+	TTLDays int      `json:"ttl_days"` // 0 = no expiry
 }
 
 type patMintResp struct {
-	ID        string    `json:"id"`
-	Token     string    `json:"token"`    // cleartext, once only
-	Prefix    string    `json:"prefix"`
-	Name      string    `json:"name"`
-	Scopes    []string  `json:"scopes"`
+	ID        string     `json:"id"`
+	Token     string     `json:"token"`  // cleartext, once only
+	Prefix    string     `json:"prefix"`
+	Name      string     `json:"name"`
+	Scopes    []string   `json:"scopes"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // JSON shape matches the lumid_auth_ui PATInfo TS interface verbatim.
-// Timestamps are emitted as unix seconds (0 when absent) so the frontend
-// can do plain `t > 0` checks without date parsing. `status` is always
-// "active" here because the list query filters out revoked rows;
-// AuditDialog sees revoked ones through a separate endpoint.
 type patListItem struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
@@ -53,10 +75,119 @@ type patListItem struct {
 	Source      string   `json:"source"`
 }
 
+// ── argon2id helpers ─────────────────────────────────────────────────────────
+
+// argon2idHash computes an argon2id hash with a fresh random salt.
+// Stored format: base64RawStd(salt) + ":" + base64RawStd(hash).
+func argon2idHash(cleartext string) (string, error) {
+	salt := make([]byte, argon2SaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	h := argon2.IDKey([]byte(cleartext), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+	return base64.RawStdEncoding.EncodeToString(salt) + ":" + base64.RawStdEncoding.EncodeToString(h), nil
+}
+
+// argon2idVerify verifies a cleartext token against an argon2id encoded hash.
+func argon2idVerify(cleartext, encoded string) bool {
+	parts := strings.SplitN(encoded, ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	salt, err1 := base64.RawStdEncoding.DecodeString(parts[0])
+	expected, err2 := base64.RawStdEncoding.DecodeString(parts[1])
+	if err1 != nil || err2 != nil || len(salt) < 8 {
+		return false
+	}
+	h := argon2.IDKey([]byte(cleartext), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+	return subtle.ConstantTimeCompare(h, expected) == 1
+}
+
+// patLookupKey extracts the 16-char lookup key from a cleartext native PAT
+// (the first 16 hex chars of the random part). Used to narrow the DB query
+// for argon2id tokens, which can't use WHERE hash = ? (non-deterministic).
+func patLookupKey(cleartext string) string {
+	if !strings.HasPrefix(cleartext, patCleartextPrefix) {
+		return ""
+	}
+	raw := cleartext[len(patCleartextPrefix):]
+	if len(raw) < 16 {
+		return ""
+	}
+	return raw[:16]
+}
+
+// ── PAT lookup ───────────────────────────────────────────────────────────────
+
+// findPATRow resolves a cleartext token to its DB row without filtering by
+// revocation/expiry — the caller checks those to give accurate error messages.
+// Tries argon2id path (new tokens) via lookup_key, then falls back to SHA-256
+// (legacy sha256 tokens from before the argon2id migration).
+func findPATRow(tok string) (*models.Token, bool) {
+	// argon2id path: narrow by lookup_key, then verify hash.
+	if lk := patLookupKey(tok); lk != "" {
+		var rows []models.Token
+		common.DB.Where("lookup_key = ? AND hash_alg = ?", lk, "argon2id").Find(&rows)
+		for i := range rows {
+			if argon2idVerify(tok, rows[i].Hash) {
+				return &rows[i], true
+			}
+		}
+	}
+	// SHA-256 fallback for legacy lm_pat_* / rm_pat_* tokens.
+	sum := sha256.Sum256([]byte(tok))
+	hash := hex.EncodeToString(sum[:])
+	var row models.Token
+	if err := common.DB.Where("hash = ? AND hash_alg = ?", hash, "sha256").First(&row).Error; err == nil {
+		return &row, true
+	}
+	return nil, false
+}
+
+// lookupPAT resolves a token to an active (not revoked, not expired) DB row.
+func lookupPAT(tok string) (*models.Token, bool) {
+	row, ok := findPATRow(tok)
+	if !ok {
+		return nil, false
+	}
+	if row.RevokedAt != nil {
+		return nil, false
+	}
+	if row.ExpiresAt != nil && row.ExpiresAt.Before(time.Now()) {
+		return nil, false
+	}
+	return row, true
+}
+
+// ── rate limiting ────────────────────────────────────────────────────────────
+
+// checkPATMintRate enforces 10 PAT mints/rotates per user per hour via Redis.
+// Fails open when Redis is unavailable.
+func checkPATMintRate(ctx context.Context, userID string) bool {
+	if common.Redis == nil {
+		return true
+	}
+	key := "rl:pat:mint:" + userID
+	n, err := common.Redis.Incr(ctx, key).Result()
+	if err != nil {
+		return true
+	}
+	if n == 1 {
+		_ = common.Redis.Expire(ctx, key, time.Duration(patMintWindowS)*time.Second).Err()
+	}
+	return n <= int64(patMintHourlyLimit)
+}
+
+// ── handlers ─────────────────────────────────────────────────────────────────
+
 func PATMintHandler(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
+		return
+	}
+	if !callerHasLumidWrite(c) {
+		fail(c, http.StatusForbidden, 1005, "PAT scope insufficient: lumid:write required to mint tokens")
 		return
 	}
 	var req patMintReq
@@ -68,10 +199,29 @@ func PATMintHandler(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1001, "scopes required")
 		return
 	}
-	// Gate against the user's effective matrix row. Prevents non-admins
-	// from minting a `*`-scope PAT (which would light up as admin on
-	// every service via computeAccess). Admins pass through; users get
-	// each requested scope checked against their current level.
+	if len(req.Name) > patMaxNameLen {
+		fail(c, http.StatusBadRequest, 1001, "name too long (max 128 chars)")
+		return
+	}
+	if len(req.Scopes) > patMaxScopes {
+		fail(c, http.StatusBadRequest, 1001, "too many scopes (max 20)")
+		return
+	}
+	scopeStr := strings.Join(req.Scopes, " ")
+	if len(scopeStr) > patMaxScopeLen {
+		fail(c, http.StatusBadRequest, 1001, "scopes string too long")
+		return
+	}
+	if req.TTLDays > patMaxTTLDays {
+		fail(c, http.StatusBadRequest, 1001, "ttl_days too large (max 3650)")
+		return
+	}
+	if !checkPATMintRate(c.Request.Context(), userID) {
+		fail(c, http.StatusTooManyRequests, 1429, "too many tokens minted; try again later")
+		return
+	}
+
+	// Gate against the user's effective matrix row.
 	var u models.User
 	if err := common.DB.Where("id = ?", userID).First(&u).Error; err != nil {
 		fail(c, http.StatusUnauthorized, 1003, "user not found")
@@ -96,9 +246,13 @@ func PATMintHandler(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "rng")
 		return
 	}
-	cleartext := "lm_pat_live_" + raw
-	sum := sha256.Sum256([]byte(cleartext))
-	hash := hex.EncodeToString(sum[:])
+	cleartext := patCleartextPrefix + raw
+	argonHash, err := argon2idHash(cleartext)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "hash")
+		return
+	}
+	lk := patLookupKey(cleartext)
 
 	var expAt *time.Time
 	if req.TTLDays > 0 {
@@ -109,11 +263,12 @@ func PATMintHandler(c *gin.Context) {
 	row := &models.Token{
 		ID:        uuid.NewString(),
 		UserID:    userID,
-		Prefix:    "lm_pat_",
-		Hash:      hash,
-		HashAlg:   "sha256", // argon2id is Phase 8; plain sha256 is good enough + cheap to verify
+		Prefix:    patCleartextPrefix,
+		LookupKey: lk,
+		Hash:      argonHash,
+		HashAlg:   "argon2id",
 		Name:      req.Name,
-		Scopes:    strings.Join(req.Scopes, " "),
+		Scopes:    scopeStr,
 		ExpiresAt: expAt,
 		Source:    "native",
 	}
@@ -122,7 +277,7 @@ func PATMintHandler(c *gin.Context) {
 		return
 	}
 	ok_(c, "minted", patMintResp{
-		ID: row.ID, Token: cleartext, Prefix: "lm_pat_live_",
+		ID: row.ID, Token: cleartext, Prefix: patCleartextPrefix,
 		Name: row.Name, Scopes: req.Scopes, ExpiresAt: expAt,
 	})
 }
@@ -133,9 +288,30 @@ func PATListHandler(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
 		return
 	}
+
+	limit := 100
+	offset := 0
+	if l := c.Query("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			if n > 200 {
+				n = 200
+			}
+			limit = n
+		}
+	}
+	if o := c.Query("offset"); o != "" {
+		if n, err := strconv.Atoi(o); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	var total int64
+	common.DB.Model(&models.Token{}).Where("user_id = ? AND revoked_at IS NULL", userID).Count(&total)
+
 	var rows []models.Token
 	common.DB.Where("user_id = ? AND revoked_at IS NULL", userID).
-		Order("created_at DESC").Find(&rows)
+		Order("created_at DESC").Limit(limit).Offset(offset).Find(&rows)
+
 	out := make([]patListItem, 0, len(rows))
 	for _, r := range rows {
 		var lastUsed, expires int64
@@ -150,14 +326,14 @@ func PATListHandler(c *gin.Context) {
 			Name:        r.Name,
 			TokenPrefix: r.Prefix,
 			Scopes:      strings.Fields(r.Scopes),
-			Status:      "active", // revoked rows filtered by the WHERE above
+			Status:      "active",
 			LastUsedAt:  lastUsed,
 			ExpiresAt:   expires,
 			CreateTime:  r.CreatedAt.Unix(),
 			Source:      r.Source,
 		})
 	}
-	ok_(c, "ok", gin.H{"tokens": out, "total": len(out)})
+	ok_(c, "ok", gin.H{"tokens": out, "total": total, "limit": limit, "offset": offset})
 }
 
 func PATRevokeHandler(c *gin.Context) {
@@ -166,32 +342,44 @@ func PATRevokeHandler(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
 		return
 	}
+	if !callerHasLumidWrite(c) {
+		fail(c, http.StatusForbidden, 1005, "PAT scope insufficient: lumid:write required to revoke tokens")
+		return
+	}
 	id := c.Param("id")
-	now := time.Now()
-	res := common.DB.Model(&models.Token{}).
-		Where("id = ? AND user_id = ? AND revoked_at IS NULL", id, userID).
-		Update("revoked_at", &now)
-	if res.RowsAffected == 0 {
+
+	var existing models.Token
+	if err := common.DB.Where("id = ? AND user_id = ?", id, userID).First(&existing).Error; err != nil {
 		fail(c, http.StatusNotFound, 1002, "token not found")
 		return
 	}
+	if existing.RevokedAt != nil {
+		fail(c, http.StatusConflict, 1006, "token already revoked")
+		return
+	}
+	common.DB.Model(&existing).Update("revoked_at", gorm.Expr("NOW()"))
 	ok_(c, "revoked", nil)
 }
 
 // PATRotateHandler revokes an existing PAT and mints a replacement with
 // the same name + scopes + TTL (computed from the remaining lifespan of
-// the original, if it had one). Returns the new cleartext once. The
-// caller is responsible for swapping it into their keyring / env.
+// the original, if it had one). Returns the new cleartext once.
 func PATRotateHandler(c *gin.Context) {
 	userID, found := currentUserID(c)
 	if !found {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
 		return
 	}
+	if !callerHasLumidWrite(c) {
+		fail(c, http.StatusForbidden, 1005, "PAT scope insufficient: lumid:write required to rotate tokens")
+		return
+	}
+	if !checkPATMintRate(c.Request.Context(), userID) {
+		fail(c, http.StatusTooManyRequests, 1429, "too many tokens rotated; try again later")
+		return
+	}
 	id := c.Param("id")
 
-	// Atomic handoff: revoke old + mint new in one transaction so the
-	// caller either gets both records or neither.
 	var newToken string
 	var newRow models.Token
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
@@ -200,29 +388,35 @@ func PATRotateHandler(c *gin.Context) {
 			id, userID).First(&old).Error; err != nil {
 			return err
 		}
-		now := time.Now()
-		if err := tx.Model(&old).Update("revoked_at", &now).Error; err != nil {
+		if err := tx.Model(&old).Update("revoked_at", gorm.Expr("NOW()")).Error; err != nil {
 			return err
 		}
 		raw, err := randHex(32)
 		if err != nil {
 			return err
 		}
-		cleartext := "lm_pat_live_" + raw
-		sum := sha256.Sum256([]byte(cleartext))
-		hash := hex.EncodeToString(sum[:])
+		cleartext := patCleartextPrefix + raw
+		argonHash, err := argon2idHash(cleartext)
+		if err != nil {
+			return err
+		}
+		lk := patLookupKey(cleartext)
+
 		var expAt *time.Time
 		if old.ExpiresAt != nil {
-			// Preserve the original remaining lifespan (not absolute deadline).
-			t := time.Now().Add(time.Until(*old.ExpiresAt))
-			expAt = &t
+			remaining := time.Until(*old.ExpiresAt)
+			if remaining > 0 {
+				t := time.Now().Add(remaining)
+				expAt = &t
+			}
 		}
 		newRow = models.Token{
 			ID:        uuid.NewString(),
 			UserID:    userID,
-			Prefix:    "lm_pat_",
-			Hash:      hash,
-			HashAlg:   "sha256",
+			Prefix:    patCleartextPrefix,
+			LookupKey: lk,
+			Hash:      argonHash,
+			HashAlg:   "argon2id",
 			Name:      old.Name,
 			Scopes:    old.Scopes,
 			ExpiresAt: expAt,
@@ -235,43 +429,51 @@ func PATRotateHandler(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		fail(c, http.StatusNotFound, 1002,
-			"token not found or already revoked")
+		fail(c, http.StatusNotFound, 1002, "token not found or already revoked")
 		return
 	}
 	scopes := strings.Fields(newRow.Scopes)
 	ok_(c, "rotated", patMintResp{
-		ID: newRow.ID, Token: newToken, Prefix: "lm_pat_live_",
+		ID: newRow.ID, Token: newToken, Prefix: patCleartextPrefix,
 		Name: newRow.Name, Scopes: scopes, ExpiresAt: newRow.ExpiresAt,
 	})
 }
 
+// callerHasLumidWrite returns true when the request is authenticated via a
+// session JWT (unrestricted) or via a PAT whose scopes include lumid:write,
+// lumid:admin, lumid:*, or the global wildcard *.
+func callerHasLumidWrite(c *gin.Context) bool {
+	tok := bearerToken(c)
+	if !strings.HasPrefix(tok, "lm_pat_") {
+		return true // session JWT — not PAT-gated
+	}
+	row, ok := lookupPAT(tok)
+	if !ok {
+		return false
+	}
+	for _, s := range strings.Fields(row.Scopes) {
+		if s == "*" || s == "lumid:write" || s == "lumid:admin" || s == "lumid:*" {
+			return true
+		}
+	}
+	return false
+}
+
 // currentUserID resolves the session cookie, Bearer JWT, or lm_pat_*
 // PAT to a user id. Returns (id, true) on success.
-//
-// Accepting PATs here (not just JWTs) is what makes the unified-auth
-// claim work for callers like lumid /api/v1/user: a power-user with
-// only a PAT must still be able to read their own profile the same
-// way a session-cookie caller can.
 func currentUserID(c *gin.Context) (string, bool) {
 	tok := bearerToken(c)
 	if tok == "" {
 		return "", false
 	}
-	// JWT path first — fast, no DB hit.
+	// JWT path — fast, no DB hit.
 	if claims, err := common.VerifyJWT(tok); err == nil {
 		return claims.Subject, true
 	}
-	// PAT path — same tokens.hash lookup used by introspectNative.
-	if strings.HasPrefix(tok, "lm_pat_") {
-		sum := sha256.Sum256([]byte(tok))
-		hash := hex.EncodeToString(sum[:])
-		var row models.Token
-		if err := common.DB.Where("hash = ?", hash).First(&row).Error; err == nil {
-			if row.RevokedAt == nil &&
-				(row.ExpiresAt == nil || row.ExpiresAt.After(time.Now())) {
-				return row.UserID, true
-			}
+	// PAT path (lm_pat_* and rm_pat_*).
+	if strings.HasPrefix(tok, "lm_pat_") || strings.HasPrefix(tok, "rm_pat_") {
+		if row, ok := lookupPAT(tok); ok {
+			return row.UserID, true
 		}
 	}
 	return "", false
@@ -285,23 +487,10 @@ func randHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// ok_ — same shape as the helper in helpers.go. Named with trailing
-// underscore because `ok` is a frequent local var in this file.
+// ok_ — same shape as the helper in helpers.go.
 func ok_(c *gin.Context, msg string, data any) { ok(c, msg, data) }
 
 // GrantableScopesHandler — GET /api/v1/identity/grantable-scopes.
-// Tells the caller which scopes they can mint a PAT with, so the UI
-// can render an accurate picker instead of letting the user request
-// scopes the backend will 403. Shape mirrors the admin matrix so the
-// PAT mint dialog and the admin users access view can share widgets.
-//
-// Response:
-//   {
-//     "role":        "user" | "admin",
-//     "services":    [ "lumid", "qa", "runmesh", ... ],
-//     "matrix":      { "lumid": "read", "qa": "write", ... },
-//     "can_wildcard": bool   // true iff the global `*` scope is grantable
-//   }
 func GrantableScopesHandler(c *gin.Context) {
 	userID, found := currentUserID(c)
 	if !found {

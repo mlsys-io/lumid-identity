@@ -10,9 +10,9 @@ import (
 
 // meCORS — permissive but bounded CORS for the /api/v1/me/* surface
 // the new web UI calls cross-origin. Allowed origins come from the
-// ME_CORS_ALLOWED_ORIGINS env var (comma-separated). Default in dev:
-// xp.io + lum.id. Credentials are enabled (the UI sends lm_session
-// cookie + PAT bearers).
+// ME_CORS_ALLOWED_ORIGINS env var (comma-separated). Default covers
+// xp.io + lum.id + lumid.market (QA frontend) + localhost dev ports.
+// Credentials are enabled (the UI sends lm_session cookie + PAT bearers).
 //
 // IMPORTANT: never use "*" with credentials — that's a security error
 // browsers reject anyway. The Vary header keeps CDNs honest if any
@@ -20,7 +20,7 @@ import (
 func meCORS() gin.HandlerFunc {
 	allowed := os.Getenv("ME_CORS_ALLOWED_ORIGINS")
 	if allowed == "" {
-		allowed = "https://xp.io,https://lum.id,http://localhost:5173,http://localhost:13080"
+		allowed = "https://xp.io,https://lum.id,https://lumid.market,https://lumid.market:2443,http://localhost:3000,http://localhost:5173,http://localhost:13080"
 	}
 	set := map[string]bool{}
 	for _, o := range strings.Split(allowed, ",") {
@@ -214,7 +214,18 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app",           MeAppsUninstall)
 			me.GET("/apps/:app/ui",           MeAppUI)          // app-declared Studio surface (markdown)
 			me.GET("/apps/:app/ui/:surface",  MeAppUISurface)
+			me.PUT("/apps/:app/ui",           MeUpdateAppUI)    // write/create surface markdown
+			me.PUT("/apps/:app/ui/:surface",  MeUpdateAppUISurface)
+			me.POST("/apps/:app/ui/generate", MeGenerateAppUI)  // AI-generate surface from config
+			me.GET("/apps/:app/config",       MeAppConfig)      // read xpcloud.yaml
+			me.PUT("/apps/:app/config",       MeUpdateAppConfig) // write xpcloud.yaml (YAML-validated)
 			me.GET("/intents/:id",            MeIntentGet)
+			// Permanently dismiss a failed/optimistic install card by app name.
+			me.DELETE("/install-intents/:name", MeInstallIntentDelete)
+			// Submit target for lumid:form widgets — allowlisted actions only.
+			me.POST("/form-action", MeFormAction)
+			// GPU rentals store — backs the me://gpu-rentals read source.
+			me.GET("/gpu-rentals", MeGpuRentalsList)
 
 			// Per-loop control.
 			me.PATCH("/loops/:app/:loop",     MeLoopPatch)
@@ -265,6 +276,8 @@ func Register(r *gin.Engine) {
 			// to render text deltas + tool-call events as they arrive,
 			// instead of waiting 5-10s for a synchronous reply.
 			me.POST("/agent/chat/stream", MeAgentChatStream)
+			// Tool approval — unblocks a destructive tool pending user consent.
+			me.POST("/agent/chat/tool-approve", MeAgentToolApprove)
 			// Available LLM backends — populates the model dropdown
 			// in StudioChat. Returns [{id, displayName, default}].
 			me.GET("/agent/models", MeAgentModels)

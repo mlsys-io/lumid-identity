@@ -4,26 +4,38 @@ package handler
 //
 //   GET /me/apps/:app/ui           — serve the app's default UI surface
 //   GET /me/apps/:app/ui/:surface  — serve a named surface ("home" == default)
+//   PUT /me/apps/:app/ui           — write/create the default surface markdown
+//   PUT /me/apps/:app/ui/:surface  — write/create a named surface markdown
 //
 // An xpio app declares an optional `ui:` block in its xpcloud.yaml:
 //
 //   ui:
-//     sidebar: { label, icon, section, order, badge_source }
-//     surface: { markdown: "ui/home.md" }   # OR native: "<key>"
+//     sidebar: { show: true, label, icon, section, order, badge_source }
+//     surface:  { markdown: "ui/home.md" }   # OR native: "<key>" (default surface)
+//     surfaces: { home: "ui/home.md", detail: "ui/detail.md" }  # optional, named
 //
-// `surface.markdown` is a bundle-relative path to a Markdown document the
-// app builder authors; the Studio shell fetches it here and renders it at
-// runtime (react-markdown + Lumid directive widgets). `surface.native` is a
-// reserved, bundle-internal key resolved ONLY by the first-party client
-// against its compiled registry — the server echoes it but never serves
-// arbitrary code. Markdown serving reuses the same path-traversal guard as
-// the dataset peek surface (resolveAppDir + abs-prefix check + .md-only +
-// size cap), so an app author can never read outside their own bundle.
+// Special markdown path prefixes (fork template sharing):
+//
+//   "@fork_of"        — inherit the parent app's markdown (fork_of field in xpcloud.yaml)
+//   "@shared/<name>"  — read from ~/.xp/apps/.templates/<name>.md (operator-level shared)
+//
+// `sidebar.show` is the explicit on/off toggle (omit → shown when a sidebar
+// block is present; false → keep the config but hide the entry).
+//
+// Markdown serving reuses the same path-traversal guard as the dataset peek
+// surface (resolveAppDir + abs-prefix check + .md-only + size cap), so an
+// app author can never read outside their own bundle.
+//
+// PUT writes are tenant-only (operator-shared dirs are not writable via the
+// API — the identity container runs as a different UID). For @fork_of and
+// @shared surfaces, PUT writes a per-fork override to ui/home.md and updates
+// xpcloud.yaml to point to it (detaches the fork from the template).
 
 import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -33,6 +45,9 @@ import (
 // ---- shared ui types (also consumed by me_apps.go MeAppsList) ----
 
 type appUISidebar struct {
+	// Show is the explicit on/off toggle. nil (omitted) = shown when a sidebar
+	// block is present (back-compat); false = keep label/icon config but hide.
+	Show        *bool  `yaml:"show"         json:"show,omitempty"`
 	Label       string `yaml:"label"        json:"label"`
 	Icon        string `yaml:"icon"         json:"icon,omitempty"`
 	Section     string `yaml:"section"      json:"section,omitempty"`
@@ -43,11 +58,19 @@ type appUISidebar struct {
 type appUISurface struct {
 	Markdown string `yaml:"markdown" json:"markdown,omitempty"`
 	Native   string `yaml:"native"   json:"native,omitempty"`
+	// Page is a STRUCTURED page spec (ui/page.yaml) compiled to lumid markdown
+	// on serve — the reliable, deterministic surface. When set, it's the
+	// source of truth; no separate compiled home.md is kept.
+	Page string `yaml:"page" json:"page,omitempty"`
 }
 
 type appUI struct {
 	Sidebar *appUISidebar `yaml:"sidebar" json:"sidebar,omitempty"`
+	// Surface is the default ("home") surface — kept for back-compat.
 	Surface *appUISurface `yaml:"surface" json:"surface,omitempty"`
+	// Surfaces is the optional named-markdown map (name → bundle-relative .md).
+	// Each is reachable at /studio/a/<app>/<name>; "home" is the default.
+	Surfaces map[string]string `yaml:"surfaces" json:"surfaces,omitempty"`
 }
 
 // readAppUI parses ONLY the `ui:` subtree from an app's xpcloud.yaml.
@@ -66,6 +89,68 @@ func readAppUI(appDir string) *appUI {
 	return doc.UI
 }
 
+// readForkOf returns the fork_of field from an app's xpcloud.yaml, or "".
+func readForkOf(appDir string) string {
+	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	if err != nil {
+		return ""
+	}
+	var doc struct {
+		ForkOf string `yaml:"fork_of"`
+	}
+	_ = yaml.Unmarshal(b, &doc)
+	return doc.ForkOf
+}
+
+var sharedTemplateNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+// resolveSpecialMdPath handles @fork_of and @shared/<name> markdown paths.
+// Returns (resolvedMdPath, resolvedAppDir); empty strings signal "not found".
+// Never recurses — if the parent also uses @fork_of, returns ("", "").
+func resolveSpecialMdPath(special, currentAppDir, userID string) (mdPath, appDir string) {
+	switch {
+	case special == "@fork_of":
+		parent := readForkOf(currentAppDir)
+		if parent == "" {
+			return "", ""
+		}
+		// Strip owner prefix (owner/name → name) for resolveAppDir lookup.
+		parentName := parent
+		if i := strings.LastIndex(parent, "/"); i >= 0 {
+			parentName = parent[i+1:]
+		}
+		parentDir := resolveAppDir(userID, parentName)
+		if parentDir == "" {
+			return "", ""
+		}
+		parentUI := readAppUI(parentDir)
+		if parentUI == nil {
+			return "", ""
+		}
+		// Read the parent's home surface path. Do NOT recurse if parent also @fork_of.
+		var parentMd string
+		if p, ok := parentUI.Surfaces["home"]; ok {
+			parentMd = p
+		} else if parentUI.Surface != nil {
+			parentMd = parentUI.Surface.Markdown
+		}
+		if parentMd == "" || strings.HasPrefix(parentMd, "@") {
+			return "", ""
+		}
+		return parentMd, parentDir
+
+	case strings.HasPrefix(special, "@shared/"):
+		name := strings.TrimPrefix(special, "@shared/")
+		if !sharedTemplateNameRe.MatchString(name) {
+			return "", ""
+		}
+		templatesDir := filepath.Join(operatorHome(), ".xp", "apps", ".templates")
+		mdFile := filepath.Join(templatesDir, name+".md")
+		return mdFile, templatesDir
+	}
+	return "", ""
+}
+
 // MeAppUI — GET /me/apps/:app/ui (default surface).
 func MeAppUI(c *gin.Context) { serveAppSurface(c, "") }
 
@@ -73,9 +158,7 @@ func MeAppUI(c *gin.Context) { serveAppSurface(c, "") }
 func MeAppUISurface(c *gin.Context) { serveAppSurface(c, c.Param("surface")) }
 
 // serveAppSurface resolves the app dir, reads the ui.surface declaration,
-// and returns the Markdown body (or the native key) for the requested
-// surface. surfaceName "" or "home" maps to the single declared surface;
-// other names 404 (named multi-surface support is a future extension).
+// and returns the Markdown body (or the native key) for the requested surface.
 func serveAppSurface(c *gin.Context, surfaceName string) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -87,9 +170,9 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app")
 		return
 	}
-	if surfaceName != "" && surfaceName != "home" {
-		fail(c, http.StatusNotFound, 1404, "unknown surface")
-		return
+	name := surfaceName
+	if name == "" {
+		name = "home"
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
@@ -97,18 +180,58 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		return
 	}
 	ui := readAppUI(appDir)
-	if ui == nil || ui.Surface == nil {
+	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
 		fail(c, http.StatusNotFound, 1404, "app declares no ui surface")
+		return
+	}
+
+	// Resolve the requested surface name → (markdown path | native key | page spec).
+	var mdPath, native, pagePath string
+	if p, ok := ui.Surfaces[name]; ok {
+		mdPath = p
+	} else if name == "home" && ui.Surface != nil {
+		mdPath, native, pagePath = ui.Surface.Markdown, ui.Surface.Native, ui.Surface.Page
+	} else {
+		fail(c, http.StatusNotFound, 1404, "unknown surface")
+		return
+	}
+
+	// Structured page spec → compile to markdown on serve (deterministic, no
+	// stored home.md). The spec (ui/page.yaml) is the single source of truth.
+	if pagePath != "" {
+		if strings.ContainsAny(pagePath, "\x00") || strings.Contains(pagePath, "..") || filepath.IsAbs(pagePath) {
+			fail(c, http.StatusBadRequest, 1400, "invalid page path")
+			return
+		}
+		abs := filepath.Clean(filepath.Join(appDir, pagePath))
+		if abs != appDir && !strings.HasPrefix(abs, appDir+string(filepath.Separator)) {
+			fail(c, http.StatusBadRequest, 1400, "page path escapes app")
+			return
+		}
+		pb, rerr := os.ReadFile(abs)
+		if rerr != nil {
+			fail(c, http.StatusNotFound, 1404, "page spec not found: "+pagePath)
+			return
+		}
+		md, cerr := compilePageSpec(pb)
+		if cerr != nil {
+			fail(c, http.StatusUnprocessableEntity, 1422, "page spec: "+cerr.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"app": app, "surface": name, "markdown": md, "path": pagePath},
+		})
 		return
 	}
 
 	// Native escape-hatch: no markdown body, the client resolves the key
 	// against its first-party compiled registry.
-	if ui.Surface.Markdown == "" {
-		if ui.Surface.Native != "" {
+	if mdPath == "" {
+		if native != "" {
 			c.JSON(http.StatusOK, gin.H{
 				"ret_code": 0, "message": "ok",
-				"data": gin.H{"app": app, "surface": "home", "native": ui.Surface.Native},
+				"data": gin.H{"app": app, "surface": name, "native": native},
 			})
 			return
 		}
@@ -116,17 +239,44 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		return
 	}
 
-	// Path-guard: relative, no traversal, must stay under the app dir, .md only.
-	rel := ui.Surface.Markdown
-	if strings.ContainsAny(rel, "\x00") || strings.HasSuffix(rel, "/") {
-		fail(c, http.StatusBadRequest, 1400, "invalid surface path")
-		return
+	// Special path prefixes: @fork_of inherits from the parent app;
+	// @shared/<name> reads from the operator-level shared templates dir.
+	// The resolved path is reported back as-is so the client can show
+	// "inherits from template" in the editor UI.
+	resolvedPath := mdPath
+	if strings.HasPrefix(mdPath, "@") {
+		var resolvedDir string
+		resolvedPath, resolvedDir = resolveSpecialMdPath(mdPath, appDir, userID)
+		if resolvedPath == "" {
+			fail(c, http.StatusNotFound, 1404, "template not found ("+mdPath+")")
+			return
+		}
+		// For @shared, resolvedPath is an absolute path; treat it directly.
+		// For @fork_of, resolvedPath is relative to resolvedDir.
+		if strings.HasPrefix(mdPath, "@shared/") {
+			return // handled below — abs path used directly
+		}
+		appDir = resolvedDir
 	}
-	target := filepath.Join(appDir, rel)
-	abs, err := filepath.Abs(target)
-	if err != nil || !strings.HasPrefix(abs, appDir+string(os.PathSeparator)) {
-		fail(c, http.StatusBadRequest, 1400, "invalid surface path")
-		return
+
+	// Path-guard: relative, no traversal, must stay under the app dir, .md only.
+	var abs string
+	if filepath.IsAbs(resolvedPath) {
+		// @shared — absolute path already validated by sharedTemplateNameRe.
+		abs = resolvedPath
+	} else {
+		rel := resolvedPath
+		if strings.ContainsAny(rel, "\x00") || strings.HasSuffix(rel, "/") {
+			fail(c, http.StatusBadRequest, 1400, "invalid surface path")
+			return
+		}
+		target := filepath.Join(appDir, rel)
+		var err error
+		abs, err = filepath.Abs(target)
+		if err != nil || !strings.HasPrefix(abs, appDir+string(os.PathSeparator)) {
+			fail(c, http.StatusBadRequest, 1400, "invalid surface path")
+			return
+		}
 	}
 	if strings.ToLower(filepath.Ext(abs)) != ".md" {
 		fail(c, http.StatusBadRequest, 1400, "surface must be a .md file")
@@ -153,11 +303,225 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
 			"app":       app,
-			"surface":   "home",
-			"path":      rel,
+			"surface":   name,
+			"path":      mdPath, // original declared path (may be "@fork_of" etc.)
 			"markdown":  string(buf[:n]),
 			"bytes":     st.Size(),
 			"truncated": truncated,
 		},
 	})
+}
+
+// ── Write endpoint ─────────────────────────────────────────────────────────
+
+// MeUpdateAppUI — PUT /me/apps/:app/ui
+func MeUpdateAppUI(c *gin.Context) { updateAppSurface(c, "") }
+
+// MeUpdateAppUISurface — PUT /me/apps/:app/ui/:surface
+func MeUpdateAppUISurface(c *gin.Context) { updateAppSurface(c, c.Param("surface")) }
+
+type meUpdateAppUIBody struct {
+	Markdown string `json:"markdown" binding:"required"`
+	Surface  string `json:"surface"`
+}
+
+// updateAppSurface writes the caller's markdown to the resolved surface file.
+// Writes are tenant-only; operator-shared apps are read-only via the API.
+// For @fork_of / @shared surfaces, writes a per-fork override ui/home.md and
+// patches xpcloud.yaml to point to it (detaches from the shared template).
+func updateAppSurface(c *gin.Context, surfaceName string) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	if !slugRe.MatchString(app) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app")
+		return
+	}
+
+	var body meUpdateAppUIBody
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid request body")
+		return
+	}
+	name := surfaceName
+	if name == "" {
+		if body.Surface != "" {
+			name = body.Surface
+		} else {
+			name = "home"
+		}
+	}
+	const maxBytes = 256 * 1024
+	if len(body.Markdown) > maxBytes {
+		fail(c, http.StatusRequestEntityTooLarge, 1413, "markdown exceeds 256 KB limit")
+		return
+	}
+
+	// Resolve the app dir — tenant tree first, then operator-shared.
+	// Both dirs are writable by the identity container (both bind-mounted RW).
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		fail(c, http.StatusNotFound, 1404, "app not found")
+		return
+	}
+
+	ui := readAppUI(appDir)
+	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
+		fail(c, http.StatusNotFound, 1404, "app declares no ui surface")
+		return
+	}
+
+	// Resolve the surface → declared markdown path.
+	var mdPath string
+	if p, ok := ui.Surfaces[name]; ok {
+		mdPath = p
+	} else if name == "home" && ui.Surface != nil {
+		mdPath = ui.Surface.Markdown
+	} else {
+		fail(c, http.StatusNotFound, 1404, "unknown surface")
+		return
+	}
+
+	if mdPath == "" && ui.Surface != nil && ui.Surface.Native != "" {
+		fail(c, http.StatusBadRequest, 1400, "native surfaces are not editable via the API")
+		return
+	}
+
+	// For template-inherited paths, write to a local override and patch xpcloud.yaml.
+	if strings.HasPrefix(mdPath, "@") {
+		const overridePath = "ui/home.md"
+		mdPath = overridePath
+		if err := patchXpcloudUISurface(appDir, name, overridePath); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "failed to update xpcloud.yaml: "+err.Error())
+			return
+		}
+	}
+
+	if mdPath == "" {
+		// No declared path — default to ui/home.md and write it.
+		mdPath = "ui/home.md"
+	}
+
+	// Path-guard: same as GET.
+	if strings.ContainsAny(mdPath, "\x00") || strings.HasSuffix(mdPath, "/") {
+		fail(c, http.StatusBadRequest, 1400, "invalid surface path")
+		return
+	}
+	target := filepath.Join(appDir, mdPath)
+	abs, err := filepath.Abs(target)
+	if err != nil || !strings.HasPrefix(abs, appDir+string(os.PathSeparator)) {
+		fail(c, http.StatusBadRequest, 1400, "invalid surface path")
+		return
+	}
+	if strings.ToLower(filepath.Ext(abs)) != ".md" {
+		fail(c, http.StatusBadRequest, 1400, "surface must be a .md file")
+		return
+	}
+
+	// Create parent dirs if writing for the first time.
+	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "cannot create surface directory")
+		return
+	}
+
+	// Atomic write: tmp → rename to avoid partial reads.
+	tmp := abs + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body.Markdown), 0644); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "cannot write surface")
+		return
+	}
+	if err := os.Rename(tmp, abs); err != nil {
+		_ = os.Remove(tmp)
+		fail(c, http.StatusInternalServerError, 1500, "cannot save surface")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{"ok": true, "path": mdPath, "bytes": len(body.Markdown)},
+	})
+}
+
+// patchXpcloudUISurface rewrites the ui.surface.markdown (or ui.surfaces[name])
+// field in xpcloud.yaml to point to a local override path. Used when the user
+// edits a @fork_of or @shared surface — their edit becomes a fork-specific file.
+// patchXpcloudUISurfacePage sets ui.surface.page (and clears markdown/native)
+// so the structured spec becomes the home surface — compiled on serve.
+func patchXpcloudUISurfacePage(appDir, pagePath string) error {
+	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
+	b, err := os.ReadFile(yamlPath)
+	if err != nil {
+		return err
+	}
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return err
+	}
+	ui, _ := doc["ui"].(map[string]interface{})
+	if ui == nil {
+		ui = map[string]interface{}{}
+		doc["ui"] = ui
+	}
+	surface, _ := ui["surface"].(map[string]interface{})
+	if surface == nil {
+		surface = map[string]interface{}{}
+		ui["surface"] = surface
+	}
+	surface["page"] = pagePath
+	delete(surface, "markdown")
+	delete(surface, "native")
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	tmp := yamlPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, yamlPath)
+}
+
+func patchXpcloudUISurface(appDir, surfaceName, newPath string) error {
+	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
+	b, err := os.ReadFile(yamlPath)
+	if err != nil {
+		return err
+	}
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return err
+	}
+	ui, _ := doc["ui"].(map[string]interface{})
+	if ui == nil {
+		ui = map[string]interface{}{}
+		doc["ui"] = ui
+	}
+	if surfaceName == "home" {
+		surface, _ := ui["surface"].(map[string]interface{})
+		if surface == nil {
+			surface = map[string]interface{}{}
+			ui["surface"] = surface
+		}
+		surface["markdown"] = newPath
+		delete(surface, "native") // clear native if present
+	} else {
+		surfaces, _ := ui["surfaces"].(map[string]interface{})
+		if surfaces == nil {
+			surfaces = map[string]interface{}{}
+			ui["surfaces"] = surfaces
+		}
+		surfaces[surfaceName] = newPath
+	}
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	tmp := yamlPath + ".tmp"
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, yamlPath)
 }

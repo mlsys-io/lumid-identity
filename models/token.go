@@ -11,6 +11,7 @@ type Token struct {
 	ID          string     `gorm:"type:varchar(36);primaryKey" json:"id"`
 	UserID      string     `gorm:"type:varchar(36);index;not null" json:"user_id"`
 	Prefix      string     `gorm:"type:varchar(16);index;not null" json:"prefix"`  // lm_ | rm_pat_ | rmk_ | flm-
+	LookupKey   string     `gorm:"type:varchar(32);index" json:"-"`                 // first 16 hex chars of raw token; argon2id lookup index
 	Hash        string     `gorm:"type:varchar(255);index;not null" json:"-"`
 	HashAlg     string     `gorm:"type:varchar(16);default:'argon2id'" json:"-"`  // argon2id | sha256
 	Name        string     `gorm:"type:varchar(128)" json:"name"`

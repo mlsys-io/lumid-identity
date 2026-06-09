@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -151,9 +152,12 @@ func MeAppsList(c *gin.Context) {
 		HasXPCld  bool   `json:"has_xpcloud"`
 		HasOverr  bool   `json:"has_user_overrides"`
 		Tenant    bool   `json:"tenant"`         // true = this user's tenant root; false = operator-shared
+		Status    string `json:"status"`         // "ready" | "installing" | "failed"
+		Error     string `json:"error,omitempty"`
 		UI        *appUI `json:"ui,omitempty"`   // optional Studio sidebar + surface declaration (xpcloud.yaml::ui)
 	}
 	out := make([]appCard, 0, 16)
+	onDisk := map[string]bool{} // names backed by a real install (dedupe vs pending intents)
 
 	walk := func(root string, isTenant bool) {
 		entries, err := os.ReadDir(root)
@@ -175,12 +179,14 @@ func MeAppsList(c *gin.Context) {
 			if xpErr == nil {
 				ui = readAppUI(dir)
 			}
+			onDisk[e.Name()] = true
 			out = append(out, appCard{
 				Name:     e.Name(),
 				HasMfst:  mfstErr == nil,
 				HasXPCld: xpErr == nil,
 				HasOverr: ovErr == nil,
 				Tenant:   isTenant,
+				Status:   "ready",
 				UI:       ui,
 			})
 		}
@@ -191,11 +197,157 @@ func MeAppsList(c *gin.Context) {
 	// flagged tenant:false so the UI can show them as read-only.
 	walk(filepath.Join(operatorHome(), ".xp", "apps"), false)
 
+	// Merge in-flight + failed installs for THIS caller so an optimistic
+	// card shows immediately (the picker writes the real dir up to ~60s
+	// later). Strictly user_sub-filtered: the me-intents dir is shared
+	// across users, so an unfiltered scan would leak other tenants' installs.
+	for _, pc := range pendingInstallCards(userID, onDisk) {
+		out = append(out, appCard{
+			Name:    pc.name,
+			Tenant:  true,
+			Status:  pc.status,
+			Error:   pc.err,
+		})
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{"apps": out},
 	})
 	return // (kept to mirror the early-return on error below; non-fatal)
+}
+
+// pendingCard is a synthetic app card derived from an unresolved or failed
+// install intent (no on-disk app yet).
+type pendingCard struct {
+	name   string
+	status string // "installing" | "failed"
+	err    string
+}
+
+// pendingInstallCards scans the shared me-intents dir for THIS user's install
+// intents and returns synthetic cards for ones not yet (or never) materialized
+// on disk. user_sub filtering is mandatory — the dir is shared across tenants.
+func pendingInstallCards(userSub string, onDisk map[string]bool) []pendingCard {
+	dir := intentDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var cards []pendingCard
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".result.json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue
+		}
+		var env struct {
+			IntentID  string         `json:"intent_id"`
+			Action    string         `json:"action"`
+			UserSub   string         `json:"user_sub"`
+			CreatedAt string         `json:"created_at"`
+			Payload   map[string]any `json:"payload"`
+		}
+		if json.Unmarshal(b, &env) != nil {
+			continue
+		}
+		if env.Action != "install" || env.UserSub != userSub {
+			continue
+		}
+		// Age guard: never surface a stale install card. An install resolves
+		// in well under a minute; anything older than an hour is a dead/
+		// abandoned intent (e.g. an old e2e-test leftover) — skip it so it
+		// doesn't clutter My Apps forever. The user can still see it via the
+		// intent inspector; this is just the optimistic-card surface.
+		if t, err := time.Parse(time.RFC3339, env.CreatedAt); err == nil && time.Since(t) > time.Hour {
+			continue
+		}
+		appName := installAppName(env.Payload)
+		if appName == "" || onDisk[appName] || seen[appName] {
+			continue
+		}
+		// Resolved? Read the result to distinguish installing vs failed.
+		resultPath := filepath.Join(dir, env.IntentID+".result.json")
+		if rb, err := os.ReadFile(resultPath); err == nil {
+			ok, errMsg := installResultOK(rb)
+			if ok {
+				// Succeeded but the dir wasn't found above (e.g. installed under
+				// a different name / discovery lag) — let the real card win once
+				// it appears; skip the synthetic one.
+				continue
+			}
+			seen[appName] = true
+			cards = append(cards, pendingCard{name: appName, status: "failed", err: errMsg})
+			continue
+		}
+		seen[appName] = true
+		cards = append(cards, pendingCard{name: appName, status: "installing"})
+	}
+	return cards
+}
+
+// installResultOK interprets a picker result file. The picker writes
+// top-level `ok:true` to mean "intent processed" even when the install
+// itself failed — the real failure is nested in `data` as an HTTP-ish
+// status (>=400) and/or an `error`/`body.detail` string. Returns
+// (success, errorMessage).
+func installResultOK(rb []byte) (bool, string) {
+	var res struct {
+		OK    bool           `json:"ok"`
+		Error string         `json:"error"`
+		Data  map[string]any `json:"data"`
+	}
+	if json.Unmarshal(rb, &res) != nil {
+		return false, "install failed"
+	}
+	if !res.OK {
+		if res.Error != "" {
+			return false, res.Error
+		}
+		return false, "install failed"
+	}
+	// ok:true — inspect the nested data for an embedded failure.
+	if res.Data != nil {
+		if st, ok := res.Data["status"].(float64); ok && st >= 400 {
+			if e, _ := res.Data["error"].(string); e != "" {
+				return false, e
+			}
+			if body, ok := res.Data["body"].(map[string]any); ok {
+				if d, _ := body["detail"].(string); d != "" {
+					return false, d
+				}
+			}
+			return false, "install failed (HTTP " + strconv.Itoa(int(st)) + ")"
+		}
+		if e, _ := res.Data["error"].(string); e != "" {
+			return false, e
+		}
+	}
+	return true, ""
+}
+
+// installAppName derives the display name for an install intent from its
+// payload: the explicit `as` rename, else the last path segment of the slug.
+func installAppName(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	if as, _ := payload["as"].(string); strings.TrimSpace(as) != "" {
+		return strings.TrimSpace(as)
+	}
+	slug, _ := payload["slug"].(string)
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		return ""
+	}
+	if i := strings.LastIndex(slug, "/"); i >= 0 {
+		slug = slug[i+1:]
+	}
+	return strings.TrimSuffix(slug, "-draft")
 }
 
 
@@ -249,6 +401,58 @@ func MeIntentGet(c *gin.Context) {
 			"intent":    envelope,
 		},
 	})
+}
+
+// MeInstallIntentDelete — DELETE /me/install-intents/:name. Permanently
+// removes the caller's install intent(s) for an app NAME (json + result),
+// so a failed/optimistic install card can actually be dismissed. Scoped to
+// the caller's own intents (user_sub match); path-traversal blocked. This is
+// a synchronous file delete — no picker round-trip — because a failed install
+// has no app on disk to uninstall.
+func MeInstallIntentDelete(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	name := c.Param("name")
+	if name == "" || strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
+		fail(c, http.StatusBadRequest, 1400, "invalid app name")
+		return
+	}
+	dir := intentDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		ok_(c, "dismissed", gin.H{"removed": 0})
+		return
+	}
+	removed := 0
+	for _, e := range entries {
+		fn := e.Name()
+		if e.IsDir() || !strings.HasSuffix(fn, ".json") || strings.HasSuffix(fn, ".result.json") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(dir, fn))
+		if err != nil {
+			continue
+		}
+		var env struct {
+			IntentID string         `json:"intent_id"`
+			Action   string         `json:"action"`
+			UserSub  string         `json:"user_sub"`
+			Payload  map[string]any `json:"payload"`
+		}
+		if json.Unmarshal(b, &env) != nil {
+			continue
+		}
+		if env.Action != "install" || env.UserSub != userID || installAppName(env.Payload) != name {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, fn))
+		_ = os.Remove(filepath.Join(dir, env.IntentID+".result.json"))
+		removed++
+	}
+	ok_(c, "dismissed", gin.H{"removed": removed})
 }
 
 // writeIntent atomically writes <uuid>.json into ~/.lumilake/me-intents/

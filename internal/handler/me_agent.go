@@ -2365,6 +2365,29 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "list_experiments",
+			"description": "List an app's declared experiments: hypothesis, kind (regression/explore/arms), sample count, best variant vs baseline, and whether success criteria are met.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app": map[string]any{"type": "string"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
+			"name":        "experiment_status",
+			"description": "Detailed state for one experiment: per-variant aggregates, delta vs baseline, per-case score history (casebook experiments), and verdict.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app": map[string]any{"type": "string"},
+					"id":  map[string]any{"type": "string"},
+				},
+				"required": []string{"app", "id"},
+			},
+		},
+		{
 			"name":        "fork_app",
 			"description": "Fork an installed app into the user's own xp.io repo and install the fork so they can edit it. Use when the user wants to customize a showcase app or 'make it their own'.",
 			"input_schema": map[string]any{
@@ -2493,6 +2516,36 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			return map[string]any{"error": "intent write failed"}, false
 		}
 		return map[string]any{"intent_id": id, "status": "pending"}, true
+
+	case "list_experiments":
+		app, _ := args["app"].(string)
+		if app == "" {
+			return map[string]any{"error": "app required"}, false
+		}
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not installed"}, false
+		}
+		exps := loadAppExperiments(dir)
+		return map[string]any{"experiments": exps, "count": len(exps)}, true
+
+	case "experiment_status":
+		app, _ := args["app"].(string)
+		id, _ := args["id"].(string)
+		if app == "" || id == "" {
+			return map[string]any{"error": "app and id required"}, false
+		}
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not installed"}, false
+		}
+		detail, found := loadExperimentDetail(dir, id)
+		if !found {
+			return map[string]any{"error": "experiment not found"}, false
+		}
+		// keep the tool result compact for the model: drop raw rows
+		delete(detail, "results")
+		return map[string]any(detail), true
 
 	case "fork_app":
 		app, _ := args["app"].(string)

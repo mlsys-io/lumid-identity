@@ -225,6 +225,11 @@ func Register(r *gin.Engine) {
 			me.POST("/apps/:app/fork",    MeAppFork)
 			me.POST("/apps/:app/publish", MeAppPublish)
 			me.POST("/apps/:app/propose", MeAppPropose)
+			// Experiments — read-only observability for experiments[]
+			// (hypothesis × variants × dataset/casebook × metric).
+			me.GET("/apps/:app/experiments",                  MeAppExperiments)
+			me.GET("/apps/:app/experiments/:id",              MeAppExperiment)
+			me.GET("/apps/:app/experiments/:id/case/:caseId", MeAppExperimentCase)
 			me.GET("/intents/:id",            MeIntentGet)
 			// Permanently dismiss a failed/optimistic install card by app name.
 			me.DELETE("/install-intents/:name", MeInstallIntentDelete)

@@ -398,14 +398,16 @@ func (f *flexStrings) UnmarshalJSON(b []byte) error {
 }
 
 type rawEngine struct {
-	Type   string `json:"type"   yaml:"type"`
-	Module string `json:"module" yaml:"module"`
+	Type       string `json:"type"       yaml:"type"`
+	Module     string `json:"module"     yaml:"module"`
+	Experiment string `json:"experiment" yaml:"experiment"`
 }
 
 type rawStep struct {
 	ID             string `json:"id"              yaml:"id"`
 	Skill          string `json:"skill"           yaml:"skill"`
 	KnowledgeAgent string `json:"knowledge_agent" yaml:"knowledge_agent"`
+	Experiment     string `json:"experiment"      yaml:"experiment"`
 }
 
 type rawGoal struct {

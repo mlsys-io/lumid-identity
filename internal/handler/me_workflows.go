@@ -202,6 +202,9 @@ type WorkflowRow struct {
 	Tenant       bool   `json:"tenant"`         // true = tenant-installed; false = operator-shared
 	Showcase     bool   `json:"showcase"`       // operator-shared app on the backend showcase list (curates the home grid without a frontend rebuild)
 	Version      string `json:"version,omitempty"` // app version (manifest.json/xpcloud.yaml) — surfaced so EVERY card shows a version badge, incl. tenant apps loadAppGitStatus can't see
+	// Experiments this workflow is attached to (steps[].experiment /
+	// engine.experiment) — drives the flask chip in the detail card.
+	ExperimentIDs []string `json:"experiment_ids,omitempty"`
 	LastRunTS    float64 `json:"last_run_ts,omitempty"`
 	LastRunOK    *bool   `json:"last_run_ok,omitempty"`
 	NextRunTS    float64 `json:"next_run_ts,omitempty"`
@@ -403,6 +406,19 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					Engine:       engine,
 					StepCount:    len(L.Steps),
 					CostCentsMTD: costMap[e.Name()+"."+L.Name],
+				}
+				// Experiments attached to this loop (flask chip).
+				expIDs := map[string]bool{}
+				if L.Engine.Experiment != "" {
+					expIDs[L.Engine.Experiment] = true
+				}
+				for _, st := range L.Steps {
+					if st.Experiment != "" {
+						expIDs[st.Experiment] = true
+					}
+				}
+				for eid := range expIDs {
+					row.ExperimentIDs = append(row.ExperimentIDs, eid)
 				}
 				row.RunSpark, row.RunsRecent = buildRunSparkDetailed(
 					filepath.Join(appDir, "data", "journal.jsonl"),

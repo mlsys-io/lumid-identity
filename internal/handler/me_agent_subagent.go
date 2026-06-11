@@ -30,11 +30,11 @@ import (
 )
 
 const (
-	subAgentMaxIterations = 5
-	subAgentTimeout       = 45 * time.Second
-	subAgentMaxTokens     = 4096
-	maxParallelAgents     = 4 // concurrent sub-agents in spawn_agents
-	maxAgentTasks         = 6 // total tasks accepted per spawn_agents call
+	subAgentMaxIterations = 10
+	subAgentTimeout       = 180 * time.Second
+	subAgentMaxTokens     = 8192
+	maxParallelAgents     = 6  // concurrent sub-agents in spawn_agents
+	maxAgentTasks         = 10 // total tasks accepted per spawn_agents call
 )
 
 // subAgentDefaultTools — sane read-only + research subset for a

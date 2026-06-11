@@ -192,6 +192,9 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 	// Accept either and normalize so downstream consumers see a clean array.
 	raw := strings.ReplaceAll(row.Scopes, ",", " ")
 	scopeList := common.ExpandFlowmeshScopes(strings.Fields(raw))
+	if u.Role == "admin" || u.Role == "super_admin" {
+		scopeList = ensureAdminFlowmeshScopes(scopeList)
+	}
 	var exp int64
 	if row.ExpiresAt != nil {
 		exp = *row.ExpiresAt
@@ -239,6 +242,9 @@ func introspectNative(token string) *IntrospectResponse {
 	// Expand flowmesh:read/write shortcuts to the fine-grained vocab
 	// FlowMesh's plugin v0.2.0+ requires. See common/scopes.go.
 	scopes := common.ExpandFlowmeshScopes(strings.Fields(row.Scopes))
+	if u.Role == "admin" || u.Role == "super_admin" {
+		scopes = ensureAdminFlowmeshScopes(scopes)
+	}
 	var exp int64
 	if row.ExpiresAt != nil {
 		exp = row.ExpiresAt.Unix()
@@ -314,6 +320,20 @@ func recordIntrospectAudit(ip, ua, token string) {
 		 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?)`,
 		prefix, `{"prefix":"`+prefix+`"}`, ip, ua,
 	)
+}
+
+// ensureAdminFlowmeshScopes appends flowmesh:workflows:write for admin/super_admin
+// users unless an alias already grants it ("*", "flowmesh:*", "flowmesh:admin").
+// JWT tokens already carry "*" so this only fires for PATs with narrower scopes.
+func ensureAdminFlowmeshScopes(scopes []string) []string {
+	const target = "flowmesh:workflows:write"
+	for _, s := range scopes {
+		switch s {
+		case "*", "flowmesh:*", "flowmesh:admin", target:
+			return scopes
+		}
+	}
+	return append(scopes, target)
 }
 
 func itoa(i int64) string {

@@ -52,8 +52,8 @@ const (
 	anthropicEndpoint    = "https://api.anthropic.com/v1/messages"
 	anthropicVersion     = "2023-06-01"
 	anthropicModel       = "claude-haiku-4-5-20251001"
-	maxToolLoopIterations = 20 // Claude Code parity — deep agentic loops need 20+ steps
-	maxTokensPerTurn     = 4096 // default per-turn output cap; providers may override via maxOutputTokens (kv.run GPU models use 16384)
+	maxToolLoopIterations = 50 // Claude Code parity — long refactors routinely need dozens of steps
+	maxTokensPerTurn     = 16384 // default per-turn output cap; providers may override via maxOutputTokens
 )
 
 // ── Tool approval registry ──────────────────────────────────────────────────
@@ -118,7 +118,9 @@ func lumidosURL() string {
 // the result map. The schedule server runs the actual Python ops function.
 func dispatchLumidosTool(name string, args map[string]any) (map[string]any, bool) {
 	payload, _ := json.Marshal(map[string]any{"tool": name, "args": args})
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 90s: ops tools walk the knowledge graph (xp_status on a large KG
+	// measures ~35s) — 30s cut those off mid-flight.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		lumidosURL()+"/api/v1/tools/invoke", bytes.NewReader(payload))
@@ -521,16 +523,22 @@ func requestApproval(approvalID string) chan bool {
 }
 
 // MeAgentToolApprove — POST /api/v1/me/agent/chat/tool-approve
-// Body: {"approval_id": "...", "approved": true}
-// Unblocks the pending tool dispatch in the SSE stream.
+// Body: {"approval_id": "...", "approved": true, "always": false, "tool": ""}
+// Unblocks the pending tool dispatch in the SSE stream. When always=true
+// (and approved), the named tool is added to the caller's persistent
+// grant list — future calls skip the approval gate entirely. Grants are
+// per-user and revocable via DELETE /me/agent/tool-grants/:name.
 func MeAgentToolApprove(c *gin.Context) {
-	if _, ok := currentUserID(c); !ok {
+	userID, ok := currentUserID(c)
+	if !ok {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
 	var body struct {
 		ApprovalID string `json:"approval_id"`
 		Approved   bool   `json:"approved"`
+		Always     bool   `json:"always,omitempty"`
+		Tool       string `json:"tool,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.ApprovalID == "" {
 		fail(c, http.StatusBadRequest, 1400, "approval_id required")
@@ -542,6 +550,9 @@ func MeAgentToolApprove(c *gin.Context) {
 		return
 	}
 	toolApprovals.Delete(body.ApprovalID)
+	if body.Approved && body.Always && destructiveTools[body.Tool] {
+		_ = grantTool(userID, body.Tool)
+	}
 	ch.(chan bool) <- body.Approved
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
@@ -871,13 +882,19 @@ type meAgentChatBody struct {
 	// agent_id — persona_id wins when both are set. See
 	// me_agent_personas.go.
 	PersonaID string `json:"persona_id,omitempty"`
+	// Optional: claude CLI session id from a previous turn's
+	// claude_session SSE event. When set (and owned by this user — see
+	// userOwnsClaudeSession), the claude-code provider resumes that
+	// session via `claude --resume` instead of replaying flattened
+	// history, preserving the CLI's own tool-result context across turns.
+	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 }
 
 // thinkingBudgetTokens — Anthropic's extended thinking budget. Pulled
 // out so we can adjust per-provider later if needed. Must leave room
 // in max_tokens for the actual response.
-const thinkingBudgetTokens = 4000
-const thinkingMaxTokens = 8192 // max_tokens when thinking is enabled
+const thinkingBudgetTokens = 8192
+const thinkingMaxTokens = 24576 // max_tokens when thinking is enabled (budget + room for the answer)
 
 // chatMessageToAnthropic promotes one chatMessage into the Anthropic
 // /v1/messages content shape. With no attachments it stays as a plain
@@ -1059,8 +1076,13 @@ func MeAgentChat(c *gin.Context) {
 		var sb strings.Builder
 		argsByID := map[string]map[string]any{}
 		var streamErr string
+		var ccSessionID string
 		emit := func(ev map[string]any) bool {
 			switch ev["type"] {
+			case "claude_session":
+				if sid, ok := ev["session_id"].(string); ok {
+					ccSessionID = sid
+				}
 			case "text":
 				if d, ok := ev["delta"].(string); ok {
 					sb.WriteString(d)
@@ -1093,7 +1115,7 @@ func MeAgentChat(c *gin.Context) {
 			}
 			return true
 		}
-		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, emit); err != nil {
+		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, emit); err != nil {
 			fail(c, http.StatusBadGateway, 1502, "llm call: "+err.Error())
 			return
 		}
@@ -1108,10 +1130,11 @@ func MeAgentChat(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
 			"data": gin.H{
-				"reply":       finalText,
-				"tool_calls":  toolCalls,
-				"model_used":  provider.id,
-				"auto_routed": autoRouted,
+				"reply":             finalText,
+				"tool_calls":        toolCalls,
+				"model_used":        provider.id,
+				"auto_routed":       autoRouted,
+				"claude_session_id": ccSessionID,
 				"usage": gin.H{
 					"input_tokens":  0,
 					"output_tokens": 0,
@@ -1123,7 +1146,7 @@ func MeAgentChat(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 600*time.Second)
 	defer cancel()
 
 	// Tool-use loop.
@@ -1450,22 +1473,24 @@ func buildSystemPrompt(userID, role, agentID string) string {
 		tenantList = strings.Join(apps, ", ")
 	}
 
-	return `You are the LumidOS assistant — a focused helper that automates the user's intent via xpio apps.
+	return `You are the LumidOS assistant — a focused helper that automates what the user wants via their installed apps.
 
 You have tools to:
   - list, install, uninstall apps from xp.io
-  - start, stop, or fire one-shot cycles on loops
-  - record the user's feedback on cycles (Hook 2 — what worked, what to change)
-  - query recent cycle results
+  - start, stop, or fire one-off runs of an app's workflows
+  - record the user's feedback on runs (what worked, what to change)
+  - query recent run results
   - search the web (web_search), fetch one URL (web_fetch), or run deep research (deep_research)
   - look up financial data by symbol (query_findata)
   - remember things about the user long-term (remember_about_me) — call this whenever the user shares a preference, fact about themselves, or a working style hint that should persist
 
-When the user expresses an intent, prefer doing the work via tools over describing how they could do it themselves. Confirm what you did in 1-2 sentences after each action.
+When the user expresses an intent, prefer doing the work via tools over describing how they could do it themselves. Confirm what you did in 1-2 sentences after each action. When the user asks you to run, pause, install, fork, or publish something, you MUST call the matching tool in that same turn — never answer with prose alone, and never claim an action happened without its tool result.
+
+VOCABULARY: in replies, always say "app", "workflow", and "run" — never internal terms like "loop", "cycle", "intent", or raw tool names. When the user asks how to watch progress or inspect results, point them at the app page's Workflows tab (each run there is inspectable stage by stage) — do NOT recite tool names like loop_status or loop_history.
 
 The user already has these apps installed in their tenant: ` + tenantList + `
 
-When you don't know an app's slug, call list_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent cycle of the most likely loop and tell them you did so — they can refine later.
+When you don't know an app's slug, call list_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent run of the most likely workflow and tell them you did so — they can refine later.
 
 ## Creating a new workflow — roll it out as a conversation, one clear step at a time
 When the user wants to build a new workflow/app (e.g. they say "create a workflow" or "new intent"), GUIDE them — never dump a pre-baked template, and do NOT assume crypto trading. Walk these steps, each as its own short turn:
@@ -1508,6 +1533,7 @@ Search the tree with glob_files('**/*.go') / grep_files('pattern', path_glob='**
 ## Your workspace
 You have a private, isolated workspace. Find files with glob_files('**/*') and grep_files('pattern'); read them with read_file; create/modify them with write_file, edit_file, or multi_edit (these ask for your approval first). bash_exec runs commands in a network-free sandbox with your workspace mounted. Delegate parallel sub-tasks with spawn_agents. Everything is confined to your own space — you can't see or touch anyone else's.`
 		}
+		extra += renderTasksBlock(userID)
 		if agentID != "" {
 			return extra + renderAgentBankBlock(userID, agentID)
 		}
@@ -2090,14 +2116,31 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "bash_exec",
-			"description": "Execute a bash command in your workspace. super_admin: runs in the /proj tree. Everyone else: runs in an isolated Docker sandbox — no network, your workspace mounted at /workspace, capped CPU/memory. Requires approval. Max 120s timeout.",
+			"description": "Execute a bash command in your workspace. super_admin: runs in the /proj tree. Everyone else: runs in an isolated Docker sandbox — no network, your workspace mounted at /workspace, capped CPU/memory. Requires approval. Foreground max 120s. For long-running work (builds, batch jobs) set background=true: returns a task_id immediately and runs up to 30 minutes; check progress later with list_tasks / task_output.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"command":         map[string]any{"type": "string", "description": "Bash command to run."},
-					"timeout_seconds": map[string]any{"type": "integer", "description": "Timeout 1-120s, default 30."},
+					"timeout_seconds": map[string]any{"type": "integer", "description": "Foreground: 1-120s (default 30). Background: 1-1800s (default 600)."},
+					"background":      map[string]any{"type": "boolean", "description": "Run detached; returns {task_id} immediately. Default false."},
 				},
 				"required": []string{"command"},
+			},
+		},
+		{
+			"name":        "list_tasks",
+			"description": "List your background bash tasks (from bash_exec with background=true): id, status (running|done|error|timeout), command, started/finished times, exit code.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "task_output",
+			"description": "Fetch the captured output of one background task by task_id. While a sandboxed (non-operator) task is still running its output arrives only on completion; operator tasks stream incrementally.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task_id": map[string]any{"type": "string"},
+				},
+				"required": []string{"task_id"},
 			},
 		},
 		// ── LumidOS ops tools (proxied to schedule server :9100) ────────────
@@ -2322,6 +2365,43 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "fork_app",
+			"description": "Fork an installed app into the user's own xp.io repo and install the fork so they can edit it. Use when the user wants to customize a showcase app or 'make it their own'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string", "description": "installed app slug"},
+					"name": map[string]any{"type": "string", "description": "optional new name for the fork"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
+			"name":        "publish_app",
+			"description": "Publish the user's local changes of THEIR app (a fork or composed app) to their xp.io repo. Use when the user says 'publish my app/changes'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":     map[string]any{"type": "string"},
+					"summary": map[string]any{"type": "string"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
+			"name":        "propose_upstream",
+			"description": "Open a pull request proposing the user's published fork changes to the upstream app. Use when the user wants to contribute changes back.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":   map[string]any{"type": "string"},
+					"title": map[string]any{"type": "string"},
+					"body":  map[string]any{"type": "string"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
 			"name":        "app_push",
 			"description": "Push a local xpio app to xp.io (publish / update). Auto-bumps patch version if content changed. Requires approval.",
 			"input_schema": map[string]any{
@@ -2413,6 +2493,80 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			return map[string]any{"error": "intent write failed"}, false
 		}
 		return map[string]any{"intent_id": id, "status": "pending"}, true
+
+	case "fork_app":
+		app, _ := args["app"].(string)
+		name, _ := args["name"].(string)
+		if app == "" {
+			return map[string]any{"error": "app required"}, false
+		}
+		if name == "" {
+			name = app
+		}
+		bearer, err := xpcloudUserJWT(userID)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		upstream := appUpstreamSlug(userID, app)
+		code, resp, err := xpcloudJSON(http.MethodPost,
+			xpcloudBaseURL()+"/api/v1/repos/"+upstream+"/fork", bearer,
+			map[string]any{"name": name})
+		if err != nil || code >= 300 {
+			return map[string]any{"error": fmt.Sprintf("fork failed (%d): %v %v", code, resp["detail"], err)}, false
+		}
+		iid := writeIntentDirect(userID, "install", map[string]any{"slug": userID + "/" + name, "as": name, "bearer": bearer})
+		return map[string]any{"fork": userID + "/" + name, "upstream": upstream, "install_intent": iid,
+			"repo_url": "https://xp.io/" + userID + "/" + name}, true
+
+	case "publish_app":
+		app, _ := args["app"].(string)
+		summary, _ := args["summary"].(string)
+		if app == "" {
+			return map[string]any{"error": "app required"}, false
+		}
+		bearer, err := xpcloudUserJWT(userID)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		iid := writeIntentDirect(userID, "publish_app", map[string]any{"app": app, "summary": summary, "bearer": bearer})
+		if iid == "" {
+			return map[string]any{"error": "queue publish intent failed"}, false
+		}
+		return map[string]any{"intent_id": iid, "state": "queued",
+			"repo_url": "https://xp.io/" + userID + "/" + app}, true
+
+	case "propose_upstream":
+		app, _ := args["app"].(string)
+		title, _ := args["title"].(string)
+		prBody, _ := args["body"].(string)
+		if app == "" {
+			return map[string]any{"error": "app required"}, false
+		}
+		if title == "" {
+			title = "Changes from fork of " + app
+		}
+		bearer, err := xpcloudUserJWT(userID)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		upstream := ""
+		if code, meta, e := xpcloudJSON(http.MethodGet, xpcloudBaseURL()+"/api/v1/repos/"+userID+"/"+app, bearer, nil); e == nil && code == 200 {
+			if fo, _ := meta["fork_of"].(string); fo != "" {
+				upstream = fo
+			}
+		}
+		if upstream == "" {
+			upstream = appUpstreamSlug(userID, app)
+		}
+		code, resp, err := xpcloudJSON(http.MethodPost,
+			xpcloudBaseURL()+"/api/v1/repos/"+upstream+"/pulls", bearer,
+			map[string]any{"title": title, "body": prBody, "head_owner": userID,
+				"head_name": app, "head_branch": "main", "base_branch": "main"})
+		if err != nil || code >= 300 {
+			return map[string]any{"error": fmt.Sprintf("propose failed (%d): %v %v", code, resp["detail"], err)}, false
+		}
+		return map[string]any{"upstream": upstream, "pull": resp["pr"],
+			"pulls_url": "https://xp.io/" + upstream + "/pulls"}, true
 
 	case "run_loop_now":
 		app, _ := args["app"].(string)
@@ -2817,7 +2971,17 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if v, ok := args["timeout_seconds"].(float64); ok {
 			timeout = int(v)
 		}
+		if bg, _ := args["background"].(bool); bg {
+			return startBackgroundBash(userID, role, command, timeout)
+		}
 		return toolBashExec(userID, role, command, timeout)
+
+	case "list_tasks":
+		return toolListTasks(userID), true
+
+	case "task_output":
+		taskID, _ := args["task_id"].(string)
+		return toolTaskOutput(userID, taskID)
 
 	case "spawn_agents":
 		return toolSpawnAgents(c, userID, args)

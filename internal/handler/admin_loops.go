@@ -324,18 +324,77 @@ func loopNames(ls []struct {
 }
 
 type rawLoop struct {
-	Name           string     `json:"name"            yaml:"name"`
-	Schedule       string     `json:"schedule"        yaml:"schedule"`
-	KnowledgeAgent string     `json:"knowledge_agent" yaml:"knowledge_agent"`
-	Description    string     `json:"description"     yaml:"description"`
-	PrimaryRole    string     `json:"primary_role"    yaml:"primary_role"`
-	Mode           string     `json:"mode"            yaml:"mode"`
-	Skills         []string   `json:"skills"          yaml:"skills"`
-	SkillsInvoked  []string   `json:"skills_invoked"  yaml:"skills_invoked"`
-	Datasets       []string   `json:"datasets"        yaml:"datasets"`
-	Steps          []rawStep  `json:"steps"           yaml:"steps"`
-	Engine         rawEngine  `json:"engine"          yaml:"engine"`
-	Goal           rawGoal    `json:"goal"            yaml:"goal"`
+	Name           string      `json:"name"            yaml:"name"`
+	Schedule       string      `json:"schedule"        yaml:"schedule"`
+	KnowledgeAgent string      `json:"knowledge_agent" yaml:"knowledge_agent"`
+	Description    string      `json:"description"     yaml:"description"`
+	PrimaryRole    string      `json:"primary_role"    yaml:"primary_role"`
+	Mode           string      `json:"mode"            yaml:"mode"`
+	Skills         flexStrings `json:"skills"          yaml:"skills"`
+	SkillsInvoked  flexStrings `json:"skills_invoked"  yaml:"skills_invoked"`
+	Datasets       flexStrings `json:"datasets"        yaml:"datasets"`
+	Steps          []rawStep   `json:"steps"           yaml:"steps"`
+	Engine         rawEngine   `json:"engine"          yaml:"engine"`
+	Goal           rawGoal     `json:"goal"            yaml:"goal"`
+}
+
+// flexStrings accepts a list whose entries are bare strings OR objects
+// (the autoresearch contract allows skills_invoked/datasets entries as
+// either "id" or {skill:|name:|id:, ...} docs — auto-sysresearch ships
+// object-form skills_invoked). The old strict []string made the WHOLE
+// loop unmarshal fail, the manifest.json fallback failed identically,
+// and the app's workflows silently vanished from /me/workflows while
+// the (tolerant, Python) scheduler kept running them: invisible
+// automation. Object entries coerce to their skill/name/id field.
+type flexStrings []string
+
+func coerceFlexEntry(m map[string]any) string {
+	for _, k := range []string{"skill", "name", "id"} {
+		if v, ok := m[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (f *flexStrings) UnmarshalYAML(value *yaml.Node) error {
+	var raw []any
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	out := make([]string, 0, len(raw))
+	for _, e := range raw {
+		switch v := e.(type) {
+		case string:
+			out = append(out, v)
+		case map[string]any:
+			if s := coerceFlexEntry(v); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	*f = out
+	return nil
+}
+
+func (f *flexStrings) UnmarshalJSON(b []byte) error {
+	var raw []any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	out := make([]string, 0, len(raw))
+	for _, e := range raw {
+		switch v := e.(type) {
+		case string:
+			out = append(out, v)
+		case map[string]any:
+			if s := coerceFlexEntry(v); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	*f = out
+	return nil
 }
 
 type rawEngine struct {
@@ -1055,9 +1114,9 @@ func AdminLoops(c *gin.Context) {
 				row.PrimaryRole = detail.PrimaryRole
 				row.KnowledgeAgent = detail.KnowledgeAgent
 				row.Mode = detail.Mode
-				row.Skills = detail.Skills
-				row.SkillsInvoked = detail.SkillsInvoked
-				row.Datasets = detail.Datasets
+				row.Skills = []string(detail.Skills)
+				row.SkillsInvoked = []string(detail.SkillsInvoked)
+				row.Datasets = []string(detail.Datasets)
 				row.GoalPrimary = detail.Goal.Primary
 				row.GoalTracked = detail.Goal.Tracked
 				if detail.Engine.Type != "" {

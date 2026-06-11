@@ -62,10 +62,19 @@ func streamClaudeCodeViaProxy(
 	messages []chatMessage,
 	systemPrompt string,
 	model string, // claude CLI --model alias ("opus" | "sonnet")
+	sessionID string, // optional claude session to resume (must be owned by userID)
 	emit func(map[string]any) bool,
 ) error {
 	if model == "" {
 		model = "opus"
+	}
+	// Session continuity: resume the prior claude CLI session when the
+	// client passes one back. Only sessions THIS user was previously
+	// issued (recorded by recordClaudeSession below) are honored —
+	// anything else is silently ignored and starts fresh, so a caller
+	// can't graft someone else's transcript into their context.
+	if sessionID != "" && !userOwnsClaudeSession(userID, sessionID) {
+		sessionID = ""
 	}
 	// Access policy mirrored from the in-house file tools (writeRoot):
 	// only super_admin operates the /proj deployment tree with full
@@ -80,11 +89,12 @@ func streamClaudeCodeViaProxy(
 		workspace = ownWorkspace(userID)
 	}
 	body, _ := json.Marshal(map[string]any{
-		"messages":  proxyMessages(messages),
-		"model":     model,
-		"system":    systemPrompt,
-		"role":      role,
-		"workspace": workspace,
+		"messages":   proxyMessages(messages),
+		"model":      model,
+		"system":     systemPrompt,
+		"role":       role,
+		"workspace":  workspace,
+		"session_id": sessionID,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -124,6 +134,17 @@ func streamClaudeCodeViaProxy(
 		}
 
 		switch event["type"] {
+
+		case "system":
+			// init event carries the session_id of this run. Record it
+			// against the user (authorizes future --resume) and surface
+			// it to the client so the next turn can pass it back.
+			if sub, _ := event["subtype"].(string); sub == "init" {
+				if sid, _ := event["session_id"].(string); sid != "" {
+					recordClaudeSession(userID, sid)
+					emit(map[string]any{"type": "claude_session", "session_id": sid})
+				}
+			}
 
 		case "stream_event":
 			// Inner Anthropic API SSE event.

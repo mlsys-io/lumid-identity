@@ -9,8 +9,17 @@ package handler
 // operator-shared fallback), size cap (64 KB), no path traversal.
 // The PUT validates that the submitted text is parseable YAML before writing
 // so a syntax error never silently breaks the app's runtime manifest.
+//
+// Concurrency: writes are OPTIMISTICALLY LOCKED. GET returns a `sha` of the
+// current bytes; PUT carries it back as `base_sha` and the server 409s when
+// the file changed since that read — so a stale editor tab can no longer
+// silently clobber edits made elsewhere (the Manage panel, another tab, an
+// agent). base_sha is optional for back-compat: CLI/scripted writers that
+// don't send it keep last-write-wins semantics.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +27,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
+
+func contentSHA(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
 
 const configMaxBytes = 64 * 1024 // 64 KB — xpcloud.yaml is always small
 
@@ -53,6 +67,7 @@ func MeAppConfig(c *gin.Context) {
 			"app":   app,
 			"yaml":  string(b),
 			"bytes": len(b),
+			"sha":   contentSHA(b),
 		},
 	})
 }
@@ -71,7 +86,8 @@ func MeUpdateAppConfig(c *gin.Context) {
 	}
 
 	var body struct {
-		YAML string `json:"yaml" binding:"required"`
+		YAML    string `json:"yaml" binding:"required"`
+		BaseSHA string `json:"base_sha"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid request body")
@@ -96,6 +112,17 @@ func MeUpdateAppConfig(c *gin.Context) {
 	}
 	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
 
+	// Optimistic lock: refuse a write based on a stale read. A 409 means
+	// "someone else changed the config since you loaded it" — the client
+	// reloads, reapplies, and retries.
+	if body.BaseSHA != "" {
+		if cur, err := os.ReadFile(yamlPath); err == nil && contentSHA(cur) != body.BaseSHA {
+			fail(c, http.StatusConflict, 1409,
+				"config changed since you loaded it — reload to pick up the other edit, then reapply yours")
+			return
+		}
+	}
+
 	// Atomic write.
 	tmp := yamlPath + ".tmp"
 	if err := os.WriteFile(tmp, []byte(body.YAML), 0644); err != nil {
@@ -110,6 +137,7 @@ func MeUpdateAppConfig(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
-		"data": gin.H{"ok": true, "bytes": len(body.YAML)},
+		// Echo the new sha so the editor can chain further saves without a reload.
+		"data": gin.H{"ok": true, "bytes": len(body.YAML), "sha": contentSHA([]byte(body.YAML))},
 	})
 }

@@ -64,6 +64,12 @@ type appUISurface struct {
 	Page string `yaml:"page" json:"page,omitempty"`
 }
 
+// appUINavItem is one entry in an app's surface switcher (ui.nav).
+type appUINavItem struct {
+	Surface string `yaml:"surface" json:"surface"`
+	Label   string `yaml:"label"   json:"label,omitempty"`
+}
+
 type appUI struct {
 	Sidebar *appUISidebar `yaml:"sidebar" json:"sidebar,omitempty"`
 	// Surface is the default ("home") surface — kept for back-compat.
@@ -71,6 +77,11 @@ type appUI struct {
 	// Surfaces is the optional named-markdown map (name → bundle-relative .md).
 	// Each is reachable at /studio/a/<app>/<name>; "home" is the default.
 	Surfaces map[string]string `yaml:"surfaces" json:"surfaces,omitempty"`
+	// Nav is an optional ORDERED surface switcher. When set, the client renders
+	// a tab bar so a multi-surface app's surfaces are pickable from any of them
+	// (not just via home-page links). Only list param-free, directly-routable
+	// surfaces (each links to /studio/a/<app>/<surface>).
+	Nav []appUINavItem `yaml:"nav" json:"nav,omitempty"`
 }
 
 // readAppUI parses ONLY the `ui:` subtree from an app's xpcloud.yaml.
@@ -87,6 +98,24 @@ func readAppUI(appDir string) *appUI {
 		return nil
 	}
 	return doc.UI
+}
+
+// readAppConfig parses the TOP-LEVEL `config:` map from an app's xpcloud.yaml.
+// This is the app's user-editable configuration (the Config button edits it) —
+// surfaces receive it so widgets like the data-app browser take their defaults
+// from config instead of hard-coded directive values. Best-effort → nil.
+func readAppConfig(appDir string) map[string]any {
+	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Config map[string]any `yaml:"config"`
+	}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return nil
+	}
+	return doc.Config
 }
 
 // readForkOf returns the fork_of field from an app's xpcloud.yaml, or "".
@@ -184,6 +213,7 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		fail(c, http.StatusNotFound, 1404, "app declares no ui surface")
 		return
 	}
+	appCfg := readAppConfig(appDir)
 
 	// Resolve the requested surface name → (markdown path | native key | page spec).
 	var mdPath, native, pagePath string
@@ -194,6 +224,13 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 	} else {
 		fail(c, http.StatusNotFound, 1404, "unknown surface")
 		return
+	}
+	// Named surfaces may ALSO be structured page specs — a `surfaces:` entry
+	// pointing at a .yaml compiles through compilePageSpec exactly like the
+	// default surface's `page:`. This keeps every tab of a multi-surface app
+	// in the configurable spec format (not just home).
+	if strings.HasSuffix(strings.ToLower(mdPath), ".yaml") || strings.HasSuffix(strings.ToLower(mdPath), ".yml") {
+		pagePath, mdPath = mdPath, ""
 	}
 
 	// Structured page spec → compile to markdown on serve (deterministic, no
@@ -220,7 +257,16 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		}
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
-			"data": gin.H{"app": app, "surface": name, "markdown": md, "path": pagePath},
+			"data": gin.H{
+				"app": app, "surface": name, "markdown": md, "path": pagePath,
+				"nav": ui.Nav, "config": appCfg,
+				// The editable source of truth: the editor edits THIS (the
+				// markdown above is compiled output). sha backs the PUT's
+				// optimistic lock.
+				"format": "page",
+				"spec":   string(pb),
+				"sha":    contentSHA(pb),
+			},
 		})
 		return
 	}
@@ -231,7 +277,7 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		if native != "" {
 			c.JSON(http.StatusOK, gin.H{
 				"ret_code": 0, "message": "ok",
-				"data": gin.H{"app": app, "surface": name, "native": native},
+				"data": gin.H{"app": app, "surface": name, "native": native, "nav": ui.Nav, "config": appCfg},
 			})
 			return
 		}
@@ -308,6 +354,9 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 			"markdown":  string(buf[:n]),
 			"bytes":     st.Size(),
 			"truncated": truncated,
+			"nav":       ui.Nav,
+			"config":    appCfg,
+			"sha":       contentSHA(buf[:n]), // optimistic-lock token for PUT
 		},
 	})
 }
@@ -321,8 +370,14 @@ func MeUpdateAppUI(c *gin.Context) { updateAppSurface(c, "") }
 func MeUpdateAppUISurface(c *gin.Context) { updateAppSurface(c, c.Param("surface")) }
 
 type meUpdateAppUIBody struct {
-	Markdown string `json:"markdown" binding:"required"`
+	// Exactly one of Markdown / Spec is the payload: Markdown for .md
+	// surfaces, Spec (raw page.yaml text) for structured page surfaces.
+	Markdown string `json:"markdown"`
+	Spec     string `json:"spec"`
 	Surface  string `json:"surface"`
+	// BaseSHA is the sha returned by the GET this edit started from —
+	// optimistic lock; mismatch → 409 (stale buffer, someone else saved).
+	BaseSHA string `json:"base_sha"`
 }
 
 // updateAppSurface writes the caller's markdown to the resolved surface file.
@@ -346,6 +401,10 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 		fail(c, http.StatusBadRequest, 1400, "invalid request body")
 		return
 	}
+	if body.Markdown == "" && body.Spec == "" {
+		fail(c, http.StatusBadRequest, 1400, "body needs `markdown` (md surface) or `spec` (page surface)")
+		return
+	}
 	name := surfaceName
 	if name == "" {
 		if body.Surface != "" {
@@ -355,8 +414,8 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 		}
 	}
 	const maxBytes = 256 * 1024
-	if len(body.Markdown) > maxBytes {
-		fail(c, http.StatusRequestEntityTooLarge, 1413, "markdown exceeds 256 KB limit")
+	if len(body.Markdown) > maxBytes || len(body.Spec) > maxBytes {
+		fail(c, http.StatusRequestEntityTooLarge, 1413, "surface exceeds 256 KB limit")
 		return
 	}
 
@@ -373,18 +432,76 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 		fail(c, http.StatusNotFound, 1404, "app declares no ui surface")
 		return
 	}
-
-	// Resolve the surface → declared markdown path.
-	var mdPath string
+	// Resolve the surface → declared markdown path (or structured page spec).
+	var mdPath, pagePath string
 	if p, ok := ui.Surfaces[name]; ok {
-		mdPath = p
+		if low := strings.ToLower(p); strings.HasSuffix(low, ".yaml") || strings.HasSuffix(low, ".yml") {
+			pagePath = p
+		} else {
+			mdPath = p
+		}
 	} else if name == "home" && ui.Surface != nil {
-		mdPath = ui.Surface.Markdown
+		mdPath, pagePath = ui.Surface.Markdown, ui.Surface.Page
 	} else {
 		fail(c, http.StatusNotFound, 1404, "unknown surface")
 		return
 	}
 
+	// Structured page surface — the SPEC is the editable artifact (the served
+	// markdown is compiled output). Validate through the compiler so a broken
+	// spec can never be saved, honor the optimistic lock, write atomically.
+	if pagePath != "" {
+		if body.Spec == "" {
+			fail(c, http.StatusBadRequest, 1400,
+				"this surface is a structured page spec — send `spec` (the raw "+pagePath+" text), not markdown")
+			return
+		}
+		if strings.ContainsAny(pagePath, "\x00") || strings.Contains(pagePath, "..") || filepath.IsAbs(pagePath) {
+			fail(c, http.StatusBadRequest, 1400, "invalid page path")
+			return
+		}
+		absSpec := filepath.Clean(filepath.Join(appDir, pagePath))
+		if !strings.HasPrefix(absSpec, appDir+string(filepath.Separator)) {
+			fail(c, http.StatusBadRequest, 1400, "page path escapes app")
+			return
+		}
+		if _, cerr := compilePageSpec([]byte(body.Spec)); cerr != nil {
+			fail(c, http.StatusUnprocessableEntity, 1422, "page spec invalid: "+cerr.Error())
+			return
+		}
+		if body.BaseSHA != "" {
+			if cur, rerr := os.ReadFile(absSpec); rerr == nil && contentSHA(cur) != body.BaseSHA {
+				fail(c, http.StatusConflict, 1409,
+					"this page changed since you loaded it — reload to pick up the other edit, then reapply yours")
+				return
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(absSpec), 0755); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "cannot create surface directory")
+			return
+		}
+		tmp := absSpec + ".tmp"
+		if err := os.WriteFile(tmp, []byte(body.Spec), 0644); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "cannot write page spec")
+			return
+		}
+		if err := os.Rename(tmp, absSpec); err != nil {
+			_ = os.Remove(tmp)
+			fail(c, http.StatusInternalServerError, 1500, "cannot save page spec")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"ok": true, "path": pagePath, "bytes": len(body.Spec),
+				"format": "page", "sha": contentSHA([]byte(body.Spec))},
+		})
+		return
+	}
+
+	if body.Markdown == "" {
+		fail(c, http.StatusBadRequest, 1400, "this surface is markdown — send `markdown`")
+		return
+	}
 	if mdPath == "" && ui.Surface != nil && ui.Surface.Native != "" {
 		fail(c, http.StatusBadRequest, 1400, "native surfaces are not editable via the API")
 		return
@@ -421,6 +538,15 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 		return
 	}
 
+	// Optimistic lock — refuse a stale-buffer save (see meUpdateAppUIBody).
+	if body.BaseSHA != "" {
+		if cur, rerr := os.ReadFile(abs); rerr == nil && contentSHA(cur) != body.BaseSHA {
+			fail(c, http.StatusConflict, 1409,
+				"this page changed since you loaded it — reload to pick up the other edit, then reapply yours")
+			return
+		}
+	}
+
 	// Create parent dirs if writing for the first time.
 	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "cannot create surface directory")
@@ -441,7 +567,8 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
-		"data": gin.H{"ok": true, "path": mdPath, "bytes": len(body.Markdown)},
+		"data": gin.H{"ok": true, "path": mdPath, "bytes": len(body.Markdown),
+			"sha": contentSHA([]byte(body.Markdown))},
 	})
 }
 

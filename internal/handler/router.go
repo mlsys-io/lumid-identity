@@ -219,6 +219,12 @@ func Register(r *gin.Engine) {
 			me.POST("/apps/:app/ui/generate", MeGenerateAppUI)  // AI-generate surface from config
 			me.GET("/apps/:app/config",       MeAppConfig)      // read xpcloud.yaml
 			me.PUT("/apps/:app/config",       MeUpdateAppConfig) // write xpcloud.yaml (YAML-validated)
+			me.POST("/apps/:app/skills",      MeAppAddSkill)    // add a kind=skill repo to skill_imports[]
+			// Repo workflow — fork a showcase app, publish your tree
+			// to YOUR xp.io repo, propose changes upstream as a PR.
+			me.POST("/apps/:app/fork",    MeAppFork)
+			me.POST("/apps/:app/publish", MeAppPublish)
+			me.POST("/apps/:app/propose", MeAppPropose)
 			me.GET("/intents/:id",            MeIntentGet)
 			// Permanently dismiss a failed/optimistic install card by app name.
 			me.DELETE("/install-intents/:name", MeInstallIntentDelete)
@@ -278,6 +284,10 @@ func Register(r *gin.Engine) {
 			me.POST("/agent/chat/stream", MeAgentChatStream)
 			// Tool approval — unblocks a destructive tool pending user consent.
 			me.POST("/agent/chat/tool-approve", MeAgentToolApprove)
+			// Persistent "always allow" grants for destructive tools —
+			// written by tool-approve with always=true; listed/revoked here.
+			me.GET("/agent/tool-grants", MeAgentToolGrants)
+			me.DELETE("/agent/tool-grants/:name", MeAgentToolGrantRevoke)
 			// Available LLM backends — populates the model dropdown
 			// in StudioChat. Returns [{id, displayName, default}].
 			me.GET("/agent/models", MeAgentModels)
@@ -350,6 +360,9 @@ func Register(r *gin.Engine) {
 			// listing + paginated memories with kind filter.
 			me.GET("/knowledge/agents",                  MeKnowledgeAgents)
 			me.GET("/knowledge/agents/:id/memories",     MeKnowledgeMemories)
+			// Marketplace kind=agent consumption: delta-sync a published
+			// bank into the caller's tenant KG (subscribe_bank intent).
+			me.POST("/knowledge/subscriptions",          MeKnowledgeSubscribe)
 
 			// Approval queue — drafts produced by personal-agent's
 			// email/draft + calendar/propose skills. The send action

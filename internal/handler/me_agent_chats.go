@@ -51,6 +51,9 @@ type chatRecord struct {
 	// so the user knows what backed the thread.
 	Model string `json:"model,omitempty"`
 	Mode  string `json:"mode,omitempty"`
+	// Claude CLI session backing this thread (claude-code providers).
+	// Restored on thread load so --resume continuity survives reloads.
+	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 }
 
 func chatsDir(userID string) string {
@@ -198,10 +201,11 @@ func MeChatSave(c *gin.Context) {
 		return
 	}
 	var body struct {
-		ID       string           `json:"id"`
-		Messages []map[string]any `json:"messages"`
-		Model    string           `json:"model"`
-		Mode     string           `json:"mode"`
+		ID              string           `json:"id"`
+		Messages        []map[string]any `json:"messages"`
+		Model           string           `json:"model"`
+		Mode            string           `json:"mode"`
+		ClaudeSessionID string           `json:"claude_session_id"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -245,6 +249,9 @@ func MeChatSave(c *gin.Context) {
 	rec.Messages = body.Messages
 	rec.Model = body.Model
 	rec.Mode = body.Mode
+	if body.ClaudeSessionID != "" {
+		rec.ClaudeSessionID = body.ClaudeSessionID
+	}
 	rec.Title = inferTitle(body.Messages)
 	rec.UpdatedAt = now
 

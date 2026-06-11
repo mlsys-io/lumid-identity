@@ -31,6 +31,10 @@ type cycleListItem struct {
 	Loop     string `json:"loop"`
 	Ts       string `json:"ts"`
 	OK       bool   `json:"ok"`
+	// Running marks a cycle dir with no cycle.json yet whose dir is
+	// recent — the run is still in flight (engines write cycle.json at
+	// completion). Without this the list showed in-flight runs as ok.
+	Running  bool   `json:"running,omitempty"`
 	Duration float64 `json:"duration_s,omitempty"`
 	StepCount int   `json:"step_count"`
 }
@@ -85,6 +89,10 @@ func MeCyclesList(c *gin.Context) {
 							item.Duration = v
 						}
 					}
+				} else if st, serr := os.Stat(filepath.Join(cyclesRoot, lp.Name(), td.Name())); serr == nil &&
+					time.Since(st.ModTime()) < 2*time.Hour {
+					// No cycle.json yet + recent dir = run still in flight.
+					item.Running = true
 				}
 				// Step count = number of .json files (minus cycle.json itself).
 				files, _ := os.ReadDir(filepath.Join(cyclesRoot, lp.Name(), td.Name()))

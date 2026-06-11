@@ -169,6 +169,14 @@ func readAppVersion(appDir string) string {
 // RUNNING_APPS constant was baked into the JS bundle. Override via the
 // LUMID_SHOWCASE_APPS env var (comma-separated); defaults to the canonical
 // showcase. A user's OWN tenant apps always show regardless of this list.
+// userIsAdmin reports whether the user holds an operator-level role.
+// One indexed-PK lookup; callers are list endpoints, not hot paths.
+func userIsAdmin(userID string) bool {
+	var role string
+	common.DB.Raw(`SELECT role FROM users WHERE id = ? LIMIT 1`, userID).Scan(&role)
+	return role == "admin" || role == "super_admin"
+}
+
 func showcaseApps() map[string]bool {
 	raw := os.Getenv("LUMID_SHOWCASE_APPS")
 	if strings.TrimSpace(raw) == "" {
@@ -305,6 +313,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 
 	showcase := showcaseApps()        // backend-driven home-grid curation
 	seenTenantApps := map[string]bool{} // dedupe: tenant app shadows operator-shared
+	privileged := userIsAdmin(userID)   // admins see all operator loops; users only showcase
 
 	scan := func(appsRoot string, isTenant bool) {
 		entries, err := os.ReadDir(appsRoot)
@@ -325,6 +334,12 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			} else if seenTenantApps[e.Name()] {
 				continue
 			}
+			// Privacy: the operator tree carries personal/ops loops
+			// (yao-agent, lqt-mailbox, skill-ci, …). Plain users only get
+			// the curated showcase set; everything else is operator-private.
+			if !isTenant && !privileged && !showcase[e.Name()] {
+				continue
+			}
 			appDir := filepath.Join(appsRoot, e.Name())
 			loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml"))
 			if err != nil || len(loops) == 0 {
@@ -340,11 +355,27 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			// full rawLoop parse (object-typed datasets/skills_invoked).
 			goalsByLoop := readYamlLoopGoals(filepath.Join(appDir, "xpcloud.yaml"))
 			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
+			scheduleMap := readScheduleOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			for _, L := range loops {
 				if L.Name == "" {
 					continue
 				}
+				if s, ok := scheduleMap[L.Name]; ok {
+					L.Schedule = s
+				}
+				// Scheduler job-ids are tenant-scoped for tenant installs
+				// (xpio:<sub[:8]>:<app>:<loop>, see xpio_scheduler.job_id).
+				// Looking up the unprefixed key for a tenant row would
+				// inherit the OPERATOR's stale run state — a fresh install
+				// must read "no runs yet", not someone else's failures.
 				jobID := "xpio:" + e.Name() + ":" + L.Name
+				if isTenant {
+					sub := userID
+					if len(sub) > 8 {
+						sub = sub[:8]
+					}
+					jobID = "xpio:" + sub + ":" + e.Name() + ":" + L.Name
+				}
 				s := state.Loops[jobID]
 				enabled := true
 				if v, ok := enabledMap[L.Name]; ok {
@@ -382,7 +413,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				} else if L.Goal.Primary != "" || len(L.Goal.Tracked) > 0 {
 					row.Goal = &WorkflowGoal{Primary: L.Goal.Primary, Tracked: L.Goal.Tracked}
 				}
-				row.Datasets = L.Datasets
+				row.Datasets = []string(L.Datasets)
 				row.MemoryAgents = memAgents
 				if s.LastOk != nil {
 					b := *s.LastOk
@@ -713,6 +744,24 @@ func readEnabledOverrides(path string) map[string]bool {
 		settings, _ := v.(map[string]any)
 		if en, ok := settings["enabled"].(bool); ok {
 			out[name] = en
+		}
+	}
+	return out
+}
+
+// readScheduleOverrides returns per-loop schedule overrides from
+// .user-overrides.yaml (written by MeLoopPatch + the chat agent's
+// patch_loop). The scheduler merges these at discovery; the workflow
+// list must show the SAME effective schedule or a chat-patched
+// schedule looks like it silently failed.
+func readScheduleOverrides(path string) map[string]string {
+	out := map[string]string{}
+	overrides := readSimpleOverrides(path)
+	loopsMap, _ := overrides["loops"].(map[string]any)
+	for name, v := range loopsMap {
+		settings, _ := v.(map[string]any)
+		if s, ok := settings["schedule"].(string); ok && s != "" {
+			out[name] = s
 		}
 	}
 	return out

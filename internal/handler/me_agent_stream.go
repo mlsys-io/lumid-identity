@@ -110,9 +110,10 @@ func MeAgentChatStream(c *gin.Context) {
 	totalInputTokens := 0
 	totalOutputTokens := 0
 
-	// 300s — deep agentic loops (20 iterations) and long claude-code Opus
-	// runs need headroom; SSE keeps the connection alive with deltas.
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 300*time.Second)
+	// 30 min — deep agentic loops (50 iterations), long claude-code Opus
+	// runs, and pause-for-approval all need headroom; SSE keeps the
+	// connection alive with deltas.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
 	defer cancel()
 
 	// Surface the routing decision immediately. When auto_routed=true,
@@ -129,7 +130,7 @@ func MeAgentChatStream(c *gin.Context) {
 	// me_agent tool list; the system prompt is passed as context only.
 	if isClaudeCodeProvider(provider) {
 		_ = tools // not used for this provider
-		if err := streamClaudeCodeViaProxy(ctx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, emit); err != nil {
+		if err := streamClaudeCodeViaProxy(ctx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, emit); err != nil {
 			emit(map[string]any{"type": "error", "message": err.Error()})
 		}
 		emit(map[string]any{"type": "done"})
@@ -178,8 +179,11 @@ func MeAgentChatStream(c *gin.Context) {
 		// Execute tools + emit + append tool_result blocks.
 		toolResultBlocks := []map[string]any{}
 		for _, tu := range toolUses {
-			// For destructive tools: pause and wait for user approval (30s).
-			if destructiveTools[tu.name] {
+			// For destructive tools: pause and wait for user approval —
+			// unless the user has a persistent "always allow" grant for
+			// this tool (POST tool-approve with always=true; revocable
+			// via DELETE /me/agent/tool-grants/:name).
+			if destructiveTools[tu.name] && !hasToolGrant(userID, tu.name) {
 				approvalID := uuid.New().String()
 				ch := requestApproval(approvalID)
 				emit(map[string]any{
@@ -192,7 +196,9 @@ func MeAgentChatStream(c *gin.Context) {
 				approved := false
 				select {
 				case approved = <-ch:
-				case <-time.After(30 * time.Second):
+				case <-time.After(10 * time.Minute):
+					toolApprovals.Delete(approvalID)
+				case <-ctx.Done():
 					toolApprovals.Delete(approvalID)
 				}
 				if !approved {

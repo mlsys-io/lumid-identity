@@ -95,6 +95,16 @@ func MeAppsInstall(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid 'as' name")
 		return
 	}
+	// Kind gate — only kind=app (and legacy autoresearch) is installable.
+	// Skills are imported by apps, agents are subscribed, datasets are
+	// mounted, strategy/workflow are browse-only. Fail-OPEN when the kind
+	// can't be resolved (bare slugs, drafts, xpcloud down) — the Python
+	// installer re-checks authoritatively and returns the same pointers.
+	if kind := marketplaceRepoKind(c, body.Slug); kind != "" && kind != "app" && kind != "autoresearch" {
+		fail(c, http.StatusUnprocessableEntity, 1422, kindInstallPointer(kind, body.Slug))
+		return
+	}
+
 	id := writeIntent(c, "install", userID, map[string]any{
 		"slug":    body.Slug,
 		"runtime": body.Runtime,

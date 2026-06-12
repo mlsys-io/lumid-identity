@@ -225,6 +225,12 @@ func Register(r *gin.Engine) {
 			me.POST("/apps/:app/fork",    MeAppFork)
 			me.POST("/apps/:app/publish", MeAppPublish)
 			me.POST("/apps/:app/propose", MeAppPropose)
+			// Experiments — read-only observability for experiments[]
+			// (hypothesis × variants × dataset/casebook × metric).
+			me.GET("/experiments",                            MeExperiments) // cross-app aggregate (Workstream F)
+			me.GET("/apps/:app/experiments",                  MeAppExperiments)
+			me.GET("/apps/:app/experiments/:id",              MeAppExperiment)
+			me.GET("/apps/:app/experiments/:id/case/:caseId", MeAppExperimentCase)
 			me.GET("/intents/:id",            MeIntentGet)
 			// Permanently dismiss a failed/optimistic install card by app name.
 			me.DELETE("/install-intents/:name", MeInstallIntentDelete)
@@ -355,6 +361,12 @@ func Register(r *gin.Engine) {
 			// Engine-revamp human checkpoint — approve/revamp a cycle's
 			// held actions; writes the engine's side files for next cycle.
 			me.POST("/cycles/:app/:loop/:ts/review", MeCycleReview)
+
+			// Workstream E — skills as a first-class surface: inventory
+			// (used_by + versions + CI health), catalog discovery, detail.
+			me.GET("/skills",              MeSkills)
+			me.GET("/skills/discover",     MeSkillsDiscover)
+			me.GET("/skills/:owner/:name", MeSkillDetail)
 
 			// Phase S3-D — knowledge browser. Per-agent bank.jsonl
 			// listing + paginated memories with kind filter.

@@ -81,6 +81,9 @@ var destructiveTools = map[string]bool{
 	"run_loop":       true,
 	"submit_workflow": true,
 	"xp_ingest":      true,
+	// C3 observability/action tools that mutate state.
+	"review_action":  true,
+	"app_config_set": true,
 }
 
 // lumidosToolNames is the set of tool names dispatched to the LumidOS schedule
@@ -888,6 +891,16 @@ type meAgentChatBody struct {
 	// session via `claude --resume` instead of replaying flattened
 	// history, preserving the CLI's own tool-result context across turns.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+	// Optional structured "what the user is looking at" payload from the
+	// Studio shell (ViewingContext in StudioContext.ts). Rendered into a
+	// per-request system block + tool grounding hints so "this run" /
+	// "this app" resolve without the user re-stating them. Shape:
+	//   {path, page, app?, loop?, run_id?, cycle?{app,loop,ts},
+	//    selection?{kind,id,label,affordances[],meta},
+	//    picked?{kind,id,label,affordances[]}}
+	// Sent fresh each turn (not embedded in history), so it never goes
+	// stale on replay.
+	Context map[string]any `json:"context,omitempty"`
 }
 
 // thinkingBudgetTokens — Anthropic's extended thinking budget. Pulled
@@ -1425,6 +1438,12 @@ func min(a, b int) int {
 // level concern, not done here).
 func resolvePromptAndTools(userID, role string, body meAgentChatBody) (string, []map[string]any, string) {
 	tools := buildToolDefsForRole(role)
+	// Viewing context rides on every prompt variant (persona included) —
+	// it's per-request situational awareness, not persona flavor. Both
+	// the streaming and non-streaming endpoints, and the claude-code
+	// CLI delegation (which receives systemPrompt as context), inherit
+	// it from here.
+	ctxBlock := renderViewingContext(body.Context)
 	if body.PersonaID != "" {
 		p, _ := loadPersona(userID, body.PersonaID)
 		if p != nil {
@@ -1435,11 +1454,85 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody) (string, [
 				}
 				tools = filterTools(tools, allow)
 			}
-			return p.SystemPrompt, tools, p.PreferredModel
+			return p.SystemPrompt + ctxBlock, tools, p.PreferredModel
 		}
 		// Fall through if persona id is invalid — chat still works.
 	}
-	return buildSystemPrompt(userID, role, body.AgentID), tools, ""
+	return buildSystemPrompt(userID, role, body.AgentID) + ctxBlock, tools, ""
+}
+
+// renderViewingContext turns the Studio shell's structured "what the
+// user is looking at" payload into a system-prompt block with tool
+// grounding hints, so "this run" / "this app" resolve without the user
+// re-stating them. Empty/absent context renders nothing.
+func renderViewingContext(ctx map[string]any) string {
+	if len(ctx) == 0 {
+		return ""
+	}
+	str := func(k string) string {
+		v, _ := ctx[k].(string)
+		return v
+	}
+	var b strings.Builder
+	b.WriteString("\n\n## Viewing context (this turn)\n")
+	if p := str("path"); p != "" {
+		fmt.Fprintf(&b, "The user is on %s", p)
+		if pg := str("page"); pg != "" {
+			fmt.Fprintf(&b, " (%s page)", pg)
+		}
+		b.WriteString(".\n")
+	}
+	app, loop, runID := str("app"), str("loop"), str("run_id")
+	if app != "" {
+		fmt.Fprintf(&b, "Grounding: \"this app\" = %s.", app)
+		if loop != "" {
+			fmt.Fprintf(&b, " \"This workflow\" = %s (pass app=%s, loop=%s to workflow/loop tools).", loop, app, loop)
+		}
+		b.WriteString("\n")
+	}
+	if cy, ok := ctx["cycle"].(map[string]any); ok {
+		ca, _ := cy["app"].(string)
+		cl, _ := cy["loop"].(string)
+		cts, _ := cy["ts"].(string)
+		if ca != "" && cl != "" && cts != "" {
+			fmt.Fprintf(&b, "\"This run\" = the open run: app=%s loop=%s ts=%s (pass these to run/cycle tools).\n", ca, cl, cts)
+		}
+	} else if runID != "" {
+		fmt.Fprintf(&b, "\"This run\" = run_id=%s.\n", runID)
+	}
+	renderRef := func(label string, m map[string]any) {
+		kind, _ := m["kind"].(string)
+		id, _ := m["id"].(string)
+		if kind == "" || id == "" {
+			return
+		}
+		fmt.Fprintf(&b, "%s: %s id=%s", label, kind, id)
+		if lb, _ := m["label"].(string); lb != "" {
+			fmt.Fprintf(&b, " (%q)", lb)
+		}
+		if affs, ok := m["affordances"].([]any); ok && len(affs) > 0 {
+			parts := make([]string, 0, len(affs))
+			for _, a := range affs {
+				if s, ok := a.(string); ok {
+					parts = append(parts, s)
+				}
+			}
+			if len(parts) > 0 {
+				fmt.Fprintf(&b, " — available actions: %s", strings.Join(parts, ", "))
+			}
+		}
+		b.WriteString("\n")
+	}
+	if sel, ok := ctx["selection"].(map[string]any); ok {
+		renderRef("Page selection", sel)
+	}
+	if pk, ok := ctx["picked"].(map[string]any); ok {
+		// The user-pinned pick is the explicit referent — it wins over
+		// the page selection when both could answer "this".
+		renderRef("User is POINTING AT (primary referent)", pk)
+	}
+	b.WriteString("Use this context silently — don't recite it back. When the user says \"this\"/\"it\"/\"here\", resolve against the grounding above before asking them to clarify.\n")
+	return b.String()
 }
 
 // buildToolDefsForRole returns the tool list a caller may use. EVERY role
@@ -1499,6 +1592,14 @@ When the user wants to build a new workflow/app (e.g. they say "create a workflo
   3. PRESENT THE PIPELINE CLEARLY: from the compose result, lay out the assembled steps as a NUMBERED list, one per line, in the form "N. <Stage> — <skill>: <what this step does>". Then state the schedule and the goal in one line each. Every step must be legible so they know exactly what will run.
   4. CONFIRM + INSTALL: ask "Want me to install it?" — on yes, call install_app with the draft slug, then offer to run the first cycle.
 Keep each turn tight and concrete. Adapt the domain to whatever they describe — research, monitoring, annotation, trading, anything.
+
+## Linking into the Studio
+When your answer references an app, workflow, or run, link it with a plain markdown link — these navigate in-app:
+  - app page:        /studio/apps/<app>
+  - workflow open:   /studio/apps/<app>?selected=<loop>
+  - one run open:    /studio/apps/<app>?selected=<loop>&cycle=<ts>
+  - activity feed:   /studio/runs    · inbox: /studio/inbox    · knowledge: /studio/knowledge
+Example: "the [morning brief](/studio/apps/personal-agent?selected=morning_brief) failed twice". Prefer a link over telling the user where to click.
 
 Stay grounded: don't invent apps, loops, or features. If a tool fails, surface the error briefly and suggest the next step.` + func() string {
 		extra := ""
@@ -1585,6 +1686,112 @@ func buildToolDefs() []map[string]any {
 					"loop": map[string]any{"type": "string"},
 				},
 				"required": []string{"app", "loop"},
+			},
+		},
+		{
+			"name":        "cycle_detail",
+			"description": "Inspect ONE run of a workflow: per-step status, outputs, errors, prompt audit (sha + preview), sidecar artifacts, and memories learned. The go-to tool for 'why did this run fail?' / 'what happened in this run?'. ts accepts 'latest'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string"},
+					"loop": map[string]any{"type": "string"},
+					"ts":   map[string]any{"type": "string", "description": "Run timestamp dir (e.g. 20260611T193609Z) or 'latest'."},
+				},
+				"required": []string{"app", "loop"},
+			},
+		},
+		{
+			"name":        "loops_health",
+			"description": "Health snapshot of EVERY workflow: status (ok|failing|stale|never|manual), consecutive failures, last error for failing ones. Use for 'how are my workflows doing?' / 'what's broken?'. Failures sort first.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			"name":        "review_action",
+			"description": "Act on a run's review queue: approve a held action, revamp a step with new instructions, or dismiss. Mirrors the inspector's review buttons.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":               map[string]any{"type": "string"},
+					"loop":              map[string]any{"type": "string"},
+					"decision":          map[string]any{"type": "string", "enum": []string{"approve", "revamp", "dismiss"}},
+					"step_id":           map[string]any{"type": "string"},
+					"step_instructions": map[string]any{"type": "string", "description": "Required for revamp — the new instructions for that step."},
+					"outbox_ref":        map[string]any{"type": "string"},
+				},
+				"required": []string{"app", "loop", "decision"},
+			},
+		},
+		{
+			"name":        "experiment_case",
+			"description": "Drill into one case of an app experiment: all result rows + the latest metrics per question.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":     map[string]any{"type": "string"},
+					"id":      map[string]any{"type": "string", "description": "experiment id"},
+					"case_id": map[string]any{"type": "string"},
+				},
+				"required": []string{"app", "id", "case_id"},
+			},
+		},
+		{
+			"name":        "loop_metric_series",
+			"description": "A workflow's KPI trajectory over its recent runs (per-metric time series). Use for 'is it improving?' / 'plot the trend'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string"},
+					"loop": map[string]any{"type": "string"},
+				},
+				"required": []string{"app", "loop"},
+			},
+		},
+		{
+			"name":        "app_config_get",
+			"description": "Read an installed app's xpcloud.yaml (workflows, schedules, skill imports, publish policy). Returns the YAML + a sha for optimistic-locked writes.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app": map[string]any{"type": "string"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
+			"name":        "app_config_set",
+			"description": "Overwrite an installed app's xpcloud.yaml. Validates YAML; pass base_sha from app_config_get to avoid clobbering concurrent edits. Requires user approval.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":      map[string]any{"type": "string"},
+					"yaml":     map[string]any{"type": "string"},
+					"base_sha": map[string]any{"type": "string"},
+				},
+				"required": []string{"app", "yaml"},
+			},
+		},
+		{
+			"name":        "knowledge_agents",
+			"description": "List the USER's own knowledge agents (their tenant banks) with memory counts. Prefer this over xp_agents, which reads the operator host.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			"name":        "knowledge_memories",
+			"description": "Newest memories from one of the USER's knowledge agents. Prefer this over xp_memories, which reads the operator host.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent": map[string]any{"type": "string"},
+					"limit": map[string]any{"type": "integer", "description": "max rows (default 25, cap 100)"},
+				},
+				"required": []string{"agent"},
 			},
 		},
 		{
@@ -2632,6 +2839,47 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			return map[string]any{"error": err.Error()}, false
 		}
 		return map[string]any{"job_id": jobID, "state": "queued"}, true
+
+	case "cycle_detail":
+		app, _ := args["app"].(string)
+		loop, _ := args["loop"].(string)
+		ts, _ := args["ts"].(string)
+		return toolCycleDetail(userID, app, loop, ts)
+
+	case "loops_health":
+		return toolLoopsHealth(userID)
+
+	case "review_action":
+		return toolReviewAction(userID, args)
+
+	case "experiment_case":
+		app, _ := args["app"].(string)
+		id, _ := args["id"].(string)
+		caseID, _ := args["case_id"].(string)
+		return toolExperimentCase(userID, app, id, caseID)
+
+	case "loop_metric_series":
+		app, _ := args["app"].(string)
+		loop, _ := args["loop"].(string)
+		return toolLoopMetricSeries(userID, app, loop)
+
+	case "app_config_get":
+		app, _ := args["app"].(string)
+		return toolAppConfigGet(userID, app)
+
+	case "app_config_set":
+		return toolAppConfigSet(userID, args)
+
+	case "knowledge_agents":
+		return toolKnowledgeAgents(userID)
+
+	case "knowledge_memories":
+		agent, _ := args["agent"].(string)
+		limit := 0
+		if v, ok := args["limit"].(float64); ok {
+			limit = int(v)
+		}
+		return toolKnowledgeMemories(userID, agent, limit)
 
 	case "give_feedback":
 		app, _ := args["app"].(string)

@@ -55,56 +55,8 @@ func MeCycleReview(c *gin.Context) {
 		return
 	}
 
-	dataDir := filepath.Join(tenantAppsDir(userID), app, "data")
-	// Anchor inside the tenant tree so app/loop params can't escape.
-	abs, err := filepath.Abs(dataDir)
-	if err != nil || !strings.HasPrefix(abs, tenantAppsDir(userID)+string(os.PathSeparator)) {
-		fail(c, http.StatusBadRequest, 1400, "invalid path")
-		return
-	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "mkdir: "+err.Error())
-		return
-	}
-
-	switch body.Decision {
-	case "approve":
-		ref := body.OutboxRef
-		if ref == "" && body.StepID != "" {
-			ref = loop + ":" + body.StepID
-		}
-		if ref == "" {
-			fail(c, http.StatusBadRequest, 1400, "approve needs outbox_ref or step_id")
-			return
-		}
-		if err := reviewMergeJSON(filepath.Join(dataDir, "approved_actions.json"),
-			func(m map[string]any) {
-				m[ref] = map[string]any{"approved_at": time.Now().UTC().Format(time.RFC3339)}
-			}); err != nil {
-			fail(c, http.StatusInternalServerError, 1500, err.Error())
-			return
-		}
-	case "revamp", "edit":
-		if body.StepID == "" || strings.TrimSpace(body.StepInstructions) == "" {
-			fail(c, http.StatusBadRequest, 1400, "revamp needs step_id and step_instructions")
-			return
-		}
-		if err := reviewMergeJSON(filepath.Join(dataDir, "step_instructions_pending.json"),
-			func(m map[string]any) {
-				loopMap, _ := m[loop].(map[string]any)
-				if loopMap == nil {
-					loopMap = map[string]any{}
-				}
-				loopMap[body.StepID] = body.StepInstructions
-				m[loop] = loopMap
-			}); err != nil {
-			fail(c, http.StatusInternalServerError, 1500, err.Error())
-			return
-		}
-	case "dismiss":
-		// No-op: the held action simply re-stages on the next cycle.
-	default:
-		fail(c, http.StatusBadRequest, 1400, "unknown decision: "+body.Decision)
+	if code, msg := applyCycleReview(userID, app, loop, body); code != 0 {
+		fail(c, code, code+1000, msg)
 		return
 	}
 
@@ -115,6 +67,57 @@ func MeCycleReview(c *gin.Context) {
 			"decision": body.Decision,
 		},
 	})
+}
+
+// applyCycleReview is MeCycleReview's core, shared with the chat tool
+// `review_action`. Returns (0, "") on success or (httpStatus, message).
+func applyCycleReview(userID, app, loop string, body cycleReviewBody) (int, string) {
+	dataDir := filepath.Join(tenantAppsDir(userID), app, "data")
+	// Anchor inside the tenant tree so app/loop params can't escape.
+	abs, err := filepath.Abs(dataDir)
+	if err != nil || !strings.HasPrefix(abs, tenantAppsDir(userID)+string(os.PathSeparator)) {
+		return http.StatusBadRequest, "invalid path"
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return http.StatusInternalServerError, "mkdir: " + err.Error()
+	}
+
+	switch body.Decision {
+	case "approve":
+		ref := body.OutboxRef
+		if ref == "" && body.StepID != "" {
+			ref = loop + ":" + body.StepID
+		}
+		if ref == "" {
+			return http.StatusBadRequest, "approve needs outbox_ref or step_id"
+		}
+		if err := reviewMergeJSON(filepath.Join(dataDir, "approved_actions.json"),
+			func(m map[string]any) {
+				m[ref] = map[string]any{"approved_at": time.Now().UTC().Format(time.RFC3339)}
+			}); err != nil {
+			return http.StatusInternalServerError, err.Error()
+		}
+	case "revamp", "edit":
+		if body.StepID == "" || strings.TrimSpace(body.StepInstructions) == "" {
+			return http.StatusBadRequest, "revamp needs step_id and step_instructions"
+		}
+		if err := reviewMergeJSON(filepath.Join(dataDir, "step_instructions_pending.json"),
+			func(m map[string]any) {
+				loopMap, _ := m[loop].(map[string]any)
+				if loopMap == nil {
+					loopMap = map[string]any{}
+				}
+				loopMap[body.StepID] = body.StepInstructions
+				m[loop] = loopMap
+			}); err != nil {
+			return http.StatusInternalServerError, err.Error()
+		}
+	case "dismiss":
+		// No-op: the held action simply re-stages on the next cycle.
+	default:
+		return http.StatusBadRequest, "unknown decision: " + body.Decision
+	}
+	return 0, ""
 }
 
 // reviewMergeJSON reads a JSON object file (or {} if absent), applies mut,

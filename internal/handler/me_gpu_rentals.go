@@ -177,12 +177,34 @@ func buildSshTaskYAML(name, user, mode, image string, ttl, idle, gpu, gpuMemGB, 
 	return b.String()
 }
 
-// flowmeshDo issues an authenticated request to the FlowMesh Host. body may be
-// nil. Returns the response bytes + status.
-func flowmeshDo(userID, email, role, method, path, contentType string, body []byte) ([]byte, int, error) {
-	bearer, _, _, err := common.IssueBridgeJWT(userID, email, role, "flowmesh", []string{"flowmesh:ssh"}, 10*time.Minute)
-	if err != nil {
-		return nil, 0, fmt.Errorf("mint flowmesh bearer: %w", err)
+// rentalScopes — what the GPU-rental lifecycle actually needs on FlowMesh:
+// workflow create/cancel (kind-level write), task + result reads for status
+// and SSH connection info, plus the SSH gateway's own scope. The previous
+// {"flowmesh:ssh"}-only bearer failed the lumid plugin's kind-level check
+// ("kind-level write on workflow requires 'flowmesh:workflows:write'") for
+// every non-`*` principal — the app never said which capability it was
+// exercising on the user's behalf (root cause, 2026-06-12).
+var rentalScopes = []string{
+	"flowmesh:ssh",
+	"flowmesh:workflows:write",
+	"flowmesh:workflows:read",
+	"flowmesh:tasks:read",
+	"flowmesh:results:read",
+}
+
+// flowmeshDo issues an authenticated request to the FlowMesh Host. body may
+// be nil. customKey, when non-empty, is a USER-SUPPLIED credential (lm_pat_/
+// rm_pat_/flm-…) used verbatim as the bearer — the user explicitly chose
+// which principal this action runs as. Empty → mint the scoped bridge JWT.
+// The key is never logged and never persisted.
+func flowmeshDo(userID, email, role, method, path, contentType string, body []byte, customKey string) ([]byte, int, error) {
+	bearer := strings.TrimSpace(customKey)
+	if bearer == "" {
+		minted, _, _, err := common.IssueBridgeJWT(userID, email, role, "flowmesh", rentalScopes, 10*time.Minute)
+		if err != nil {
+			return nil, 0, fmt.Errorf("mint flowmesh bearer: %w", err)
+		}
+		bearer = minted
 	}
 	var rdr io.Reader
 	if body != nil {
@@ -209,7 +231,7 @@ func flowmeshDo(userID, email, role, method, path, contentType string, body []by
 // flowmeshTaskStatus fetches a single task's live status from FlowMesh with a
 // short timeout. Returns "" on any failure (caller keeps the stored status).
 func flowmeshTaskStatus(userID, email, role, taskID string) string {
-	bearer, _, _, err := common.IssueBridgeJWT(userID, email, role, "flowmesh", []string{"flowmesh:ssh"}, 10*time.Minute)
+	bearer, _, _, err := common.IssueBridgeJWT(userID, email, role, "flowmesh", rentalScopes, 10*time.Minute)
 	if err != nil {
 		return ""
 	}
@@ -294,7 +316,11 @@ func gpuRentalCreateAction(_ *gin.Context, userID, _ string, values map[string]a
 	yaml := buildSshTaskYAML(name, "flowmesh", mode, image, ttlMin*60, idleMin*60, gpu, gpuMem, cpu, memGB, pubKey, env)
 
 	email, role := userEmailRole(userID)
-	rb, status, err := flowmeshDo(userID, email, role, http.MethodPost, "/api/v1/workflows", "text/plain", []byte(yaml))
+	customKey, err := runAsBearer(userID, email, role, "flowmesh", values)
+	if err != nil {
+		return nil, err
+	}
+	rb, status, err := flowmeshDo(userID, email, role, http.MethodPost, "/api/v1/workflows", "text/plain", []byte(yaml), customKey)
 	if err != nil {
 		return nil, err
 	}
@@ -329,6 +355,7 @@ func gpuRentalCreateAction(_ *gin.Context, userID, _ string, values map[string]a
 
 // gpuRentalCancelAction — allowlisted: cancels a rental's FlowMesh workflow.
 func gpuRentalCancelAction(_ *gin.Context, userID, _ string, values map[string]any) (any, error) {
+
 	id := valStr(values, "id")
 	wf := valStr(values, "workflow_id")
 	var rental models.GpuRental
@@ -341,7 +368,15 @@ func gpuRentalCancelAction(_ *gin.Context, userID, _ string, values map[string]a
 		return nil, fmt.Errorf("workflow_id (or a known rental id) required")
 	}
 	email, role := userEmailRole(userID)
-	rb, status, err := flowmeshDo(userID, email, role, http.MethodPost, "/api/v1/workflows/"+wf+"/cancel", "", nil)
+	// A rental created under a pasted external key is owned by THAT
+	// principal — cancel accepts the same run-as choice so ownership
+	// matches. PAT-profile and session bearers share the user principal,
+	// so those cancel interchangeably.
+	customKey, err := runAsBearer(userID, email, role, "flowmesh", values)
+	if err != nil {
+		return nil, err
+	}
+	rb, status, err := flowmeshDo(userID, email, role, http.MethodPost, "/api/v1/workflows/"+wf+"/cancel", "", nil, customKey)
 	if err != nil {
 		return nil, err
 	}

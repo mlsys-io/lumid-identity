@@ -284,6 +284,44 @@ func loadExperimentDetail(appDir, id string) (gin.H, bool) {
 
 // ─── handlers ───────────────────────────────────────────────────────
 
+// MeExperiments — GET /api/v1/me/experiments: cross-app aggregate
+// (Workstream F). Iterates the caller's apps (tenant first, operator-
+// shared after, tenant shadowing) and annotates each experiment with
+// its owning app. Cheap — local file reads only.
+func MeExperiments(c *gin.Context) {
+	userID, okk := currentUserID(c)
+	if !okk {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	all := []gin.H{}
+	seen := map[string]bool{}
+	for _, root := range []string{tenantAppsDir(userID), filepath.Join(operatorHome(), ".xp", "apps")} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || seen[e.Name()] {
+				continue
+			}
+			seen[e.Name()] = true
+			exps := loadAppExperiments(filepath.Join(root, e.Name()))
+			for _, exp := range exps {
+				exp["app"] = e.Name()
+				all = append(all, exp)
+			}
+		}
+	}
+	// Newest movement first; experiments without an updated_at sort last.
+	sort.SliceStable(all, func(i, j int) bool {
+		ui, _ := all[i]["updated_at"].(string)
+		uj, _ := all[j]["updated_at"].(string)
+		return ui > uj
+	})
+	ok(c, "ok", gin.H{"experiments": all, "count": len(all)})
+}
+
 func MeAppExperiments(c *gin.Context) {
 	userID, okk := currentUserID(c)
 	if !okk {

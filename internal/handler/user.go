@@ -90,10 +90,20 @@ func SessionBearerHandler(c *gin.Context) {
 		}
 	case "flowmesh":
 		audience = "flowmesh"
-		// Narrow runtime-only scope: lets the UI submit SSH tasks + poll
-		// + stream logs + open the proxy WebSocket. Not a PAT scope a
-		// user can mint; session-bearer only.
-		scopes = []string{"flowmesh:ssh"}
+		// Runtime-only scopes for the GPU-rental UI: submit/cancel the SSH
+		// workflow, poll tasks/results, stream logs, open the proxy
+		// WebSocket. flowmesh:ssh alone failed the lumid plugin's
+		// kind-level check on workflow create ("requires
+		// 'flowmesh:workflows:write'") for every non-`*` user — the app
+		// wasn't saying which capability it exercises (2026-06-12).
+		// Session-bearer only, 10-min TTL; not PAT-mintable.
+		scopes = []string{
+			"flowmesh:ssh",
+			"flowmesh:workflows:write",
+			"flowmesh:workflows:read",
+			"flowmesh:tasks:read",
+			"flowmesh:results:read",
+		}
 	default:
 		fail(c, http.StatusBadRequest, 1001, "audience must be 'runmesh' or 'flowmesh'")
 		return

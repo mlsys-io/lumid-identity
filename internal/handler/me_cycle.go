@@ -148,6 +148,18 @@ func MeCycleDetail(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app or loop")
 		return
 	}
+	data, found := cycleDetailForUser(userID, app, loop, ts)
+	if !found {
+		fail(c, http.StatusNotFound, 1404, "cycle not found")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
+}
+
+// cycleDetailForUser is MeCycleDetail's core, shared with the chat tool
+// `cycle_detail` so "why did this run fail?" gets the same steps +
+// prompt-audit view the inspector renders. Returns (data, found).
+func cycleDetailForUser(userID, app, loop, ts string) (gin.H, bool) {
 	// Resolve against the caller's tenant tree first, then operator-shared
 	// (~/.xp/apps) — /me/workflows surfaces both, so the detail (and its
 	// clickable sparkline dots) must too. Each candidate is anchored to its
@@ -165,8 +177,7 @@ func MeCycleDetail(c *gin.Context) {
 		}
 	}
 	if cycleDir == "" {
-		fail(c, http.StatusNotFound, 1404, "cycle not found")
-		return
+		return nil, false
 	}
 
 	// Headline cycle.json
@@ -274,21 +285,18 @@ func MeCycleDetail(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{
-			"app":     app,
-			"loop":    loop,
-			"ts":      ts,
-			"summary": cycleSummary,
-			"steps":   steps,
-			"files":   files,
-			// What the cycle LEARNED — memories its learn stage wrote, by time
-			// window. Surfaces the synthesized insight (banks), not just the
-			// mechanical run, so a dot drill-in shows "learned: <memory>".
-			"memories_learned": memoriesLearnedInCycle(userID, app, loop, ts),
-		},
-	})
+	return gin.H{
+		"app":     app,
+		"loop":    loop,
+		"ts":      ts,
+		"summary": cycleSummary,
+		"steps":   steps,
+		"files":   files,
+		// What the cycle LEARNED — memories its learn stage wrote, by time
+		// window. Surfaces the synthesized insight (banks), not just the
+		// mechanical run, so a dot drill-in shows "learned: <memory>".
+		"memories_learned": memoriesLearnedInCycle(userID, app, loop, ts),
+	}, true
 }
 
 // kpiPair is one named numeric extracted from a cycle, in stable order.

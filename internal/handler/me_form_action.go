@@ -14,10 +14,16 @@ package handler
 // generated-markdown path can reach a backend write.
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
+
+// errFormActionNotAllowed is returned by dispatchFormAction when the action
+// key isn't on the allowlist. Callers map it to the right status (403 for the
+// HTTP handler, an error result for the chat tool).
+var errFormActionNotAllowed = errors.New("form action not allowed")
 
 type formActionReq struct {
 	Action string         `json:"action" binding:"required"`
@@ -40,6 +46,18 @@ var formActions = map[string]formActionFn{
 	// input validation + scope check.
 }
 
+// dispatchFormAction runs one allowlisted form action for a caller. Shared by
+// the HTTP handler (MeFormAction) and the chat agent's app_action tool so a
+// generated form and the AI hit the SAME validated backend path. Returns
+// errFormActionNotAllowed when the key isn't registered.
+func dispatchFormAction(c *gin.Context, userID, role, action string, values map[string]any) (any, error) {
+	fn, allowed := formActions[action]
+	if !allowed {
+		return nil, errFormActionNotAllowed
+	}
+	return fn(c, userID, role, values)
+}
+
 func MeFormAction(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -51,14 +69,13 @@ func MeFormAction(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body")
 		return
 	}
-	fn, allowed := formActions[req.Action]
-	if !allowed {
+	role := currentUserRole(c)
+	result, err := dispatchFormAction(c, userID, role, req.Action, req.Values)
+	if errors.Is(err, errFormActionNotAllowed) {
 		// Unknown / unregistered action — the allowlist's whole point.
 		fail(c, http.StatusForbidden, 1005, "form action not allowed: "+req.Action)
 		return
 	}
-	role := currentUserRole(c)
-	result, err := fn(c, userID, role, req.Values)
 	if err != nil {
 		fail(c, http.StatusBadGateway, 1502, err.Error())
 		return

@@ -21,6 +21,7 @@ package handler
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -32,7 +33,13 @@ import (
 )
 
 const (
-	defaultRateLimit    = 60
+	// The Studio dashboard legitimately bursts many /me/* calls: the Apps
+	// page polls ~6 endpoints/20s, the shell polls drafts+recents, the chat
+	// loads models/personas/agents on mount + a runs SSE, and
+	// useStudioRefetch re-fans-out on every chat tool call. 60/min throttled
+	// real single-user use (apps/jobs failed to load). This is a rogue-client
+	// backstop, not a security boundary — set it well above human polling.
+	defaultRateLimit    = 1200
 	defaultRateWindowS  = 60
 )
 
@@ -96,6 +103,9 @@ func MeRateLimit() gin.HandlerFunc {
 			if retry < 1 {
 				retry = windowS
 			}
+			// Distinct, greppable event — so a rate-limit storm is visible at a
+			// glance instead of being inferred from a wall of GIN 429 lines.
+			log.Printf("[me-ratelimit] tripped caller=%s n=%d/%d path=%s", callerKey(c), n, limit, c.FullPath())
 			c.Header("Retry-After", strconv.Itoa(retry))
 			c.Header("X-RateLimit-Limit", strconv.Itoa(limit))
 			c.Header("X-RateLimit-Reset", strconv.Itoa(retry))

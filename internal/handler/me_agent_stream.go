@@ -51,6 +51,7 @@ func MeAgentChatStream(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	stashViewingApp(c, body.Context)
 	if len(body.Messages) == 0 || len(body.Messages) > 50 {
 		fail(c, http.StatusBadRequest, 1400, "messages required, ≤50 turns")
 		return
@@ -66,7 +67,7 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	budget := effectiveDailyBudget(provider)
-	if budget > 0 {
+	if budget > 0 && role != "super_admin" {
 		used := tokensUsedLast24h(userID)
 		if used >= budget {
 			c.Header("X-Budget-Used", strconv.Itoa(used))

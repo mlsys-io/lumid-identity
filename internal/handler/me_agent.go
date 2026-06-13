@@ -84,6 +84,10 @@ var destructiveTools = map[string]bool{
 	// C3 observability/action tools that mutate state.
 	"review_action":  true,
 	"app_config_set": true,
+	// Generic app-ops mutations (operate any app from chat). Reads
+	// (app_read/app_actions/show_app_surface) are NOT gated.
+	"app_action": true,
+	"qa_call":    true,
 }
 
 // lumidosToolNames is the set of tool names dispatched to the LumidOS schedule
@@ -1026,6 +1030,7 @@ func MeAgentChat(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	stashViewingApp(c, body.Context)
 	if len(body.Messages) == 0 {
 		fail(c, http.StatusBadRequest, 1400, "messages required")
 		return
@@ -1047,10 +1052,12 @@ func MeAgentChat(c *gin.Context) {
 	}
 
 	// Daily token budget — server-funded LLM. Default 50K total
-	// tokens/24h/user. Override via ANTHROPIC_DAILY_TOKEN_BUDGET env;
-	// 0 disables the cap entirely (for operator/super_admin use).
+	// tokens/24h/user. Override via ANTHROPIC_DAILY_TOKEN_BUDGET env.
+	// super_admin (operator) is exempt — they run/test the whole platform,
+	// not a budgeted end user (the long-standing intent in this comment that
+	// was never actually wired).
 	budget := effectiveDailyBudget(provider)
-	if budget > 0 {
+	if budget > 0 && role != "super_admin" {
 		used := tokensUsedLast24h(userID)
 		if used >= budget {
 			c.Header("X-Budget-Used", strconv.Itoa(used))
@@ -1444,6 +1451,13 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody) (string, [
 	// CLI delegation (which receives systemPrompt as context), inherit
 	// it from here.
 	ctxBlock := renderViewingContext(body.Context)
+	// When grounded on an app, tell the agent what it can DO there (operable
+	// actions), so it offers concrete help instead of just describing.
+	if body.Context != nil {
+		if app, ok := body.Context["app"].(string); ok && app != "" {
+			ctxBlock += groundedActionsHint(userID, app)
+		}
+	}
 	if body.PersonaID != "" {
 		p, _ := loadPersona(userID, body.PersonaID)
 		if p != nil {
@@ -1543,7 +1557,10 @@ func renderViewingContext(ctx map[string]any) string {
 // by hiding tools per role. "Highest capabilities for all users", with
 // isolation preserved by the sandbox rather than by capability removal.
 func buildToolDefsForRole(role string) []map[string]any {
-	return buildToolDefs()
+	// Generic "operate any app" tools (app_actions/app_read/show_app_surface/
+	// app_action/qa_call) are available to every role — gated by the
+	// formActions + scheme/path allowlists + approval, not by role.
+	return append(buildToolDefs(), appOpsToolDefs()...)
 }
 
 // buildSystemPrompt assembles the assistant's persona + a snapshot
@@ -3286,6 +3303,11 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 
 	case "spawn_agents":
 		return toolSpawnAgents(c, userID, args)
+	}
+
+	// ── Generic app-ops bridge (operate any app from chat) ────────────────
+	if res, okRes, handled := dispatchAppOpsTool(c, userID, role, name, args); handled {
+		return res, okRes
 	}
 
 	// ── LumidOS bridge ────────────────────────────────────────────────────

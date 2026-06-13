@@ -39,7 +39,11 @@ const (
 	// useStudioRefetch re-fans-out on every chat tool call. 60/min throttled
 	// real single-user use (apps/jobs failed to load). This is a rogue-client
 	// backstop, not a security boundary — set it well above human polling.
-	defaultRateLimit    = 1200
+	// 300/min (5/sec sustained per caller). After the client over-fetch cuts
+	// (longer polls, narrowed refetch scopes) + in-flight GET dedup, normal
+	// dashboard use sits well under this; a runaway still trips it. (Was 1200
+	// as an emergency ceiling during the 429 incident; 60 originally.)
+	defaultRateLimit    = 300
 	defaultRateWindowS  = 60
 )
 

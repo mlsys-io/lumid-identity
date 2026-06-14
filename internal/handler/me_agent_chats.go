@@ -54,6 +54,10 @@ type chatRecord struct {
 	// Claude CLI session backing this thread (claude-code providers).
 	// Restored on thread load so --resume continuity survives reloads.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+	// App this conversation is grounded on (Studio workspace app slug), so the
+	// session picker can group/switch by app and re-open the right workspace.
+	// Empty = a general (non-app) chat from the home.
+	App string `json:"app,omitempty"`
 }
 
 func chatsDir(userID string) string {
@@ -121,6 +125,7 @@ func MeChatsList(c *gin.Context) {
 		Title     string `json:"title"`
 		Model     string `json:"model,omitempty"`
 		Mode      string `json:"mode,omitempty"`
+		App       string `json:"app,omitempty"`
 		MsgCount  int    `json:"msg_count"`
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
@@ -144,6 +149,7 @@ func MeChatsList(c *gin.Context) {
 			Title:     r.Title,
 			Model:     r.Model,
 			Mode:      r.Mode,
+			App:       r.App,
 			MsgCount:  len(r.Messages),
 			CreatedAt: r.CreatedAt,
 			UpdatedAt: r.UpdatedAt,
@@ -206,6 +212,7 @@ func MeChatSave(c *gin.Context) {
 		Model           string           `json:"model"`
 		Mode            string           `json:"mode"`
 		ClaudeSessionID string           `json:"claude_session_id"`
+		App             string           `json:"app"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -251,6 +258,11 @@ func MeChatSave(c *gin.Context) {
 	rec.Mode = body.Mode
 	if body.ClaudeSessionID != "" {
 		rec.ClaudeSessionID = body.ClaudeSessionID
+	}
+	// App grounding — set on create; on update keep the existing value unless a
+	// non-empty app is sent (a thread shouldn't silently lose its app binding).
+	if body.App != "" {
+		rec.App = body.App
 	}
 	rec.Title = inferTitle(body.Messages)
 	rec.UpdatedAt = now

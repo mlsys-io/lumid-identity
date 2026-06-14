@@ -371,6 +371,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			goalsByLoop := readYamlLoopGoals(filepath.Join(appDir, "xpcloud.yaml"))
 			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			scheduleMap := readScheduleOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
+			goalMap := readGoalOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			for _, L := range loops {
 				if L.Name == "" {
 					continue
@@ -440,6 +441,14 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.Goal = &WorkflowGoal{Primary: g.Primary, Tracked: g.Tracked}
 				} else if L.Goal.Primary != "" || len(L.Goal.Tracked) > 0 {
 					row.Goal = &WorkflowGoal{Primary: L.Goal.Primary, Tracked: L.Goal.Tracked}
+				}
+				// User goal override (PATCH /me/loops) wins over the declared
+				// goal — keep the declared tracked-metric names alongside it.
+				if gv, ok := goalMap[L.Name]; ok && gv != "" {
+					if row.Goal == nil {
+						row.Goal = &WorkflowGoal{}
+					}
+					row.Goal.Primary = gv
 				}
 				row.Datasets = []string(L.Datasets)
 				row.MemoryAgents = memAgents
@@ -790,6 +799,22 @@ func readScheduleOverrides(path string) map[string]string {
 		settings, _ := v.(map[string]any)
 		if s, ok := settings["schedule"].(string); ok && s != "" {
 			out[name] = s
+		}
+	}
+	return out
+}
+
+// readGoalOverrides returns per-loop goal-primary overrides from
+// .user-overrides.yaml (written by MeLoopPatch when a user edits a goal).
+// Merged over the declared xpcloud.yaml goal so an edit shows immediately.
+func readGoalOverrides(path string) map[string]string {
+	out := map[string]string{}
+	overrides := readSimpleOverrides(path)
+	loopsMap, _ := overrides["loops"].(map[string]any)
+	for name, v := range loopsMap {
+		settings, _ := v.(map[string]any)
+		if g, ok := settings["goal"].(string); ok && g != "" {
+			out[name] = g
 		}
 	}
 	return out

@@ -1516,6 +1516,12 @@ func renderViewingContext(ctx map[string]any) string {
 			fmt.Fprintf(&b, " \"This workflow\" = %s (pass app=%s, loop=%s to workflow/loop tools).", loop, app, loop)
 		}
 		b.WriteString("\n")
+		// The app workspace shows the app's structured details (workflows, runs,
+		// pipeline) in its own panel — so the chat must NOT re-dump them. Reveal
+		// PROGRESSIVELY: answer with one focused thing + the single best next
+		// step, and only surface a specific data card (show_app_surface / one
+		// entity card) when explicitly asked. Never paste whole tables/lists.
+		b.WriteString("Style: this is the app's grounded chat beside its details panel. Be progressive/hierarchical — one focused point + the next step per turn; don't dump tables, run lists, or the whole surface (the panel already shows them); pull in a single card only when asked.\n")
 	}
 	if cy, ok := ctx["cycle"].(map[string]any); ok {
 		ca, _ := cy["app"].(string)

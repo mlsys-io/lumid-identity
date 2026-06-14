@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -277,22 +278,33 @@ func MeWorkflows(c *gin.Context) {
 
 	rows := make([]WorkflowRow, 0, 32)
 
-	// 1. Scheduled — reuse the existing AdminLoops scan but scope it
-	//    to the caller's tenant tree + operator-shared. AdminLoops
-	//    today serves operator-only; we duplicate the scan with the
-	//    tenant root prepended.
+	// Run the two sources CONCURRENTLY — the scheduled scan is filesystem-bound
+	// (tenant + operator app trees) and the visual fetch is an n8n HTTP round-
+	// trip; running them sequentially made /me/workflows the slowest aggregate
+	// on the apps page (~400ms = fs + n8n). max() instead of sum(). The main
+	// goroutine only reads c inside the worker (cookie/request ctx) while
+	// blocked on Wait, so there's no concurrent gin.Context write.
+	var sched, vis []WorkflowRow
+	var wg sync.WaitGroup
+	// 1. Scheduled — the caller's tenant tree + operator-shared xpio loops.
 	if kindFilter == "" || kindFilter == "scheduled" {
-		rows = append(rows, scheduledWorkflows(userID)...)
+		wg.Add(1)
+		go func() { defer wg.Done(); sched = scheduledWorkflows(userID) }()
 	}
-
-	// 2. Visual — n8n. Soft-fail on unauthenticated (W1 norm); the
-	//    list is empty until the user signs into n8n directly. W2 SSO
-	//    bridge will mint the session cookie automatically.
+	// 2. Visual — n8n. Soft-fail on unauthenticated (W1 norm); empty until the
+	//    user signs into n8n directly.
 	if kindFilter == "" || kindFilter == "visual" {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
-		defer cancel()
-		rows = append(rows, visualWorkflows(ctx, c)...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
+			defer cancel()
+			vis = visualWorkflows(ctx, c)
+		}()
 	}
+	wg.Wait()
+	rows = append(rows, sched...)
+	rows = append(rows, vis...)
 
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",

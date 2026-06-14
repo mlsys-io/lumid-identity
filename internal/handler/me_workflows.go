@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -277,22 +278,33 @@ func MeWorkflows(c *gin.Context) {
 
 	rows := make([]WorkflowRow, 0, 32)
 
-	// 1. Scheduled — reuse the existing AdminLoops scan but scope it
-	//    to the caller's tenant tree + operator-shared. AdminLoops
-	//    today serves operator-only; we duplicate the scan with the
-	//    tenant root prepended.
+	// Run the two sources CONCURRENTLY — the scheduled scan is filesystem-bound
+	// (tenant + operator app trees) and the visual fetch is an n8n HTTP round-
+	// trip; running them sequentially made /me/workflows the slowest aggregate
+	// on the apps page (~400ms = fs + n8n). max() instead of sum(). The main
+	// goroutine only reads c inside the worker (cookie/request ctx) while
+	// blocked on Wait, so there's no concurrent gin.Context write.
+	var sched, vis []WorkflowRow
+	var wg sync.WaitGroup
+	// 1. Scheduled — the caller's tenant tree + operator-shared xpio loops.
 	if kindFilter == "" || kindFilter == "scheduled" {
-		rows = append(rows, scheduledWorkflows(userID)...)
+		wg.Add(1)
+		go func() { defer wg.Done(); sched = scheduledWorkflows(userID) }()
 	}
-
-	// 2. Visual — n8n. Soft-fail on unauthenticated (W1 norm); the
-	//    list is empty until the user signs into n8n directly. W2 SSO
-	//    bridge will mint the session cookie automatically.
+	// 2. Visual — n8n. Soft-fail on unauthenticated (W1 norm); empty until the
+	//    user signs into n8n directly.
 	if kindFilter == "" || kindFilter == "visual" {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
-		defer cancel()
-		rows = append(rows, visualWorkflows(ctx, c)...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
+			defer cancel()
+			vis = visualWorkflows(ctx, c)
+		}()
 	}
+	wg.Wait()
+	rows = append(rows, sched...)
+	rows = append(rows, vis...)
 
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
@@ -359,6 +371,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			goalsByLoop := readYamlLoopGoals(filepath.Join(appDir, "xpcloud.yaml"))
 			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			scheduleMap := readScheduleOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
+			goalMap := readGoalOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			for _, L := range loops {
 				if L.Name == "" {
 					continue
@@ -428,6 +441,14 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.Goal = &WorkflowGoal{Primary: g.Primary, Tracked: g.Tracked}
 				} else if L.Goal.Primary != "" || len(L.Goal.Tracked) > 0 {
 					row.Goal = &WorkflowGoal{Primary: L.Goal.Primary, Tracked: L.Goal.Tracked}
+				}
+				// User goal override (PATCH /me/loops) wins over the declared
+				// goal — keep the declared tracked-metric names alongside it.
+				if gv, ok := goalMap[L.Name]; ok && gv != "" {
+					if row.Goal == nil {
+						row.Goal = &WorkflowGoal{}
+					}
+					row.Goal.Primary = gv
 				}
 				row.Datasets = []string(L.Datasets)
 				row.MemoryAgents = memAgents
@@ -778,6 +799,22 @@ func readScheduleOverrides(path string) map[string]string {
 		settings, _ := v.(map[string]any)
 		if s, ok := settings["schedule"].(string); ok && s != "" {
 			out[name] = s
+		}
+	}
+	return out
+}
+
+// readGoalOverrides returns per-loop goal-primary overrides from
+// .user-overrides.yaml (written by MeLoopPatch when a user edits a goal).
+// Merged over the declared xpcloud.yaml goal so an edit shows immediately.
+func readGoalOverrides(path string) map[string]string {
+	out := map[string]string{}
+	overrides := readSimpleOverrides(path)
+	loopsMap, _ := overrides["loops"].(map[string]any)
+	for name, v := range loopsMap {
+		settings, _ := v.(map[string]any)
+		if g, ok := settings["goal"].(string); ok && g != "" {
+			out[name] = g
 		}
 	}
 	return out

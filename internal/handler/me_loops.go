@@ -3,7 +3,7 @@ package handler
 // /api/v1/me/loops/* — per-loop control plane.
 //
 // Three actions, all completable in-Go without external execution:
-//   PATCH /me/loops/:app/:loop {runtime?, schedule?, enabled?}
+//   PATCH /me/loops/:app/:loop {runtime?, schedule?, enabled?, goal?}
 //       — writes ~/.xp/apps/:app/.user-overrides.yaml (Helm-values
 //         style; merged last by sdk/apps/app_runner.load_manifest in
 //         P1+). In P0 the file lands on disk and the scheduler honors
@@ -38,6 +38,9 @@ type meLoopPatchBody struct {
 	Runtime  *string `json:"runtime,omitempty"`
 	Schedule *string `json:"schedule,omitempty"`
 	Enabled  *bool   `json:"enabled,omitempty"`
+	// Goal — the loop's objective (xpcloud.yaml loops[].goal.primary). An
+	// empty string clears the override (reverts to the declared goal).
+	Goal *string `json:"goal,omitempty"`
 }
 
 // PATCH /api/v1/me/loops/:app/:loop
@@ -110,6 +113,20 @@ func MeLoopPatch(c *gin.Context) {
 	}
 	if body.Enabled != nil {
 		loopOver["enabled"] = *body.Enabled
+	}
+	if body.Goal != nil {
+		// Single-line; bound the length so the tiny YAML emitter (which
+		// quotes via %q on one line) stays well-formed. Empty clears it.
+		g := strings.TrimSpace(*body.Goal)
+		g = strings.ReplaceAll(g, "\n", " ")
+		if len(g) > 280 {
+			g = g[:280]
+		}
+		if g == "" {
+			delete(loopOver, "goal")
+		} else {
+			loopOver["goal"] = g
+		}
 	}
 	loopsMap[loop] = loopOver
 	overrides["loops"] = loopsMap
@@ -306,7 +323,7 @@ func writeSimpleOverrides(path string, data map[string]any) error {
 				continue
 			}
 			b.WriteString("  " + loopName + ":\n")
-			for _, k := range []string{"runtime", "schedule", "enabled"} {
+			for _, k := range []string{"runtime", "schedule", "enabled", "goal"} {
 				v, ok := over[k]
 				if !ok {
 					continue

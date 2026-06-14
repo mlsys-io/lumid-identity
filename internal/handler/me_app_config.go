@@ -105,8 +105,14 @@ func MeUpdateAppConfig(c *gin.Context) {
 		return
 	}
 
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
+	// WRITE path: only the caller's own tenant install may be mutated — never
+	// the operator-shared bundle (which the scheduler + every other tenant read).
+	appDir, owned, shared := resolveOwnedAppDir(userID, app)
+	if !owned {
+		if shared {
+			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}

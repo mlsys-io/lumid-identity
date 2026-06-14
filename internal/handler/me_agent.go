@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -84,6 +85,10 @@ var destructiveTools = map[string]bool{
 	// C3 observability/action tools that mutate state.
 	"review_action":  true,
 	"app_config_set": true,
+	// Generic app-ops mutations (operate any app from chat). Reads
+	// (app_read/app_actions/show_app_surface) are NOT gated.
+	"app_action": true,
+	"qa_call":    true,
 }
 
 // lumidosToolNames is the set of tool names dispatched to the LumidOS schedule
@@ -547,16 +552,23 @@ func MeAgentToolApprove(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "approval_id required")
 		return
 	}
-	ch, ok := toolApprovals.Load(body.ApprovalID)
+	// LoadAndDelete is atomic — two concurrent approve POSTs for the same id
+	// can't both Load-then-send (which would block the second forever on the
+	// cap-1 channel and leak a goroutine). The loser gets the 404 below.
+	ch, ok := toolApprovals.LoadAndDelete(body.ApprovalID)
 	if !ok {
 		fail(c, http.StatusNotFound, 1404, "approval not found (may have timed out)")
 		return
 	}
-	toolApprovals.Delete(body.ApprovalID)
 	if body.Approved && body.Always && destructiveTools[body.Tool] {
 		_ = grantTool(userID, body.Tool)
 	}
-	ch.(chan bool) <- body.Approved
+	// Non-blocking send: if the waiting stream already gave up (10-min timeout
+	// or client disconnect), there's no reader — don't block this request.
+	select {
+	case ch.(chan bool) <- body.Approved:
+	default:
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -1026,6 +1038,7 @@ func MeAgentChat(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	stashViewingApp(c, body.Context)
 	if len(body.Messages) == 0 {
 		fail(c, http.StatusBadRequest, 1400, "messages required")
 		return
@@ -1047,10 +1060,12 @@ func MeAgentChat(c *gin.Context) {
 	}
 
 	// Daily token budget — server-funded LLM. Default 50K total
-	// tokens/24h/user. Override via ANTHROPIC_DAILY_TOKEN_BUDGET env;
-	// 0 disables the cap entirely (for operator/super_admin use).
+	// tokens/24h/user. Override via ANTHROPIC_DAILY_TOKEN_BUDGET env.
+	// super_admin (operator) is exempt — they run/test the whole platform,
+	// not a budgeted end user (the long-standing intent in this comment that
+	// was never actually wired).
 	budget := effectiveDailyBudget(provider)
-	if budget > 0 {
+	if budget > 0 && role != "super_admin" {
 		used := tokensUsedLast24h(userID)
 		if used >= budget {
 			c.Header("X-Budget-Used", strconv.Itoa(used))
@@ -1326,7 +1341,12 @@ func tokensUsedLast24h(userSub string) int {
 		Select("COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out").
 		Row()
 	if row != nil {
-		_ = row.Scan(&totals.Inp, &totals.Out)
+		// On a scan error this returns 0 — i.e. budget enforcement fails OPEN
+		// (a DB blip mustn't lock every non-admin out of chat). Log it so the
+		// outage is greppable rather than silently un-metered.
+		if err := row.Scan(&totals.Inp, &totals.Out); err != nil {
+			log.Printf("[me-agent] budget query failed user=%s err=%v (treating usage as 0, fail-open)", userSub, err)
+		}
 	}
 	return totals.Inp + totals.Out
 }
@@ -1444,6 +1464,13 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody) (string, [
 	// CLI delegation (which receives systemPrompt as context), inherit
 	// it from here.
 	ctxBlock := renderViewingContext(body.Context)
+	// When grounded on an app, tell the agent what it can DO there (operable
+	// actions), so it offers concrete help instead of just describing.
+	if body.Context != nil {
+		if app, ok := body.Context["app"].(string); ok && app != "" {
+			ctxBlock += groundedActionsHint(userID, app)
+		}
+	}
 	if body.PersonaID != "" {
 		p, _ := loadPersona(userID, body.PersonaID)
 		if p != nil {
@@ -1489,6 +1516,12 @@ func renderViewingContext(ctx map[string]any) string {
 			fmt.Fprintf(&b, " \"This workflow\" = %s (pass app=%s, loop=%s to workflow/loop tools).", loop, app, loop)
 		}
 		b.WriteString("\n")
+		// The app workspace shows the app's structured details (workflows, runs,
+		// pipeline) in its own panel — so the chat must NOT re-dump them. Reveal
+		// PROGRESSIVELY: answer with one focused thing + the single best next
+		// step, and only surface a specific data card (show_app_surface / one
+		// entity card) when explicitly asked. Never paste whole tables/lists.
+		b.WriteString("Style: this is the app's grounded chat beside its details panel. Be progressive/hierarchical — one focused point + the next step per turn; don't dump tables, run lists, or the whole surface (the panel already shows them); pull in a single card only when asked.\n")
 	}
 	if cy, ok := ctx["cycle"].(map[string]any); ok {
 		ca, _ := cy["app"].(string)
@@ -1543,7 +1576,10 @@ func renderViewingContext(ctx map[string]any) string {
 // by hiding tools per role. "Highest capabilities for all users", with
 // isolation preserved by the sandbox rather than by capability removal.
 func buildToolDefsForRole(role string) []map[string]any {
-	return buildToolDefs()
+	// Generic "operate any app" tools (app_actions/app_read/show_app_surface/
+	// app_action/qa_call) are available to every role — gated by the
+	// formActions + scheme/path allowlists + approval, not by role.
+	return append(buildToolDefs(), appOpsToolDefs()...)
 }
 
 // buildSystemPrompt assembles the assistant's persona + a snapshot
@@ -2695,6 +2731,21 @@ func buildToolDefs() []map[string]any {
 // Returns (result, ok). result is always a JSON-able map; on failure
 // it contains {"error": "..."} and ok is false.
 func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any) (map[string]any, bool) {
+	// Approval backstop — destructive tools must NOT execute unless they were
+	// approved. The streaming handler runs the interactive approval gate and
+	// then sets "approved_tool" on the context before calling us; an "always
+	// allow" grant also clears them. Any OTHER caller (the non-streaming
+	// /me/agent/chat endpoint, the sub-agent loop) reaches here without that
+	// marker — fail closed so a mutating tool can never run unconsented,
+	// regardless of transport. This is enforcement-at-the-sink; the per-
+	// transport gate stays for the interactive UX.
+	if destructiveTools[name] {
+		approved, _ := c.Get("approved_tool")
+		if approved != name && !hasToolGrant(userID, name) {
+			log.Printf("[me-agent] BLOCKED destructive tool=%q user=%s — no approval on this path", name, userID)
+			return map[string]any{"error": "this action requires explicit user approval, which was not granted on this request"}, false
+		}
+	}
 	switch name {
 	case "list_apps":
 		return toolListApps(userID), true
@@ -3288,10 +3339,16 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return toolSpawnAgents(c, userID, args)
 	}
 
+	// ── Generic app-ops bridge (operate any app from chat) ────────────────
+	if res, okRes, handled := dispatchAppOpsTool(c, userID, role, name, args); handled {
+		return res, okRes
+	}
+
 	// ── LumidOS bridge ────────────────────────────────────────────────────
 	if lumidosToolNames[name] {
 		return dispatchLumidosTool(name, args)
 	}
 
+	log.Printf("[me-agent] unknown tool name=%q user=%s — in prompt catalog but not wired into dispatch", name, userID)
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

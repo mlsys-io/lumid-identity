@@ -45,12 +45,10 @@ func flowmeshBaseURL() string {
 }
 
 // MeGpuRentalsList — GET /me/gpu-rentals. Backs the me://gpu-rentals source.
-func MeGpuRentalsList(c *gin.Context) {
-	userID, ok := currentUserID(c)
-	if !ok {
-		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
-		return
-	}
+// gpuRentalsData returns the caller's rentals with live FlowMesh status. Shared
+// by the HTTP handler (MeGpuRentalsList) and the chat agent's app_read tool so
+// "what GPU rentals do I have?" in chat returns the same data the page shows.
+func gpuRentalsData(userID string) gin.H {
 	var rows []models.GpuRental
 	common.DB.Where("user_id = ?", userID).Order("created_at DESC").Find(&rows)
 
@@ -81,7 +79,16 @@ func MeGpuRentalsList(c *gin.Context) {
 			"created": r.CreatedAt.Format(time.RFC3339),
 		})
 	}
-	ok_(c, "ok", gin.H{"rentals": out, "count": len(out)})
+	return gin.H{"rentals": out, "count": len(out)}
+}
+
+func MeGpuRentalsList(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	ok_(c, "ok", gpuRentalsData(userID))
 }
 
 // ── form value coercion (lumid:form sends inputs as strings) ──────────────────

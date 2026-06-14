@@ -21,10 +21,10 @@ package handler
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -32,9 +32,30 @@ import (
 )
 
 const (
-	defaultRateLimit    = 60
+	// The Studio dashboard legitimately bursts many /me/* calls: the Apps
+	// page polls ~6 endpoints/20s, the shell polls drafts+recents, the chat
+	// loads models/personas/agents on mount + a runs SSE, and
+	// useStudioRefetch re-fans-out on every chat tool call. 60/min throttled
+	// real single-user use (apps/jobs failed to load). This is a rogue-client
+	// backstop, not a security boundary — set it well above human polling.
+	// 300/min (5/sec sustained per caller). After the client over-fetch cuts
+	// (longer polls, narrowed refetch scopes) + in-flight GET dedup, normal
+	// dashboard use sits well under this; a runaway still trips it. (Was 1200
+	// as an emergency ceiling during the 429 incident; 60 originally.)
+	defaultRateLimit    = 300
 	defaultRateWindowS  = 60
 )
+
+// rateLimitScript — INCR the counter and, if it has no expiry yet (new key OR a
+// stuck key whose window-start EXPIRE was lost), set the window TTL. Atomic, one
+// round-trip; guarantees every counter eventually resets (a key with no TTL
+// otherwise accumulates forever and 429s the caller permanently).
+const rateLimitScript = `
+local n = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n`
 
 func rateLimitN() int {
 	if v := os.Getenv("LUMID_ME_RATE_LIMIT"); v != "" {
@@ -80,15 +101,16 @@ func MeRateLimit() gin.HandlerFunc {
 		}
 		key := "rl:me:" + callerKey(c)
 		ctx := c.Request.Context()
-		// INCR then EXPIRE — both pipelined would be cleaner but the
-		// two-call shape keeps the dependency on go-redis tight.
-		n, err := common.Redis.Incr(ctx, key).Result()
+		// INCR + guarantee a TTL, atomically. The old shape only set EXPIRE when
+		// n==1; if that EXPIRE was ever lost (Redis hiccup, or a window-start
+		// that never came), the key lived FOREVER — accumulating past the limit
+		// and 429ing the caller permanently ("stuck throttled", counter climbing
+		// ~1/req with no reset). Setting EXPIRE whenever TTL<0 makes a stuck key
+		// self-heal on its very next request and a fresh key always windowed.
+		n, err := common.Redis.Eval(ctx, rateLimitScript, []string{key}, windowS).Int64()
 		if err != nil {
 			c.Next()
 			return
-		}
-		if n == 1 {
-			_ = common.Redis.Expire(ctx, key, time.Duration(windowS)*time.Second).Err()
 		}
 		if n > int64(limit) {
 			ttl, _ := common.Redis.TTL(ctx, key).Result()
@@ -96,6 +118,9 @@ func MeRateLimit() gin.HandlerFunc {
 			if retry < 1 {
 				retry = windowS
 			}
+			// Distinct, greppable event — so a rate-limit storm is visible at a
+			// glance instead of being inferred from a wall of GIN 429 lines.
+			log.Printf("[me-ratelimit] tripped caller=%s n=%d/%d path=%s", callerKey(c), n, limit, c.FullPath())
 			c.Header("Retry-After", strconv.Itoa(retry))
 			c.Header("X-RateLimit-Limit", strconv.Itoa(limit))
 			c.Header("X-RateLimit-Reset", strconv.Itoa(retry))

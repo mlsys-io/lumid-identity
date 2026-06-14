@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,6 +52,7 @@ func MeAgentChatStream(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	stashViewingApp(c, body.Context)
 	if len(body.Messages) == 0 || len(body.Messages) > 50 {
 		fail(c, http.StatusBadRequest, 1400, "messages required, ≤50 turns")
 		return
@@ -66,7 +68,7 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	budget := effectiveDailyBudget(provider)
-	if budget > 0 {
+	if budget > 0 && role != "super_admin" {
 		used := tokensUsedLast24h(userID)
 		if used >= budget {
 			c.Header("X-Budget-Used", strconv.Itoa(used))
@@ -138,6 +140,12 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	for i := 0; i < maxToolLoopIterations; i++ {
+		// Stop the moment the client is gone — otherwise the loop keeps making
+		// upstream LLM calls and dispatching (possibly destructive) tools for a
+		// disconnected user, burning budget with nothing reading the result.
+		if ctx.Err() != nil {
+			return
+		}
 		maxTok := maxTokensPerTurn
 		if provider.maxOutputTokens > 0 {
 			maxTok = provider.maxOutputTokens
@@ -166,6 +174,10 @@ func MeAgentChatStream(c *gin.Context) {
 		totalOutputTokens += outTok
 
 		if err != nil {
+			// Surface upstream detail server-side too — the browser gets a
+			// friendly message, but ops needs the real provider/status/body to
+			// debug a kv.run cold-start / MiniMax 503 / Anthropic 429.
+			log.Printf("[me-agent] stream turn failed provider=%s user=%s err=%v", provider.id, userID, err)
 			emit(map[string]any{"type": "error", "message": err.Error()})
 			break
 		}
@@ -179,6 +191,21 @@ func MeAgentChatStream(c *gin.Context) {
 		// Execute tools + emit + append tool_result blocks.
 		toolResultBlocks := []map[string]any{}
 		for _, tu := range toolUses {
+			// The model emitted malformed tool arguments (truncated stream from a
+			// thinking model, etc.). Don't dispatch with garbage input — report it
+			// as an error tool_result so the model can retry with valid args,
+			// instead of running e.g. an install/qa_call with no real fields.
+			if _, bad := tu.input["_parse_error"]; bad {
+				log.Printf("[me-agent] tool=%s user=%s — invalid tool arguments from model, skipping dispatch", tu.name, userID)
+				result := map[string]any{"error": "the model produced invalid (unparseable) tool arguments — retry with valid JSON"}
+				emit(map[string]any{"type": "tool_call", "name": tu.name, "args": tu.input, "result": result, "ok": false})
+				payload, _ := json.Marshal(result)
+				toolResultBlocks = append(toolResultBlocks, map[string]any{
+					"type": "tool_result", "tool_use_id": tu.id,
+					"content": string(payload), "is_error": true,
+				})
+				continue
+			}
 			// For destructive tools: pause and wait for user approval —
 			// unless the user has a persistent "always allow" grant for
 			// this tool (POST tool-approve with always=true; revocable
@@ -202,6 +229,9 @@ func MeAgentChatStream(c *gin.Context) {
 					toolApprovals.Delete(approvalID)
 				}
 				if !approved {
+					// Audit the denial/timeout — dispatchTool never runs, so the
+					// [app-ops] audit line can't cover this. Greppable as [me-agent].
+					log.Printf("[me-agent] approval denied/timeout tool=%s user=%s", tu.name, userID)
 					result := map[string]any{"error": "user denied permission for " + tu.name}
 					emit(map[string]any{"type": "tool_call", "name": tu.name, "args": tu.input, "result": result, "ok": false})
 					payload, _ := json.Marshal(result)
@@ -212,6 +242,11 @@ func MeAgentChatStream(c *gin.Context) {
 					continue
 				}
 			}
+			// By here the tool is cleared to run (non-destructive, an "always"
+			// grant, or freshly approved). Mark it so the dispatchTool backstop
+			// (which fail-closes destructive tools on un-gated transports) lets
+			// THIS call through. Per-tool + synchronous, so no cross-tool leak.
+			c.Set("approved_tool", tu.name)
 			result, callOK := dispatchTool(c, userID, role, tu.name, tu.input)
 			emit(map[string]any{
 				"type":   "tool_call",

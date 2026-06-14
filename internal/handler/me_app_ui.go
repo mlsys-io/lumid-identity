@@ -419,10 +419,16 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 		return
 	}
 
-	// Resolve the app dir — tenant tree first, then operator-shared.
-	// Both dirs are writable by the identity container (both bind-mounted RW).
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
+	// WRITE path: the surface must live in the caller's OWN tenant install.
+	// Both dirs are bind-mounted RW into the container, so editing the
+	// operator-shared copy would silently change the surface for every other
+	// tenant + the scheduler — refuse it (install your own fork first).
+	appDir, owned, shared := resolveOwnedAppDir(userID, app)
+	if !owned {
+		if shared {
+			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}

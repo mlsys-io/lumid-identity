@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -153,12 +154,14 @@ func dispatchAppOpsTool(c *gin.Context, userID, role, name string, args map[stri
 		}
 		res, err := dispatchFormAction(c, userID, role, action, values)
 		// Audit trail — mutating app actions invoked by the AI on the user's
-		// behalf. Greppable as [app-ops] for ops review.
-		log.Printf("[app-ops] action=%s user=%s ok=%v", action, userID, err == nil)
+		// behalf. Greppable as [app-ops]. Include the failure reason so an
+		// incident review can tell "not allowed" from a backend 502.
 		if err != nil {
+			log.Printf("[app-ops] action=%s user=%s ok=false err=%v", action, userID, err)
 			return map[string]any{"error": err.Error(), "action": action}, false, true
 		}
-		out := map[string]any{"action": action, "ok": true}
+		log.Printf("[app-ops] action=%s user=%s ok=true", action, userID)
+		out := map[string]any{}
 		if m, ok := res.(gin.H); ok {
 			for k, v := range m {
 				out[k] = v
@@ -170,6 +173,10 @@ func dispatchAppOpsTool(c *gin.Context, userID, role, name string, args map[stri
 		} else {
 			out["result"] = res
 		}
+		// Set the dispatcher's own keys LAST so an action result that happens to
+		// carry its own "action"/"ok" can't shadow them (entityCards reads both).
+		out["action"] = action
+		out["ok"] = true
 		return out, true, true
 
 	case "qa_call":
@@ -177,10 +184,11 @@ func dispatchAppOpsTool(c *gin.Context, userID, role, name string, args map[stri
 		path := strVal(args, "path")
 		body, _ := args["body"].(map[string]any)
 		res, err := qaCall(c, method, path, body)
-		log.Printf("[app-ops] qa_call %s %s user=%s ok=%v", method, path, userID, err == nil)
 		if err != nil {
+			log.Printf("[app-ops] qa_call %s %s user=%s ok=false err=%v", method, path, userID, err)
 			return map[string]any{"error": err.Error(), "path": path}, false, true
 		}
+		log.Printf("[app-ops] qa_call %s %s user=%s ok=true", method, path, userID)
 		return map[string]any{"ok": true, "method": method, "path": path, "result": res}, true, true
 	}
 	return nil, false, false
@@ -496,10 +504,22 @@ func qaCall(c *gin.Context, method, path string, body map[string]any) (any, erro
 		return nil, &appOpsError{"qa unreachable: " + err.Error()}
 	}
 	defer resp.Body.Close()
+	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	var out any
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if len(rawBody) > 0 {
+		_ = json.Unmarshal(rawBody, &out)
+	}
 	if resp.StatusCode >= 400 {
-		return nil, &appOpsError{fmt.Sprintf("qa %d: %v", resp.StatusCode, out)}
+		// Prefer the parsed JSON; fall back to the raw (truncated) body so a
+		// non-JSON gateway error (nginx 502 HTML) is diagnosable, not "<nil>".
+		detail := fmt.Sprintf("%v", out)
+		if out == nil {
+			detail = strings.TrimSpace(string(rawBody))
+			if len(detail) > 300 {
+				detail = detail[:300]
+			}
+		}
+		return nil, &appOpsError{fmt.Sprintf("qa %d: %s", resp.StatusCode, detail)}
 	}
 	return out, nil
 }

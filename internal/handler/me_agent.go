@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -551,16 +552,23 @@ func MeAgentToolApprove(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "approval_id required")
 		return
 	}
-	ch, ok := toolApprovals.Load(body.ApprovalID)
+	// LoadAndDelete is atomic — two concurrent approve POSTs for the same id
+	// can't both Load-then-send (which would block the second forever on the
+	// cap-1 channel and leak a goroutine). The loser gets the 404 below.
+	ch, ok := toolApprovals.LoadAndDelete(body.ApprovalID)
 	if !ok {
 		fail(c, http.StatusNotFound, 1404, "approval not found (may have timed out)")
 		return
 	}
-	toolApprovals.Delete(body.ApprovalID)
 	if body.Approved && body.Always && destructiveTools[body.Tool] {
 		_ = grantTool(userID, body.Tool)
 	}
-	ch.(chan bool) <- body.Approved
+	// Non-blocking send: if the waiting stream already gave up (10-min timeout
+	// or client disconnect), there's no reader — don't block this request.
+	select {
+	case ch.(chan bool) <- body.Approved:
+	default:
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -1333,7 +1341,12 @@ func tokensUsedLast24h(userSub string) int {
 		Select("COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out").
 		Row()
 	if row != nil {
-		_ = row.Scan(&totals.Inp, &totals.Out)
+		// On a scan error this returns 0 — i.e. budget enforcement fails OPEN
+		// (a DB blip mustn't lock every non-admin out of chat). Log it so the
+		// outage is greppable rather than silently un-metered.
+		if err := row.Scan(&totals.Inp, &totals.Out); err != nil {
+			log.Printf("[me-agent] budget query failed user=%s err=%v (treating usage as 0, fail-open)", userSub, err)
+		}
 	}
 	return totals.Inp + totals.Out
 }
@@ -2712,6 +2725,21 @@ func buildToolDefs() []map[string]any {
 // Returns (result, ok). result is always a JSON-able map; on failure
 // it contains {"error": "..."} and ok is false.
 func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any) (map[string]any, bool) {
+	// Approval backstop — destructive tools must NOT execute unless they were
+	// approved. The streaming handler runs the interactive approval gate and
+	// then sets "approved_tool" on the context before calling us; an "always
+	// allow" grant also clears them. Any OTHER caller (the non-streaming
+	// /me/agent/chat endpoint, the sub-agent loop) reaches here without that
+	// marker — fail closed so a mutating tool can never run unconsented,
+	// regardless of transport. This is enforcement-at-the-sink; the per-
+	// transport gate stays for the interactive UX.
+	if destructiveTools[name] {
+		approved, _ := c.Get("approved_tool")
+		if approved != name && !hasToolGrant(userID, name) {
+			log.Printf("[me-agent] BLOCKED destructive tool=%q user=%s — no approval on this path", name, userID)
+			return map[string]any{"error": "this action requires explicit user approval, which was not granted on this request"}, false
+		}
+	}
 	switch name {
 	case "list_apps":
 		return toolListApps(userID), true
@@ -3315,5 +3343,6 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return dispatchLumidosTool(name, args)
 	}
 
+	log.Printf("[me-agent] unknown tool name=%q user=%s — in prompt catalog but not wired into dispatch", name, userID)
 	return map[string]any{"error": "unknown tool: " + name}, false
 }

@@ -15,6 +15,7 @@ package handler
 
 import (
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -77,6 +78,7 @@ func MeFormAction(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		log.Printf("[form-action] action=%s user=%s err=%v", req.Action, userID, err)
 		fail(c, http.StatusBadGateway, 1502, err.Error())
 		return
 	}

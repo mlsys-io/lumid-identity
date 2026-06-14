@@ -24,7 +24,16 @@ import (
 
 // resolveAppDir returns the app's bundle dir (tenant tree first, then
 // operator-shared), or "" if neither exists.
+//
+// `app` MUST be a single directory segment. Several callers gate it only with
+// slugRe (which permits "/" and ".."), so we reject path separators and
+// traversal HERE — the shared sink — rather than trusting each caller. Without
+// this, `app = "../<victim_sub>/.xp/apps/<app>"` would filepath.Join out of the
+// tenant root into another tenant's (or the operator's) bundle.
 func resolveAppDir(userSub, app string) string {
+	if app == "" || strings.ContainsAny(app, "/\\") || strings.Contains(app, "..") {
+		return ""
+	}
 	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
 		dir := filepath.Join(base, app)
 		if st, err := os.Stat(dir); err == nil && st.IsDir() {
@@ -32,6 +41,26 @@ func resolveAppDir(userSub, app string) string {
 		}
 	}
 	return ""
+}
+
+// resolveOwnedAppDir is the WRITE-path resolver: it returns ONLY the caller's
+// own tenant install, never the operator-shared copy. `owned` is false (and the
+// returned dir is "") when the app exists only as a shared bundle — callers
+// must 403 rather than mutate a bundle every other tenant + the scheduler read.
+// `shared` distinguishes "shared, not yours" from "not installed at all" for a
+// clearer error. Mirrors the guard in me_app_skills.go.
+func resolveOwnedAppDir(userSub, app string) (dir string, owned, shared bool) {
+	if app == "" || strings.ContainsAny(app, "/\\") || strings.Contains(app, "..") {
+		return "", false, false
+	}
+	tenantDir := filepath.Join(tenantAppsDir(userSub), app)
+	if st, err := os.Stat(tenantDir); err == nil && st.IsDir() {
+		return tenantDir, true, false
+	}
+	if resolveAppDir(userSub, app) != "" {
+		return "", false, true
+	}
+	return "", false, false
 }
 
 // Folders (relative to the app dir) we treat as dataset sources, with a

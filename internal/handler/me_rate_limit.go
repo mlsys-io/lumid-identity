@@ -25,7 +25,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -46,6 +45,17 @@ const (
 	defaultRateLimit    = 300
 	defaultRateWindowS  = 60
 )
+
+// rateLimitScript — INCR the counter and, if it has no expiry yet (new key OR a
+// stuck key whose window-start EXPIRE was lost), set the window TTL. Atomic, one
+// round-trip; guarantees every counter eventually resets (a key with no TTL
+// otherwise accumulates forever and 429s the caller permanently).
+const rateLimitScript = `
+local n = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n`
 
 func rateLimitN() int {
 	if v := os.Getenv("LUMID_ME_RATE_LIMIT"); v != "" {
@@ -91,15 +101,16 @@ func MeRateLimit() gin.HandlerFunc {
 		}
 		key := "rl:me:" + callerKey(c)
 		ctx := c.Request.Context()
-		// INCR then EXPIRE — both pipelined would be cleaner but the
-		// two-call shape keeps the dependency on go-redis tight.
-		n, err := common.Redis.Incr(ctx, key).Result()
+		// INCR + guarantee a TTL, atomically. The old shape only set EXPIRE when
+		// n==1; if that EXPIRE was ever lost (Redis hiccup, or a window-start
+		// that never came), the key lived FOREVER — accumulating past the limit
+		// and 429ing the caller permanently ("stuck throttled", counter climbing
+		// ~1/req with no reset). Setting EXPIRE whenever TTL<0 makes a stuck key
+		// self-heal on its very next request and a fresh key always windowed.
+		n, err := common.Redis.Eval(ctx, rateLimitScript, []string{key}, windowS).Int64()
 		if err != nil {
 			c.Next()
 			return
-		}
-		if n == 1 {
-			_ = common.Redis.Expire(ctx, key, time.Duration(windowS)*time.Second).Err()
 		}
 		if n > int64(limit) {
 			ttl, _ := common.Redis.TTL(ctx, key).Result()

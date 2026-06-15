@@ -359,6 +359,9 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app/loops/:loop", MeLoopDelete)
 			// Direct workflow compose (composer wizard — instant, no chat LLM).
 			me.POST("/workflows/compose", MeComposeWorkflow)
+			// Server-truth validation of a composed draft (manifest_lint +
+			// pipeline_shape) for the new-workflow wizard's validation card.
+			me.POST("/workflows/validate", MeValidateWorkflow)
 			// Engine-revamp human checkpoint — approve/revamp a cycle's
 			// held actions; writes the engine's side files for next cycle.
 			me.POST("/cycles/:app/:loop/:ts/review", MeCycleReview)
@@ -400,6 +403,10 @@ func Register(r *gin.Engine) {
 			me.GET("/runs/:run_id",               MeRunDetail)
 			me.POST("/runs/:run_id/mark",         MeRunMark)
 			me.GET("/runs/stream",                MeRunsStream)
+
+			// Fleet — P4. Cross-workflow rollup: per-workflow health +
+			// 30d cost/tokens/learning, plus fleet totals.
+			me.GET("/portfolio",                  MePortfolio)
 
 			// Mind — the Improve surface (W4). Per-workflow report
 			// cards (plain-English deltas) + on-demand skill evaluation.

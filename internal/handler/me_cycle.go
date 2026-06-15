@@ -37,6 +37,11 @@ type cycleListItem struct {
 	Running  bool   `json:"running,omitempty"`
 	Duration float64 `json:"duration_s,omitempty"`
 	StepCount int   `json:"step_count"`
+	// Per-cycle LLM cost headline (aggregated by the runner into
+	// cycle.json's `cost` block). Lets the run list show cost/tokens
+	// without a detail fetch per row.
+	CostUSD     float64 `json:"cost_usd,omitempty"`
+	TotalTokens float64 `json:"total_tokens,omitempty"`
 }
 
 // MeCyclesList serves GET /api/v1/me/cycles?app=&loop=&limit=
@@ -87,6 +92,14 @@ func MeCyclesList(c *gin.Context) {
 						}
 						if v, ok := raw["duration_s"].(float64); ok {
 							item.Duration = v
+						}
+						if cost, ok := raw["cost"].(map[string]any); ok {
+							if v, ok := cost["cost_usd"].(float64); ok {
+								item.CostUSD = v
+							}
+							if v, ok := cost["total_tokens"].(float64); ok {
+								item.TotalTokens = v
+							}
 						}
 					}
 				} else if st, serr := os.Stat(filepath.Join(cyclesRoot, lp.Name(), td.Name())); serr == nil &&

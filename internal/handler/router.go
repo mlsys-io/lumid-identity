@@ -404,6 +404,10 @@ func Register(r *gin.Engine) {
 			me.POST("/runs/:run_id/mark",         MeRunMark)
 			me.GET("/runs/stream",                MeRunsStream)
 
+			// Fleet — P4. Cross-workflow rollup: per-workflow health +
+			// 30d cost/tokens/learning, plus fleet totals.
+			me.GET("/portfolio",                  MePortfolio)
+
 			// Mind — the Improve surface (W4). Per-workflow report
 			// cards (plain-English deltas) + on-demand skill evaluation.
 			me.GET("/mind/workflow/:slug",        MeMindWorkflow)

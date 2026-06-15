@@ -352,6 +352,7 @@ func Register(r *gin.Engine) {
 			// Dataset / casebook explorer for the app-overview page.
 			me.GET("/apps/:app/datasets",      MeAppDatasets)
 			me.GET("/apps/:app/dataset-file",  MeAppDatasetFile)
+			me.GET("/apps/:app/casebook",      MeCasebook)
 			// Goal-metric trajectory across cycles (improvement over iterations).
 			me.GET("/apps/:app/loops/:loop/metric-series", MeLoopMetricSeries)
 			// Hard-remove a single workflow (loop) from one of the caller's apps.

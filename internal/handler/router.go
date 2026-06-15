@@ -359,6 +359,9 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app/loops/:loop", MeLoopDelete)
 			// Direct workflow compose (composer wizard — instant, no chat LLM).
 			me.POST("/workflows/compose", MeComposeWorkflow)
+			// Server-truth validation of a composed draft (manifest_lint +
+			// pipeline_shape) for the new-workflow wizard's validation card.
+			me.POST("/workflows/validate", MeValidateWorkflow)
 			// Engine-revamp human checkpoint — approve/revamp a cycle's
 			// held actions; writes the engine's side files for next cycle.
 			me.POST("/cycles/:app/:loop/:ts/review", MeCycleReview)

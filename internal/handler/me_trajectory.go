@@ -114,8 +114,15 @@ func MeTrajectory(c *gin.Context) {
 		return
 	}
 
-	// 1. Pick the experiment dir.
-	expID, expDir := pickExperiment(appDir, expWant)
+	// 1. Pick the experiment dir — strictly the selected loop's declared
+	//    experiment (metrics are workflow-bound; data is shared). No loop
+	//    given → fall back to most-rows (back-compat).
+	loopExps := loopExperiments(appDir, loop)
+	expAllow := map[string]bool{}
+	for _, x := range loopExps {
+		expAllow[x] = true
+	}
+	expID, expDir := pickExperiment(appDir, expWant, expAllow, loop != "")
 
 	// Cycle dirs under data/cycles/<loop>/ (capped, oldest→newest) — used both
 	// for run_ts mapping and the no-experiment linear fallback.
@@ -252,9 +259,12 @@ func MeTrajectory(c *gin.Context) {
 // pickExperiment resolves the experiment dir. When `want` is set and exists,
 // use it. Otherwise prefer the dir whose results.jsonl has the most rows; tie /
 // no rows → the one whose state metric is non-empty. Returns ("","") if none.
-func pickExperiment(appDir, want string) (string, string) {
+func pickExperiment(appDir, want string, allowed map[string]bool, strict bool) (string, string) {
+	if strict && len(allowed) == 0 {
+		return "", "" // this workflow declares no experiment → no variant metrics
+	}
 	expRoot := filepath.Join(appDir, "data", "experiments")
-	if want != "" {
+	if want != "" && (!strict || allowed[want]) {
 		d := filepath.Join(expRoot, want)
 		if st, err := os.Stat(d); err == nil && st.IsDir() {
 			return want, d
@@ -268,6 +278,9 @@ func pickExperiment(appDir, want string) (string, string) {
 	for _, e := range ents {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
+		}
+		if strict && !allowed[e.Name()] {
+			continue // not this workflow's experiment
 		}
 		d := filepath.Join(expRoot, e.Name())
 		rows := countLines(filepath.Join(d, "results.jsonl"))

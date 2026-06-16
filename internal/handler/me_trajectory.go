@@ -41,6 +41,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -61,6 +62,7 @@ type trajNode struct {
 	Scored     bool           `json:"scored"`
 	DeltaVsBaseline *float64  `json:"delta_vs_baseline,omitempty"`
 	IsChampion bool           `json:"is_champion,omitempty"`
+	DurationS  *float64       `json:"duration_s,omitempty"`
 }
 
 type trajCycle struct {
@@ -70,6 +72,7 @@ type trajCycle struct {
 	ChampionScore  *float64 `json:"champion_score,omitempty"`
 	Learned        int      `json:"learned"`
 	BestDelta      *float64 `json:"best_delta,omitempty"`
+	DurationS      *float64 `json:"duration_s,omitempty"`
 }
 
 // one variant trial after grouping (a single best-scored representative per
@@ -125,9 +128,12 @@ func MeTrajectory(c *gin.Context) {
 		"cycle_scan_cap": cycleScanCap,
 	}
 
+	// per-request cache so variants sharing a cycle dir don't re-walk it.
+	durCache := map[string]float64{}
+
 	if expDir == "" {
 		// 9. No experiments dir → linear run chain from cycle dirs.
-		nodes, cycles := linearRunChain(appDir, loop, cycleDirs)
+		nodes, cycles := linearRunChain(appDir, loop, cycleDirs, durCache)
 		data["has_variants"] = false
 		data["nodes"] = nodes
 		data["cycles"] = cycles
@@ -210,6 +216,12 @@ func MeTrajectory(c *gin.Context) {
 					n.DeltaVsBaseline = &d
 				}
 			}
+			// execution time — wall-clock file span of the run's cycle dir.
+			if n.RunTs != "" {
+				if dur := durationAtRunTs(appDir, loop, n.RunTs, durCache); dur > 0 {
+					n.DurationS = &dur
+				}
+			}
 			if i == cycleChampIdx {
 				n.IsChampion = true
 				cyc.ChampionID = n.ID
@@ -218,6 +230,10 @@ func MeTrajectory(c *gin.Context) {
 				if hasBaseline {
 					d := roundN(sc-baseline, 4)
 					cyc.BestDelta = &d
+				}
+				if n.DurationS != nil {
+					dv := *n.DurationS
+					cyc.DurationS = &dv
 				}
 				prevChampionID = n.ID
 				// 8. learned — memories pushed by this cycle's champion run.
@@ -499,6 +515,56 @@ func mapRunTs(cycleDirs []string, cycleTs, variantTs string) string {
 	return best
 }
 
+// durationAtRunTs estimates a cycle's execution time as the wall-clock FILE SPAN
+// of its cycle dir: newest file mtime − oldest file mtime, in seconds. The
+// command-engine cycle.json carries no duration; the dir-name→mtime delta is
+// polluted by the scheduled-vs-actual offset, so we use the file span instead.
+// Returns 0 when runTs is empty, the dir is missing, or fewer than 2 files.
+// Results are cached per runTs (variants sharing a cycle don't re-walk).
+func durationAtRunTs(appDir, loop, runTs string, cache map[string]float64) float64 {
+	if loop == "" || runTs == "" {
+		return 0
+	}
+	if cache != nil {
+		if v, ok2 := cache[runTs]; ok2 {
+			return v
+		}
+	}
+	span := 0.0
+	dir := filepath.Join(appDir, "data", "cycles", loop, runTs)
+	ents, err := os.ReadDir(dir)
+	if err == nil {
+		var minT, maxT time.Time
+		n := 0
+		for _, e := range ents {
+			if e.IsDir() {
+				continue
+			}
+			st, serr := os.Stat(filepath.Join(dir, e.Name()))
+			if serr != nil {
+				continue
+			}
+			mt := st.ModTime()
+			if n == 0 || mt.Before(minT) {
+				minT = mt
+			}
+			if n == 0 || mt.After(maxT) {
+				maxT = mt
+			}
+			n++
+		}
+		if n >= 2 {
+			if d := maxT.Sub(minT).Seconds(); d > 0 {
+				span = roundN(d, 3)
+			}
+		}
+	}
+	if cache != nil {
+		cache[runTs] = span
+	}
+	return span
+}
+
 // learnedAtRunTs sums auto_publish.memories[*].pushed from a run's cycle.json.
 func learnedAtRunTs(appDir, loop, runTs string) int {
 	if loop == "" || runTs == "" {
@@ -541,7 +607,7 @@ func sumPushed(cj map[string]any) int {
 // depth = index, score = the cycle's primary numeric metric (scored if any),
 // run_ts = the cycle dir, label = a short date. No baseline node (no baseline
 // to anchor to). cycleDirs is oldest→newest.
-func linearRunChain(appDir, loop string, cycleDirs []string) ([]trajNode, []trajCycle) {
+func linearRunChain(appDir, loop string, cycleDirs []string, durCache map[string]float64) ([]trajNode, []trajCycle) {
 	nodes := []trajNode{}
 	cycles := []trajCycle{}
 	parent := ""
@@ -561,11 +627,18 @@ func linearRunChain(appDir, loop string, cycleDirs []string) ([]trajNode, []traj
 			sc := score
 			n.Score = &sc
 		}
+		if dur := durationAtRunTs(appDir, loop, ts, durCache); dur > 0 {
+			n.DurationS = &dur
+		}
 		nodes = append(nodes, n)
 		cyc := trajCycle{Ts: ts, NVariants: 1, ChampionID: n.ID, Learned: learnedAtRunTs(appDir, loop, ts)}
 		if scored {
 			sc := score
 			cyc.ChampionScore = &sc
+		}
+		if n.DurationS != nil {
+			dv := *n.DurationS
+			cyc.DurationS = &dv
 		}
 		cycles = append(cycles, cyc)
 		parent = n.ID

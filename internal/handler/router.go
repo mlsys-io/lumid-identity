@@ -355,6 +355,9 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/casebook",      MeCasebook)
 			// Variant trajectory tree (baseline → per-cycle variants → champion trunk).
 			me.GET("/apps/:app/trajectory",    MeTrajectory)
+			// Trajectory control-signal channel (right-click "branch from here").
+			me.POST("/apps/:app/trajectory/signal",  MeTrajectorySignal)
+			me.GET("/apps/:app/trajectory/signals",  MeTrajectorySignals)
 			// Goal-metric trajectory across cycles (improvement over iterations).
 			me.GET("/apps/:app/loops/:loop/metric-series", MeLoopMetricSeries)
 			// Hard-remove a single workflow (loop) from one of the caller's apps.

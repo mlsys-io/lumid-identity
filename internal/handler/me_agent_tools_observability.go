@@ -164,6 +164,33 @@ func toolExperimentCase(userID, app, id, caseID string) (map[string]any, bool) {
 	return map[string]any{"case_id": caseID, "rows": caseRows, "latest_by_question": latestByQ}, true
 }
 
+// toolCasebook — the data casebook a workflow's goal metrics are scored on
+// (mirrors MeCasebook): per-case latest score + history + metric evolution,
+// scoped to the loop's declared experiment. Reuses the same builder funcs.
+func toolCasebook(userID, app, loop string) (map[string]any, bool) {
+	if app == "" {
+		return map[string]any{"error": "app required"}, false
+	}
+	if !slugRe.MatchString(app) || (loop != "" && !slugRe.MatchString(loop)) {
+		return map[string]any{"error": "invalid app or loop"}, false
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	expAllow := map[string]bool{}
+	for _, x := range loopExperiments(appDir, loop) {
+		expAllow[x] = true
+	}
+	scores, metricEvo := casebookScoresFromExperiments(appDir, expAllow, loop != "")
+	cases := casebookRoster(appDir, scores)
+	return map[string]any{
+		"app": app, "loop": loop,
+		"cases": cases, "metrics_evolution": metricEvo,
+		"version_history": casebookVersionHistory(appDir, loop),
+	}, true
+}
+
 // toolLoopMetricSeries — a workflow's KPI trajectory over its recent
 // runs (compact window for chat: last 50 cycles).
 func toolLoopMetricSeries(userID, app, loop string) (map[string]any, bool) {

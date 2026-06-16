@@ -63,6 +63,10 @@ type trajNode struct {
 	DeltaVsBaseline *float64  `json:"delta_vs_baseline,omitempty"`
 	IsChampion bool           `json:"is_champion,omitempty"`
 	DurationS  *float64       `json:"duration_s,omitempty"`
+	// NeedsDecision: the run has pending advisor suggestions / offers or a
+	// held review_queue item awaiting a human decision (drives the canvas
+	// "needs-attention" badge).
+	NeedsDecision bool        `json:"needs_decision,omitempty"`
 }
 
 type trajCycle struct {
@@ -228,6 +232,7 @@ func MeTrajectory(c *gin.Context) {
 				if dur := durationAtRunTs(appDir, loop, n.RunTs, durCache); dur > 0 {
 					n.DurationS = &dur
 				}
+				n.NeedsDecision = needsDecisionAtRunTs(appDir, loop, n.RunTs)
 			}
 			if i == cycleChampIdx {
 				n.IsChampion = true
@@ -592,6 +597,29 @@ func learnedAtRunTs(appDir, loop, runTs string) int {
 		return 0
 	}
 	return sumPushed(cj)
+}
+
+// needsDecisionAtRunTs — true when the run has pending advisor suggestions /
+// offers or a held review_queue item awaiting a human decision. Reads the
+// run's cycle.json; best-effort (missing/odd → false).
+func needsDecisionAtRunTs(appDir, loop, runTs string) bool {
+	if loop == "" || runTs == "" {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(appDir, "data", "cycles", loop, runTs, "cycle.json"))
+	if err != nil {
+		return false
+	}
+	var cj map[string]any
+	if json.Unmarshal(b, &cj) != nil {
+		return false
+	}
+	for _, k := range []string{"offers", "review_queue"} {
+		if a, ok := cj[k].([]any); ok && len(a) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // sumPushed totals auto_publish.memories[*].pushed in a parsed cycle.json.

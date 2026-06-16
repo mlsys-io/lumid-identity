@@ -355,6 +355,8 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/casebook",      MeCasebook)
 			// Per-case data↔metric mapping log (AI labeling/scoring records).
 			me.GET("/apps/:app/casebook/case-log", MeCaseLog)
+			// Live execution feed — tail journal.jsonl for a running cycle.
+			me.GET("/apps/:app/cycle-log",     MeCycleLog)
 			// Variant trajectory tree (baseline → per-cycle variants → champion trunk).
 			me.GET("/apps/:app/trajectory",    MeTrajectory)
 			// Trajectory control-signal channel (right-click "branch from here").

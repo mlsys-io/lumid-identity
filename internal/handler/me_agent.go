@@ -792,7 +792,7 @@ func containsImageAttachment(msgs []chatMessage) bool {
 // where autoRouted is true when we overrode. Used to surface the
 // override in the usage event so the UI can show "answered by
 // Claude (auto)" instead of pretending the user's selection ran.
-func autoRouteForTurn(req []chatMessage, picked llmProvider, role string) (llmProvider, bool) {
+func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx map[string]any) (llmProvider, bool) {
 	if containsImageAttachment(req) && !providerSupportsVision(picked) {
 		// Route to the first vision-capable provider the caller's role
 		// allows. gemma4 is first + allowed to everyone + multimodal, so
@@ -803,7 +803,47 @@ func autoRouteForTurn(req []chatMessage, picked llmProvider, role string) (llmPr
 			}
 		}
 	}
+	// Grounded observability drill-in (the trajectory "Ask about this run /
+	// step / case" affordances send cycle/step_id/case_id in the context).
+	// These NEED the me_agent data tools (cycle_detail, casebook, …) which the
+	// claude-code CLI provider can't see — it runs its own toolset. So when the
+	// picked provider is claude-code AND this is a drill-in, route to the first
+	// tool-capable (non-claude-code) provider the role allows. Prefer
+	// kvrun-minimax over gemma4 for tool-following quality.
+	if isClaudeCodeProvider(picked) && groundedDrillIn(ctx) {
+		var fallback *llmProvider
+		for i := range llmProviders {
+			p := llmProviders[i]
+			if isClaudeCodeProvider(p) || !providerAllowed(role, p) {
+				continue
+			}
+			if p.id == "kvrun-minimax" {
+				return p, true
+			}
+			if fallback == nil {
+				fallback = &p
+			}
+		}
+		if fallback != nil {
+			return *fallback, true
+		}
+	}
 	return picked, false
+}
+
+// groundedDrillIn reports whether the turn's viewing context points at a
+// specific run / step / case (vs a bare app-level view) — i.e. a question
+// that needs the me_agent observability tools to answer.
+func groundedDrillIn(ctx map[string]any) bool {
+	if ctx == nil {
+		return false
+	}
+	for _, k := range []string{"cycle", "step_id", "case_id"} {
+		if v, ok := ctx[k]; ok && v != nil && v != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveProvider picks the provider for a chat request. Falls back
@@ -1050,7 +1090,7 @@ func MeAgentChat(c *gin.Context) {
 
 	role := currentUserRole(c)
 	provider := resolveProvider(body.Model, role)
-	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role)
+	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context)
 	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
 	apiKey, err := provider.keyFn()
 	if err != nil {

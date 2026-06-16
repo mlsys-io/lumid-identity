@@ -60,7 +60,7 @@ func MeAgentChatStream(c *gin.Context) {
 
 	role := currentUserRole(c)
 	provider := resolveProvider(body.Model, role)
-	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role)
+	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context)
 	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503, "chat unavailable: "+err.Error())

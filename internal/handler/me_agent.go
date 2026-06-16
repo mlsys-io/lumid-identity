@@ -1787,6 +1787,18 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "casebook",
+			"description": "The data casebook a workflow's goal metrics are scored on: each case with its latest score + score history, plus how the casebook's metrics evolved. Metrics are scoped to the loop's experiment. Use for 'what cases / which regressed / how is the data scored'.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string"},
+					"loop": map[string]any{"type": "string", "description": "loop name (scopes metrics to that workflow's experiment)"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
 			"name":        "app_config_get",
 			"description": "Read an installed app's xpcloud.yaml (workflows, schedules, skill imports, publish policy). Returns the YAML + a sha for optimistic-locked writes.",
 			"input_schema": map[string]any{
@@ -2913,6 +2925,11 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		app, _ := args["app"].(string)
 		loop, _ := args["loop"].(string)
 		return toolLoopMetricSeries(userID, app, loop)
+
+	case "casebook":
+		app, _ := args["app"].(string)
+		loop, _ := args["loop"].(string)
+		return toolCasebook(userID, app, loop)
 
 	case "app_config_get":
 		app, _ := args["app"].(string)

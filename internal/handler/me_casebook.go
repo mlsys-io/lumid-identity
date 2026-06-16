@@ -37,7 +37,56 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 )
+
+// loopExperiments returns the experiment names a loop declares in xpcloud.yaml
+// (engine.experiment + any steps[].experiment). This is the strict
+// metrics→workflow binding: an experiment's scores belong to the loop that
+// runs it, even though different loops can share the same DATA (cases).
+// Empty slice = the loop declares no experiment (so it has no metrics of its
+// own). Shared across the trajectory + casebook handlers (same package).
+func loopExperiments(appDir, loop string) []string {
+	if loop == "" {
+		return nil
+	}
+	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Loops []struct {
+			Name   string `yaml:"name"`
+			Engine struct {
+				Experiment string `yaml:"experiment"`
+			} `yaml:"engine"`
+			Steps []struct {
+				Experiment string `yaml:"experiment"`
+			} `yaml:"steps"`
+		} `yaml:"loops"`
+	}
+	if yaml.Unmarshal(b, &doc) != nil {
+		return nil
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, l := range doc.Loops {
+		if l.Name != loop {
+			continue
+		}
+		add(l.Engine.Experiment)
+		for _, s := range l.Steps {
+			add(s.Experiment)
+		}
+	}
+	return out
+}
 
 // Folders (relative to the app dir) we scan for per-case files, in priority
 // order — the first folder that yields cases wins as the "roster" so a seed
@@ -117,8 +166,14 @@ func MeCasebook(c *gin.Context) {
 	}
 
 	// 1. Per-case scores + metric evolution, mined from experiments first so the
-	//    case roster can be enriched with latest_score / score_history.
-	scores, metricEvo := casebookScoresFromExperiments(appDir)
+	//    case roster can be enriched with latest_score / score_history. Metrics
+	//    are strictly bound to the selected loop's experiments (data is shared,
+	//    metrics are not); with no loop given we fall back to all (back-compat).
+	expAllow := map[string]bool{}
+	for _, x := range loopExperiments(appDir, loop) {
+		expAllow[x] = true
+	}
+	scores, metricEvo := casebookScoresFromExperiments(appDir, expAllow, loop != "")
 
 	// 2. The case roster (per-case files, then a flat single-file casebook).
 	cases := casebookRoster(appDir, scores)
@@ -156,12 +211,18 @@ func MeCasebook(c *gin.Context) {
 // Rows look like:
 //   {"ts":"…Z","variant_id":"current","metrics":{"question_score":0.65,…},
 //    "cycle_ts":"20260612T112000Z","dims":{"case_id":"Case_001…","q_id":"Q2"}}
-func casebookScoresFromExperiments(appDir string) (map[string][]casebookScorePoint, []casebookMetricEvolution) {
+// allowed/strict bind metrics to the selected workflow: when strict, only the
+// loop's declared experiments contribute scores (different loops can share the
+// DATA but never each other's metrics). strict && empty allowed → no metrics.
+func casebookScoresFromExperiments(appDir string, allowed map[string]bool, strict bool) (map[string][]casebookScorePoint, []casebookMetricEvolution) {
 	scores := map[string][]casebookScorePoint{}
 	// metric -> cycle_ts -> values (averaged per cycle for the trajectory)
 	metricByCycle := map[string]map[string][]float64{}
 	metricOrder := []string{}
 
+	if strict && len(allowed) == 0 {
+		return scores, nil // this workflow declares no experiment → no metrics
+	}
 	expRoot := filepath.Join(appDir, "data", "experiments")
 	exps, err := os.ReadDir(expRoot)
 	if err != nil {
@@ -170,6 +231,9 @@ func casebookScoresFromExperiments(appDir string) (map[string][]casebookScorePoi
 	for _, e := range exps {
 		if !e.IsDir() {
 			continue
+		}
+		if strict && !allowed[e.Name()] {
+			continue // not this workflow's experiment
 		}
 		// The experiment's primary metric (for per-case latest_score). Falls
 		// back to a sensible scan of the metrics dict when state.json is absent.

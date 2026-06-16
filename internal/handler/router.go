@@ -353,6 +353,8 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/datasets",      MeAppDatasets)
 			me.GET("/apps/:app/dataset-file",  MeAppDatasetFile)
 			me.GET("/apps/:app/casebook",      MeCasebook)
+			// Variant trajectory tree (baseline → per-cycle variants → champion trunk).
+			me.GET("/apps/:app/trajectory",    MeTrajectory)
 			// Goal-metric trajectory across cycles (improvement over iterations).
 			me.GET("/apps/:app/loops/:loop/metric-series", MeLoopMetricSeries)
 			// Hard-remove a single workflow (loop) from one of the caller's apps.

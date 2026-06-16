@@ -20,9 +20,29 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
+
+// readStreamPartial reads the in-flight LLM call's partial sidecar (written by
+// claude_code_caller as a turn streams) and returns it as a conversation row,
+// or nil if absent/empty. Tagged partial:true so the UI can show a live cursor.
+func readStreamPartial(cdir string) map[string]any {
+	b, err := os.ReadFile(filepath.Join(cdir, ".llm_stream.json"))
+	if err != nil {
+		return nil
+	}
+	var row map[string]any
+	if json.Unmarshal(b, &row) != nil {
+		return nil
+	}
+	if row["event"] == nil {
+		row["event"] = "llm"
+	}
+	row["partial"] = true
+	return row
+}
 
 const cycleLogTailCap = 300
 
@@ -79,6 +99,26 @@ func MeCycleLog(c *gin.Context) {
 			if st, e2 := os.Stat(cdir); e2 == nil {
 				running = true // dir exists, no cycle.json yet → in flight
 				_ = st
+			}
+		}
+		// While the cycle runs, surface the IN-FLIGHT LLM call's partial text
+		// (the .llm_stream.json sidecar the caller tees) as the live last turn,
+		// so the session reveals output progressively instead of one finished
+		// block at a time. Skip it once the full turn is in the conv log.
+		if running {
+			if pr := readStreamPartial(cdir); pr != nil {
+				prResp, _ := pr["response"].(string)
+				dup := false
+				for _, r := range conv {
+					if r["event"] == "llm" {
+						if rs, _ := r["response"].(string); prResp != "" && strings.HasPrefix(rs, prResp) {
+							dup = true // the final turn already supersedes this partial
+						}
+					}
+				}
+				if !dup && prResp != "" {
+					conv = append(conv, pr)
+				}
 			}
 		}
 		ok(c, "ok", gin.H{"app": app, "loop": loop, "ts": ts, "rows": conv, "running": running, "conversation": true})

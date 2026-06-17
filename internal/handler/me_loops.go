@@ -198,6 +198,82 @@ func MeLoopRunNow(c *gin.Context) {
 	})
 }
 
+// POST /api/v1/me/loops/:app/:loop/stop
+//
+// Cooperative stop for a running cycle. Writes a per-loop signal file that the
+// runner's claude_code_caller checks before each LLM call (it raises → the
+// cycle aborts and marks itself interrupted). For instant UI feedback we also
+// (a) append a "stopped by user" journal event and (b) stamp the in-flight
+// cycle dir with an interrupted cycle.json so the inspector/session reflect it
+// even before the subprocess notices.
+func MeLoopStop(c *gin.Context) {
+	userID, authed := currentUserID(c)
+	if !authed {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	loop := c.Param("loop")
+	if !slugRe.MatchString(app) || !slugRe.MatchString(loop) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app/loop name")
+		return
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		fail(c, http.StatusNotFound, 1404, "app not found")
+		return
+	}
+	// 1. Write the cooperative stop signal (runner aborts on its next LLM call).
+	controlDir := filepath.Join(appDir, "data", "control")
+	_ = os.MkdirAll(controlDir, 0o755)
+	sig := map[string]any{"loop": loop, "by": userID, "at": time.Now().UTC().Format(time.RFC3339)}
+	if b, err := json.Marshal(sig); err == nil {
+		_ = os.WriteFile(filepath.Join(controlDir, "stop."+loop+".signal"), b, 0o644)
+	}
+	// 2. Append a journal event so the live session shows "stopped by user".
+	jrow := map[string]any{
+		"ts": time.Now().UTC().Format(time.RFC3339), "loop": loop,
+		"event": "control", "stage": "stopped", "status": "stopped",
+		"ok": false, "outcome": "interrupted", "note": "stopped by user",
+	}
+	if b, err := json.Marshal(jrow); err == nil {
+		if f, e := os.OpenFile(filepath.Join(appDir, "data", "journal.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
+			_, _ = f.Write(append(b, '\n'))
+			_ = f.Close()
+		}
+	}
+	// 3. Stamp the newest in-flight cycle dir (no cycle.json yet) as interrupted.
+	stopped := ""
+	cyclesDir := filepath.Join(appDir, "data", "cycles", loop)
+	if entries, err := os.ReadDir(cyclesDir); err == nil {
+		newest := ""
+		for _, e := range entries {
+			if e.IsDir() && e.Name() > newest {
+				if _, err := os.Stat(filepath.Join(cyclesDir, e.Name(), "cycle.json")); err != nil {
+					newest = e.Name() // in-flight (no cycle.json)
+				}
+			}
+		}
+		if newest != "" {
+			cj := map[string]any{
+				"ok": false, "app": app, "loop": loop, "status": "interrupted",
+				"outcome": "interrupted", "reason": "user_stopped",
+				"cycle_dir":   filepath.Join(cyclesDir, newest),
+				"stopped_at":  time.Now().UTC().Format(time.RFC3339),
+				"interrupted": true,
+			}
+			if b, err := json.MarshalIndent(cj, "", "  "); err == nil {
+				_ = os.WriteFile(filepath.Join(cyclesDir, newest, "cycle.json"), b, 0o644)
+				stopped = newest
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "stop requested",
+		"data": gin.H{"loop": loop, "stopped_cycle": stopped},
+	})
+}
+
 // GET /api/v1/me/loops/health
 //
 // P0: returns the same shape as /admin/loops (delegates internally).

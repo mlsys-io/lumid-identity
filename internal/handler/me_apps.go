@@ -145,6 +145,34 @@ func MeAppsUninstall(c *gin.Context) {
 	})
 }
 
+// POST /api/v1/me/apps/:app/update — pull upstream updates into an installed
+// app (three-way merge via ops.app_update). Queued as an intent the scheduler
+// runs (it has the venv + tenant mounts), same pattern as install/uninstall.
+func MeAppUpdate(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	if !slugRe.MatchString(app) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app name")
+		return
+	}
+	var body struct {
+		DryRun bool `json:"dry_run"`
+	}
+	_ = c.ShouldBindJSON(&body) // optional
+	id := writeIntent(c, "update", userID, map[string]any{"app": app, "dry_run": body.DryRun})
+	if id == "" {
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"ret_code": 0, "message": "update queued",
+		"data": gin.H{"intent_id": id, "status": "pending"},
+	})
+}
+
 // GET /api/v1/me/apps — list installed apps for the current user.
 // Reads from the caller's tenant root + appends operator-shared apps
 // (the historical ~/.xp/apps/ tree) so the operator's own loops still

@@ -222,6 +222,7 @@ func Register(r *gin.Engine) {
 			me.POST("/apps/:app/skills",      MeAppAddSkill)    // add a kind=skill repo to skill_imports[]
 			// Repo workflow — fork a showcase app, publish your tree
 			// to YOUR xp.io repo, propose changes upstream as a PR.
+			me.POST("/apps/:app/update",  MeAppUpdate)   // pull upstream updates (three-way merge)
 			me.POST("/apps/:app/fork",    MeAppFork)
 			me.POST("/apps/:app/publish", MeAppPublish)
 			me.POST("/apps/:app/propose", MeAppPropose)

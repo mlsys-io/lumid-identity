@@ -242,6 +242,7 @@ func Register(r *gin.Engine) {
 			// Per-loop control.
 			me.PATCH("/loops/:app/:loop",     MeLoopPatch)
 			me.POST("/loops/:app/:loop/run",  MeLoopRunNow)
+			me.POST("/loops/:app/:loop/stop", MeLoopStop)
 			me.GET("/loops/health",           MeLoopsHealth)
 
 			// Per-(app, key) secrets.

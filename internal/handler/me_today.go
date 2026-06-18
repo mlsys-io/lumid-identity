@@ -94,7 +94,8 @@ func MeToday(c *gin.Context) {
 			continue
 		}
 		appName := d.Name()
-		journal := filepath.Join(tenantApps, appName, "data", "journal.jsonl")
+		appDir := filepath.Join(tenantApps, appName)
+		journal, _ := ResolveRuntimeReadPath(appDir, "data/journal.jsonl")
 		rows := readTodayJournal(journal, todayStart)
 		// Group by loop; keep the latest per loop.
 		latest := map[string]map[string]any{}
@@ -269,7 +270,7 @@ func countPendingDraftsForUser(userSub string) int {
 		}
 		appDir := filepath.Join(tenantApps, d.Name())
 		stateMap := loadStateMap(appDir)
-		outboxRoot := filepath.Join(appDir, "data", "outbox")
+		outboxRoot, _ := ResolveRuntimeReadPath(appDir, "data/outbox")
 		tsDirs, _ := os.ReadDir(outboxRoot)
 		for _, td := range tsDirs {
 			if !td.IsDir() {

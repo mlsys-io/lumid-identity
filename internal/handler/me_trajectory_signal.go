@@ -91,7 +91,11 @@ func MeTrajectorySignal(c *gin.Context) {
 		Status:        "pending",
 	}
 
-	controlDir := filepath.Join(appDir, "data", "control")
+	controlDir, err := ResolveRuntimeWritePath(appDir, "data/control")
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "could not prepare control dir")
+		return
+	}
 	if err := os.MkdirAll(controlDir, 0o775); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "could not prepare control dir")
 		return
@@ -143,7 +147,8 @@ func MeTrajectorySignals(c *gin.Context) {
 		return
 	}
 
-	records := readSignals(filepath.Join(appDir, "data", "control", "signals.jsonl"), loop)
+	controlDir, _ := ResolveRuntimeReadPath(appDir, "data/control")
+	records := readSignals(filepath.Join(controlDir, "signals.jsonl"), loop)
 	ok(c, "ok", gin.H{"signals": records, "count": len(records)})
 }
 

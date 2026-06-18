@@ -110,7 +110,9 @@ func agentEnqueueOneshot(userID, app, loop string) (string, error) {
 // (app, loop) — caller's tenant first, then operator-shared.
 func agentLatestCycleTs(userID, app, loop string) (string, error) {
 	for _, base := range []string{tenantAppsDir(userID), filepath.Join(operatorHome(), ".xp", "apps")} {
-		dir := filepath.Join(base, app, "data", "cycles", loop)
+		// Prefer the canonical .lumid/cycles tree, fall back to legacy data/cycles.
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(base, app), "data/cycles")
+		dir := filepath.Join(cyclesRoot, loop)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -153,10 +155,19 @@ func agentWriteFeedback(userID, app, loop, ts string, rating int, note string) e
 		return err
 	}
 	// Best-effort journal append; primary record is feedback.jsonl.
+	// cycleDir is <appDir>/{.lumid|data}/cycles/<loop>/<ts>; strip ts, loop,
+	// then either the canonical or legacy "<root>/cycles/" suffix to recover appDir.
 	appDir := strings.TrimSuffix(strings.TrimSuffix(cycleDir, ts), "/")
 	appDir = strings.TrimSuffix(appDir, loop)
-	appDir = strings.TrimSuffix(appDir, "/data/cycles/")
-	_ = appendJSONL(filepath.Join(appDir, "data", "journal.jsonl"), entry)
+	appDir = strings.TrimSuffix(appDir, "/")
+	appDir = strings.TrimSuffix(appDir, "/"+filepath.Join(RuntimeStateDir, "cycles"))
+	appDir = strings.TrimSuffix(appDir, "/data/cycles")
+	// Journal is a runtime artifact: write to the canonical .lumid/journal.jsonl.
+	journalPath, err := ResolveRuntimeWritePath(appDir, "data/journal.jsonl")
+	if err != nil {
+		journalPath = filepath.Join(appDir, "data", "journal.jsonl")
+	}
+	_ = appendJSONL(journalPath, entry)
 	return nil
 }
 
@@ -170,7 +181,9 @@ func agentListCycles(userID, app, loop string, limit int) []map[string]any {
 		{tenantAppsDir(userID), "tenant"},
 		{filepath.Join(operatorHome(), ".xp", "apps"), "shared"},
 	} {
-		dir := filepath.Join(src.base, app, "data", "cycles", loop)
+		// Prefer the canonical .lumid/cycles tree, fall back to legacy data/cycles.
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(src.base, app), "data/cycles")
+		dir := filepath.Join(cyclesRoot, loop)
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			continue

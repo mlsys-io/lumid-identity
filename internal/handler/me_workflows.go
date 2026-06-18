@@ -143,7 +143,8 @@ func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
 	// ARCHIVE the loop's cycle history (don't destroy) so "walk me through
 	// run X" stays answerable after a workflow delete. Move it into
 	// .xp/.trash/<app>/<loop>-<ts>/ (dot-dir → skipped by the apps scan).
-	srcCycles := filepath.Join(appDir, "data", "cycles", loop)
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	srcCycles := filepath.Join(cyclesRoot, loop)
 	if _, err := os.Stat(srcCycles); err == nil {
 		trashDir := filepath.Join(tenantAppsDir(userID), "..", ".trash", app)
 		_ = os.MkdirAll(trashDir, 0o755)
@@ -384,6 +385,10 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			}
 			memAgents := readYamlMemoryAgents(specPath)
 			appVersion := readAppVersion(appDir)
+			// Runtime artifacts now live under .lumid/ (legacy data/ still
+			// honored). Resolve once per app; .lumid/ wins when present.
+			journalPath, _ := ResolveRuntimeReadPath(appDir, "data/journal.jsonl")
+			cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
 			// Tolerant goal read — survives loops whose other fields break the
 			// full rawLoop parse (object-typed datasets/skills_invoked).
 			goalsByLoop := readYamlLoopGoals(specPath)
@@ -452,8 +457,8 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.ExperimentIDs = append(row.ExperimentIDs, eid)
 				}
 				row.RunSpark, row.RunsRecent = buildRunSparkDetailed(
-					filepath.Join(appDir, "data", "journal.jsonl"),
-					filepath.Join(appDir, "data", "cycles", L.Name),
+					journalPath,
+					filepath.Join(cyclesRoot, L.Name),
 					L.Name, 14)
 				if g, ok := goalsByLoop[L.Name]; ok {
 					row.Goal = &WorkflowGoal{Primary: g.Primary, Tracked: g.Tracked}
@@ -478,12 +483,12 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				// for tenant loops (frozen at the last operator run). The
 				// per-app journal is the real run log — prefer it so
 				// last-run reflects what actually ran.
-				if jts, jok, ok := lastRunFromJournal(filepath.Join(appDir, "data", "journal.jsonl"), L.Name); ok {
+				if jts, jok, ok := lastRunFromJournal(journalPath, L.Name); ok {
 					row.LastRunTS = jts
 					row.LastRunOK = &jok
 				}
-				row.Running = loopRunning(appDir, L.Name, row.LastRunTS)
-				row.LastRunRecovered = lastRunRecovered(filepath.Join(appDir, "data", "journal.jsonl"), L.Name)
+				row.Running = loopRunning(cyclesRoot, L.Name, row.LastRunTS)
+				row.LastRunRecovered = lastRunRecovered(journalPath, L.Name)
 				out = append(out, row)
 			}
 		}
@@ -582,8 +587,8 @@ func fetchCostsByEndpoint(userSub string) map[string]int {
 // cycle dir (created at cycle start) is newer than its last completed
 // journal entry (written at cycle end). The recency cap avoids reporting
 // a crashed-cycle leftover dir as "running" forever.
-func loopRunning(appDir, loop string, lastJTS float64) bool {
-	ents, err := os.ReadDir(filepath.Join(appDir, "data", "cycles", loop))
+func loopRunning(cyclesRoot, loop string, lastJTS float64) bool {
+	ents, err := os.ReadDir(filepath.Join(cyclesRoot, loop))
 	if err != nil {
 		return false
 	}

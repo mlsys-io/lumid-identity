@@ -517,8 +517,10 @@ func uniqStrings(in []string) []string {
 // under either data/cycles/<loop>/ (auto-quant/ops shape) or
 // data/outbox/<case>/<ts>/ (mbb-ai shape; no per-loop subdir).
 func latestCycleDir(appDir, loop string) (string, string) {
-	// shape 1: data/cycles/<loop>/<ts>/
-	c1 := filepath.Join(appDir, "data", "cycles", loop)
+	// shape 1: data/cycles/<loop>/<ts>/ — resolve canonical .lumid/cycles
+	// when present, else legacy data/cycles.
+	cyclesBase, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	c1 := filepath.Join(cyclesBase, loop)
 	if entries, err := os.ReadDir(c1); err == nil {
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() > entries[j].Name() })
 		for _, e := range entries {
@@ -528,7 +530,7 @@ func latestCycleDir(appDir, loop string) (string, string) {
 		}
 	}
 	// shape 2: data/outbox/<case>/<ts>/ (mbb-ai); take newest globally.
-	c2 := filepath.Join(appDir, "data", "outbox")
+	c2, _ := ResolveRuntimeReadPath(appDir, "data/outbox")
 	type cand struct{ path, ts string }
 	var newest cand
 	if cases, err := os.ReadDir(c2); err == nil {
@@ -565,10 +567,13 @@ func loadLastErrors(cycleDir, appDir string) ([]loopErrorRow, string) {
 	// line typically captures pre-step failures (no setup, missing
 	// loop, invalid mode) that don't reach step_errors.json. Apps
 	// keep it under either ``journal.jsonl`` (top-level) or
-	// ``data/journal.jsonl`` — try both and pick the newest.
+	// ``data/journal.jsonl`` — resolve the canonical .lumid/journal.jsonl
+	// first, then fall back to legacy data/journal.jsonl and the
+	// top-level journal.jsonl.
+	journalCanonical, _ := ResolveRuntimeReadPath(appDir, "data/journal.jsonl")
 	journalTail := ""
 	for _, jp := range []string{
-		filepath.Join(appDir, "data", "journal.jsonl"),
+		journalCanonical,
 		filepath.Join(appDir, "journal.jsonl"),
 	} {
 		b, err := os.ReadFile(jp)
@@ -931,7 +936,8 @@ func loadAppGitStatus(home, app string) appGitStatus {
 	// from xpcloud. Newly-published-but-not-reinstalled apps may have
 	// a different shape; fall back to the operator's PAT subject.
 	publishedSlug := ""
-	if b, err := os.ReadFile(filepath.Join(appDir, "origin.json")); err == nil {
+	originPath, _ := ResolveRuntimeReadPath(appDir, "origin.json")
+	if b, err := os.ReadFile(originPath); err == nil {
 		var o struct {
 			Slug    string `json:"slug"`
 			Owner   string `json:"owner_sub"`

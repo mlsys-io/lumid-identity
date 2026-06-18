@@ -67,7 +67,7 @@ func MeCyclesList(c *gin.Context) {
 		if appFilter != "" && a.Name() != appFilter {
 			continue
 		}
-		cyclesRoot := filepath.Join(tenantApps, a.Name(), "data", "cycles")
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(tenantApps, a.Name()), "data/cycles")
 		loops, _ := os.ReadDir(cyclesRoot)
 		for _, lp := range loops {
 			if !lp.IsDir() {
@@ -179,7 +179,11 @@ func cycleDetailForUser(userID, app, loop, ts string) (gin.H, bool) {
 	// own root with a prefix guard so a crafted ts can't escape either base.
 	var cycleDir string
 	for _, root := range []string{tenantAppsDir(userID), filepath.Join(operatorHome(), ".xp", "apps")} {
-		cand := filepath.Join(root, app, "data", "cycles", loop, ts)
+		// Resolve data/cycles → .lumid/cycles (canonical wins when present) then
+		// anchor loop/ts under it. Prefix-guard still anchors to root so a crafted
+		// app/loop/ts can't escape either base.
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(root, app), "data/cycles")
+		cand := filepath.Join(cyclesRoot, loop, ts)
 		abs, err := filepath.Abs(cand)
 		if err != nil || !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
 			continue
@@ -436,7 +440,8 @@ func MeLoopMetricSeries(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	cyclesDir := filepath.Join(appDir, "data", "cycles", loop)
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	cyclesDir := filepath.Join(cyclesRoot, loop)
 	ents, _ := os.ReadDir(cyclesDir)
 	type dirT struct {
 		ts    string

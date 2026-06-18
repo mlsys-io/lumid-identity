@@ -76,7 +76,8 @@ func draftIDRe() string { return `^[0-9a-f]{16}$` }
 // per JSON file. State joined from drafts-state.json (default pending).
 func listDraftsForApp(appDir, app string, stateMap map[string]draftState) []draftCard {
 	out := []draftCard{}
-	outboxRoot := filepath.Join(appDir, "data", "outbox")
+	// Prefer the canonical .lumid/outbox; fall back to legacy data/outbox.
+	outboxRoot, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "outbox"))
 	st, err := os.Stat(outboxRoot)
 	if err != nil || !st.IsDir() {
 		return out
@@ -183,7 +184,8 @@ func resolveDraftByID(userSub, wantID string) (absPath, app, rel string) {
 			continue
 		}
 		appDir := filepath.Join(tenantApps, a.Name())
-		outboxRoot := filepath.Join(appDir, "data", "outbox")
+		// Prefer the canonical .lumid/outbox; fall back to legacy data/outbox.
+		outboxRoot, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "outbox"))
 		tsDirs, _ := os.ReadDir(outboxRoot)
 		for _, td := range tsDirs {
 			if !td.IsDir() {

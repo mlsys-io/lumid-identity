@@ -97,6 +97,7 @@ var casebookCaseDirs = []string{
 	"data/seed",
 	"data/eval-casebook",
 	"sample_data",
+	".lumid/inbox", // canonical runtime inbox (alongside legacy data/inbox below)
 	"data/inbox",
 }
 
@@ -224,7 +225,7 @@ func casebookScoresFromExperiments(appDir string, allowed map[string]bool, stric
 	if strict && len(allowed) == 0 {
 		return scores, nil // this workflow declares no experiment → no metrics
 	}
-	expRoot := filepath.Join(appDir, "data", "experiments")
+	expRoot, _ := ResolveRuntimeReadPath(appDir, "data/experiments")
 	exps, err := os.ReadDir(expRoot)
 	if err != nil {
 		return scores, nil

@@ -78,7 +78,8 @@ func MeCycleLog(c *gin.Context) {
 	// ts=latest → resolve to the newest cycle dir (the running/just-finished
 	// one), so a "view the running session" affordance needn't know the ts.
 	if ts == "latest" && loop != "" {
-		if entries, err := os.ReadDir(filepath.Join(appDir, "data", "cycles", loop)); err == nil {
+		loopCyclesDir, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "cycles", loop))
+		if entries, err := os.ReadDir(loopCyclesDir); err == nil {
 			newest := ""
 			for _, e := range entries {
 				if e.IsDir() && e.Name() > newest {
@@ -94,7 +95,7 @@ func MeCycleLog(c *gin.Context) {
 	if ts != "" && loop != "" && slugRe.MatchString(ts) {
 		conv := cycleConversation(appDir, loop, ts)
 		running := false
-		cdir := filepath.Join(appDir, "data", "cycles", loop, ts)
+		cdir, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "cycles", loop, ts))
 		if _, err := os.Stat(filepath.Join(cdir, "cycle.json")); err != nil {
 			if st, e2 := os.Stat(cdir); e2 == nil {
 				running = true // dir exists, no cycle.json yet → in flight
@@ -125,7 +126,7 @@ func MeCycleLog(c *gin.Context) {
 		return
 	}
 
-	path := filepath.Join(appDir, "data", "journal.jsonl")
+	path, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "journal.jsonl"))
 	rows := []map[string]any{}
 	total := 0
 	if f, err := os.Open(path); err == nil {
@@ -194,12 +195,14 @@ func cycleConversation(appDir, loop, ts string) []map[string]any {
 		}
 	}
 	// 1. LLM turns for this cycle (definitively this run's AI generation).
-	readJSONL(filepath.Join(appDir, "data", "cycles", loop, ts, ".llm_conversation.jsonl"), func(r map[string]any) {
+	convPath, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "cycles", loop, ts, ".llm_conversation.jsonl"))
+	readJSONL(convPath, func(r map[string]any) {
 		out = append(out, r)
 	})
 	// 2. Journal stage/tool events from this cycle's start onward (loop-scoped).
 	start := digitsOnlyTs(ts)
-	readJSONL(filepath.Join(appDir, "data", "journal.jsonl"), func(r map[string]any) {
+	journalPath, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "journal.jsonl"))
+	readJSONL(journalPath, func(r map[string]any) {
 		if lp, ok := r["loop"].(string); ok && lp != "" && lp != loop {
 			return
 		}

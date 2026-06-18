@@ -6,10 +6,16 @@ package handler
 // /me/knowledge/agents/:id/memories?kind=&limit= — paginated bank
 //
 // Reads the tenant's xpio agentic KG at
-//   ~/.tenants/<sub>/.xp/kg/agents/<agent>/bank.jsonl
+//   ~/.tenants/<sub>/.xp/kg/{memories,agents}/<agent>/bank.jsonl
 // One line per memory; each is a small JSON dict the schema docs at
 // LumidOS/xpio/schema.py describe. We surface the most useful fields
 // without forcing the UI to know the full schema.
+//
+// During the "agents -> memories" rename the on-disk dir is migrating from
+// kg/agents/<id> to kg/memories/<id>. These reads are tenant-scoped (rooted at
+// ~/.tenants/<sub>/.xp), so they can't use the operator-rooted KGBankDir
+// resolver in kg_paths.go; instead they apply the same dual-read rule here:
+// prefer kg/memories/<id>, fall back to the legacy kg/agents/<id>.
 
 import (
 	"bufio"
@@ -24,6 +30,37 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// tenantKGRoot returns the tenant KG root dir to READ for the given user,
+// preferring ~/.tenants/<sub>/.xp/kg/memories over the legacy .../kg/agents.
+// The bool is true when an existing directory was found; when false the
+// returned path is the canonical "memories" root (a read will simply miss).
+// Mirrors KGBankDir's dual-read rule (kg_paths.go) for the tenant-scoped root.
+func tenantKGRoot(userID string) (string, bool) {
+	base := filepath.Join(operatorHome(), ".tenants", userID, ".xp", "kg")
+	for _, sub := range []string{kgMemoriesDir, kgAgentsDir} {
+		p := filepath.Join(base, sub)
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			return p, true
+		}
+	}
+	return filepath.Join(base, kgMemoriesDir), false
+}
+
+// tenantKGBankDir returns the bank directory to READ for the given agent id
+// under the tenant KG, preferring ~/.tenants/<sub>/.xp/kg/memories/<id> over
+// the legacy .../kg/agents/<id>. The bool is true when an existing directory
+// was found; when false the returned path is the canonical memories path.
+func tenantKGBankDir(userID, agentID string) (string, bool) {
+	base := filepath.Join(operatorHome(), ".tenants", userID, ".xp", "kg")
+	for _, sub := range []string{kgMemoriesDir, kgAgentsDir} {
+		p := filepath.Join(base, sub, agentID)
+		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
+			return p, true
+		}
+	}
+	return filepath.Join(base, kgMemoriesDir, agentID), false
+}
 
 type knowledgeAgent struct {
 	ID            string `json:"id"`
@@ -40,7 +77,7 @@ func MeKnowledgeAgents(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
-	kgRoot := filepath.Join(operatorHome(), ".tenants", userID, ".xp", "kg", "agents")
+	kgRoot, _ := tenantKGRoot(userID)
 	agents := []knowledgeAgent{}
 	dirs, err := os.ReadDir(kgRoot)
 	if err != nil {
@@ -116,7 +153,8 @@ func MeKnowledgeMemories(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid agent id")
 		return
 	}
-	bankPath := filepath.Join(operatorHome(), ".tenants", userID, ".xp", "kg", "agents", agent, "bank.jsonl")
+	bankDir, _ := tenantKGBankDir(userID, agent)
+	bankPath := filepath.Join(bankDir, "bank.jsonl")
 	abs, _ := filepath.Abs(bankPath)
 	if !strings.HasPrefix(abs, filepath.Join(operatorHome(), ".tenants", userID)+string(os.PathSeparator)) {
 		fail(c, http.StatusBadRequest, 1400, "invalid path")

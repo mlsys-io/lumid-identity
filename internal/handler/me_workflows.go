@@ -51,22 +51,39 @@ func MeLoopDelete(c *gin.Context) {
 	}
 	app := c.Param("app")
 	loop := c.Param("loop")
-	if !slugRe.MatchString(app) || loop == "" {
-		fail(c, http.StatusBadRequest, 1400, "invalid app or loop")
+	remaining, status, code, msg := removeLoopFromApp(userID, app, loop)
+	if status != http.StatusOK {
+		fail(c, status, code, msg)
 		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"app": app, "removed_loop": loop, "remaining": remaining,
+			"note": "scheduler unregisters this workflow within a few minutes",
+		},
+	})
+}
+
+// removeLoopFromApp removes a loop/workflow from the caller's tenant app:
+// strips it from xpcloud.yaml::loops[] (and the manifest.json mirror) and
+// ARCHIVES its cycle history into .xp/.trash (never destroys it). Shared by
+// MeLoopDelete (HTTP) and the delete_loop chatbox tool. Returns
+// (remaining, httpStatus, retCode, message); status==200 means success.
+func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
+	if !slugRe.MatchString(app) || loop == "" {
+		return 0, http.StatusBadRequest, 1400, "invalid app or loop"
 	}
 	appDir := filepath.Join(tenantAppsDir(userID), app)
 	xpPath := filepath.Join(appDir, "xpcloud.yaml")
 	b, err := os.ReadFile(xpPath)
 	if err != nil {
-		fail(c, http.StatusNotFound, 1404,
-			"app not found in your account (operator-shared apps can't be edited)")
-		return
+		return 0, http.StatusNotFound, 1404,
+			"app not found in your account (operator-shared apps can't be edited)"
 	}
 	var doc map[string]any
 	if err := yaml.Unmarshal(b, &doc); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "parse xpcloud.yaml: "+err.Error())
-		return
+		return 0, http.StatusInternalServerError, 1500, "parse xpcloud.yaml: " + err.Error()
 	}
 	rawLoops, _ := doc["loops"].([]any)
 	kept := make([]any, 0, len(rawLoops))
@@ -81,23 +98,19 @@ func MeLoopDelete(c *gin.Context) {
 		kept = append(kept, l)
 	}
 	if !found {
-		fail(c, http.StatusNotFound, 1404, "workflow '"+loop+"' not found in "+app)
-		return
+		return 0, http.StatusNotFound, 1404, "workflow '" + loop + "' not found in " + app
 	}
 	if len(kept) == 0 {
-		fail(c, http.StatusBadRequest, 1409,
-			"can't remove the last workflow — delete the app instead")
-		return
+		return 0, http.StatusBadRequest, 1409,
+			"can't remove the last workflow — delete the app instead"
 	}
 	doc["loops"] = kept
 	out, err := yaml.Marshal(doc)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "marshal: "+err.Error())
-		return
+		return 0, http.StatusInternalServerError, 1500, "marshal: " + err.Error()
 	}
 	if err := os.WriteFile(xpPath, out, 0o644); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write xpcloud.yaml: "+err.Error())
-		return
+		return 0, http.StatusInternalServerError, 1500, "write xpcloud.yaml: " + err.Error()
 	}
 	// Mirror into manifest.json::loops[] if it carries them (legacy shape).
 	if mb, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
@@ -131,14 +144,7 @@ func MeLoopDelete(c *gin.Context) {
 			_ = os.RemoveAll(srcCycles) // fallback: still remove from the live tree
 		}
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{
-			"app": app, "removed_loop": loop, "remaining": len(kept),
-			"note": "scheduler unregisters this workflow within a few minutes",
-		},
-	})
+	return len(kept), http.StatusOK, 0, ""
 }
 
 // readAppVersion reads an app's version from manifest.json (preferred) or

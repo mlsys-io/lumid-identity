@@ -89,6 +89,15 @@ var destructiveTools = map[string]bool{
 	// (app_read/app_actions/show_app_surface) are NOT gated.
 	"app_action": true,
 	"qa_call":    true,
+	// Admin control-plane writes (admin_users / admin_clusters reads are NOT gated).
+	"admin_set_user_role":      true,
+	"admin_set_user_status":    true,
+	"admin_grant_access":       true,
+	"admin_set_worker_pricing": true,
+	// Account self-service writes (account_list_pat is NOT gated).
+	"account_revoke_pat":  true,
+	"account_set_profile": true,
+	"delete_loop":         true,
 }
 
 // lumidosToolNames is the set of tool names dispatched to the LumidOS schedule
@@ -1619,7 +1628,16 @@ func buildToolDefsForRole(role string) []map[string]any {
 	// Generic "operate any app" tools (app_actions/app_read/show_app_surface/
 	// app_action/qa_call) are available to every role — gated by the
 	// formActions + scheme/path allowlists + approval, not by role.
-	return append(buildToolDefs(), appOpsToolDefs()...)
+	defs := append(buildToolDefs(), appOpsToolDefs()...)
+	// Account self-service (own tokens/profile) — available to every role.
+	defs = append(defs, accountToolDefs()...)
+	// Admin control-plane tools are advertised only to admin/super_admin (the
+	// model never sees them otherwise); dispatch re-checks role as well.
+	if role == "admin" || role == "super_admin" {
+		defs = append(defs, adminToolDefs()...)
+		defs = append(defs, clusterToolDefs()...)
+	}
+	return defs
 }
 
 // buildSystemPrompt assembles the assistant's persona + a snapshot
@@ -3394,6 +3412,30 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 
 	case "spawn_agents":
 		return toolSpawnAgents(c, userID, args)
+	}
+
+	// ── Admin control-plane tools (admin/super_admin only) ────────────────
+	switch name {
+	case "admin_users":
+		return toolAdminUsersList(role, args)
+	case "admin_set_user_role":
+		return toolAdminUsersSet(c, userID, role, "role", args)
+	case "admin_set_user_status":
+		return toolAdminUsersSet(c, userID, role, "status", args)
+	case "admin_grant_access":
+		return toolAdminGrantAccess(c, userID, role, args)
+	case "admin_clusters":
+		return toolAdminClusters(userID, role, args)
+	case "admin_set_worker_pricing":
+		return toolAdminSetWorkerPricing(userID, role, args)
+	case "account_list_pat":
+		return toolAccountListPat(userID)
+	case "account_revoke_pat":
+		return toolAccountRevokePat(c, userID, args)
+	case "account_set_profile":
+		return toolAccountSetProfile(c, userID, args)
+	case "delete_loop":
+		return toolDeleteLoop(userID, args)
 	}
 
 	// ── Generic app-ops bridge (operate any app from chat) ────────────────

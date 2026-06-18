@@ -57,15 +57,23 @@ func canonicalRel(legacyRel string) string {
 // installs keep working. The bool is true when an existing file/dir was found;
 // when false the returned path is the legacy path (a read will simply miss).
 func ResolveRuntimeReadPath(appDir, legacyRel string) (string, bool) {
-	canonical := filepath.Join(appDir, canonicalRel(legacyRel))
-	if _, err := os.Stat(canonical); err == nil {
-		return canonical, true
+	// Bundle-root dual-read (Phase 4 app -> agent): try each bundle-root
+	// candidate (canonical ".../agents/<name>" first, legacy ".../apps/<name>"
+	// fallback), and within each, prefer the canonical ".lumid/<name>" over the
+	// legacy "data/..." path. See manifest_paths.go::bundleRootCandidates.
+	roots := bundleRootCandidates(appDir)
+	for _, root := range roots {
+		canonical := filepath.Join(root, canonicalRel(legacyRel))
+		if _, err := os.Stat(canonical); err == nil {
+			return canonical, true
+		}
+		legacy := filepath.Join(root, filepath.Clean(legacyRel))
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy, true
+		}
 	}
-	legacy := filepath.Join(appDir, filepath.Clean(legacyRel))
-	if _, err := os.Stat(legacy); err == nil {
-		return legacy, true
-	}
-	return legacy, false
+	// None found: default to the legacy path under the canonical bundle root.
+	return filepath.Join(roots[0], filepath.Clean(legacyRel)), false
 }
 
 // ResolveRuntimeWritePath returns the canonical ".lumid/<name>" path to WRITE
@@ -73,7 +81,10 @@ func ResolveRuntimeReadPath(appDir, legacyRel string) (string, bool) {
 // path currently exists. Parent directories are created so the caller can write
 // immediately. New runtime writes always land under ".lumid/".
 func ResolveRuntimeWritePath(appDir, legacyRel string) (string, error) {
-	canonical := filepath.Join(appDir, canonicalRel(legacyRel))
+	// Write into the EXISTING bundle root (canonical ".../agents/<name>" when
+	// present, else legacy ".../apps/<name>") so runtime artifacts land next to
+	// the bundle the rest of the stack reads, not a phantom sibling.
+	canonical := filepath.Join(resolveBundleDir(appDir), canonicalRel(legacyRel))
 	if err := os.MkdirAll(filepath.Dir(canonical), 0o755); err != nil {
 		return "", err
 	}

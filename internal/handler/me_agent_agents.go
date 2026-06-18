@@ -47,7 +47,7 @@ func findAgentRole(agentID string) *agentRole {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		manifestPath := filepath.Join(appsRoot, e.Name(), "xpcloud.yaml")
+		manifestPath, _ := ResolveSpecPath(filepath.Join(appsRoot, e.Name()))
 		b, err := os.ReadFile(manifestPath)
 		if err != nil {
 			continue

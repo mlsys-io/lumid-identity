@@ -56,8 +56,10 @@ type expManifest struct {
 
 func readExpManifest(appDir string) expManifest {
 	var m expManifest
-	if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
-		_ = yaml.Unmarshal(b, &m)
+	if specPath, ok := ResolveSpecPath(appDir); ok {
+		if b, err := os.ReadFile(specPath); err == nil {
+			_ = yaml.Unmarshal(b, &m)
+		}
 	}
 	return m
 }

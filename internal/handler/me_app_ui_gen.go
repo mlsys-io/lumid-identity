@@ -238,7 +238,8 @@ func MeGenerateAppUI(c *gin.Context) {
 		return
 	}
 
-	yamlBytes, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(appDir)
+	yamlBytes, err := os.ReadFile(specPath)
 	if err != nil {
 		fail(c, http.StatusUnprocessableEntity, 1422, "xpcloud.yaml not found in app bundle")
 		return
@@ -457,7 +458,8 @@ type skillInfo struct {
 // an unresolved skill still surfaces by repo name so the model knows the
 // capability exists.
 func resolveAppSkills(appDir, userSub string) []skillInfo {
-	yb, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(appDir)
+	yb, err := os.ReadFile(specPath)
 	if err != nil {
 		return nil
 	}

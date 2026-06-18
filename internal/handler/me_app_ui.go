@@ -87,7 +87,8 @@ type appUI struct {
 // readAppUI parses ONLY the `ui:` subtree from an app's xpcloud.yaml.
 // Best-effort: any read/parse error (or no ui block) → nil, never fatal.
 func readAppUI(appDir string) *appUI {
-	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(specPath)
 	if err != nil {
 		return nil
 	}
@@ -105,7 +106,8 @@ func readAppUI(appDir string) *appUI {
 // surfaces receive it so widgets like the data-app browser take their defaults
 // from config instead of hard-coded directive values. Best-effort → nil.
 func readAppConfig(appDir string) map[string]any {
-	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(specPath)
 	if err != nil {
 		return nil
 	}
@@ -120,7 +122,8 @@ func readAppConfig(appDir string) map[string]any {
 
 // readForkOf returns the fork_of field from an app's xpcloud.yaml, or "".
 func readForkOf(appDir string) string {
-	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(specPath)
 	if err != nil {
 		return ""
 	}
@@ -584,8 +587,8 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 // patchXpcloudUISurfacePage sets ui.surface.page (and clears markdown/native)
 // so the structured spec becomes the home surface — compiled on serve.
 func patchXpcloudUISurfacePage(appDir, pagePath string) error {
-	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
-	b, err := os.ReadFile(yamlPath)
+	readPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(readPath)
 	if err != nil {
 		return err
 	}
@@ -610,16 +613,24 @@ func patchXpcloudUISurfacePage(appDir, pagePath string) error {
 	if err != nil {
 		return err
 	}
+	yamlPath := SpecWritePath(appDir)
 	tmp := yamlPath + ".tmp"
 	if err := os.WriteFile(tmp, out, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, yamlPath)
+	if err := os.Rename(tmp, yamlPath); err != nil {
+		return err
+	}
+	// Avoid orphaning a pre-existing legacy spec now that the dotfile is canonical.
+	if readPath != yamlPath {
+		_ = os.Remove(readPath)
+	}
+	return nil
 }
 
 func patchXpcloudUISurface(appDir, surfaceName, newPath string) error {
-	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
-	b, err := os.ReadFile(yamlPath)
+	readPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(readPath)
 	if err != nil {
 		return err
 	}
@@ -652,9 +663,17 @@ func patchXpcloudUISurface(appDir, surfaceName, newPath string) error {
 	if err != nil {
 		return err
 	}
+	yamlPath := SpecWritePath(appDir)
 	tmp := yamlPath + ".tmp"
 	if err := os.WriteFile(tmp, out, 0644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, yamlPath)
+	if err := os.Rename(tmp, yamlPath); err != nil {
+		return err
+	}
+	// Avoid orphaning a pre-existing legacy spec now that the dotfile is canonical.
+	if readPath != yamlPath {
+		_ = os.Remove(readPath)
+	}
+	return nil
 }

@@ -38,11 +38,11 @@ func toolListApps(userID string) map[string]any {
 			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
-			_, mfstErr := os.Stat(filepath.Join(root, e.Name(), "manifest.json"))
+			_, mfstOk := ResolveManifestPath(filepath.Join(root, e.Name()))
 			out = append(out, appCard{
 				Name:    e.Name(),
 				Tenant:  isTenant,
-				HasMfst: mfstErr == nil,
+				HasMfst: mfstOk,
 			})
 		}
 	}

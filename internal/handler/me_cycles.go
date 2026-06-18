@@ -314,7 +314,8 @@ func memoriesLearnedInCycle(userSub, app, loop, ts string) []map[string]any {
 	// Memory agents from xpcloud.yaml (tenant copy first, then operator-shared).
 	var agents []string
 	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
-		if a := readYamlMemoryAgents(filepath.Join(base, app, "xpcloud.yaml")); len(a) > 0 {
+		specPath, _ := ResolveSpecPath(filepath.Join(base, app))
+		if a := readYamlMemoryAgents(specPath); len(a) > 0 {
 			agents = a
 			break
 		}

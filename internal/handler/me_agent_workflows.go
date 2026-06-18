@@ -414,11 +414,11 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 	if err := os.MkdirAll(draftDir, 0o775); err != nil {
 		return map[string]any{"error": "draft dir: " + err.Error()}
 	}
-	if err := os.WriteFile(filepath.Join(draftDir, "xpcloud.yaml"), []byte(yaml), 0o644); err != nil {
+	if err := os.WriteFile(SpecWritePath(draftDir), []byte(yaml), 0o644); err != nil {
 		return map[string]any{"error": "write yaml: " + err.Error()}
 	}
 	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
-	if err := os.WriteFile(filepath.Join(draftDir, "manifest.json"), manifestBytes, 0o644); err != nil {
+	if err := os.WriteFile(ManifestWritePath(draftDir), manifestBytes, 0o644); err != nil {
 		return map[string]any{"error": "write manifest: " + err.Error()}
 	}
 	makeDraftWritable(draftDir)
@@ -475,12 +475,12 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 	if err := os.MkdirAll(draftDir, 0o775); err != nil {
 		return map[string]any{"error": "draft dir: " + err.Error()}
 	}
-	if err := os.WriteFile(filepath.Join(draftDir, "xpcloud.yaml"), []byte(buildTradingXpcloudYaml(slug, intent)), 0o644); err != nil {
+	if err := os.WriteFile(SpecWritePath(draftDir), []byte(buildTradingXpcloudYaml(slug, intent)), 0o644); err != nil {
 		return map[string]any{"error": "write yaml: " + err.Error()}
 	}
 	manifest := map[string]any{"name": slug, "kind": "app", "version": "0.1.0", "description": intent, "status": "draft", "fork_of": "auto-quant"}
 	mb, _ := json.MarshalIndent(manifest, "", "  ")
-	_ = os.WriteFile(filepath.Join(draftDir, "manifest.json"), mb, 0o644)
+	_ = os.WriteFile(ManifestWritePath(draftDir), mb, 0o644)
 	makeDraftWritable(draftDir)
 
 	// Run the REAL search → match → verify procedure against live xp.io:
@@ -551,8 +551,9 @@ func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
 		return map[string]any{"error": "slug must be '<app>:<loop>'"}
 	}
 	app := parts[0]
-	xpcloudPath := filepath.Join(tenantAppsDir(userID), app, "xpcloud.yaml")
-	if _, err := os.Stat(xpcloudPath); err != nil {
+	appDir := filepath.Join(tenantAppsDir(userID), app)
+	xpcloudPath, ok := ResolveSpecPath(appDir)
+	if !ok {
 		return map[string]any{"error": fmt.Sprintf("tenant copy of '%s' not found; install the workflow first via compose_workflow or app_install", app)}
 	}
 	b, err := os.ReadFile(xpcloudPath)
@@ -572,8 +573,14 @@ func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
 	}
 	// Append below an existing skill_imports: block; otherwise create one.
 	updated := appendToSkillImports(yamlContent, needle)
-	if err := os.WriteFile(xpcloudPath, []byte(updated), 0o644); err != nil {
+	writePath := SpecWritePath(appDir)
+	if err := os.WriteFile(writePath, []byte(updated), 0o644); err != nil {
 		return map[string]any{"error": "write xpcloud.yaml: " + err.Error()}
+	}
+	// Avoid orphaning a pre-existing legacy spec: if we read from the legacy
+	// name, drop it now that the canonical dotfile holds the updated content.
+	if xpcloudPath != writePath {
+		_ = os.Remove(xpcloudPath)
 	}
 	return map[string]any{
 		"slug":   slug,

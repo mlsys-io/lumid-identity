@@ -82,7 +82,8 @@ func MeValidateWorkflow(c *gin.Context) {
 // manifest.json: name regex, kind ∈ valid kinds, non-empty version.
 func validateManifestLint(dir string) validateCheck {
 	ck := validateCheck{Check: "manifest_lint", Status: "pass"}
-	b, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	mfPath, _ := ResolveManifestPath(dir)
+	b, err := os.ReadFile(mfPath)
 	if err != nil {
 		ck.Status = "fail"
 		ck.Detail = "manifest.json missing"
@@ -120,7 +121,8 @@ func validateManifestLint(dir string) validateCheck {
 // or an engine (Pattern B). This is the "do I have a real pipeline?" gate.
 func validatePipelineShape(dir string) validateCheck {
 	ck := validateCheck{Check: "pipeline_shape", Status: "pass"}
-	b, err := os.ReadFile(filepath.Join(dir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(dir)
+	b, err := os.ReadFile(specPath)
 	if err != nil {
 		ck.Status = "fail"
 		ck.Detail = "xpcloud.yaml missing"

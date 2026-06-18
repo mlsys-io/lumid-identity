@@ -122,7 +122,8 @@ func MeSkills(c *gin.Context) {
 			}
 			seenApps[e.Name()] = true
 			app := e.Name()
-			b, err := os.ReadFile(filepath.Join(root, app, "xpcloud.yaml"))
+			specPath, _ := ResolveSpecPath(filepath.Join(root, app))
+			b, err := os.ReadFile(specPath)
 			if err != nil {
 				continue
 			}
@@ -217,8 +218,16 @@ func buildSkillRow(repo string, u *skillUsage, roots []string) meSkillRow {
 		base := filepath.Join(root, filepath.FromSlash(repo))
 		if st, err := os.Stat(base); err == nil && st.IsDir() {
 			row.InstalledOnDisk = true
-			for _, fn := range []string{"manifest.json", "manifest.yaml", "manifest.yml", "xpcloud.yaml"} {
-				b, err := os.ReadFile(filepath.Join(base, fn))
+			candidates := []string{}
+			if mp, ok := ResolveManifestPath(base); ok {
+				candidates = append(candidates, mp)
+			}
+			candidates = append(candidates, filepath.Join(base, "manifest.yml"))
+			if sp, ok := ResolveSpecPath(base); ok {
+				candidates = append(candidates, sp)
+			}
+			for _, fn := range candidates {
+				b, err := os.ReadFile(fn)
 				if err != nil {
 					continue
 				}

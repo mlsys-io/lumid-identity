@@ -327,7 +327,8 @@ func toolAppConfigGet(userID, app string) (map[string]any, bool) {
 	if appDir == "" {
 		return map[string]any{"error": "app not found: " + app}, false
 	}
-	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(specPath)
 	if err != nil {
 		return map[string]any{"error": "xpcloud.yaml not found"}, false
 	}
@@ -357,12 +358,13 @@ func toolAppConfigSet(userID string, args map[string]any) (map[string]any, bool)
 	if appDir == "" {
 		return map[string]any{"error": "app not found: " + app}, false
 	}
-	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
+	curPath, _ := ResolveSpecPath(appDir)
 	if baseSHA != "" {
-		if cur, err := os.ReadFile(yamlPath); err == nil && contentSHA(cur) != baseSHA {
+		if cur, err := os.ReadFile(curPath); err == nil && contentSHA(cur) != baseSHA {
 			return map[string]any{"error": "config changed since you loaded it — call app_config_get again and reapply"}, false
 		}
 	}
+	yamlPath := SpecWritePath(appDir)
 	tmp := yamlPath + ".tmp"
 	if err := os.WriteFile(tmp, []byte(yamlText), 0644); err != nil {
 		return map[string]any{"error": "cannot write config"}, false
@@ -370,6 +372,10 @@ func toolAppConfigSet(userID string, args map[string]any) (map[string]any, bool)
 	if err := os.Rename(tmp, yamlPath); err != nil {
 		_ = os.Remove(tmp)
 		return map[string]any{"error": "cannot save config"}, false
+	}
+	// Avoid orphaning a pre-existing legacy file with stale content.
+	if curPath != yamlPath {
+		_ = os.Remove(curPath)
 	}
 	return map[string]any{"app": app, "saved": true, "sha": contentSHA([]byte(yamlText))}, true
 }

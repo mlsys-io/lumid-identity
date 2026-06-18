@@ -50,7 +50,8 @@ func loopExperiments(appDir, loop string) []string {
 	if loop == "" {
 		return nil
 	}
-	b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml"))
+	specPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(specPath)
 	if err != nil {
 		return nil
 	}
@@ -597,7 +598,8 @@ func casebookVersionHistory(appDir, loop string) []casebookVersionPoint {
 // manifest.json. Best-effort: returns labels like "cases_v1 v1.0.0".
 func declaredDatasets(appDir string) []string {
 	// manifest.json is structured JSON — parse it directly.
-	if b, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+	manifestPath, _ := ResolveManifestPath(appDir)
+	if b, err := os.ReadFile(manifestPath); err == nil {
 		var m map[string]any
 		if json.Unmarshal(b, &m) == nil {
 			if arr, ok := m["datasets"].([]any); ok {
@@ -622,7 +624,8 @@ func declaredDatasets(appDir string) []string {
 	}
 	// xpcloud.yaml fallback — a light line scan (no YAML dep in this package):
 	// collect `- id: <x>` entries under a `datasets:` block.
-	if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+	specPath, _ := ResolveSpecPath(appDir)
+	if b, err := os.ReadFile(specPath); err == nil {
 		out := []string{}
 		inDS := false
 		for _, raw := range strings.Split(string(b), "\n") {

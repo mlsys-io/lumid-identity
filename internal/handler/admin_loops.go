@@ -265,7 +265,8 @@ func discoverManifestLoops(home string) []appSchedulerIndex {
 		// so its schedule wins when both files declare the same loop.
 		idx.App = e.Name()
 		// xpcloud.yaml::loops[] (canonical)
-		if yamlLoops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+		specPath, _ := ResolveSpecPath(appDir)
+		if yamlLoops, err := readYamlLoops(specPath); err == nil {
 			for _, L := range yamlLoops {
 				idx.Loops = append(idx.Loops, struct {
 					Name           string `json:"name"`
@@ -277,7 +278,8 @@ func discoverManifestLoops(home string) []appSchedulerIndex {
 		}
 		// manifest.json::loops[] (legacy mirror — only fills in loops xpcloud.yaml didn't declare)
 		if seenNames := loopNames(idx.Loops); true {
-			if mf, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
+			manifestPath, _ := ResolveManifestPath(appDir)
+			if mf, err := readManifestLoops(manifestPath); err == nil {
 				for _, L := range mf {
 					if _, dup := seenNames[L.Name]; dup {
 						continue
@@ -427,7 +429,8 @@ func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
 	// 1) xpcloud.yaml::loops[] — canonical runtime source. Read first
 	//    so its schedule + steps + skills_invoked beat any stale
 	//    manifest.json mirror.
-	if loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+	specPath, _ := ResolveSpecPath(appDir)
+	if loops, err := readYamlLoops(specPath); err == nil {
 		for _, L := range loops {
 			if L.Name == loop {
 				p, ts := latestCycleDir(appDir, loop)
@@ -436,7 +439,8 @@ func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
 		}
 	}
 	// 2) manifest.json::loops[] — fallback only.
-	if loops, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
+	manifestPath, _ := ResolveManifestPath(appDir)
+	if loops, err := readManifestLoops(manifestPath); err == nil {
 		for _, L := range loops {
 			if L.Name == loop {
 				p, ts := latestCycleDir(appDir, loop)
@@ -895,7 +899,8 @@ func loadAppGitStatus(home, app string) appGitStatus {
 	out := appGitStatus{App: app, Status: "no_git"}
 	appDir := filepath.Join(home, ".xp", "apps", app)
 	// version + kind from manifest.json (preferred) or xpcloud.yaml
-	if b, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+	manifestPath, _ := ResolveManifestPath(appDir)
+	if b, err := os.ReadFile(manifestPath); err == nil {
 		var m struct {
 			Version string `json:"version"`
 			Kind    string `json:"kind"`
@@ -906,7 +911,8 @@ func loadAppGitStatus(home, app string) appGitStatus {
 		}
 	}
 	if out.Kind == "" {
-		if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+		specPath, _ := ResolveSpecPath(appDir)
+		if b, err := os.ReadFile(specPath); err == nil {
 			var m struct {
 				Kind    string `yaml:"kind"`
 				Version string `yaml:"version"`

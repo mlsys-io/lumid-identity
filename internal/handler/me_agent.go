@@ -84,7 +84,13 @@ var destructiveTools = map[string]bool{
 	// same LumidOS bridge handler (see agentToolAlias + dispatchTool).
 	"agent_push":    true,
 	"agent_install": true,
-	"run_loop":      true,
+	// NOTE: running an ALREADY-INSTALLED workflow (run_loop / app_run /
+	// agent_run / run_loop_now) is intentionally NOT gated. It is the core,
+	// non-destructive action of the assistant — firing a one-shot cycle of a
+	// loop the user already installed. Gating it forced an approval round-trip
+	// that the tool-using model never completed, so "run X" never ran. Genuine
+	// mutations (push/install/delete/billing/submit_workflow/live-trade) stay
+	// gated below.
 	"submit_workflow": true,
 	"xp_ingest":      true,
 	// C3 observability/action tools that mutate state.
@@ -1724,7 +1730,9 @@ You have tools to:
 
 When the user expresses an intent, prefer doing the work via tools over describing how they could do it themselves. Confirm what you did in 1-2 sentences after each action. When the user asks you to run, pause, install, fork, or publish something, you MUST call the matching tool in that same turn — never answer with prose alone, and never claim an action happened without its tool result.
 
-VOCABULARY: in replies, always say "app", "workflow", and "run" — never internal terms like "loop", "cycle", "intent", or raw tool names. When the user asks how to watch progress or inspect results, point them at the app page's Workflows tab (each run there is inspectable stage by stage) — do NOT recite tool names like loop_status or loop_history.
+RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL run_loop_now with that app and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call list_apps (or the app's detail) to resolve it, then run it. Firing a run of an already-installed workflow is safe and needs no approval. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
+
+VOCABULARY: in replies, always say "app", "workflow", and "run" — never internal terms like "loop", "cycle", "intent", or raw tool names. When the user asks how to watch progress or inspect PAST results, point them at the app page's Workflows tab (each run there is inspectable stage by stage) — do NOT recite tool names like loop_status or loop_history. (This is for inspection; when they ask to RUN something, run it per the rule above rather than pointing them at the tab.)
 
 The user already has these apps installed in their tenant: ` + tenantList + `
 
@@ -2669,7 +2677,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "run_loop",
-			"description": "Trigger a research loop to run immediately (outside its normal schedule). Requires approval.",
+			"description": "Trigger a research loop to run immediately (outside its normal schedule). For firing a one-off run of an installed app's workflow, prefer run_loop_now (app+loop).",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

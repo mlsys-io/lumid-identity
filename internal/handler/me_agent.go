@@ -97,9 +97,15 @@ var destructiveTools = map[string]bool{
 	"review_action":  true,
 	"app_config_set": true,
 	// Generic app-ops mutations (operate any app from chat). Reads
-	// (app_read/app_actions/show_app_surface) are NOT gated.
+	// (app_read/app_actions/show_app_surface/app_ui_get) are NOT gated.
 	"app_action": true,
 	"qa_call":    true,
+	// App-surface authoring + run lifecycle (close the UI-only gaps). Writes
+	// land only in the caller's OWN tenant install / advisory run markers.
+	"app_ui_set":      true,
+	"app_ui_generate": true,
+	"run_promote":     true,
+	"run_discard":     true,
 	// Admin control-plane writes (admin_users / admin_clusters reads are NOT gated).
 	"admin_set_user_role":      true,
 	"admin_set_user_status":    true,
@@ -865,32 +871,109 @@ func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx ma
 			}
 		}
 	}
-	// Grounded observability drill-in (the trajectory "Ask about this run /
-	// step / case" affordances send cycle/step_id/case_id in the context).
-	// These NEED the me_agent data tools (cycle_detail, casebook, …) which the
-	// claude-code CLI provider can't see — it runs its own toolset. So when the
-	// picked provider is claude-code AND this is a drill-in, route to the first
-	// tool-capable (non-claude-code) provider the role allows. Prefer
-	// kvrun-minimax over gemma4 for tool-following quality.
-	if isClaudeCodeProvider(picked) && groundedDrillIn(ctx) {
-		var fallback *llmProvider
-		for i := range llmProviders {
-			p := llmProviders[i]
-			if isClaudeCodeProvider(p) || !providerAllowed(role, p) {
-				continue
-			}
-			if p.id == "kvrun-minimax" {
-				return p, true
-			}
-			if fallback == nil {
-				fallback = &p
-			}
-		}
-		if fallback != nil {
-			return *fallback, true
+	// The claude-code CLI provider runs its OWN toolset (Bash/Read/Write/Web) and
+	// can't see the me_agent registry, so any turn that NEEDS those tools must
+	// route to a tool-capable (HTTP /v1/messages) provider. Two such turns:
+	//   • a grounded observability drill-in (cycle/step/case → cycle_detail,
+	//     casebook, … data tools), or
+	//   • a control-plane request (install/run/publish/edit-ui/promote/… — the
+	//     verbs the PLATFORM is driven by, served by the me_agent tools).
+	// This is what makes "controllability work for ALL models": select Claude
+	// Code, ask it to install/run/publish/edit something, and the action still
+	// executes — on a tool-capable model, surfaced via the `route` event. (We
+	// only steal clearly-platform turns; generic "run the tests / install numpy"
+	// stay in claude-code, where its Bash/file tools are the right runtime.)
+	if isClaudeCodeProvider(picked) && (groundedDrillIn(ctx) || controlIntent(req)) {
+		if p, ok := firstToolCapableProvider(role); ok {
+			return p, true
 		}
 	}
 	return picked, false
+}
+
+// firstToolCapableProvider returns the best non-claude-code provider the role
+// may use — these speak Anthropic /v1/messages and so expose the full me_agent
+// tool registry + run the tool-use loop. Prefers kvrun-minimax for tool-
+// following quality, else the first allowed provider (gemma4 for everyone).
+func firstToolCapableProvider(role string) (llmProvider, bool) {
+	var fallback *llmProvider
+	for i := range llmProviders {
+		p := llmProviders[i]
+		if isClaudeCodeProvider(p) || !providerAllowed(role, p) {
+			continue
+		}
+		if p.id == "kvrun-minimax" {
+			return p, true
+		}
+		if fallback == nil {
+			fallback = &p
+		}
+	}
+	if fallback != nil {
+		return *fallback, true
+	}
+	return llmProvider{}, false
+}
+
+// controlIntent reports whether the latest user turn asks the assistant to DO
+// something on the PLATFORM (install/run/publish/edit/promote/…) — work that
+// needs the me_agent control-plane tools. Heuristic (recall-biased, but kept to
+// clearly-platform phrases so it doesn't steal shell/code turns from claude-
+// code): a hit routes a tool-less provider to a tool-capable one; a miss simply
+// behaves as before. Scans only the most recent user message.
+func controlIntent(msgs []chatMessage) bool {
+	text := ""
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			text = strings.ToLower(msgs[i].Content)
+			break
+		}
+	}
+	if text == "" {
+		return false
+	}
+	for _, kw := range controlIntentPhrases {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// controlIntentPhrases — platform-control cues. Deliberately phrase-level (e.g.
+// "run the workflow", not bare "run ") so code/shell asks a super_admin uses
+// claude-code for ("run the tests", "install numpy") are NOT routed away.
+var controlIntentPhrases = []string{
+	// app lifecycle
+	"install the app", "install app", "uninstall", "reinstall the app",
+	"remove the app", "delete the app",
+	"fork the app", "fork this app", "publish the app", "publish this app",
+	"publish my app", "unpublish", "propose upstream", "open a pr upstream",
+	"subscribe to", "add the skill", "add skill to", "import the skill",
+	// run / schedule a workflow (platform nouns, not bare "run")
+	"run the workflow", "run this workflow", "run the loop", "run the app",
+	"run the cycle", "run a cycle", "run now", "run it now", "trigger the workflow",
+	"trigger the loop", "kick off the", "fire the workflow", "fire a run",
+	"pause the workflow", "pause this workflow", "resume the workflow",
+	"pause the loop", "resume the loop", "stop the workflow",
+	"schedule the workflow", "schedule this workflow", "schedule the loop",
+	"change the schedule", "set the schedule", "set the cron",
+	// runs
+	"promote the run", "promote this run", "promote run", "discard the run",
+	"discard this run", "discard run",
+	// app surface / config authoring
+	"edit the app ui", "edit the page", "edit the ui", "edit the config",
+	"edit the app config", "update the config", "update the app config",
+	"generate a ui", "generate the ui", "generate a page", "generate the page",
+	"regenerate the page", "build the page", "build me a page",
+	// authoring / composition
+	"create a workflow", "new workflow", "create an app", "new app", "compose a workflow",
+	// trading / quantarena
+	"place a trade", "register the strategy", "register a strategy",
+	"join the competition", "join competition",
+	// account / admin
+	"set my profile", "remember that i", "set the role", "set user role",
+	"grant access", "suspend the user", "suspend user",
 }
 
 // groundedDrillIn reports whether the turn's viewing context points at a

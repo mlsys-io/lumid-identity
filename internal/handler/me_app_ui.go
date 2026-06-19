@@ -517,8 +517,9 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 	}
 
 	// For template-inherited paths, write to a local override and patch xpcloud.yaml.
+	// New override files land in the canonical ".ui/" dotfile directory.
 	if strings.HasPrefix(mdPath, "@") {
-		const overridePath = "ui/home.md"
+		overridePath := appUIWriteRef("home.md")
 		mdPath = overridePath
 		if err := patchXpcloudUISurface(appDir, name, overridePath); err != nil {
 			fail(c, http.StatusInternalServerError, 1500, "failed to update xpcloud.yaml: "+err.Error())
@@ -527,8 +528,8 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 	}
 
 	if mdPath == "" {
-		// No declared path — default to ui/home.md and write it.
-		mdPath = "ui/home.md"
+		// No declared path — default to the canonical .ui/home.md and write it.
+		mdPath = appUIWriteRef("home.md")
 	}
 
 	// Path-guard: same as GET.

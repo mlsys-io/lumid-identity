@@ -334,7 +334,7 @@ func appActionsCatalog(userID, app string) map[string]any {
 	if dir == "" {
 		return map[string]any{"error": "app not installed: " + app}
 	}
-	uiDir := filepath.Join(dir, "ui")
+	uiDir := appUIDir(dir)
 	entries, _ := os.ReadDir(uiDir)
 
 	actions := []map[string]any{}

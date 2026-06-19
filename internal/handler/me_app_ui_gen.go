@@ -250,11 +250,11 @@ func MeGenerateAppUI(c *gin.Context) {
 	// if present; else seed from the NL page-spec (which names allowlisted
 	// action keys) + the app's skills.
 	currentPage := ""
-	if pb, e := os.ReadFile(filepath.Join(appDir, "ui", "page.yaml")); e == nil {
+	if pb, e := readAppUIFile(appDir, "page.yaml"); e == nil {
 		currentPage = string(pb)
 	}
 	pageSpec := ""
-	if pb, e := os.ReadFile(filepath.Join(appDir, "ui", "page-spec.md")); e == nil {
+	if pb, e := readAppUIFile(appDir, "page-spec.md"); e == nil {
 		pageSpec = string(pb)
 	}
 	skills := resolveAppSkills(appDir, userID)
@@ -281,7 +281,8 @@ func MeGenerateAppUI(c *gin.Context) {
 	}
 
 	// Persist page.yaml as the source of truth + point the surface at it.
-	uiDir := filepath.Join(appDir, "ui")
+	// NEW writes land in the canonical ".ui/" dotfile directory.
+	uiDir := appUIWriteDir(appDir)
 	if err := os.MkdirAll(uiDir, 0755); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "cannot create ui directory")
 		return
@@ -297,10 +298,10 @@ func MeGenerateAppUI(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "cannot save page.yaml")
 		return
 	}
-	_ = patchXpcloudUISurfacePage(appDir, "ui/page.yaml")
+	_ = patchXpcloudUISurfacePage(appDir, appUIWriteRef("page.yaml"))
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
-		"data": gin.H{"markdown": md, "path": "ui/page.yaml", "source": "generated"},
+		"data": gin.H{"markdown": md, "path": appUIWriteRef("page.yaml"), "source": "generated"},
 	})
 }
 
@@ -308,7 +309,8 @@ func MeGenerateAppUI(c *gin.Context) {
 // patches xpcloud.yaml to point at it, and returns the standard JSON. Shared by
 // the LLM path and the deterministic compiler path.
 func writeSurfaceAndRespond(c *gin.Context, appDir, md, source string) {
-	uiDir := filepath.Join(appDir, "ui")
+	// NEW writes land in the canonical ".ui/" dotfile directory.
+	uiDir := appUIWriteDir(appDir)
 	if err := os.MkdirAll(uiDir, 0755); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "cannot create ui directory")
 		return
@@ -324,10 +326,10 @@ func writeSurfaceAndRespond(c *gin.Context, appDir, md, source string) {
 		fail(c, http.StatusInternalServerError, 1500, "cannot save surface file")
 		return
 	}
-	_ = patchXpcloudUISurface(appDir, "home", "ui/home.md")
+	_ = patchXpcloudUISurface(appDir, "home", appUIWriteRef("home.md"))
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
-		"data": gin.H{"markdown": md, "path": "ui/home.md", "source": source},
+		"data": gin.H{"markdown": md, "path": appUIWriteRef("home.md"), "source": source},
 	})
 }
 

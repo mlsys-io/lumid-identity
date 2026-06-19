@@ -82,7 +82,11 @@ func xpcloudJSON(method, url, bearer string, body any) (int, map[string]any, err
 // fall back to the canonical showcase owner the user installed from.
 func appUpstreamSlug(userID, app string) string {
 	fallback := "a3f48236-ffe9-4fb9-9548-6e044d5cd9c7/" + app
-	mp := filepath.Join(tenantAppsDir(userID), app, "manifest.json")
+	appDir := filepath.Join(tenantAppsDir(userID), app)
+	mp, ok := ResolveManifestPath(appDir)
+	if !ok {
+		return fallback
+	}
 	b, err := os.ReadFile(mp)
 	if err != nil {
 		return fallback

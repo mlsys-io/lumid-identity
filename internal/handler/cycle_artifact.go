@@ -76,7 +76,10 @@ func CycleArtifact(c *gin.Context) {
 
 	home := operatorHome()
 	appRoot := filepath.Join(home, ".xp", "apps", app)
-	cyclesRoot := filepath.Join(appRoot, "data", "cycles", loop)
+	// Resolve the cycles runtime dir to its canonical .lumid/cycles location
+	// when present, falling back to the legacy data/cycles path otherwise.
+	cyclesBase, _ := ResolveRuntimeReadPath(appRoot, "data/cycles")
+	cyclesRoot := filepath.Join(cyclesBase, loop)
 
 	cycleDir := ""
 	if ts == "" {

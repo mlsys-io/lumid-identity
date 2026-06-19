@@ -75,7 +75,7 @@ func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
 		return 0, http.StatusBadRequest, 1400, "invalid app or loop"
 	}
 	appDir := filepath.Join(tenantAppsDir(userID), app)
-	xpPath := filepath.Join(appDir, "xpcloud.yaml")
+	xpPath, _ := ResolveSpecPath(appDir)
 	b, err := os.ReadFile(xpPath)
 	if err != nil {
 		return 0, http.StatusNotFound, 1404,
@@ -109,11 +109,16 @@ func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
 	if err != nil {
 		return 0, http.StatusInternalServerError, 1500, "marshal: " + err.Error()
 	}
-	if err := os.WriteFile(xpPath, out, 0o644); err != nil {
+	specOut := SpecWritePath(appDir)
+	if err := os.WriteFile(specOut, out, 0o644); err != nil {
 		return 0, http.StatusInternalServerError, 1500, "write xpcloud.yaml: " + err.Error()
 	}
+	if xpPath != specOut {
+		_ = os.Remove(xpPath) // don't orphan a pre-existing legacy spec file
+	}
 	// Mirror into manifest.json::loops[] if it carries them (legacy shape).
-	if mb, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+	manPath, _ := ResolveManifestPath(appDir)
+	if mb, err := os.ReadFile(manPath); err == nil {
 		var mj map[string]any
 		if json.Unmarshal(mb, &mj) == nil {
 			if ml, ok := mj["loops"].([]any); ok {
@@ -127,7 +132,10 @@ func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
 				}
 				mj["loops"] = keptM
 				if nb, e := json.MarshalIndent(mj, "", "  "); e == nil {
-					_ = os.WriteFile(filepath.Join(appDir, "manifest.json"), nb, 0o644)
+					manOut := ManifestWritePath(appDir)
+					if e2 := os.WriteFile(manOut, nb, 0o644); e2 == nil && manPath != manOut {
+						_ = os.Remove(manPath) // don't orphan a pre-existing legacy manifest
+					}
 				}
 			}
 		}
@@ -135,7 +143,8 @@ func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
 	// ARCHIVE the loop's cycle history (don't destroy) so "walk me through
 	// run X" stays answerable after a workflow delete. Move it into
 	// .xp/.trash/<app>/<loop>-<ts>/ (dot-dir → skipped by the apps scan).
-	srcCycles := filepath.Join(appDir, "data", "cycles", loop)
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	srcCycles := filepath.Join(cyclesRoot, loop)
 	if _, err := os.Stat(srcCycles); err == nil {
 		trashDir := filepath.Join(tenantAppsDir(userID), "..", ".trash", app)
 		_ = os.MkdirAll(trashDir, 0o755)
@@ -151,7 +160,8 @@ func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
 // xpcloud.yaml. Used so EVERY card carries a version badge — loadAppGitStatus
 // only reads the operator home, so tenant apps were version-less without this.
 func readAppVersion(appDir string) string {
-	if b, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+	manPath, _ := ResolveManifestPath(appDir)
+	if b, err := os.ReadFile(manPath); err == nil {
 		var m struct {
 			Version string `json:"version"`
 		}
@@ -159,7 +169,8 @@ func readAppVersion(appDir string) string {
 			return m.Version
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+	specPath, _ := ResolveSpecPath(appDir)
+	if b, err := os.ReadFile(specPath); err == nil {
 		var m struct {
 			Version string `yaml:"version"`
 		}
@@ -362,19 +373,25 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				continue
 			}
 			appDir := filepath.Join(appsRoot, e.Name())
-			loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml"))
+			specPath, _ := ResolveSpecPath(appDir)
+			manPath, _ := ResolveManifestPath(appDir)
+			loops, err := readYamlLoops(specPath)
 			if err != nil || len(loops) == 0 {
 				// Try manifest.json fallback.
-				loops, _ = readManifestLoops(filepath.Join(appDir, "manifest.json"))
+				loops, _ = readManifestLoops(manPath)
 			}
 			if len(loops) == 0 {
 				continue
 			}
-			memAgents := readYamlMemoryAgents(filepath.Join(appDir, "xpcloud.yaml"))
+			memAgents := readYamlMemoryAgents(specPath)
 			appVersion := readAppVersion(appDir)
+			// Runtime artifacts now live under .lumid/ (legacy data/ still
+			// honored). Resolve once per app; .lumid/ wins when present.
+			journalPath, _ := ResolveRuntimeReadPath(appDir, "data/journal.jsonl")
+			cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
 			// Tolerant goal read — survives loops whose other fields break the
 			// full rawLoop parse (object-typed datasets/skills_invoked).
-			goalsByLoop := readYamlLoopGoals(filepath.Join(appDir, "xpcloud.yaml"))
+			goalsByLoop := readYamlLoopGoals(specPath)
 			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			scheduleMap := readScheduleOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			goalMap := readGoalOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
@@ -440,8 +457,8 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.ExperimentIDs = append(row.ExperimentIDs, eid)
 				}
 				row.RunSpark, row.RunsRecent = buildRunSparkDetailed(
-					filepath.Join(appDir, "data", "journal.jsonl"),
-					filepath.Join(appDir, "data", "cycles", L.Name),
+					journalPath,
+					filepath.Join(cyclesRoot, L.Name),
 					L.Name, 14)
 				if g, ok := goalsByLoop[L.Name]; ok {
 					row.Goal = &WorkflowGoal{Primary: g.Primary, Tracked: g.Tracked}
@@ -466,12 +483,12 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				// for tenant loops (frozen at the last operator run). The
 				// per-app journal is the real run log — prefer it so
 				// last-run reflects what actually ran.
-				if jts, jok, ok := lastRunFromJournal(filepath.Join(appDir, "data", "journal.jsonl"), L.Name); ok {
+				if jts, jok, ok := lastRunFromJournal(journalPath, L.Name); ok {
 					row.LastRunTS = jts
 					row.LastRunOK = &jok
 				}
-				row.Running = loopRunning(appDir, L.Name, row.LastRunTS)
-				row.LastRunRecovered = lastRunRecovered(filepath.Join(appDir, "data", "journal.jsonl"), L.Name)
+				row.Running = loopRunning(cyclesRoot, L.Name, row.LastRunTS)
+				row.LastRunRecovered = lastRunRecovered(journalPath, L.Name)
 				out = append(out, row)
 			}
 		}
@@ -570,8 +587,8 @@ func fetchCostsByEndpoint(userSub string) map[string]int {
 // cycle dir (created at cycle start) is newer than its last completed
 // journal entry (written at cycle end). The recency cap avoids reporting
 // a crashed-cycle leftover dir as "running" forever.
-func loopRunning(appDir, loop string, lastJTS float64) bool {
-	ents, err := os.ReadDir(filepath.Join(appDir, "data", "cycles", loop))
+func loopRunning(cyclesRoot, loop string, lastJTS float64) bool {
+	ents, err := os.ReadDir(filepath.Join(cyclesRoot, loop))
 	if err != nil {
 		return false
 	}
@@ -935,7 +952,7 @@ func MeImportFromN8n(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "draft dir: "+err.Error())
 		return
 	}
-	if err := os.WriteFile(filepath.Join(draftDir, "xpcloud.yaml"), []byte(yaml), 0o644); err != nil {
+	if err := os.WriteFile(SpecWritePath(draftDir), []byte(yaml), 0o644); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "write yaml: "+err.Error())
 		return
 	}
@@ -945,7 +962,7 @@ func MeImportFromN8n(c *gin.Context) {
 		"fork_of":     "n8n:" + body.N8nID,
 	}
 	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
-	_ = os.WriteFile(filepath.Join(draftDir, "manifest.json"), manifestBytes, 0o644)
+	_ = os.WriteFile(ManifestWritePath(draftDir), manifestBytes, 0o644)
 
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
@@ -1033,12 +1050,14 @@ func appendUnique(arr []string, s string) []string {
 // operator-shared copy. Returns the loops list + a label describing
 // where it came from ("tenant" | "operator-shared").
 func readLoopsFromAnywhere(userID, app string) ([]rawLoop, string) {
+	tenantSpec, _ := ResolveSpecPath(filepath.Join(tenantAppsDir(userID), app))
+	operatorSpec, _ := ResolveSpecPath(filepath.Join(operatorHome(), ".xp", "apps", app))
 	for _, candidate := range []struct {
 		path  string
 		label string
 	}{
-		{filepath.Join(tenantAppsDir(userID), app, "xpcloud.yaml"), "tenant"},
-		{filepath.Join(operatorHome(), ".xp", "apps", app, "xpcloud.yaml"), "operator-shared"},
+		{tenantSpec, "tenant"},
+		{operatorSpec, "operator-shared"},
 	} {
 		loops, err := readYamlLoops(candidate.path)
 		if err == nil && len(loops) > 0 {

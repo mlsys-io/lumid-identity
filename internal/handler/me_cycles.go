@@ -106,9 +106,13 @@ func MeCycleFeedback(c *gin.Context) {
 	}
 
 	// 2. Per-app journal so loops dashboards surface the count.
+	// cycleDir is <appDir>/<cycles-root>/<loop>/<ts> where <cycles-root> is
+	// either ".lumid/cycles" (canonical) or "data/cycles" (legacy); peel off
+	// ts/loop/cycles/<state-dir> to recover the bundle root.
 	appDir := strings.TrimSuffix(strings.TrimSuffix(cycleDir, body.Ts), "/")
-	appDir = strings.TrimSuffix(appDir, body.Loop)
-	appDir = strings.TrimSuffix(appDir, "/data/cycles/")
+	appDir = strings.TrimSuffix(strings.TrimSuffix(appDir, body.Loop), "/")
+	appDir = strings.TrimSuffix(appDir, "/.lumid/cycles")
+	appDir = strings.TrimSuffix(appDir, "/data/cycles")
 	// 2b. Mirror into the improvement ledger so the Intent detail
 	//     page can render this as an axis="examples" event without
 	//     scanning every cycle dir. Non-fatal; the canonical record
@@ -139,7 +143,19 @@ func MeCycleFeedback(c *gin.Context) {
 		})
 	}
 
-	if err := appendJSONL(filepath.Join(appDir, "data", "journal.jsonl"), entry); err != nil {
+	journalPath, jerr := ResolveRuntimeWritePath(appDir, "data/journal.jsonl")
+	if jerr != nil {
+		// Non-fatal — the primary record is in feedback.jsonl.
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "feedback saved (journal path resolve failed: " + jerr.Error() + ")",
+			"data": gin.H{
+				"cycle_dir": cycleDir,
+				"source":    source,
+			},
+		})
+		return
+	}
+	if err := appendJSONL(journalPath, entry); err != nil {
 		// Non-fatal — the primary record is in feedback.jsonl.
 		// We still log via the response.
 		c.JSON(http.StatusOK, gin.H{
@@ -175,7 +191,9 @@ func resolveCycleDir(userSub, app, loop, ts string) (string, string) {
 		{filepath.Join(operatorHome(), ".xp", "apps"), "shared"},
 	}
 	for _, cand := range candidates {
-		dir := filepath.Join(cand.base, app, "data", "cycles", loop, ts)
+		// Prefer the canonical .lumid/cycles tree, fall back to legacy data/cycles.
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(cand.base, app), "data/cycles")
+		dir := filepath.Join(cyclesRoot, loop, ts)
 		if st, err := os.Stat(dir); err == nil && st.IsDir() {
 			return dir, cand.source
 		}
@@ -196,7 +214,8 @@ func nearestCycleDir(userSub, app, loop, wantTs string) (string, string) {
 	var bestDir, bestTs string
 	var bestDiff time.Duration = 1<<62 - 1
 	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
-		root := filepath.Join(base, app, "data", "cycles", loop)
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(base, app), "data/cycles")
+		root := filepath.Join(cyclesRoot, loop)
 		entries, err := os.ReadDir(root)
 		if err != nil {
 			continue
@@ -240,7 +259,8 @@ func nearestSummaryDir(userSub, app, loop, ts string) string {
 	want, werr := time.Parse(layout, ts)
 	best, bestDiff := "", time.Duration(1<<62-1)
 	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
-		root := filepath.Join(base, app, "data", "cycles", loop)
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(base, app), "data/cycles")
+		root := filepath.Join(cyclesRoot, loop)
 		entries, err := os.ReadDir(root)
 		if err != nil {
 			continue
@@ -293,7 +313,8 @@ func memoriesLearnedInCycle(userSub, app, loop, ts string) []map[string]any {
 	end := start.Add(24 * time.Hour)
 	nextTs := ""
 	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
-		entries, derr := os.ReadDir(filepath.Join(base, app, "data", "cycles", loop))
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(base, app), "data/cycles")
+		entries, derr := os.ReadDir(filepath.Join(cyclesRoot, loop))
 		if derr != nil {
 			continue
 		}
@@ -314,7 +335,8 @@ func memoriesLearnedInCycle(userSub, app, loop, ts string) []map[string]any {
 	// Memory agents from xpcloud.yaml (tenant copy first, then operator-shared).
 	var agents []string
 	for _, base := range []string{tenantAppsDir(userSub), filepath.Join(operatorHome(), ".xp", "apps")} {
-		if a := readYamlMemoryAgents(filepath.Join(base, app, "xpcloud.yaml")); len(a) > 0 {
+		specPath, _ := ResolveSpecPath(filepath.Join(base, app))
+		if a := readYamlMemoryAgents(specPath); len(a) > 0 {
 			agents = a
 			break
 		}

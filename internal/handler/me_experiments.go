@@ -56,8 +56,10 @@ type expManifest struct {
 
 func readExpManifest(appDir string) expManifest {
 	var m expManifest
-	if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
-		_ = yaml.Unmarshal(b, &m)
+	if specPath, ok := ResolveSpecPath(appDir); ok {
+		if b, err := os.ReadFile(specPath); err == nil {
+			_ = yaml.Unmarshal(b, &m)
+		}
 	}
 	return m
 }
@@ -84,7 +86,8 @@ func expLoops(m expManifest) map[string][]string {
 
 func readExpState(appDir, id string) map[string]any {
 	st := map[string]any{}
-	b, err := os.ReadFile(filepath.Join(appDir, "data", "experiments", id, "state.json"))
+	p, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "experiments", id, "state.json"))
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return st
 	}
@@ -103,7 +106,7 @@ type expRow struct {
 
 // readExpRows returns up to the LAST `cap` rows of the results ledger.
 func readExpRows(appDir, id string, capN int) []expRow {
-	p := filepath.Join(appDir, "data", "experiments", id, "results.jsonl")
+	p, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "experiments", id, "results.jsonl"))
 	f, err := os.Open(p)
 	if err != nil {
 		return nil

@@ -207,21 +207,21 @@ func MeAppsList(c *gin.Context) {
 				continue
 			}
 			dir := filepath.Join(root, e.Name())
-			_, mfstErr := os.Stat(filepath.Join(dir, "manifest.json"))
-			_, xpErr := os.Stat(filepath.Join(dir, "xpcloud.yaml"))
+			_, mfstOK := ResolveManifestPath(dir)
+			_, xpOK := ResolveSpecPath(dir)
 			_, ovErr := os.Stat(filepath.Join(dir, ".user-overrides.yaml"))
 			// Best-effort parse of the optional ui: block (nil when absent
 			// or unparseable) so the Studio sidebar can render app-declared
 			// entries + surfaces. readAppUI lives in me_app_ui.go.
 			var ui *appUI
-			if xpErr == nil {
+			if xpOK {
 				ui = readAppUI(dir)
 			}
 			onDisk[e.Name()] = true
 			out = append(out, appCard{
 				Name:     e.Name(),
-				HasMfst:  mfstErr == nil,
-				HasXPCld: xpErr == nil,
+				HasMfst:  mfstOK,
+				HasXPCld: xpOK,
 				HasOverr: ovErr == nil,
 				Tenant:   isTenant,
 				Status:   "ready",

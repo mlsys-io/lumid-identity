@@ -268,7 +268,7 @@ func pickExperiment(appDir, want string, allowed map[string]bool, strict bool) (
 	if strict && len(allowed) == 0 {
 		return "", "" // this workflow declares no experiment → no variant metrics
 	}
-	expRoot := filepath.Join(appDir, "data", "experiments")
+	expRoot, _ := ResolveRuntimeReadPath(appDir, "data/experiments")
 	if want != "" && (!strict || allowed[want]) {
 		d := filepath.Join(expRoot, want)
 		if st, err := os.Stat(d); err == nil && st.IsDir() {
@@ -486,7 +486,8 @@ func scanCycleDirs(appDir, loop string) []string {
 	if loop == "" {
 		return nil
 	}
-	root := filepath.Join(appDir, "data", "cycles", loop)
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	root := filepath.Join(cyclesRoot, loop)
 	ents, err := os.ReadDir(root)
 	if err != nil {
 		return nil
@@ -549,7 +550,8 @@ func durationAtRunTs(appDir, loop, runTs string, cache map[string]float64) float
 		}
 	}
 	span := 0.0
-	dir := filepath.Join(appDir, "data", "cycles", loop, runTs)
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	dir := filepath.Join(cyclesRoot, loop, runTs)
 	ents, err := os.ReadDir(dir)
 	if err == nil {
 		var minT, maxT time.Time
@@ -588,7 +590,8 @@ func learnedAtRunTs(appDir, loop, runTs string) int {
 	if loop == "" || runTs == "" {
 		return 0
 	}
-	b, err := os.ReadFile(filepath.Join(appDir, "data", "cycles", loop, runTs, "cycle.json"))
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	b, err := os.ReadFile(filepath.Join(cyclesRoot, loop, runTs, "cycle.json"))
 	if err != nil {
 		return 0
 	}
@@ -606,7 +609,8 @@ func needsDecisionAtRunTs(appDir, loop, runTs string) bool {
 	if loop == "" || runTs == "" {
 		return false
 	}
-	b, err := os.ReadFile(filepath.Join(appDir, "data", "cycles", loop, runTs, "cycle.json"))
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	b, err := os.ReadFile(filepath.Join(cyclesRoot, loop, runTs, "cycle.json"))
 	if err != nil {
 		return false
 	}
@@ -690,7 +694,8 @@ func linearRunChain(appDir, loop string, cycleDirs []string, durCache map[string
 // cycleScore reads a cycle.json's primary numeric metric (first non-bookkeeping
 // numeric in metrics{}). Returns (value, true) when one is found.
 func cycleScore(appDir, loop, ts string) (float64, bool) {
-	b, err := os.ReadFile(filepath.Join(appDir, "data", "cycles", loop, ts, "cycle.json"))
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	b, err := os.ReadFile(filepath.Join(cyclesRoot, loop, ts, "cycle.json"))
 	if err != nil {
 		return 0, false
 	}

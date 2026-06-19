@@ -153,14 +153,21 @@ func MeRunMark(c *gin.Context) {
 
 	// Resolve the cycle dir (best-effort) so we can journal next to it.
 	cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
-	journalPath := filepath.Join(tenantAppsDir(userID), app, "data", "journal.jsonl")
-	if _, err := os.Stat(filepath.Dir(journalPath)); err != nil {
+	// Locate the app bundle dir (tenant first, then operator-shared), then
+	// write the synthetic journal entry to the canonical .lumid/journal.jsonl.
+	appDir := filepath.Join(tenantAppsDir(userID), app)
+	if _, err := os.Stat(appDir); err != nil {
 		// Try operator-shared.
-		journalPath = filepath.Join(operatorHome(), ".xp", "apps", app, "data", "journal.jsonl")
-		if _, err := os.Stat(filepath.Dir(journalPath)); err != nil {
+		appDir = filepath.Join(operatorHome(), ".xp", "apps", app)
+		if _, err := os.Stat(appDir); err != nil {
 			fail(c, http.StatusNotFound, 1404, "app not installed")
 			return
 		}
+	}
+	journalPath, err := ResolveRuntimeWritePath(appDir, "data/journal.jsonl")
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "resolve journal: "+err.Error())
+		return
 	}
 
 	entry := map[string]any{
@@ -289,7 +296,7 @@ func collectRuns(c *gin.Context, userID string, since, until time.Time) []RunRow
 			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
-			journal := filepath.Join(appsRoot, e.Name(), "data", "journal.jsonl")
+			journal, _ := ResolveRuntimeReadPath(filepath.Join(appsRoot, e.Name()), "data/journal.jsonl")
 			rows := readJournalInRange(journal, since, until)
 			for _, r := range rows {
 				row := journalRowToRun(e.Name(), r)

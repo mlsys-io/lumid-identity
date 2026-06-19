@@ -34,7 +34,7 @@ FROM --platform=linux/amd64 alpine:3.20
 #                     + sheet names).
 RUN apk add --no-cache \
       ca-certificates tzdata git util-linux-misc python3 \
-      poppler-utils pandoc py3-openpyxl
+      poppler-utils pandoc py3-openpyxl py3-yaml
 WORKDIR /app
 COPY --from=builder /out/identity /app/identity
 COPY configs/identity.yaml /app/configs/identity.yaml

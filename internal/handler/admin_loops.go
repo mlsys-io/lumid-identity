@@ -265,7 +265,8 @@ func discoverManifestLoops(home string) []appSchedulerIndex {
 		// so its schedule wins when both files declare the same loop.
 		idx.App = e.Name()
 		// xpcloud.yaml::loops[] (canonical)
-		if yamlLoops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+		specPath, _ := ResolveSpecPath(appDir)
+		if yamlLoops, err := readYamlLoops(specPath); err == nil {
 			for _, L := range yamlLoops {
 				idx.Loops = append(idx.Loops, struct {
 					Name           string `json:"name"`
@@ -277,7 +278,8 @@ func discoverManifestLoops(home string) []appSchedulerIndex {
 		}
 		// manifest.json::loops[] (legacy mirror — only fills in loops xpcloud.yaml didn't declare)
 		if seenNames := loopNames(idx.Loops); true {
-			if mf, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
+			manifestPath, _ := ResolveManifestPath(appDir)
+			if mf, err := readManifestLoops(manifestPath); err == nil {
 				for _, L := range mf {
 					if _, dup := seenNames[L.Name]; dup {
 						continue
@@ -427,7 +429,8 @@ func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
 	// 1) xpcloud.yaml::loops[] — canonical runtime source. Read first
 	//    so its schedule + steps + skills_invoked beat any stale
 	//    manifest.json mirror.
-	if loops, err := readYamlLoops(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+	specPath, _ := ResolveSpecPath(appDir)
+	if loops, err := readYamlLoops(specPath); err == nil {
 		for _, L := range loops {
 			if L.Name == loop {
 				p, ts := latestCycleDir(appDir, loop)
@@ -436,7 +439,8 @@ func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
 		}
 	}
 	// 2) manifest.json::loops[] — fallback only.
-	if loops, err := readManifestLoops(filepath.Join(appDir, "manifest.json")); err == nil {
+	manifestPath, _ := ResolveManifestPath(appDir)
+	if loops, err := readManifestLoops(manifestPath); err == nil {
 		for _, L := range loops {
 			if L.Name == loop {
 				p, ts := latestCycleDir(appDir, loop)
@@ -513,8 +517,10 @@ func uniqStrings(in []string) []string {
 // under either data/cycles/<loop>/ (auto-quant/ops shape) or
 // data/outbox/<case>/<ts>/ (mbb-ai shape; no per-loop subdir).
 func latestCycleDir(appDir, loop string) (string, string) {
-	// shape 1: data/cycles/<loop>/<ts>/
-	c1 := filepath.Join(appDir, "data", "cycles", loop)
+	// shape 1: data/cycles/<loop>/<ts>/ — resolve canonical .lumid/cycles
+	// when present, else legacy data/cycles.
+	cyclesBase, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	c1 := filepath.Join(cyclesBase, loop)
 	if entries, err := os.ReadDir(c1); err == nil {
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() > entries[j].Name() })
 		for _, e := range entries {
@@ -524,7 +530,7 @@ func latestCycleDir(appDir, loop string) (string, string) {
 		}
 	}
 	// shape 2: data/outbox/<case>/<ts>/ (mbb-ai); take newest globally.
-	c2 := filepath.Join(appDir, "data", "outbox")
+	c2, _ := ResolveRuntimeReadPath(appDir, "data/outbox")
 	type cand struct{ path, ts string }
 	var newest cand
 	if cases, err := os.ReadDir(c2); err == nil {
@@ -561,10 +567,13 @@ func loadLastErrors(cycleDir, appDir string) ([]loopErrorRow, string) {
 	// line typically captures pre-step failures (no setup, missing
 	// loop, invalid mode) that don't reach step_errors.json. Apps
 	// keep it under either ``journal.jsonl`` (top-level) or
-	// ``data/journal.jsonl`` — try both and pick the newest.
+	// ``data/journal.jsonl`` — resolve the canonical .lumid/journal.jsonl
+	// first, then fall back to legacy data/journal.jsonl and the
+	// top-level journal.jsonl.
+	journalCanonical, _ := ResolveRuntimeReadPath(appDir, "data/journal.jsonl")
 	journalTail := ""
 	for _, jp := range []string{
-		filepath.Join(appDir, "data", "journal.jsonl"),
+		journalCanonical,
 		filepath.Join(appDir, "journal.jsonl"),
 	} {
 		b, err := os.ReadFile(jp)
@@ -895,7 +904,8 @@ func loadAppGitStatus(home, app string) appGitStatus {
 	out := appGitStatus{App: app, Status: "no_git"}
 	appDir := filepath.Join(home, ".xp", "apps", app)
 	// version + kind from manifest.json (preferred) or xpcloud.yaml
-	if b, err := os.ReadFile(filepath.Join(appDir, "manifest.json")); err == nil {
+	manifestPath, _ := ResolveManifestPath(appDir)
+	if b, err := os.ReadFile(manifestPath); err == nil {
 		var m struct {
 			Version string `json:"version"`
 			Kind    string `json:"kind"`
@@ -906,7 +916,8 @@ func loadAppGitStatus(home, app string) appGitStatus {
 		}
 	}
 	if out.Kind == "" {
-		if b, err := os.ReadFile(filepath.Join(appDir, "xpcloud.yaml")); err == nil {
+		specPath, _ := ResolveSpecPath(appDir)
+		if b, err := os.ReadFile(specPath); err == nil {
 			var m struct {
 				Kind    string `yaml:"kind"`
 				Version string `yaml:"version"`
@@ -925,7 +936,8 @@ func loadAppGitStatus(home, app string) appGitStatus {
 	// from xpcloud. Newly-published-but-not-reinstalled apps may have
 	// a different shape; fall back to the operator's PAT subject.
 	publishedSlug := ""
-	if b, err := os.ReadFile(filepath.Join(appDir, "origin.json")); err == nil {
+	originPath, _ := ResolveRuntimeReadPath(appDir, "origin.json")
+	if b, err := os.ReadFile(originPath); err == nil {
 		var o struct {
 			Slug    string `json:"slug"`
 			Owner   string `json:"owner_sub"`

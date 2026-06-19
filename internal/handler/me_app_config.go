@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"net/http"
 	"os"
-	"path/filepath"
 
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
@@ -52,7 +51,7 @@ func MeAppConfig(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
+	yamlPath, _ := ResolveSpecPath(appDir)
 	b, err := os.ReadFile(yamlPath)
 	if err != nil {
 		fail(c, http.StatusNotFound, 1404, "xpcloud.yaml not found")
@@ -116,13 +115,16 @@ func MeUpdateAppConfig(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	yamlPath := filepath.Join(appDir, "xpcloud.yaml")
+	// Read against whichever file currently exists (dotfile or legacy) for
+	// the optimistic-lock check; write the canonical dotfile.
+	readPath, _ := ResolveSpecPath(appDir)
+	yamlPath := SpecWritePath(appDir)
 
 	// Optimistic lock: refuse a write based on a stale read. A 409 means
 	// "someone else changed the config since you loaded it" — the client
 	// reloads, reapplies, and retries.
 	if body.BaseSHA != "" {
-		if cur, err := os.ReadFile(yamlPath); err == nil && contentSHA(cur) != body.BaseSHA {
+		if cur, err := os.ReadFile(readPath); err == nil && contentSHA(cur) != body.BaseSHA {
 			fail(c, http.StatusConflict, 1409,
 				"config changed since you loaded it — reload to pick up the other edit, then reapply yours")
 			return
@@ -139,6 +141,10 @@ func MeUpdateAppConfig(c *gin.Context) {
 		_ = os.Remove(tmp)
 		fail(c, http.StatusInternalServerError, 1500, "cannot save config")
 		return
+	}
+	// Don't orphan a pre-existing legacy file once the dotfile is the truth.
+	if readPath != yamlPath {
+		_ = os.Remove(readPath)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

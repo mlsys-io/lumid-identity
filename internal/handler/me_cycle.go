@@ -42,6 +42,13 @@ type cycleListItem struct {
 	// without a detail fetch per row.
 	CostUSD     float64 `json:"cost_usd,omitempty"`
 	TotalTokens float64 `json:"total_tokens,omitempty"`
+	// Lineage — when a run was forked / re-run-from-here / run as a variant,
+	// the runner stamps the parent run's ts + a human branch label into
+	// cycle.json. Surfacing them here lets the UI's branch tree
+	// (cyclesList → MeCycleListItem) draw real edges instead of degrading to
+	// a flat linear chain. Empty for ordinary (root) runs.
+	ParentRunID string `json:"parent_run_id,omitempty"`
+	BranchLabel string `json:"branch_label,omitempty"`
 }
 
 // MeCyclesList serves GET /api/v1/me/cycles?app=&loop=&limit=
@@ -67,7 +74,7 @@ func MeCyclesList(c *gin.Context) {
 		if appFilter != "" && a.Name() != appFilter {
 			continue
 		}
-		cyclesRoot := filepath.Join(tenantApps, a.Name(), "data", "cycles")
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(tenantApps, a.Name()), "data/cycles")
 		loops, _ := os.ReadDir(cyclesRoot)
 		for _, lp := range loops {
 			if !lp.IsDir() {
@@ -100,6 +107,15 @@ func MeCyclesList(c *gin.Context) {
 							if v, ok := cost["total_tokens"].(float64); ok {
 								item.TotalTokens = v
 							}
+						}
+						// Lineage edges — written by the runner when this run
+						// forked/re-ran from an earlier cycle (see MeLoopRunNow's
+						// from_run_ts/branch_label threading). Empty for root runs.
+						if v, ok := raw["parent_run_id"].(string); ok {
+							item.ParentRunID = v
+						}
+						if v, ok := raw["branch_label"].(string); ok {
+							item.BranchLabel = v
 						}
 					}
 				} else if st, serr := os.Stat(filepath.Join(cyclesRoot, lp.Name(), td.Name())); serr == nil &&
@@ -179,7 +195,11 @@ func cycleDetailForUser(userID, app, loop, ts string) (gin.H, bool) {
 	// own root with a prefix guard so a crafted ts can't escape either base.
 	var cycleDir string
 	for _, root := range []string{tenantAppsDir(userID), filepath.Join(operatorHome(), ".xp", "apps")} {
-		cand := filepath.Join(root, app, "data", "cycles", loop, ts)
+		// Resolve data/cycles → .lumid/cycles (canonical wins when present) then
+		// anchor loop/ts under it. Prefix-guard still anchors to root so a crafted
+		// app/loop/ts can't escape either base.
+		cyclesRoot, _ := ResolveRuntimeReadPath(filepath.Join(root, app), "data/cycles")
+		cand := filepath.Join(cyclesRoot, loop, ts)
 		abs, err := filepath.Abs(cand)
 		if err != nil || !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
 			continue
@@ -436,7 +456,8 @@ func MeLoopMetricSeries(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	cyclesDir := filepath.Join(appDir, "data", "cycles", loop)
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	cyclesDir := filepath.Join(cyclesRoot, loop)
 	ents, _ := os.ReadDir(cyclesDir)
 	type dirT struct {
 		ts    string

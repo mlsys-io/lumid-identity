@@ -79,7 +79,12 @@ var destructiveTools = map[string]bool{
 	"multi_edit":     true,
 	"app_push":       true,
 	"app_install":    true,
-	"run_loop":       true,
+	// Phase 4 (app -> agent) canonical names. The old app_* names stay above
+	// as aliases so in-flight clients/prompts keep working; both route to the
+	// same LumidOS bridge handler (see agentToolAlias + dispatchTool).
+	"agent_push":    true,
+	"agent_install": true,
+	"run_loop":      true,
 	"submit_workflow": true,
 	"xp_ingest":      true,
 	// C3 observability/action tools that mutate state.
@@ -103,11 +108,20 @@ var destructiveTools = map[string]bool{
 // lumidosToolNames is the set of tool names dispatched to the LumidOS schedule
 // server bridge (POST /api/v1/tools/invoke at LUMIDOS_URL).
 var lumidosToolNames = map[string]bool{
-	// Apps
+	// Apps (legacy names — kept as aliases). Phase 4 introduces agent_* canonical
+	// twins (registered via agentToolAlias below); both forward to the same
+	// LumidOS bridge op, with the canonical name normalized back to app_* before
+	// the POST (the schedule server still speaks app_*).
 	"app_marketplace": true, "app_detail": true, "app_new": true, "app_templates": true,
 	"app_install": true, "app_clone": true, "app_update": true, "app_validate": true,
 	"app_list": true, "app_run": true, "app_publish": true, "app_push": true,
 	"app_unpublish": true, "app_add_skill": true, "skill_search": true, "loop_metrics": true,
+	// Phase 4 canonical agent_* names — accepted by the dispatcher; normalized
+	// back to app_* on the wire by agentToolWireName().
+	"agent_marketplace": true, "agent_detail": true, "agent_new": true, "agent_templates": true,
+	"agent_install": true, "agent_clone": true, "agent_update": true, "agent_validate": true,
+	"agent_list": true, "agent_run": true, "agent_publish": true, "agent_push": true,
+	"agent_unpublish": true, "agent_add_skill": true,
 	// Knowledge
 	"xp_status": true, "xp_ask": true, "xp_agents": true, "xp_memories": true,
 	"xp_ingest": true, "xp_feedback": true, "xp_new_agent": true, "xp_share": true,
@@ -121,6 +135,39 @@ var lumidosToolNames = map[string]bool{
 	"research_clone_workflow": true, "research_unpublish_workflow": true,
 	// Platform
 	"submit_workflow": true, "list_workers": true, "optimize_workflow": true,
+}
+
+// agentToolAlias maps each Phase-4 canonical agent_* tool name to the legacy
+// app_* name it aliases. Both names are advertised in the tool catalog and both
+// dispatch to the same handler; the canonical name is normalized back to the
+// legacy wire name before the LumidOS bridge POST (the schedule server still
+// recognizes app_* only). Keeping the alias means in-flight clients/prompts
+// that call app_* never break.
+var agentToolAlias = map[string]string{
+	"agent_marketplace": "app_marketplace",
+	"agent_detail":      "app_detail",
+	"agent_new":         "app_new",
+	"agent_templates":   "app_templates",
+	"agent_install":     "app_install",
+	"agent_clone":       "app_clone",
+	"agent_update":      "app_update",
+	"agent_validate":    "app_validate",
+	"agent_list":        "app_list",
+	"agent_run":         "app_run",
+	"agent_publish":     "app_publish",
+	"agent_push":        "app_push",
+	"agent_unpublish":   "app_unpublish",
+	"agent_add_skill":   "app_add_skill",
+}
+
+// agentToolWireName normalizes a canonical agent_* tool name to the legacy
+// app_* name the LumidOS schedule server understands. Non-aliased names pass
+// through unchanged.
+func agentToolWireName(name string) string {
+	if legacy, ok := agentToolAlias[name]; ok {
+		return legacy
+	}
+	return name
 }
 
 // lumidosURL returns the base URL of the LumidOS schedule server.
@@ -1387,7 +1434,11 @@ func tokensUsedLast24h(userSub string) int {
 	row := common.DB.
 		Model(&models.UsageEvent{}).
 		Where("user_sub = ? AND ts > ?", userSub, cutoff).
-		Select("COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out").
+		// NB: `out` is a MySQL reserved word — aliasing to it yields a 1064
+		// syntax error ("... as out FROM ...") and the budget query silently
+		// fail-opens (usage always 0 ⇒ no enforcement). Use `outp`. Scan is
+		// positional, so the alias name doesn't affect the read below.
+		Select("COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as outp").
 		Row()
 	if row != nil {
 		// On a scan error this returns 0 — i.e. budget enforcement fails OPEN
@@ -2641,24 +2692,42 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "app_list",
-			"description": "List all xpio apps installed on this host.",
+			"name":        "agent_list",
+			"description": "List all xpio agents installed on this host.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
-			"name":        "app_marketplace",
-			"description": "Browse the xp.io app marketplace.",
+			// Alias of agent_list (legacy name). Kept so in-flight clients/prompts
+			// calling app_list keep working; both dispatch to the same op.
+			"name":        "app_list",
+			"description": "Alias of agent_list (legacy name). List all xpio agents installed on this host.",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "agent_marketplace",
+			"description": "Browse the xp.io agent marketplace.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"q":    map[string]any{"type": "string"},
-					"kind": map[string]any{"type": "string", "description": "app | skill | autoresearch. Default: app."},
+					"kind": map[string]any{"type": "string", "description": "agent | skill | workflow | dataset | memory. Default: agent."},
 				},
 			},
 		},
 		{
-			"name":        "app_detail",
-			"description": "Get metadata and schema for a specific xpio app from the marketplace.",
+			"name":        "app_marketplace",
+			"description": "Alias of agent_marketplace (legacy name). Browse the xp.io agent marketplace.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"q":    map[string]any{"type": "string"},
+					"kind": map[string]any{"type": "string", "description": "agent | skill | workflow | dataset | memory. Default: agent."},
+				},
+			},
+		},
+		{
+			"name":        "agent_detail",
+			"description": "Get metadata and schema for a specific xpio agent from the marketplace.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{"slug": map[string]any{"type": "string"}},
@@ -2666,8 +2735,29 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "app_detail",
+			"description": "Alias of agent_detail (legacy name). Get metadata and schema for a specific xpio agent from the marketplace.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"slug": map[string]any{"type": "string"}},
+				"required":   []string{"slug"},
+			},
+		},
+		{
+			"name":        "agent_install",
+			"description": "Install an xpio agent from xp.io to this host.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"slug":     map[string]any{"type": "string"},
+					"new_name": map[string]any{"type": "string"},
+				},
+				"required": []string{"slug"},
+			},
+		},
+		{
 			"name":        "app_install",
-			"description": "Install an xpio app from xp.io to this host.",
+			"description": "Alias of agent_install (legacy name). Install an xpio agent from xp.io to this host.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -2738,8 +2828,8 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "app_push",
-			"description": "Push a local xpio app to xp.io (publish / update). Auto-bumps patch version if content changed. Requires approval.",
+			"name":        "agent_push",
+			"description": "Push a local xpio agent to xp.io (publish / update). Auto-bumps patch version if content changed. Requires approval.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -2750,8 +2840,38 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name":        "app_push",
+			"description": "Alias of agent_push (legacy name). Push a local xpio agent to xp.io (publish / update). Auto-bumps patch version if content changed. Requires approval.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name":    map[string]any{"type": "string"},
+					"message": map[string]any{"type": "string"},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        "agent_validate",
+			"description": "Validate an installed xpio agent's manifest and config before pushing.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
 			"name":        "app_validate",
-			"description": "Validate an installed xpio app's manifest and config before pushing.",
+			"description": "Alias of agent_validate (legacy name). Validate an installed xpio agent's manifest and config before pushing.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{"name": map[string]any{"type": "string"}},
+				"required":   []string{"name"},
+			},
+		},
+		{
+			"name":        "agent_update",
+			"description": "Pull the latest version of an installed agent from xp.io.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
@@ -2760,7 +2880,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "app_update",
-			"description": "Pull the latest version of an installed app from xp.io.",
+			"description": "Alias of agent_update (legacy name). Pull the latest version of an installed agent from xp.io.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
@@ -3444,8 +3564,11 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 	}
 
 	// ── LumidOS bridge ────────────────────────────────────────────────────
+	// Both legacy app_* and Phase-4 canonical agent_* names land here; the
+	// canonical name is normalized to its legacy app_* wire name first, since
+	// the schedule server still dispatches on app_*.
 	if lumidosToolNames[name] {
-		return dispatchLumidosTool(name, args)
+		return dispatchLumidosTool(agentToolWireName(name), args)
 	}
 
 	log.Printf("[me-agent] unknown tool name=%q user=%s — in prompt catalog but not wired into dispatch", name, userID)

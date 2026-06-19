@@ -1361,10 +1361,32 @@ func MeAgentChat(c *gin.Context) {
 				OK:     callOK,
 			})
 			payload, _ := json.Marshal(result)
+			content := string(payload)
+			// On failure, hand the model an UNMISTAKABLE error envelope rather
+			// than the raw result map. Weak models (e.g. kvrun-gemma4) otherwise
+			// paper over a failed tool call with a plausible-sounding answer —
+			// the dogfood "list_loops/app_detail ok=false → fabricated reply"
+			// gap. We pull a human message out of `error`/`detail` (the LumidOS
+			// bridge returns FastAPI's {"detail":...} on bad args / not-found),
+			// flag it, and instruct the model to report the failure verbatim.
+			if !callOK {
+				msg := "the tool call failed"
+				if e, ok := result["error"].(string); ok && e != "" {
+					msg = e
+				} else if d, ok := result["detail"].(string); ok && d != "" {
+					msg = d
+				}
+				eb, _ := json.Marshal(map[string]any{
+					"tool_failed": true,
+					"error":       msg,
+					"instruction": "This tool call FAILED. Tell the user it failed and why (use the error text); do NOT fabricate, guess, or substitute a plausible-sounding result.",
+				})
+				content = string(eb)
+			}
 			toolResultBlocks = append(toolResultBlocks, map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": toolID,
-				"content":     string(payload),
+				"content":     content,
 				"is_error":    !callOK,
 			})
 		}

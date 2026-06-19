@@ -1434,7 +1434,11 @@ func tokensUsedLast24h(userSub string) int {
 	row := common.DB.
 		Model(&models.UsageEvent{}).
 		Where("user_sub = ? AND ts > ?", userSub, cutoff).
-		Select("COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out").
+		// NB: `out` is a MySQL reserved word — aliasing to it yields a 1064
+		// syntax error ("... as out FROM ...") and the budget query silently
+		// fail-opens (usage always 0 ⇒ no enforcement). Use `outp`. Scan is
+		// positional, so the alias name doesn't affect the read below.
+		Select("COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as outp").
 		Row()
 	if row != nil {
 		// On a scan error this returns 0 — i.e. budget enforcement fails OPEN

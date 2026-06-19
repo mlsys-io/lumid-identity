@@ -366,6 +366,12 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/trajectory/signals",  MeTrajectorySignals)
 			// Goal-metric trajectory across cycles (improvement over iterations).
 			me.GET("/apps/:app/loops/:loop/metric-series", MeLoopMetricSeries)
+			// Branching-runtime ops + recommender (thin shims over the
+			// lumid-trajectory CLI; HOME bound to the caller's tenant root).
+			me.GET("/apps/:app/next-actions",            MeNextActions)         // recommender: what to do next
+			me.GET("/apps/:app/loops/:loop/lineage",     MeLoopLineage)         // branch tree (parent_run_id edges)
+			me.POST("/apps/:app/runs/:ts/promote",       MeRunPromote)          // mark chosen branch
+			me.POST("/apps/:app/runs/:ts/discard",       MeRunDiscard)          // grey out a run
 			// Hard-remove a single workflow (loop) from one of the caller's apps.
 			me.DELETE("/apps/:app/loops/:loop", MeLoopDelete)
 			// Direct workflow compose (composer wizard — instant, no chat LLM).

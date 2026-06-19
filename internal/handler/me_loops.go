@@ -153,6 +153,13 @@ func MeLoopPatch(c *gin.Context) {
 
 type meLoopRunBody struct {
 	Args map[string]any `json:"args,omitempty"`
+	// Trajectory ops (item 18). When this run is a fork / re-run-from-here /
+	// run-a-variant of an earlier cycle, the UI (G3b) sends these; the
+	// scheduler's drain_oneshots threads them into app_runner.cycle() so the
+	// produced cycle.json records lineage. All optional → plain run-now.
+	FromRunTs   string         `json:"from_run_ts,omitempty"`
+	Variant     map[string]any `json:"variant,omitempty"`
+	BranchLabel string         `json:"branch_label,omitempty"`
 }
 
 // POST /api/v1/me/loops/:app/:loop/run
@@ -184,8 +191,11 @@ func MeLoopRunNow(c *gin.Context) {
 		"submitted_at":   time.Now().UTC().Format(time.RFC3339),
 		"submitted_by":   userID,
 		"payload": map[string]any{
-			"oneshot": true,
-			"args":    body.Args,
+			"oneshot":      true,
+			"args":         body.Args,
+			"from_run_ts":  body.FromRunTs,
+			"variant":      body.Variant,
+			"branch_label": body.BranchLabel,
 		},
 	}
 	if err := appendJobRow(row); err != nil {

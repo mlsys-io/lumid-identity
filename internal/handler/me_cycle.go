@@ -42,6 +42,13 @@ type cycleListItem struct {
 	// without a detail fetch per row.
 	CostUSD     float64 `json:"cost_usd,omitempty"`
 	TotalTokens float64 `json:"total_tokens,omitempty"`
+	// Lineage — when a run was forked / re-run-from-here / run as a variant,
+	// the runner stamps the parent run's ts + a human branch label into
+	// cycle.json. Surfacing them here lets the UI's branch tree
+	// (cyclesList → MeCycleListItem) draw real edges instead of degrading to
+	// a flat linear chain. Empty for ordinary (root) runs.
+	ParentRunID string `json:"parent_run_id,omitempty"`
+	BranchLabel string `json:"branch_label,omitempty"`
 }
 
 // MeCyclesList serves GET /api/v1/me/cycles?app=&loop=&limit=
@@ -100,6 +107,15 @@ func MeCyclesList(c *gin.Context) {
 							if v, ok := cost["total_tokens"].(float64); ok {
 								item.TotalTokens = v
 							}
+						}
+						// Lineage edges — written by the runner when this run
+						// forked/re-ran from an earlier cycle (see MeLoopRunNow's
+						// from_run_ts/branch_label threading). Empty for root runs.
+						if v, ok := raw["parent_run_id"].(string); ok {
+							item.ParentRunID = v
+						}
+						if v, ok := raw["branch_label"].(string); ok {
+							item.BranchLabel = v
 						}
 					}
 				} else if st, serr := os.Stat(filepath.Join(cyclesRoot, lp.Name(), td.Name())); serr == nil &&

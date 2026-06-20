@@ -182,12 +182,13 @@ func toolCasebook(userID, app, loop string) (map[string]any, bool) {
 	for _, x := range loopExperiments(appDir, loop) {
 		expAllow[x] = true
 	}
-	scores, metricEvo := casebookScoresFromExperiments(appDir, expAllow, loop != "")
+	scores, metricEvo, scoredVia := casebookScoresFromExperiments(appDir, expAllow, loop != "")
 	cases := casebookRoster(appDir, scores)
 	return map[string]any{
 		"app": app, "loop": loop,
 		"cases": cases, "metrics_evolution": metricEvo,
 		"version_history": casebookVersionHistory(appDir, loop),
+		"scored_via":      scoredVia,
 	}, true
 }
 

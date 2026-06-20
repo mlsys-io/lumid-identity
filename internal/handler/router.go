@@ -222,6 +222,13 @@ func Register(r *gin.Engine) {
 			me.POST("/apps/:app/ui/generate", MeGenerateAppUI)  // AI-generate surface from config
 			me.GET("/apps/:app/config",       MeAppConfig)      // read xpcloud.yaml
 			me.PUT("/apps/:app/config",       MeUpdateAppConfig) // write xpcloud.yaml (YAML-validated)
+			// Prompt editor — analyst & judge prompt cards. List unions local
+			// overrides with inherited shared-skill prompts; PUT/DELETE write a
+			// LOCAL override in the caller's own app only (never the shared file).
+			me.GET("/apps/:app/prompts",         MeAppPrompts)
+			me.GET("/apps/:app/prompts/:name",   MeAppPrompt)
+			me.PUT("/apps/:app/prompts/:name",   MeUpdateAppPrompt)
+			me.DELETE("/apps/:app/prompts/:name", MeDeleteAppPrompt)
 			me.POST("/apps/:app/skills",      MeAppAddSkill)    // add a kind=skill repo to skill_imports[]
 			// Repo workflow — fork a showcase app, publish your tree
 			// to YOUR xp.io repo, propose changes upstream as a PR.
@@ -354,6 +361,9 @@ func Register(r *gin.Engine) {
 			// prompt audit + summary).
 			me.GET("/cycles",                       MeCyclesList)
 			me.GET("/cycles/:app/:loop/:ts",        MeCycleDetail)
+			// Grep a single cycle's run-log + issues (transcript + journal +
+			// step errors) for a query string.
+			me.GET("/cycles/:app/:loop/:ts/search", MeCycleLogSearch)
 			// Dataset / casebook explorer for the app-overview page.
 			me.GET("/apps/:app/datasets",      MeAppDatasets)
 			me.GET("/apps/:app/dataset-file",  MeAppDatasetFile)

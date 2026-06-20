@@ -106,6 +106,11 @@ var destructiveTools = map[string]bool{
 	"app_ui_generate": true,
 	"run_promote":     true,
 	"run_discard":     true,
+	// Prompt editor writes (own tenant app only) + branch-with-intention.
+	// Reads (app_prompt_list/app_prompt_get/search_run_log) are NOT gated.
+	"app_prompt_set":   true,
+	"app_prompt_reset": true,
+	"branch_run":       true,
 	// Admin control-plane writes (admin_users / admin_clusters reads are NOT gated).
 	"admin_set_user_role":      true,
 	"admin_set_user_status":    true,

@@ -175,7 +175,7 @@ func MeCasebook(c *gin.Context) {
 	for _, x := range loopExperiments(appDir, loop) {
 		expAllow[x] = true
 	}
-	scores, metricEvo := casebookScoresFromExperiments(appDir, expAllow, loop != "")
+	scores, metricEvo, scoredVia := casebookScoresFromExperiments(appDir, expAllow, loop != "")
 
 	// 2. The case roster (per-case files, then a flat single-file casebook).
 	cases := casebookRoster(appDir, scores)
@@ -203,6 +203,12 @@ func MeCasebook(c *gin.Context) {
 			"cases":             cases,
 			"version_history":   versionHistory,
 			"metrics_evolution": metricEvo,
+			// How the scores were attributed: "loop_experiment" when the loop
+			// declared its own experiment, "app_fallback" when it declared none
+			// and we fell back to the app's experiment results (so the UI can
+			// show "scored via the app's experiments" provenance), or "" when no
+			// scores were found at all.
+			"scored_via": scoredVia,
 		},
 	})
 }
@@ -215,20 +221,40 @@ func MeCasebook(c *gin.Context) {
 //    "cycle_ts":"20260612T112000Z","dims":{"case_id":"Case_001…","q_id":"Q2"}}
 // allowed/strict bind metrics to the selected workflow: when strict, only the
 // loop's declared experiments contribute scores (different loops can share the
-// DATA but never each other's metrics). strict && empty allowed → no metrics.
-func casebookScoresFromExperiments(appDir string, allowed map[string]bool, strict bool) (map[string][]casebookScorePoint, []casebookMetricEvolution) {
+// DATA but never each other's metrics).
+//
+// scoredVia (third return) reports the attribution provenance so the caller can
+// surface it: "loop_experiment" when the strict loop binding produced scores,
+// "app_fallback" when the loop declared NO experiment and we fell back to the
+// app's experiment results (non-strict), or "" when no scores were found at all.
+//
+// Fallback (WS-4b): a loop that declares no experiment used to return silent-
+// empty (`strict && len(allowed)==0`). That hid scores for loops like mbb-ai's
+// `case_cycle`, whose cases ARE scored by the app's experiments but which never
+// declared one. Instead of empty, we now drop strictness and attribute the
+// app's experiment results to the loop, tagged "app_fallback".
+func casebookScoresFromExperiments(appDir string, allowed map[string]bool, strict bool) (map[string][]casebookScorePoint, []casebookMetricEvolution, string) {
 	scores := map[string][]casebookScorePoint{}
 	// metric -> cycle_ts -> values (averaged per cycle for the trajectory)
 	metricByCycle := map[string]map[string][]float64{}
 	metricOrder := []string{}
 
-	if strict && len(allowed) == 0 {
-		return scores, nil // this workflow declares no experiment → no metrics
+	scoredVia := ""
+	if !strict {
+		scoredVia = "all_experiments"
+	} else if len(allowed) > 0 {
+		scoredVia = "loop_experiment"
+	} else {
+		// This loop declares no experiment. Rather than return empty, fall back
+		// to the app's experiment results (non-strict) so its cases still carry
+		// scores — tagged so the UI can note the looser provenance.
+		strict = false
+		scoredVia = "app_fallback"
 	}
 	expRoot, _ := ResolveRuntimeReadPath(appDir, "data/experiments")
 	exps, err := os.ReadDir(expRoot)
 	if err != nil {
-		return scores, nil
+		return scores, nil, ""
 	}
 	for _, e := range exps {
 		if !e.IsDir() {
@@ -335,7 +361,12 @@ func casebookScoresFromExperiments(appDir string, allowed map[string]bool, stric
 			evo = append(evo, casebookMetricEvolution{Metric: strings.ReplaceAll(m, "_", " "), Points: pts})
 		}
 	}
-	return scores, evo
+	// Nothing was actually attributed — clear the provenance note so the UI
+	// doesn't claim a fallback that produced no scores.
+	if len(scores) == 0 {
+		scoredVia = ""
+	}
+	return scores, evo, scoredVia
 }
 
 // pickScore returns (value, keyUsed) for the score to attribute to a result

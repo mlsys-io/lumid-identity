@@ -169,6 +169,82 @@ func appOpsToolDefs() []map[string]any {
 				"required": []string{"ts"},
 			},
 		},
+		{
+			"name":        "app_prompt_list",
+			"description": "List an app's analyst & judge PROMPT cards (analyst_system, analyst_skill_*, judge_*). Returns each prompt's name, source (local override vs shared:<skill repo>), whether it's editable, and its sha. Call this before app_prompt_get/app_prompt_set. No approval needed (read-only).",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"app": map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"}},
+			},
+		},
+		{
+			"name":        "app_prompt_get",
+			"description": "Read one of an app's prompt cards (its markdown content) so you can review or edit it. Returns {content, source, sha, editable}. The sha is the optimistic lock for app_prompt_set. No approval needed (read-only).",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"name": map[string]any{"type": "string", "description": "prompt file name, e.g. judge_score_qual.md"},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        "app_prompt_set",
+			"description": "Write/replace an app's prompt card — this is how you EDIT an analyst or judge prompt from chat. Writes a LOCAL override in your OWN installed app (the shared skill prompt is never mutated; operator-shared apps are read-only — fork first). Pass `base_sha` from app_prompt_get to avoid clobbering a concurrent edit. Requires user approval.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":      map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"name":     map[string]any{"type": "string", "description": "prompt file name, e.g. judge_score_qual.md"},
+					"content":  map[string]any{"type": "string", "description": "the new prompt markdown"},
+					"base_sha": map[string]any{"type": "string", "description": "sha from app_prompt_get (optimistic lock; optional)"},
+				},
+				"required": []string{"name", "content"},
+			},
+		},
+		{
+			"name":        "app_prompt_reset",
+			"description": "Reset an app's prompt card to its inherited shared default by removing the LOCAL override (the shared skill prompt is never touched). Use when the user wants to discard their prompt edits. Requires user approval.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"name": map[string]any{"type": "string", "description": "prompt file name, e.g. judge_score_qual.md"},
+				},
+				"required": []string{"name"},
+			},
+		},
+		{
+			"name":        "branch_run",
+			"description": "Branch from an existing run with an exploration intention — records a 'branch from here' control signal carrying a free-text note ('what should this attempt explore?') plus an optional config variant. The proposer/hypothesize stage reads the note as its directive on the next run. Use when the user wants to try a new direction off a prior run. Requires user approval.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":     map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"loop":    map[string]any{"type": "string", "description": "workflow name the run belongs to"},
+					"from_ts": map[string]any{"type": "string", "description": "the run id to branch from, e.g. 20060102T150405Z"},
+					"note":    map[string]any{"type": "string", "description": "the exploration intention — what this attempt should explore"},
+					"variant": map[string]any{"type": "object", "description": "optional config overrides for the branched attempt"},
+				},
+				"required": []string{"loop", "from_ts", "note"},
+			},
+		},
+		{
+			"name":        "search_run_log",
+			"description": "Search a single run's logs/issues — its LLM transcript, stage journal, and step errors — for a query string. Use to answer 'find the errors in the last run', 'where did it mention X'. Optional `type` narrows to llm | stage | error. Returns matches with snippets. No approval needed (read-only).",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"loop": map[string]any{"type": "string", "description": "workflow name the run belongs to"},
+					"ts":   map[string]any{"type": "string", "description": "the run id, e.g. 20060102T150405Z"},
+					"q":    map[string]any{"type": "string", "description": "case-insensitive query string"},
+					"type": map[string]any{"type": "string", "description": "optional source filter: llm | stage | error"},
+				},
+				"required": []string{"loop", "ts", "q"},
+			},
+		},
 	}
 }
 
@@ -300,6 +376,57 @@ func dispatchAppOpsTool(c *gin.Context, userID, role, name string, args map[stri
 		}
 		res, okRes := toolRunMark(userID, verb, app, strVal(args, "ts"), strVal(args, "loop"))
 		log.Printf("[app-ops] %s app=%s ts=%s user=%s ok=%v", name, app, strVal(args, "ts"), userID, okRes)
+		return res, okRes, true
+
+	case "app_prompt_list":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolAppPromptList(userID, app)
+		return res, okRes, true
+
+	case "app_prompt_get":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolAppPromptGet(userID, app, strVal(args, "name"))
+		return res, okRes, true
+
+	case "app_prompt_set":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolAppPromptSet(userID, app, args)
+		log.Printf("[app-ops] app_prompt_set app=%s name=%s user=%s ok=%v", app, strVal(args, "name"), userID, okRes)
+		return res, okRes, true
+
+	case "app_prompt_reset":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolAppPromptReset(userID, app, strVal(args, "name"))
+		log.Printf("[app-ops] app_prompt_reset app=%s name=%s user=%s ok=%v", app, strVal(args, "name"), userID, okRes)
+		return res, okRes, true
+
+	case "branch_run":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolBranchRun(userID, app, args)
+		log.Printf("[app-ops] branch_run app=%s loop=%s from=%s user=%s ok=%v", app, strVal(args, "loop"), strVal(args, "from_ts"), userID, okRes)
+		return res, okRes, true
+
+	case "search_run_log":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolSearchRunLog(userID, app, args)
 		return res, okRes, true
 	}
 	return nil, false, false
@@ -556,6 +683,256 @@ func toolRunMark(userID, verb, app, ts, loop string) (map[string]any, bool) {
 	obj["ts"] = ts
 	obj[verb+"d"] = true
 	return obj, true
+}
+
+// ── prompt tools (WS-8 / WS-7 chat twins) ───────────────────────────────────
+
+// toolAppPromptList mirrors MeAppPrompts: local + inherited shared prompt cards.
+func toolAppPromptList(userID, app string) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	_, owned, _ := resolveOwnedAppDir(userID, app)
+	byName := map[string]*promptInfo{}
+	order := []string{}
+	upsert := func(name string) *promptInfo {
+		if p, has := byName[name]; has {
+			return p
+		}
+		p := &promptInfo{Name: name}
+		byName[name] = p
+		order = append(order, name)
+		return p
+	}
+	for _, repo := range appPromptSkillImports(appDir) {
+		sdir := skillPromptsDir(userID, repo)
+		if sdir == "" {
+			continue
+		}
+		for _, n := range readMdNames(sdir) {
+			p := upsert(n)
+			p.Source = "shared:" + repo
+			p.Editable = owned
+			if b, err := os.ReadFile(filepath.Join(sdir, n)); err == nil {
+				p.SHA = contentSHA(b)
+			}
+		}
+	}
+	for _, n := range readMdNames(localPromptsDir(appDir)) {
+		p := upsert(n)
+		p.Source = "local"
+		p.Editable = owned
+		if b, err := os.ReadFile(filepath.Join(localPromptsDir(appDir), n)); err == nil {
+			p.SHA = contentSHA(b)
+		}
+	}
+	prompts := make([]promptInfo, 0, len(order))
+	for _, n := range order {
+		prompts = append(prompts, *byName[n])
+	}
+	return map[string]any{"app": app, "prompts": prompts}, true
+}
+
+// toolAppPromptGet mirrors MeAppPrompt: a prompt card's content + source + sha.
+func toolAppPromptGet(userID, app, name string) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	if !validPromptName(name) {
+		return map[string]any{"error": "valid prompt name required (.md only)"}, false
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	path, source := resolvePromptRead(userID, appDir, name)
+	if path == "" {
+		return map[string]any{"error": "prompt not found: " + name}, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]any{"error": "cannot read prompt"}, false
+	}
+	if len(b) > promptMaxBytes {
+		b = b[:promptMaxBytes]
+	}
+	_, owned, _ := resolveOwnedAppDir(userID, app)
+	return map[string]any{
+		"app": app, "name": name, "content": string(b),
+		"source": source, "sha": contentSHA(b), "editable": owned,
+	}, true
+}
+
+// toolAppPromptSet mirrors MeUpdateAppPrompt: write a LOCAL override (own app
+// only), optimistic lock, atomic. Approval-gated (destructiveTools).
+func toolAppPromptSet(userID, app string, args map[string]any) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	name := strVal(args, "name")
+	if !validPromptName(name) {
+		return map[string]any{"error": "valid prompt name required (.md only)"}, false
+	}
+	content, _ := args["content"].(string)
+	if strings.TrimSpace(content) == "" {
+		return map[string]any{"error": "content required"}, false
+	}
+	if len(content) > promptMaxBytes {
+		return map[string]any{"error": "prompt exceeds 256 KB limit"}, false
+	}
+	baseSHA := strVal(args, "base_sha")
+	appDir, owned, shared := resolveOwnedAppDir(userID, app)
+	if !owned {
+		if shared {
+			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
+		}
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	abs, err := safeAppJoin(appDir, filepath.Join(promptDirRel, name))
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	if strings.ToLower(filepath.Ext(abs)) != ".md" {
+		return map[string]any{"error": "prompt must be a .md file"}, false
+	}
+	if baseSHA != "" {
+		if cur, rerr := os.ReadFile(abs); rerr == nil && contentSHA(cur) != baseSHA {
+			return map[string]any{"error": "this prompt changed since you loaded it — call app_prompt_get again and reapply"}, false
+		}
+	}
+	if err := writeFileAtomic(abs, []byte(content)); err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	return map[string]any{"app": app, "name": name, "saved": true, "sha": contentSHA([]byte(content))}, true
+}
+
+// toolAppPromptReset mirrors MeDeleteAppPrompt: remove the LOCAL override only
+// (revert to the inherited shared prompt). Approval-gated.
+func toolAppPromptReset(userID, app, name string) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	if !validPromptName(name) {
+		return map[string]any{"error": "valid prompt name required (.md only)"}, false
+	}
+	appDir, owned, shared := resolveOwnedAppDir(userID, app)
+	if !owned {
+		if shared {
+			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
+		}
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	abs, err := safeAppJoin(appDir, filepath.Join(promptDirRel, name))
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+		return map[string]any{"error": "cannot remove prompt override"}, false
+	}
+	return map[string]any{"app": app, "name": name, "reverted": true}, true
+}
+
+// ── branch_run tool (WS-8 / WS-5) ────────────────────────────────────────────
+
+// toolBranchRun records a "branch from here" control signal carrying the
+// exploration intention (note) + optional config variant, mirroring the
+// MeTrajectorySignal write path. The proposer stage reads the pending signal's
+// note as its directive on the next run. Approval-gated (destructiveTools).
+func toolBranchRun(userID, app string, args map[string]any) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	loop := strVal(args, "loop")
+	fromTs := strVal(args, "from_ts")
+	note := strings.TrimSpace(strVal(args, "note"))
+	if loop == "" || !slugRe.MatchString(loop) {
+		return map[string]any{"error": "valid loop required"}, false
+	}
+	if fromTs == "" || !slugRe.MatchString(fromTs) || strings.ContainsAny(fromTs, "/\\") || strings.Contains(fromTs, "..") {
+		return map[string]any{"error": "valid from_ts required (e.g. 20060102T150405Z)"}, false
+	}
+	if note == "" {
+		return map[string]any{"error": "note required — say what this attempt should explore"}, false
+	}
+	var variant map[string]any
+	if v, ok := args["variant"].(map[string]any); ok {
+		variant = v
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	rec := signalRecord{
+		Ts:     time.Now().UTC().Format(time.RFC3339),
+		Action: "branch",
+		Loop:   loop,
+		FromID: fromTs,
+		Config: variant,
+		Note:   note,
+		By:     userID,
+		Status: "pending",
+	}
+	controlDir, err := ResolveRuntimeWritePath(appDir, "data/control")
+	if err != nil {
+		return map[string]any{"error": "could not prepare control dir"}, false
+	}
+	if err := os.MkdirAll(controlDir, 0o775); err != nil {
+		return map[string]any{"error": "could not prepare control dir"}, false
+	}
+	path := filepath.Join(controlDir, "signals.jsonl")
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return map[string]any{"error": "could not encode signal"}, false
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return map[string]any{"error": "could not open signals log"}, false
+	}
+	if _, werr := f.Write(append(line, '\n')); werr != nil {
+		f.Close()
+		return map[string]any{"error": "could not write signal"}, false
+	}
+	f.Close()
+	return map[string]any{
+		"app": app, "loop": loop, "from_ts": fromTs,
+		"branched": true, "note": note, "pending": countPendingSignals(path),
+	}, true
+}
+
+// ── search_run_log tool (WS-8 / WS-6) ────────────────────────────────────────
+
+// toolSearchRunLog mirrors MeCycleLogSearch: grep one run's transcript +
+// journal + step errors for q. Read-only.
+func toolSearchRunLog(userID, app string, args map[string]any) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	loop := strVal(args, "loop")
+	ts := strVal(args, "ts")
+	q := strings.TrimSpace(strVal(args, "q"))
+	kind := strVal(args, "type")
+	if loop == "" || !slugRe.MatchString(loop) {
+		return map[string]any{"error": "valid loop required"}, false
+	}
+	if ts == "" || !slugRe.MatchString(ts) {
+		return map[string]any{"error": "valid ts required (e.g. 20060102T150405Z)"}, false
+	}
+	if q == "" {
+		return map[string]any{"error": "q required"}, false
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	matches, capped := searchCycleLog(appDir, loop, ts, q, kind)
+	return map[string]any{
+		"app": app, "loop": loop, "ts": ts, "q": q, "type": kind,
+		"matches": matches, "count": len(matches), "capped": capped,
+	}, true
 }
 
 func strVal(args map[string]any, k string) string {

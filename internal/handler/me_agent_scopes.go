@@ -10,7 +10,7 @@ package handler
 // closing the "forgot to wire the tool into TOOL_EFFECTS → stale UI" bug class.
 //
 // Scope vocabulary mirrors the frontend DataScope union (chat/effects.ts):
-//   apps workflows loops runs cycles drafts knowledge config experiments users ui
+//   apps workflows loops runs cycles drafts knowledge config experiments users ui prompts
 var toolDataScopes = map[string][]string{
 	// loop / workflow execution + schedule
 	"run_loop":     {"runs", "cycles", "loops", "workflows"},
@@ -39,6 +39,12 @@ var toolDataScopes = map[string][]string{
 	// run lifecycle (advisory markers the trajectory/run views read)
 	"run_promote": {"runs", "cycles"},
 	"run_discard": {"runs", "cycles"},
+	// prompt editor (writes a local prompt-card override) → re-render the
+	// prompts surface + the app page.
+	"app_prompt_set":   {"prompts", "apps"},
+	"app_prompt_reset": {"prompts", "apps"},
+	// branch-with-intention records a control signal the run/lineage views read.
+	"branch_run": {"runs", "cycles", "workflows"},
 	// knowledge
 	"xp_ingest":        {"knowledge"},
 	"xp_feedback":      {"knowledge"},

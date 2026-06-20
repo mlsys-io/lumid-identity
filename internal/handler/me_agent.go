@@ -2765,7 +2765,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "list_loops",
-			"description": "List all scheduled auto-research loops on this host, with last run time and status.",
+			"description": "HOST/operator-scope: scheduled jobs on the LumidOS schedule server (not the caller's apps). For the USER's own installed app workflows and their health/last-run/status, use list_workflows or loops_health instead — those are tenant-scoped and are what 'my workflows / my autoresearch' refers to.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{

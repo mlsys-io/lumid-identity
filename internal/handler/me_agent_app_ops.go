@@ -11,12 +11,22 @@ package handler
 //   app_actions(app?)        — discover an app's declared actions/sources (read)
 //   app_read(source)         — GET an allowlisted data source              (read)
 //   show_app_surface(app)    — render an app's surface inline in chat      (read)
+//   app_ui_get(app,surface?) — read a surface's editable source            (read)
 //   app_action(action,vals)  — invoke an allowlisted form-action      (APPROVAL)
 //   qa_call(method,path,body)— invoke an allowlisted QuantArena write  (APPROVAL)
+//   app_ui_set(app,...)      — write/replace a surface's source        (APPROVAL)
+//   app_ui_generate(app)     — AI-generate a surface (page.yaml)        (APPROVAL)
+//   run_promote(app,ts)      — mark a run as the chosen branch          (APPROVAL)
+//   run_discard(app,ts)      — grey out a run                           (APPROVAL)
 //
 // Security: app_action reuses the formActions allowlist (me_form_action.go);
 // app_read/qa_call mirror the directive resolver's scheme/path allowlist
-// (directives.tsx); every mutating tool is in destructiveTools (approval-gated).
+// (directives.tsx); app_ui_set/app_ui_generate write ONLY to a surface in the
+// caller's OWN tenant install (resolveOwnedAppDir refuses operator-shared apps),
+// validate page specs through compilePageSpec, and honor the same optimistic
+// lock as the UI editor; run_promote/run_discard shell the same lumid-trajectory
+// CLI the UI uses, HOME-scoped to the tenant. Every mutating tool is in
+// destructiveTools (approval-gated).
 
 import (
 	"bytes"
@@ -95,6 +105,68 @@ func appOpsToolDefs() []map[string]any {
 					"body":   map[string]any{"type": "object", "description": "optional JSON body"},
 				},
 				"required": []string{"method", "path"},
+			},
+		},
+		{
+			"name":        "app_ui_get",
+			"description": "Read the EDITABLE source of an app's page (its Studio surface) so you can modify it. Returns {format: markdown|page.yaml, source, sha}. Call this before app_ui_set so you have the current source + sha (the sha is the optimistic lock). No approval needed (read-only).",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":     map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"surface": map[string]any{"type": "string", "description": "named surface (defaults to home)"},
+				},
+			},
+		},
+		{
+			"name":        "app_ui_set",
+			"description": "Write/replace the source of an app's page (its Studio surface) — this is how you EDIT an app's UI from chat. Send `markdown` for a markdown surface or `spec` (raw page.yaml text) for a structured page surface; app_ui_get tells you which `format` the surface is. Pass `base_sha` from app_ui_get to avoid clobbering a concurrent edit. Only your OWN installed apps are editable (operator-shared apps are read-only — fork first). page.yaml specs are validated before saving. Requires user approval.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":      map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"surface":  map[string]any{"type": "string", "description": "named surface (defaults to home)"},
+					"markdown": map[string]any{"type": "string", "description": "new markdown source (for a markdown surface)"},
+					"spec":     map[string]any{"type": "string", "description": "new page.yaml source text (for a structured page surface)"},
+					"base_sha": map[string]any{"type": "string", "description": "sha from app_ui_get (optimistic lock; optional)"},
+				},
+				"required": []string{"app"},
+			},
+		},
+		{
+			"name":        "app_ui_generate",
+			"description": "AI-generate (or regenerate + improve) an app's page from its config + skills, producing a validated structured page.yaml and making it the home surface. Use when the user wants a page built or refreshed for them rather than hand-editing. Writes to your OWN installed app only. Requires user approval.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app": map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+				},
+			},
+		},
+		{
+			"name":        "run_promote",
+			"description": "Promote one of an app's runs — mark it as the chosen branch (advisory; never rewrites run history). Use when the user picks a winning/champion run. Requires user approval.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"ts":   map[string]any{"type": "string", "description": "run timestamp id, e.g. 20060102T150405Z"},
+					"loop": map[string]any{"type": "string", "description": "optional workflow name to narrow the search"},
+				},
+				"required": []string{"ts"},
+			},
+		},
+		{
+			"name":        "run_discard",
+			"description": "Discard one of an app's runs — grey it out (advisory; never deletes run history). Use when the user wants a bad/abandoned run set aside. Requires user approval.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{
+					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
+					"ts":   map[string]any{"type": "string", "description": "run timestamp id, e.g. 20060102T150405Z"},
+					"loop": map[string]any{"type": "string", "description": "optional workflow name to narrow the search"},
+				},
+				"required": []string{"ts"},
 			},
 		},
 	}
@@ -190,8 +262,300 @@ func dispatchAppOpsTool(c *gin.Context, userID, role, name string, args map[stri
 		}
 		log.Printf("[app-ops] qa_call %s %s user=%s ok=true", method, path, userID)
 		return map[string]any{"ok": true, "method": method, "path": path, "result": res}, true, true
+
+	case "app_ui_get":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolAppUIGet(userID, app, strVal(args, "surface"))
+		return res, okRes, true
+
+	case "app_ui_set":
+		if strVal(args, "app") == "" {
+			args["app"] = groundedApp(c)
+		}
+		res, okRes := toolAppUISet(userID, args)
+		app := strVal(args, "app")
+		log.Printf("[app-ops] app_ui_set app=%s user=%s ok=%v", app, userID, okRes)
+		return res, okRes, true
+
+	case "app_ui_generate":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		res, okRes := toolAppUIGenerate(c, userID, app)
+		log.Printf("[app-ops] app_ui_generate app=%s user=%s ok=%v", app, userID, okRes)
+		return res, okRes, true
+
+	case "run_promote", "run_discard":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		verb := "promote"
+		if name == "run_discard" {
+			verb = "discard"
+		}
+		res, okRes := toolRunMark(userID, verb, app, strVal(args, "ts"), strVal(args, "loop"))
+		log.Printf("[app-ops] %s app=%s ts=%s user=%s ok=%v", name, app, strVal(args, "ts"), userID, okRes)
+		return res, okRes, true
 	}
 	return nil, false, false
+}
+
+// safeAppJoin joins a bundle-relative surface path to appDir, rejecting
+// traversal / absolute / NUL so a surface path can never escape the app bundle.
+func safeAppJoin(appDir, rel string) (string, error) {
+	if rel == "" || strings.ContainsAny(rel, "\x00") || strings.Contains(rel, "..") || filepath.IsAbs(rel) {
+		return "", &appOpsError{"invalid surface path"}
+	}
+	abs := filepath.Clean(filepath.Join(appDir, rel))
+	if abs != appDir && !strings.HasPrefix(abs, appDir+string(filepath.Separator)) {
+		return "", &appOpsError{"surface path escapes app"}
+	}
+	return abs, nil
+}
+
+// writeFileAtomic writes b to path via tmp+rename so readers never see a
+// partial surface. Parent dirs are created if missing.
+func writeFileAtomic(path string, b []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return &appOpsError{"cannot create surface directory"}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return &appOpsError{"cannot write surface"}
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return &appOpsError{"cannot save surface"}
+	}
+	return nil
+}
+
+// resolveSurfacePaths maps a surface name to its declared markdown / page-spec
+// path (mirrors the resolution in updateAppSurface). Exactly one of mdPath /
+// pagePath is non-empty on success.
+func resolveSurfacePaths(ui *appUI, name string) (mdPath, pagePath string, ok bool) {
+	if p, has := ui.Surfaces[name]; has {
+		if low := strings.ToLower(p); strings.HasSuffix(low, ".yaml") || strings.HasSuffix(low, ".yml") {
+			return "", p, true
+		}
+		return p, "", true
+	}
+	if name == "home" && ui.Surface != nil {
+		return ui.Surface.Markdown, ui.Surface.Page, true
+	}
+	return "", "", false
+}
+
+// toolAppUIGet returns a surface's editable source + sha + format (read-only).
+func toolAppUIGet(userID, app, surface string) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	name := surface
+	if name == "" {
+		name = "home"
+	}
+	ui := readAppUI(appDir)
+	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
+		return map[string]any{"error": "app declares no ui surface"}, false
+	}
+	mdPath, pagePath, ok := resolveSurfacePaths(ui, name)
+	if !ok {
+		return map[string]any{"error": "unknown surface: " + name}, false
+	}
+	rel, format := mdPath, "markdown"
+	if pagePath != "" {
+		rel, format = pagePath, "page.yaml"
+	}
+	if rel == "" || strings.HasPrefix(rel, "@") {
+		// Template-inherited or native: no local source yet. Report the format
+		// so the agent knows whether to author markdown or a page.yaml spec.
+		if ui.Surface != nil && ui.Surface.Native != "" && pagePath == "" && mdPath == "" {
+			return map[string]any{"app": app, "surface": name, "format": "native", "source": "", "sha": "", "note": "native surface — author markdown via app_ui_set or regenerate via app_ui_generate"}, true
+		}
+		return map[string]any{"app": app, "surface": name, "format": format, "source": "", "sha": "", "note": "inherited template — app_ui_set will create a local override"}, true
+	}
+	abs, err := safeAppJoin(appDir, rel)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	b, err := os.ReadFile(abs)
+	if err != nil {
+		return map[string]any{"app": app, "surface": name, "format": format, "path": rel, "source": "", "sha": ""}, true
+	}
+	return map[string]any{"app": app, "surface": name, "format": format, "path": rel, "source": string(b), "sha": contentSHA(b)}, true
+}
+
+// toolAppUISet writes a surface's source. Mirrors updateAppSurface's checks:
+// tenant-owned only, page specs validated through compilePageSpec, optimistic
+// lock via base_sha, atomic write, xpcloud patch for markdown surfaces.
+// Approval-gated (destructiveTools).
+func toolAppUISet(userID string, args map[string]any) (map[string]any, bool) {
+	app := strVal(args, "app")
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	markdown, _ := args["markdown"].(string)
+	spec, _ := args["spec"].(string)
+	baseSHA := strVal(args, "base_sha")
+	if strings.TrimSpace(markdown) == "" && strings.TrimSpace(spec) == "" {
+		return map[string]any{"error": "provide `markdown` (md surface) or `spec` (page.yaml surface)"}, false
+	}
+	const maxBytes = 256 * 1024
+	if len(markdown) > maxBytes || len(spec) > maxBytes {
+		return map[string]any{"error": "surface exceeds 256 KB limit"}, false
+	}
+	name := strVal(args, "surface")
+	if name == "" {
+		name = "home"
+	}
+	// WRITE path must be the caller's OWN tenant install — editing the shared
+	// copy would change the surface for every tenant + the scheduler.
+	appDir, owned, shared := resolveOwnedAppDir(userID, app)
+	if !owned {
+		if shared {
+			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
+		}
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	ui := readAppUI(appDir)
+	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
+		return map[string]any{"error": "app declares no ui surface"}, false
+	}
+	mdPath, pagePath, ok := resolveSurfacePaths(ui, name)
+	if !ok {
+		return map[string]any{"error": "unknown surface: " + name}, false
+	}
+
+	// Structured page surface — the SPEC is the editable artifact.
+	if pagePath != "" {
+		if strings.TrimSpace(spec) == "" {
+			return map[string]any{"error": "this surface is a structured page — send `spec` (raw " + pagePath + " text), not markdown"}, false
+		}
+		abs, err := safeAppJoin(appDir, pagePath)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		if _, cerr := compilePageSpec([]byte(spec)); cerr != nil {
+			return map[string]any{"error": "page spec invalid: " + cerr.Error()}, false
+		}
+		if baseSHA != "" {
+			if cur, rerr := os.ReadFile(abs); rerr == nil && contentSHA(cur) != baseSHA {
+				return map[string]any{"error": "this page changed since you loaded it — call app_ui_get again and reapply"}, false
+			}
+		}
+		if err := writeFileAtomic(abs, []byte(spec)); err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		return map[string]any{"app": app, "surface": name, "format": "page.yaml", "path": pagePath, "saved": true, "sha": contentSHA([]byte(spec))}, true
+	}
+
+	// Markdown surface.
+	if strings.TrimSpace(markdown) == "" {
+		return map[string]any{"error": "this surface is markdown — send `markdown`, not `spec`"}, false
+	}
+	if mdPath == "" && ui.Surface != nil && ui.Surface.Native != "" {
+		// Native surface — author a local markdown override (detaches native).
+		mdPath = appUIWriteRef("home.md")
+	}
+	// Inherited template / no declared path → canonical .ui/home.md override.
+	if mdPath == "" || strings.HasPrefix(mdPath, "@") {
+		mdPath = appUIWriteRef("home.md")
+	}
+	abs, err := safeAppJoin(appDir, mdPath)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	if strings.ToLower(filepath.Ext(abs)) != ".md" {
+		return map[string]any{"error": "surface must be a .md file"}, false
+	}
+	if baseSHA != "" {
+		if cur, rerr := os.ReadFile(abs); rerr == nil && contentSHA(cur) != baseSHA {
+			return map[string]any{"error": "this page changed since you loaded it — call app_ui_get again and reapply"}, false
+		}
+	}
+	if err := writeFileAtomic(abs, []byte(markdown)); err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	// Point xpcloud.yaml at the (possibly new) override file.
+	_ = patchXpcloudUISurface(appDir, name, mdPath)
+	return map[string]any{"app": app, "surface": name, "format": "markdown", "path": mdPath, "saved": true, "sha": contentSHA([]byte(markdown))}, true
+}
+
+// toolAppUIGenerate AI-generates a page.yaml surface for an OWNED app, reusing
+// the same core the HTTP "Generate UI" button calls. Approval-gated.
+func toolAppUIGenerate(c *gin.Context, userID, app string) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	// Generation persists into the bundle — require ownership (same as the UI).
+	_, owned, shared := resolveOwnedAppDir(userID, app)
+	if !owned {
+		if shared {
+			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
+		}
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+	data, status, msg := generateAppUIPage(ctx, userID, app)
+	if status != 0 {
+		return map[string]any{"error": msg}, false
+	}
+	// generateAppUIPage returns the full compiled markdown (the HTTP editor uses
+	// it for a live preview). Feeding multi-KB of compiled page back into the
+	// chat model's context is wasteful and can blow the smaller kv.run models'
+	// window — so the CHAT result carries only a short preview + byte count. The
+	// page is persisted; the user views it via the deep link / refetched surface.
+	if md, ok := data["markdown"].(string); ok {
+		data["bytes"] = len(md)
+		data["preview"] = truncateStr(strings.TrimSpace(md), 400)
+		delete(data, "markdown")
+	}
+	data["app"] = app
+	data["surface"] = "home" // generation always (re)writes the home surface
+	data["generated"] = true
+	return data, true
+}
+
+// toolRunMark promotes/discards a run via the same lumid-trajectory CLI the UI
+// uses (HOME-scoped to the caller's tenant). Approval-gated.
+func toolRunMark(userID, verb, app, ts, loop string) (map[string]any, bool) {
+	if app == "" || !validAppSlug(app) {
+		return map[string]any{"error": "valid app required (or open an app first)"}, false
+	}
+	// Mirror meRunMark's guards exactly (slugRe permits '/', so also reject path
+	// separators) — these become exec args to the trajectory CLI.
+	if ts == "" || !slugRe.MatchString(ts) || strings.ContainsAny(ts, "/\\") || strings.Contains(ts, "..") {
+		return map[string]any{"error": "valid run ts required (e.g. 20060102T150405Z)"}, false
+	}
+	cliArgs := []string{verb, "--app", app, "--ts", ts}
+	if loop != "" {
+		if !slugRe.MatchString(loop) || strings.ContainsAny(loop, "/\\") || strings.Contains(loop, "..") {
+			return map[string]any{"error": "invalid loop name"}, false
+		}
+		cliArgs = append(cliArgs, "--loop", loop)
+	}
+	obj, err, _ := runTrajectoryCLI(userID, cliArgs...)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	if obj == nil {
+		obj = map[string]any{}
+	}
+	obj["app"] = app
+	obj["ts"] = ts
+	obj[verb+"d"] = true
+	return obj, true
 }
 
 func strVal(args map[string]any, k string) string {

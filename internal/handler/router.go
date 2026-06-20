@@ -52,6 +52,7 @@ func meCORS() gin.HandlerFunc {
 // shadow each other.
 func Register(r *gin.Engine) {
 	r.GET("/healthz", Healthz)
+	r.GET("/version", Version)
 
 	// OIDC / OAuth2 — the cross-subsystem contract
 	r.GET("/.well-known/openid-configuration", OpenIDConfig)
@@ -74,6 +75,8 @@ func Register(r *gin.Engine) {
 		// func is dead code — but the route MUST exist or Gin returns
 		// 405 on OPTIONS before middleware can fire.
 		v1.OPTIONS("/*path", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+		v1.GET("/version", Version)
 
 		v1.POST("/login", LoginHandler)
 		v1.POST("/logout", LogoutHandler)

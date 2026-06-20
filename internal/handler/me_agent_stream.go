@@ -132,17 +132,18 @@ func MeAgentChatStream(c *gin.Context) {
 	// me_agent tool list; the system prompt is passed as context only.
 	if isClaudeCodeProvider(provider) {
 		_ = tools // not used for this provider
-		// Admins/super_admins lose the structured control-plane tools on this
-		// provider (claude's own file/shell tools replace the me_agent catalog,
-		// and they're read-only for non-super_admin). Surface that once so an
-		// admin isn't surprised that "install app"/"run loop"/admin verbs no-op.
+		// This turn stayed in Claude Code mode (it wasn't a platform-control or
+		// drill-in request — those auto-route to a tool-capable model upstream in
+		// autoRouteForTurn). Claude's own file/shell tools are in play here; a
+		// gentle, accurate note so an admin knows platform actions DO work — they
+		// just hop to a standard model automatically when asked.
 		if role == "admin" || role == "super_admin" {
 			emit(map[string]any{
-				"type": "notice",
-				"level": "warning",
-				"message": "Claude Code mode uses Claude's own file/shell tools — the structured " +
-					"Lumid control tools (install/run/publish, admin, etc.) are not available here. " +
-					"Switch to a standard model to drive the platform conversationally.",
+				"type":    "notice",
+				"level":   "info",
+				"message": "Claude Code mode uses Claude's own file/shell tools. Ask it to install, " +
+					"run, publish, or edit something and that action auto-runs on a standard model — " +
+					"no need to switch manually.",
 			})
 		}
 		if err := streamClaudeCodeViaProxy(ctx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, emit); err != nil {
@@ -261,13 +262,22 @@ func MeAgentChatStream(c *gin.Context) {
 			// THIS call through. Per-tool + synchronous, so no cross-tool leak.
 			c.Set("approved_tool", tu.name)
 			result, callOK := dispatchTool(c, userID, role, tu.name, tu.input)
-			emit(map[string]any{
+			ev := map[string]any{
 				"type":   "tool_call",
 				"name":   tu.name,
 				"args":   tu.input,
 				"result": result,
 				"ok":     callOK,
-			})
+			}
+			// 3a — server-authoritative refetch: on a successful mutating tool,
+			// tell the client which data scopes to invalidate so a new tool needs
+			// no frontend wiring (the client falls back to its own map otherwise).
+			if callOK {
+				if scopes := toolDataScopesFor(tu.name); len(scopes) > 0 {
+					ev["scopes"] = scopes
+				}
+			}
+			emit(ev)
 			payload, _ := json.Marshal(result)
 			toolResultBlocks = append(toolResultBlocks, map[string]any{
 				"type":        "tool_result",

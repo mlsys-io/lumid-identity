@@ -65,7 +65,15 @@ func MeCaseLog(c *gin.Context) {
 
 	records := []caseLogRecord{}
 	if !(strict && len(allow) == 0) {
-		expRoot := filepath.Join(appDir, "data", "experiments")
+		// Resolve the experiments root through the runtime-path mapper, like
+		// every other experiments reader (me_casebook / me_trajectory): it
+		// prefers the canonical .lumid/experiments (post dotfile-migration)
+		// and falls back to legacy data/experiments, across both bundle-root
+		// candidates (agents/<name> then apps/<name>). Reading the raw
+		// data/experiments path directly was the "No mapping records yet" bug —
+		// migrated apps (mbb-ai, etc.) keep their results under .lumid/ where
+		// this handler never looked.
+		expRoot, _ := ResolveRuntimeReadPath(appDir, "data/experiments")
 		if ents, err := os.ReadDir(expRoot); err == nil {
 			for _, e := range ents {
 				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {

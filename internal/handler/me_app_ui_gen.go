@@ -227,28 +227,54 @@ func MeGenerateAppUI(c *gin.Context) {
 		return
 	}
 	app := c.Param("app")
-	if !slugRe.MatchString(app) {
-		fail(c, http.StatusBadRequest, 1400, "invalid app")
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	data, status, msg := generateAppUIPage(ctx, userID, app)
+	if status != 0 {
+		code := 1500
+		switch status {
+		case http.StatusBadRequest:
+			code = 1400
+		case http.StatusNotFound:
+			code = 1404
+		case http.StatusUnprocessableEntity:
+			code = 1422
+		case http.StatusServiceUnavailable:
+			code = 1503
+		}
+		fail(c, status, code, msg)
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
+}
 
+// generateAppUIPage is the reusable core of "Generate UI": it produces a
+// STRUCTURED page.yaml (validated + compiled on serve, not freeform markdown),
+// persists it as the surface source of truth, and points xpcloud.yaml at it.
+// Shared by the HTTP handler (MeGenerateAppUI) and the chat tool
+// (app_ui_generate) so the AI can author/regenerate an app's page in
+// conversation — closing the "UI authoring is UI-only" control-plane gap.
+//
+// Returns (data, 0, "") on success; on failure (nil, httpStatus, message) so
+// callers can map to their own error envelope.
+func generateAppUIPage(ctx context.Context, userID, app string) (map[string]any, int, string) {
+	if !slugRe.MatchString(app) {
+		return nil, http.StatusBadRequest, "invalid app"
+	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
-		return
+		return nil, http.StatusNotFound, "app not found"
 	}
 
 	specPath, _ := ResolveSpecPath(appDir)
 	yamlBytes, err := os.ReadFile(specPath)
 	if err != nil {
-		fail(c, http.StatusUnprocessableEntity, 1422, "xpcloud.yaml not found in app bundle")
-		return
+		return nil, http.StatusUnprocessableEntity, "xpcloud.yaml not found in app bundle"
 	}
 
-	// "Generate UI" now produces a STRUCTURED page.yaml (validated + compiled
-	// on serve), not freeform markdown. Context: improve the CURRENT page.yaml
-	// if present; else seed from the NL page-spec (which names allowlisted
-	// action keys) + the app's skills.
+	// Context: improve the CURRENT page.yaml if present; else seed from the NL
+	// page-spec (which names allowlisted action keys) + the app's skills.
 	currentPage := ""
 	if pb, e := readAppUIFile(appDir, "page.yaml"); e == nil {
 		currentPage = string(pb)
@@ -261,13 +287,9 @@ func MeGenerateAppUI(c *gin.Context) {
 	uiSkills := resolveUISkills(userID)
 	userMsg := buildPageYamlPrompt(app, string(yamlBytes), pageSpec, currentPage, renderSkillsBlock(skills)+renderUISkillsBlock(uiSkills))
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
-	defer cancel()
-
 	generated, err := callGemmaBlocking(ctx, userMsg, pageYamlSysPrompt)
 	if err != nil {
-		fail(c, http.StatusServiceUnavailable, 1503, "gen error: "+err.Error())
-		return
+		return nil, http.StatusServiceUnavailable, "gen error: " + err.Error()
 	}
 	generated = stripOuterFence(generated) // strip any ```yaml wrapper
 
@@ -276,33 +298,26 @@ func MeGenerateAppUI(c *gin.Context) {
 	// generation a clean error, not a broken surface.)
 	md, cerr := compilePageSpec([]byte(generated))
 	if cerr != nil {
-		fail(c, http.StatusUnprocessableEntity, 1422, "generated page.yaml invalid: "+cerr.Error())
-		return
+		return nil, http.StatusUnprocessableEntity, "generated page.yaml invalid: " + cerr.Error()
 	}
 
 	// Persist page.yaml as the source of truth + point the surface at it.
 	// NEW writes land in the canonical ".ui/" dotfile directory.
 	uiDir := appUIWriteDir(appDir)
 	if err := os.MkdirAll(uiDir, 0755); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "cannot create ui directory")
-		return
+		return nil, http.StatusInternalServerError, "cannot create ui directory"
 	}
 	target := filepath.Join(uiDir, "page.yaml")
 	tmp := target + ".tmp"
 	if werr := os.WriteFile(tmp, []byte(generated), 0644); werr != nil {
-		fail(c, http.StatusInternalServerError, 1500, "cannot write page.yaml")
-		return
+		return nil, http.StatusInternalServerError, "cannot write page.yaml"
 	}
 	if rerr := os.Rename(tmp, target); rerr != nil {
 		_ = os.Remove(tmp)
-		fail(c, http.StatusInternalServerError, 1500, "cannot save page.yaml")
-		return
+		return nil, http.StatusInternalServerError, "cannot save page.yaml"
 	}
 	_ = patchXpcloudUISurfacePage(appDir, appUIWriteRef("page.yaml"))
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{"markdown": md, "path": appUIWriteRef("page.yaml"), "source": "generated"},
-	})
+	return map[string]any{"markdown": md, "path": appUIWriteRef("page.yaml"), "source": "generated"}, 0, ""
 }
 
 // writeSurfaceAndRespond persists the surface markdown to ui/home.md (atomic),

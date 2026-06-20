@@ -38,6 +38,12 @@ RUN apk add --no-cache \
 WORKDIR /app
 COPY --from=builder /out/identity /app/identity
 COPY configs/identity.yaml /app/configs/identity.yaml
+# Build provenance baked into the runtime image so GET /version reports
+# the actual deployed commit. Populated by CD via --build-arg.
+ARG GIT_SHA
+ARG BUILD_TIME
+ENV GIT_SHA=$GIT_SHA
+ENV BUILD_TIME=$BUILD_TIME
 ENV TZ=Asia/Singapore
 EXPOSE 9900
 ENTRYPOINT ["/app/identity", "-c", "/app/configs/identity.yaml"]

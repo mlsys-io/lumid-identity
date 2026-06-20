@@ -41,6 +41,10 @@ type meLoopPatchBody struct {
 	// Goal — the loop's objective (xpcloud.yaml loops[].goal.primary). An
 	// empty string clears the override (reverts to the declared goal).
 	Goal *string `json:"goal,omitempty"`
+	// Model — the per-workflow runtime model switch (loops[].model). A tier
+	// alias (haiku|sonnet|opus) or "kvrun-gemma"; empty clears the override.
+	// The scheduler maps it to the cycle's LLM env (see _run_loop_cycle).
+	Model *string `json:"model,omitempty"`
 }
 
 // PATCH /api/v1/me/loops/:app/:loop
@@ -126,6 +130,13 @@ func MeLoopPatch(c *gin.Context) {
 			delete(loopOver, "goal")
 		} else {
 			loopOver["goal"] = g
+		}
+	}
+	if body.Model != nil {
+		if m := strings.TrimSpace(*body.Model); m == "" {
+			delete(loopOver, "model") // empty → revert to the app default
+		} else {
+			loopOver["model"] = m
 		}
 	}
 	loopsMap[loop] = loopOver
@@ -409,7 +420,7 @@ func writeSimpleOverrides(path string, data map[string]any) error {
 				continue
 			}
 			b.WriteString("  " + loopName + ":\n")
-			for _, k := range []string{"runtime", "schedule", "enabled", "goal"} {
+			for _, k := range []string{"runtime", "schedule", "enabled", "goal", "model"} {
 				v, ok := over[k]
 				if !ok {
 					continue

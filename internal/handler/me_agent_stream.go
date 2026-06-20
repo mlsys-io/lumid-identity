@@ -262,13 +262,22 @@ func MeAgentChatStream(c *gin.Context) {
 			// THIS call through. Per-tool + synchronous, so no cross-tool leak.
 			c.Set("approved_tool", tu.name)
 			result, callOK := dispatchTool(c, userID, role, tu.name, tu.input)
-			emit(map[string]any{
+			ev := map[string]any{
 				"type":   "tool_call",
 				"name":   tu.name,
 				"args":   tu.input,
 				"result": result,
 				"ok":     callOK,
-			})
+			}
+			// 3a — server-authoritative refetch: on a successful mutating tool,
+			// tell the client which data scopes to invalidate so a new tool needs
+			// no frontend wiring (the client falls back to its own map otherwise).
+			if callOK {
+				if scopes := toolDataScopesFor(tu.name); len(scopes) > 0 {
+					ev["scopes"] = scopes
+				}
+			}
+			emit(ev)
 			payload, _ := json.Marshal(result)
 			toolResultBlocks = append(toolResultBlocks, map[string]any{
 				"type":        "tool_result",

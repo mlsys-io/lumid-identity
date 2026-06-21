@@ -85,9 +85,14 @@ func writeIntentDirect(userSub, action string, payload map[string]any) string {
 }
 
 // agentEnqueueOneshot appends a one-shot job to ~/.lumilake/jobs.jsonl.
-// Same schema MeLoopRunNow writes.
-func agentEnqueueOneshot(userID, app, loop string) (string, error) {
+// Same schema MeLoopRunNow writes. Optional `args` (e.g. {"cases":"Case_019"})
+// scopes the run — the loop's {{ args.* }} template expands them; nil = full.
+func agentEnqueueOneshot(userID, app, loop string, args map[string]any) (string, error) {
 	jobID := fmt.Sprintf("oneshot-%d", time.Now().UnixNano())
+	payload := map[string]any{"oneshot": true, "via": "agent"}
+	if len(args) > 0 {
+		payload["args"] = args
+	}
 	row := map[string]any{
 		"job_id":         jobID,
 		"source":         "loop_cycle",
@@ -96,14 +101,56 @@ func agentEnqueueOneshot(userID, app, loop string) (string, error) {
 		"state":          "queued",
 		"submitted_at":   time.Now().UTC().Format(time.RFC3339),
 		"submitted_by":   userID,
-		"payload": map[string]any{
-			"oneshot": true, "via": "agent",
-		},
+		"payload":        payload,
 	}
 	if err := appendJobRow(row); err != nil {
 		return "", err
 	}
 	return jobID, nil
+}
+
+// agentStopLoop — chat twin of REST MeLoopStop. Writes the per-loop cooperative
+// stop signal the runner checks before each LLM call (→ cycle aborts) + a
+// "stopped by user" journal event. Returns the in-flight cycle ts it observed
+// (best-effort, may be ""). Safe + reversible (just re-run to restart).
+func agentStopLoop(userID, app, loop string) (string, error) {
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return "", fmt.Errorf("app not found: %s", app)
+	}
+	controlDir := filepath.Join(appDir, "data", "control")
+	if err := os.MkdirAll(controlDir, 0o755); err != nil {
+		return "", err
+	}
+	sig := map[string]any{"loop": loop, "by": userID, "at": time.Now().UTC().Format(time.RFC3339)}
+	if b, err := json.Marshal(sig); err == nil {
+		if err := os.WriteFile(filepath.Join(controlDir, "stop."+loop+".signal"), b, 0o644); err != nil {
+			return "", err
+		}
+	}
+	jrow := map[string]any{
+		"ts": time.Now().UTC().Format(time.RFC3339), "loop": loop,
+		"event": "control", "stage": "stopped", "status": "stopped",
+		"ok": false, "outcome": "interrupted", "note": "stopped by user (chat)",
+	}
+	if b, err := json.Marshal(jrow); err == nil {
+		if f, e := os.OpenFile(filepath.Join(appDir, "data", "journal.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
+			_, _ = f.Write(append(b, '\n'))
+			_ = f.Close()
+		}
+	}
+	stopped := ""
+	cyclesDir := filepath.Join(appDir, "data", "cycles", loop)
+	if entries, err := os.ReadDir(cyclesDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() && e.Name() > stopped {
+				if _, err := os.Stat(filepath.Join(cyclesDir, e.Name(), "cycle.json")); err != nil {
+					stopped = e.Name()
+				}
+			}
+		}
+	}
+	return stopped, nil
 }
 
 // agentLatestCycleTs returns the most recent cycle ts dir name for

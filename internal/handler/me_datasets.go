@@ -72,7 +72,17 @@ var datasetDirs = []struct {
 }{
 	{"system", "Benchmark inputs", []string{".jsonl", ".sql", ".csv", ".md", ".txt", ".yaml"}},
 	{"sample_data", "Sample cases", []string{".json", ".jsonl", ".csv"}},
+	// Per-case roster folders — MUST stay in sync with me_casebook.go's
+	// casebookCaseDirs. The casebook lists these cases; "view data" then loads
+	// the matching file via MeAppDatasetFile (resolveCasePath scans this
+	// listing), so the same folders must be discoverable here. Omitting
+	// data/seed + data/cases is why mbb-ai cases showed in the rail but their
+	// raw "case data" resolved to "(no seed file — live-data case)".
+	{"data/cases", "Cases", []string{".json", ".jsonl", ".csv", ".md"}},
+	{"data/seed", "Seed cases", []string{".json", ".jsonl", ".csv", ".md"}},
 	{"data/eval-casebook", "Eval casebook", []string{".json", ".jsonl", ".md", ".csv"}},
+	{"data/inbox", "Inbox cases", []string{".json", ".jsonl"}},
+	{".lumid/inbox", "Inbox cases", []string{".json", ".jsonl"}},
 	{"datasets", "Datasets", []string{".json", ".jsonl", ".csv", ".sql", ".txt"}},
 }
 

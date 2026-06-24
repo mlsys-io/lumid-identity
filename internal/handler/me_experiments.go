@@ -102,6 +102,22 @@ type expRow struct {
 	Metrics   map[string]float64 `json:"metrics"`
 	Dims      map[string]string  `json:"dims,omitempty"`
 	N         *int               `json:"n,omitempty"`
+	// U1 unified-vocabulary mirrors: rows may carry `experiment` (≡ variant_id)
+	// and `item` (≡ dims). normalize() folds them onto the canonical fields so
+	// the rest of the handler keeps reading VariantID/Dims unchanged.
+	Experiment string            `json:"experiment,omitempty"`
+	Item       map[string]string `json:"item,omitempty"`
+}
+
+// normalize folds U1 mirror keys onto the canonical fields (legacy wins when
+// both are present — the Python ledger writes both identically).
+func (r *expRow) normalize() {
+	if r.VariantID == "" && r.Experiment != "" {
+		r.VariantID = r.Experiment
+	}
+	if r.Dims == nil && r.Item != nil {
+		r.Dims = r.Item
+	}
 }
 
 // readExpRows returns up to the LAST `cap` rows of the results ledger.
@@ -121,8 +137,11 @@ func readExpRows(appDir, id string, capN int) []expRow {
 			continue
 		}
 		var r expRow
-		if json.Unmarshal([]byte(line), &r) == nil && r.VariantID != "" {
-			rows = append(rows, r)
+		if json.Unmarshal([]byte(line), &r) == nil {
+			r.normalize()
+			if r.VariantID != "" {
+				rows = append(rows, r)
+			}
 		}
 	}
 	if len(rows) > capN {

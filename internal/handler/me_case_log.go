@@ -98,6 +98,9 @@ func MeCaseLog(c *gin.Context) {
 						continue
 					}
 					dims, _ := row["dims"].(map[string]any)
+					if dims == nil { // U1: `item` mirrors `dims`
+						dims, _ = row["item"].(map[string]any)
+					}
 					cid := ""
 					if dims != nil {
 						if s, ok := dims["case_id"].(string); ok {

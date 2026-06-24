@@ -306,6 +306,9 @@ func casebookScoresFromExperiments(appDir string, allowed map[string]bool, stric
 			// metric trajectory use ONLY the per-case AGGREGATE rows (case_id, no
 			// q_id), which carry the primary metric.
 			dims, _ := row["dims"].(map[string]any)
+			if dims == nil { // U1: `item` mirrors `dims`
+				dims, _ = row["item"].(map[string]any)
+			}
 			caseID := ""
 			perQuestion := false
 			if dims != nil {

@@ -3486,9 +3486,11 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if v, ok := args["limit"].(float64); ok {
 			limit = int(v)
 		}
-		if query == "" {
-			return map[string]any{"error": "query required"}, false
-		}
+		// An empty query is a BROWSE, not an error — toolSearchMarketplace
+		// returns a catalog listing when query=="". Erroring on missing query
+		// made models (notably gemma4, which often fires search_marketplace
+		// with no args for "what's available" intents) report a tool error;
+		// browsing the catalog is the right, useful behavior.
 		return toolSearchMarketplace(c, query, forApp, limit), true
 
 	case "compose_workflow":

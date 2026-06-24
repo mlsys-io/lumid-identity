@@ -40,6 +40,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,6 +48,319 @@ import (
 )
 
 const cycleScanCap = 120
+
+// appAgentMemoryTimes loads, across the app's declared memory_agents, the sorted
+// epoch-seconds of every banked memory's created_at. Used to derive a per-node
+// "agent version" = how many memories the agent had banked at/by a given run.
+// Tenant bank first (~/.tenants/<sub>/.xp/kg/...), then the operator bank.
+func appAgentMemoryTimes(userID, appDir string) []float64 {
+	specPath, _ := ResolveSpecPath(appDir)
+	var times []float64
+	for _, ag := range readYamlMemoryAgents(specPath) {
+		bankPath := ""
+		if d, ok := tenantKGBankDir(userID, ag); ok {
+			bankPath = filepath.Join(d, "bank.jsonl")
+		} else if d, ok := KGBankDir(ag); ok {
+			bankPath = filepath.Join(d, "bank.jsonl")
+		}
+		if bankPath == "" {
+			continue
+		}
+		f, err := os.Open(bankPath)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 64*1024), 2*1024*1024)
+		for sc.Scan() {
+			var raw map[string]any
+			if json.Unmarshal(sc.Bytes(), &raw) != nil {
+				continue
+			}
+			// created_at is ISO string in some banks, float epoch in others.
+			switch v := raw["created_at"].(type) {
+			case string:
+				if t, err := time.Parse(time.RFC3339, v); err == nil {
+					times = append(times, float64(t.Unix()))
+				}
+			case float64:
+				if v > 0 {
+					times = append(times, v)
+				}
+			}
+		}
+		f.Close()
+	}
+	sort.Float64s(times)
+	return times
+}
+
+// declaredDataVersion returns the workflow's declared dataset version ("v<sem>")
+// — the first top-level datasets[] entry — or "" when the app mounts no dataset.
+func declaredDataVersion(appDir string) string {
+	for _, d := range readAppDatasets(appDir) {
+		if d.Version != "" {
+			return "v" + d.Version
+		}
+	}
+	return ""
+}
+
+// dataVersionAtRunTs returns the dataset version this run was evaluated on:
+// authoritative from cycle.json assets_used.dataset.version when present, else
+// the workflow's declared version (`fallback`).
+func dataVersionAtRunTs(appDir, loop, runTs, fallback string) string {
+	if runTs != "" {
+		cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+		if b, err := os.ReadFile(filepath.Join(cyclesRoot, loop, runTs, "cycle.json")); err == nil {
+			var cj struct {
+				AssetsUsed struct {
+					Dataset struct {
+						Version string `json:"version"`
+					} `json:"dataset"`
+				} `json:"assets_used"`
+			}
+			if json.Unmarshal(b, &cj) == nil && cj.AssetsUsed.Dataset.Version != "" {
+				return "v" + cj.AssetsUsed.Dataset.Version
+			}
+		}
+	}
+	return fallback
+}
+
+// modelLabel collapses a raw model id to a glanceable family label
+// (gemma / claude / minimax / gpt), for the run-tree node chip.
+func modelLabel(k string) string {
+	k = strings.ToLower(k)
+	if i := strings.LastIndexByte(k, '/'); i >= 0 {
+		k = k[i+1:] // drop owner prefix (cyankiwi/MiniMax… → minimax…)
+	}
+	switch {
+	case strings.Contains(k, "gemma"):
+		return "gemma"
+	case strings.Contains(k, "claude"), strings.Contains(k, "sonnet"), strings.Contains(k, "haiku"), strings.Contains(k, "opus"):
+		return "claude"
+	case strings.Contains(k, "minimax"):
+		return "minimax"
+	case strings.Contains(k, "gpt"), strings.Contains(k, "openai"):
+		return "gpt"
+	}
+	if i := strings.IndexByte(k, '-'); i > 0 {
+		return k[:i]
+	}
+	return k
+}
+
+// parseAnalystModel pulls `analyst_model` from an interview_report markdown
+// (a line like "- **analyst_model**: `gemma-4-26B`").
+func parseAnalystModel(b []byte) string {
+	s := string(b)
+	i := strings.Index(s, "analyst_model")
+	if i < 0 {
+		return ""
+	}
+	r := s[i:]
+	a := strings.IndexByte(r, '`')
+	if a < 0 {
+		return ""
+	}
+	r = r[a+1:]
+	z := strings.IndexByte(r, '`')
+	if z < 0 {
+		return ""
+	}
+	return r[:z]
+}
+
+// appRunModels maps a run's cycle_ts prefix → short model label, read from the
+// per-case interview reports (outbox/<case>/<ts>/interview_report_*.md). One
+// report per distinct run is read. This is the exact per-run model — including
+// sweep runs that wrote no cycle dir (so cost.by_model is unavailable).
+func appRunModels(appDir string) map[string]string {
+	out := map[string]string{}
+	for _, root := range []string{filepath.Join(appDir, ".lumid", "outbox"), filepath.Join(appDir, "data", "outbox")} {
+		cases, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, cdir := range cases {
+			if !cdir.IsDir() {
+				continue
+			}
+			tsDirs, _ := os.ReadDir(filepath.Join(root, cdir.Name()))
+			for _, td := range tsDirs {
+				if !td.IsDir() {
+					continue
+				}
+				key := td.Name()
+				if i := strings.IndexByte(key, '_'); i > 0 {
+					key = key[:i] // cycle_ts prefix (drop the _<µs>Z suffix)
+				}
+				if _, ok := out[key]; ok {
+					continue
+				}
+				ents, _ := os.ReadDir(filepath.Join(root, cdir.Name(), td.Name()))
+				for _, e := range ents {
+					if strings.HasPrefix(e.Name(), "interview_report") && strings.HasSuffix(e.Name(), ".md") {
+						if b, rerr := os.ReadFile(filepath.Join(root, cdir.Name(), td.Name(), e.Name())); rerr == nil {
+							if m := parseAnalystModel(b); m != "" {
+								out[key] = modelLabel(m)
+							}
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// modelFromCycleJson reads cost.by_model from a run's cycle.json (runs that wrote
+// a cycle dir). Best-effort fallback when no interview report exists.
+func modelFromCycleJson(appDir, loop, runTs string) string {
+	if runTs == "" {
+		return ""
+	}
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	b, err := os.ReadFile(filepath.Join(cyclesRoot, loop, runTs, "cycle.json"))
+	if err != nil {
+		return ""
+	}
+	var cj struct {
+		Cost struct {
+			ByModel map[string]json.RawMessage `json:"by_model"`
+		} `json:"cost"`
+	}
+	if json.Unmarshal(b, &cj) != nil {
+		return ""
+	}
+	for k := range cj.Cost.ByModel {
+		return modelLabel(k)
+	}
+	return ""
+}
+
+// modelForNode prefers the exact interview-report model (by cycle_ts), else the
+// cycle.json cost.by_model at the mapped run dir.
+func modelForNode(appDir, loop, cycleTs, runTs string, runModels map[string]string) string {
+	if cycleTs != "" {
+		if m := runModels[strings.TrimSuffix(cycleTs, "Z")]; m != "" {
+			return m
+		}
+	}
+	return modelFromCycleJson(appDir, loop, runTs)
+}
+
+// branchKeyForNode computes a run's CONFIGURATION SIGNATURE — the set of axes
+// whose change forks a new branch in the run tree:
+//   • model (gemma / claude / …)
+//   • dataset version it ran on
+//   • the prompt set (content SHAs) from cycle.json assets_used, when recorded
+// Switching ANY of these = a branch; an unchanged signature = continue the same
+// branch; returning to a prior signature continues THAT branch. Deliberately
+// EXCLUDED: the agent's knowledge-bank version (it grows every run — that's
+// evolution ALONG a branch, not a branch axis) and the workflow (each workflow
+// is its own trajectory). Best-effort: missing provenance degrades to model+data.
+func branchKeyForNode(appDir, loop, cycleTs, runTs string, runModels map[string]string, fallbackData string) string {
+	model := modelForNode(appDir, loop, cycleTs, runTs, runModels)
+	data := dataVersionAtRunTs(appDir, loop, runTs, fallbackData)
+	promptSig := ""
+	if runTs != "" {
+		cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+		if b, err := os.ReadFile(filepath.Join(cyclesRoot, loop, runTs, "cycle.json")); err == nil {
+			var cj struct {
+				AssetsUsed struct {
+					Prompts map[string]string `json:"prompts"`
+					Model   string            `json:"model"`
+				} `json:"assets_used"`
+			}
+			if json.Unmarshal(b, &cj) == nil {
+				if model == "" && cj.AssetsUsed.Model != "" {
+					model = modelLabel(cj.AssetsUsed.Model)
+				}
+				if len(cj.AssetsUsed.Prompts) > 0 {
+					keys := make([]string, 0, len(cj.AssetsUsed.Prompts))
+					for k := range cj.AssetsUsed.Prompts {
+						keys = append(keys, k)
+					}
+					sort.Strings(keys)
+					var sb strings.Builder
+					for _, k := range keys {
+						sha := cj.AssetsUsed.Prompts[k]
+						if len(sha) > 8 {
+							sha = sha[:8]
+						}
+						sb.WriteString(k)
+						sb.WriteByte('=')
+						sb.WriteString(sha)
+						sb.WriteByte(';')
+					}
+					promptSig = sb.String()
+				}
+			}
+		}
+	}
+	return "m:" + model + "|d:" + data + "|p:" + promptSig
+}
+
+// assignNodeVersions stamps every real (non-baseline) node with a sequential
+// version "v<N>" in chronological order. The run tree IS the agent's version
+// history, so each node is its OWN distinct version. This supersedes the
+// bank-memory-count derivation (agentVersionAt), which collapses to a single
+// version — e.g. mbb-ai's all-"v36" — whenever the runs don't bank NEW memories
+// (the bank was seeded once, well before these runs). Versions are global and
+// unique across branches so a node can be referenced unambiguously.
+func assignNodeVersions(nodes []trajNode) {
+	idx := make([]int, 0, len(nodes))
+	for i := range nodes {
+		if nodes[i].Kind == "baseline" {
+			continue
+		}
+		idx = append(idx, i)
+	}
+	sort.SliceStable(idx, func(a, b int) bool {
+		ka, kb := versionSortKey(nodes[idx[a]]), versionSortKey(nodes[idx[b]])
+		if ka != kb {
+			return ka < kb
+		}
+		return nodes[idx[a]].ID < nodes[idx[b]].ID
+	})
+	for rank, i := range idx {
+		nodes[i].AgentVersion = "v" + strconv.Itoa(rank+1)
+	}
+}
+
+// versionSortKey orders nodes chronologically for version numbering (run dir id,
+// then cycle ts, both reduced to digits so ISO and dir-id forms compare).
+func versionSortKey(n trajNode) string {
+	if n.RunTs != "" {
+		return digitsOnly(n.RunTs)
+	}
+	if n.CycleTs != "" {
+		return digitsOnly(n.CycleTs)
+	}
+	return ""
+}
+
+// agentVersionAt returns the fixed agent version for a node — "v<N>" where N is
+// the number of memories banked at/by cycleTs (dir-id form 20060102T150405Z).
+// "" when there are no memory agents / nothing banked yet / unparseable ts.
+func agentVersionAt(times []float64, cycleTs string) string {
+	if len(times) == 0 || cycleTs == "" {
+		return ""
+	}
+	t, err := time.Parse("20060102T150405Z", cycleTs)
+	if err != nil {
+		return ""
+	}
+	cut := float64(t.Unix())
+	n := sort.Search(len(times), func(i int) bool { return times[i] > cut })
+	if n == 0 {
+		return ""
+	}
+	return "v" + strconv.Itoa(n)
+}
 
 type trajNode struct {
 	ID         string         `json:"id"`
@@ -67,6 +381,27 @@ type trajNode struct {
 	// held review_queue item awaiting a human decision (drives the canvas
 	// "needs-attention" badge).
 	NeedsDecision bool        `json:"needs_decision,omitempty"`
+	// AgentVersion: this node's version in the agent's history — "v<N>", N = the
+	// run's 1-based chronological rank in this trajectory (assignNodeVersions).
+	// The run tree IS the version history, so every node is a distinct version;
+	// versions are global + unique across branches. (Supersedes the old
+	// bank-memory-count derivation, which collapsed to one version when runs
+	// banked nothing new.)
+	AgentVersion string      `json:"agent_version,omitempty"`
+	// DataVersion: the dataset version this run was evaluated on ("v<semver>").
+	// Authoritative from cycle.json assets_used; falls back to the workflow's
+	// declared dataset version (the repo is fixed per workflow, version pinned
+	// per run). The metric on this node is scored on this data version.
+	DataVersion string       `json:"data_version,omitempty"`
+	// Model: the LLM this run used (short label — "gemma" / "claude" / …), so
+	// gemma vs claude runs are distinguishable at a glance. From the run's
+	// interview report (analyst_model) or cycle.json cost.by_model. A change of
+	// model forks a new branch; the same model continues its own branch.
+	Model string             `json:"model,omitempty"`
+	// Learned: memories this run banked (auto_publish pushed). Carried on the node
+	// itself so the UI doesn't have to index cycles[] by depth — depth is no
+	// longer the cycle index once runs branch by model.
+	Learned int              `json:"learned,omitempty"`
 }
 
 type trajCycle struct {
@@ -132,6 +467,15 @@ func MeTrajectory(c *gin.Context) {
 	// for run_ts mapping and the no-experiment linear fallback.
 	cycleDirs := scanCycleDirs(appDir, loop)
 
+	// Agent-version source: the sorted banked-memory timestamps across the app's
+	// memory_agents. Each node's agent version = how many were banked by its run.
+	memTimes := appAgentMemoryTimes(userID, appDir)
+	// The workflow's declared dataset version — the per-run fallback when a run
+	// didn't record its own (assets_used) data version.
+	declaredDataVer := declaredDataVersion(appDir)
+	// Per-run model labels (gemma / claude / …), keyed by cycle_ts prefix.
+	runModels := appRunModels(appDir)
+
 	data := gin.H{
 		"app":            app,
 		"loop":           loop,
@@ -144,7 +488,8 @@ func MeTrajectory(c *gin.Context) {
 
 	if expDir == "" {
 		// 9. No experiments dir → linear run chain from cycle dirs.
-		nodes, cycles := linearRunChain(appDir, loop, cycleDirs, durCache)
+		nodes, cycles := linearRunChain(appDir, loop, cycleDirs, durCache, memTimes, declaredDataVer, runModels)
+		assignNodeVersions(nodes)
 		data["has_variants"] = false
 		data["nodes"] = nodes
 		data["cycles"] = cycles
@@ -162,34 +507,105 @@ func MeTrajectory(c *gin.Context) {
 		data["baseline"] = nil
 	}
 
-	// 3. results.jsonl → variants grouped into cycles.
-	cycleKeys, byCycle := readVariantsGrouped(expDir, metric)
+	// 3. results.jsonl → per-case rows → consolidated into ROUNDS (a round = a full
+	//    pass over the casebook). A per-case loop emits one cycle_ts PER case, so we
+	//    break a round when a case REPEATS (a new pass began). Each round = one run
+	//    node scored as the MEAN over its cases. Rounds are grouped into cycles (by
+	//    their run) and laid out with model/config BRANCHING: consecutive runs of
+	//    the same signature chain; a different model/config forks a new branch.
+	rows := readCaseRows(expDir, metric)
+	data["has_variants"] = len(rows) > 0
 
-	data["has_variants"] = len(cycleKeys) > 0
+	// 3a. round-consolidate per variant_id (case-repeat = a new pass).
+	type rnd struct {
+		vid, firstTs, firstCycleTs string
+		seen                       map[string]bool
+		sum                        float64
+		n                          int
+		config                     map[string]any
+	}
+	var rounds []*rnd
+	cur := map[string]*rnd{}
+	for _, r := range rows {
+		key := r.caseID
+		if key == "" {
+			key = r.ts
+		}
+		g := cur[r.vid]
+		if g == nil || g.seen[key] {
+			g = &rnd{vid: r.vid, firstTs: r.ts, firstCycleTs: r.cycleTs, seen: map[string]bool{}, config: r.config}
+			cur[r.vid] = g
+			rounds = append(rounds, g)
+		}
+		if g.config == nil && r.config != nil {
+			g.config = r.config
+		}
+		g.seen[key] = true
+		if r.scored {
+			g.sum += r.score
+			g.n++
+		}
+	}
+
+	// 3b. group rounds into cycles by their representative run; a cycle holds the
+	//     variant-rounds that ran together (an A/B fan); most apps = one per cycle.
+	cycleKeys := []string{}
+	byCycle := map[string][]trajVariant{}
+	for _, g := range rounds {
+		ck := g.firstCycleTs
+		if ck == "" {
+			ck = g.firstTs
+		}
+		tv := trajVariant{variantID: g.vid, cycleTs: g.firstCycleTs, ts: g.firstTs, config: g.config}
+		if g.n > 0 {
+			tv.score = roundN(g.sum/float64(g.n), 6)
+			tv.scored = true
+		}
+		if _, seen := byCycle[ck]; !seen {
+			cycleKeys = append(cycleKeys, ck)
+		}
+		byCycle[ck] = append(byCycle[ck], tv)
+	}
+	sort.SliceStable(cycleKeys, func(i, j int) bool { return digitsOnly(cycleKeys[i]) < digitsOnly(cycleKeys[j]) })
 
 	nodes := []trajNode{}
 	cycles := []trajCycle{}
 
-	// 6. baseline node.
+	// baseline node.
 	nodes = append(nodes, trajNode{
 		ID: "baseline", Kind: "baseline", Depth: 0, Label: "baseline",
 		Scored: hasBaseline,
 		Score:  ifPtr(hasBaseline, baseline),
 	})
 
-	// 4. Champion lineage. champion-so-far across all rows up to & including the
-	// current cycle; a variant's parent = the PREVIOUS cycle's champion (baseline
-	// for the first cycle).
 	betterThan := func(a, b float64) bool {
 		if higher {
 			return a > b
 		}
 		return a < b
 	}
-	prevChampionID := "baseline"
-	for ci, ck := range cycleKeys {
+	// 4. Model/config-aware lineage. A cycle whose signature was seen CONTINUES
+	//    that branch (parent = its last champion); a NEW signature FORKS off the
+	//    chronologically-previous champion (baseline for the first). Same model
+	//    continues its branch; switching model/config (or reverting) branches.
+	type champRef struct {
+		id    string
+		depth int
+	}
+	prevOverall := champRef{"baseline", 0}
+	champBySig := map[string]champRef{}
+	for _, ck := range cycleKeys {
 		vs := byCycle[ck]
-		// best scored variant of THIS cycle (the cycle champion).
+		repRunTs := mapRunTs(cycleDirs, vs[0].cycleTs, vs[0].ts)
+		sig := branchKeyForNode(appDir, loop, vs[0].cycleTs, repRunTs, runModels, declaredDataVer)
+		if cs := configSig(vs[0].config); cs != "" {
+			sig += "|" + cs // a real A/B fan in one cycle keeps distinct branches
+		}
+		par := prevOverall
+		if c, ok := champBySig[sig]; ok {
+			par = c
+		}
+		depth := par.depth + 1
 		cycleChampIdx := -1
 		for i := range vs {
 			if !vs[i].scored {
@@ -202,23 +618,25 @@ func MeTrajectory(c *gin.Context) {
 		cyc := trajCycle{Ts: ck, NVariants: len(vs)}
 		for i := range vs {
 			v := vs[i]
+			runTs := mapRunTs(cycleDirs, v.cycleTs, v.ts)
 			n := trajNode{
 				ID:        "v:" + v.variantID,
 				Kind:      "variant",
 				VariantID: v.variantID,
 				CycleTs:   v.cycleTs,
-				Depth:     ci + 1,
-				ParentID:  prevChampionID,
+				Depth:     depth,
+				ParentID:  par.id,
 				Label:     variantLabel(v.config),
 				Config:    v.config,
 				Scored:    v.scored,
-				RunTs:     mapRunTs(cycleDirs, v.cycleTs, v.ts),
+				RunTs:     runTs,
 			}
-			// Distinct id when the same variant_id recurs across cycles (mbb-ai's
-			// "current") so nodes don't collide.
-			if len(cycleKeys) > 1 {
+			if len(cycleKeys) > 1 || len(vs) > 1 {
 				n.ID = "v:" + v.variantID + "@" + ck
 			}
+			n.AgentVersion = agentVersionAt(memTimes, v.cycleTs)
+			n.DataVersion = dataVersionAtRunTs(appDir, loop, runTs, declaredDataVer)
+			n.Model = modelForNode(appDir, loop, v.cycleTs, runTs, runModels)
 			if v.scored {
 				sc := v.score
 				n.Score = &sc
@@ -227,12 +645,11 @@ func MeTrajectory(c *gin.Context) {
 					n.DeltaVsBaseline = &d
 				}
 			}
-			// execution time — wall-clock file span of the run's cycle dir.
-			if n.RunTs != "" {
-				if dur := durationAtRunTs(appDir, loop, n.RunTs, durCache); dur > 0 {
+			if runTs != "" {
+				if dur := durationAtRunTs(appDir, loop, runTs, durCache); dur > 0 {
 					n.DurationS = &dur
 				}
-				n.NeedsDecision = needsDecisionAtRunTs(appDir, loop, n.RunTs)
+				n.NeedsDecision = needsDecisionAtRunTs(appDir, loop, runTs)
 			}
 			if i == cycleChampIdx {
 				n.IsChampion = true
@@ -247,15 +664,17 @@ func MeTrajectory(c *gin.Context) {
 					dv := *n.DurationS
 					cyc.DurationS = &dv
 				}
-				prevChampionID = n.ID
-				// 8. learned — memories pushed by this cycle's champion run.
-				cyc.Learned = learnedAtRunTs(appDir, loop, n.RunTs)
+				cyc.Learned = learnedAtRunTs(appDir, loop, runTs)
+				n.Learned = cyc.Learned
+				champBySig[sig] = champRef{n.ID, depth}
+				prevOverall = champRef{n.ID, depth}
 			}
 			nodes = append(nodes, n)
 		}
 		cycles = append(cycles, cyc)
 	}
 
+	assignNodeVersions(nodes)
 	data["nodes"] = nodes
 	data["cycles"] = cycles
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
@@ -323,21 +742,25 @@ func readExperimentState(expDir string) (metric string, higher bool, baseline fl
 	return
 }
 
-// readVariantsGrouped reads results.jsonl and groups variant trials into cycles
-// (cycle_ts when present, else ts[:10] day bucket). Within a cycle, rows sharing
-// a variant_id collapse to one representative carrying the best usable score
-// (mbb-ai writes many per-question rows + an aggregate row per cycle). Returns
-// the cycle keys oldest→newest and the per-cycle variant slices.
-func readVariantsGrouped(expDir, metric string) ([]string, map[string][]trajVariant) {
-	byCycle := map[string]map[string]*trajVariant{} // cycleKey -> variantID -> agg
-	cycleSeen := map[string]bool{}
-	cycleOrder := []string{}
+// caseRow is one per-case AGGREGATE result (dims.case_id, NOT a per-question
+// sub-score), carrying the experiment's primary metric.
+type caseRow struct {
+	vid, ts, cycleTs, caseID string
+	score                    float64
+	scored                   bool
+	config                   map[string]any
+}
 
+// readCaseRows reads results.jsonl and returns the per-case aggregate rows in
+// time order (per-question dims.q_id rows excluded). The caller consolidates
+// these by configuration signature into one node per model/config.
+func readCaseRows(expDir, metric string) []caseRow {
 	f, err := os.Open(filepath.Join(expDir, "results.jsonl"))
 	if err != nil {
-		return nil, map[string][]trajVariant{}
+		return nil
 	}
 	defer f.Close()
+	var rows []caseRow
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -349,69 +772,53 @@ func readVariantsGrouped(expDir, metric string) ([]string, map[string][]trajVari
 		if json.Unmarshal([]byte(line), &row) != nil {
 			continue
 		}
-		vid := asStr(row["variant_id"])
-		if vid == "" {
-			vid = "v"
-		}
-		rowTs := asStr(row["ts"])
-		ck := asStr(row["cycle_ts"])
-		if ck == "" {
-			// day bucket — keep it human/sortable.
-			if len(rowTs) >= 10 {
-				ck = rowTs[:10]
-			} else {
-				ck = rowTs
+		dims, _ := row["dims"].(map[string]any)
+		if dims != nil {
+			if _, isQ := dims["q_id"]; isQ {
+				continue // per-question sub-score — not a case result
 			}
 		}
-		if !cycleSeen[ck] {
-			cycleSeen[ck] = true
-			cycleOrder = append(cycleOrder, ck)
-			byCycle[ck] = map[string]*trajVariant{}
+		r := caseRow{vid: asStr(row["variant_id"]), ts: asStr(row["ts"]), cycleTs: asStr(row["cycle_ts"])}
+		if r.vid == "" {
+			r.vid = "v"
 		}
-		agg := byCycle[ck][vid]
-		if agg == nil {
-			agg = &trajVariant{variantID: vid, cycleTs: asStr(row["cycle_ts"]), ts: rowTs}
-			byCycle[ck][vid] = agg
+		if dims != nil {
+			r.caseID = asStr(dims["case_id"])
 		}
-		// earliest ts for stable run_ts mapping
-		if rowTs != "" && (agg.ts == "" || rowTs < agg.ts) {
-			agg.ts = rowTs
+		if cfg, okc := row["variant"].(map[string]any); okc {
+			r.config = scalarConfig(cfg)
 		}
-		// config: first non-empty variant{} wins (scalar fields only).
-		if agg.config == nil {
-			if cfg, okc := row["variant"].(map[string]any); okc {
-				agg.config = scalarConfig(cfg)
-			}
-		}
-		// score: prefer a row that carries the experiment's primary metric;
-		// otherwise the first scored row. metrics often empty → stays unscored.
 		if metrics, okm := row["metrics"].(map[string]any); okm && len(metrics) > 0 {
 			sc, key := pickScore(metrics, metric)
-			if key != "" {
-				if !agg.scored || (metric != "" && key == metric) {
-					agg.score = sc
-					agg.scored = true
-				}
+			if key != "" && (metric == "" || key == metric) {
+				r.score, r.scored = sc, true
 			}
 		}
+		rows = append(rows, r)
 	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
+	return rows
+}
 
-	sort.Strings(cycleOrder)
-	out := map[string][]trajVariant{}
-	for _, ck := range cycleOrder {
-		vs := make([]trajVariant, 0, len(byCycle[ck]))
-		for _, v := range byCycle[ck] {
-			vs = append(vs, *v)
-		}
-		sort.Slice(vs, func(i, j int) bool {
-			if vs[i].ts != vs[j].ts {
-				return vs[i].ts < vs[j].ts
-			}
-			return vs[i].variantID < vs[j].variantID
-		})
-		out[ck] = vs
+// configSig is a stable string fingerprint of a scalar config map (sorted keys),
+// used to keep distinct variants of the same model in distinct trajectory nodes.
+func configSig(cfg map[string]any) string {
+	if len(cfg) == 0 {
+		return ""
 	}
-	return cycleOrder, out
+	keys := make([]string, 0, len(cfg))
+	for k := range cfg {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(asString2(cfg[k]))
+		b.WriteByte(';')
+	}
+	return b.String()
 }
 
 // scalarConfig keeps only scalar config fields (string/number/bool) so the UI
@@ -509,9 +916,17 @@ func scanCycleDirs(appDir, loop string) []string {
 // cycle_ts match if present, else the latest dir whose id is <= the variant ts.
 // "" when nothing maps. cycleDirs is sorted oldest→newest.
 func mapRunTs(cycleDirs []string, cycleTs, variantTs string) string {
-	if len(cycleDirs) == 0 {
-		return ""
+	// The run's OWN timestamp is its identity — prefer it so every node is unique
+	// (cycle_ts is unique per run; collapsing many runs onto one dir breaks
+	// compare/promote/log, which key off this value).
+	own := cycleTs
+	if own == "" {
+		own = variantTs
 	}
+	if len(cycleDirs) == 0 {
+		return own
+	}
+	// Exact cycle-dir match (the run actually wrote a dir) always wins.
 	if cycleTs != "" {
 		for _, d := range cycleDirs {
 			if d == cycleTs {
@@ -519,19 +934,36 @@ func mapRunTs(cycleDirs []string, cycleTs, variantTs string) string {
 			}
 		}
 	}
-	// latest dir <= variantTs (cycle-dir ids and the ISO ts are both
-	// lexicographically time-ordered enough for "compress to digits" compare).
-	if variantTs == "" {
-		return ""
-	}
-	vKey := digitsOnly(variantTs)
+	// Otherwise snap to the nearest dir at/just-before the run, but ONLY when it's
+	// CLOSE (≤ 15 min) — i.e. an off-by-seconds dir id for the same run. A far
+	// older dir would snap MANY distinct runs onto one dir (a collision), so fall
+	// back to the run's own ts as a unique id instead.
+	kt := parseRunTs(own)
 	best := ""
+	var bestT time.Time
 	for _, d := range cycleDirs {
-		if digitsOnly(d) <= vKey {
-			best = d
+		dt := parseRunTs(d)
+		if dt.IsZero() || kt.IsZero() || dt.After(kt) {
+			continue
+		}
+		if best == "" || dt.After(bestT) {
+			best, bestT = d, dt
 		}
 	}
-	return best
+	if best != "" && !kt.IsZero() && kt.Sub(bestT) <= 15*time.Minute {
+		return best
+	}
+	return own
+}
+
+// parseRunTs parses a cycle-dir / cycle_ts id ("20060102T150405Z"). Zero time on
+// any other shape (e.g. an ISO row ts), so callers treat it as "unparseable".
+func parseRunTs(s string) time.Time {
+	t, err := time.Parse("20060102T150405Z", s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // durationAtRunTs estimates a cycle's execution time as the wall-clock FILE SPAN
@@ -652,21 +1084,47 @@ func sumPushed(cj map[string]any) int {
 // depth = index, score = the cycle's primary numeric metric (scored if any),
 // run_ts = the cycle dir, label = a short date. No baseline node (no baseline
 // to anchor to). cycleDirs is oldest→newest.
-func linearRunChain(appDir, loop string, cycleDirs []string, durCache map[string]float64) ([]trajNode, []trajCycle) {
+func linearRunChain(appDir, loop string, cycleDirs []string, durCache map[string]float64, memTimes []float64, declaredDataVer string, runModels map[string]string) ([]trajNode, []trajCycle) {
 	nodes := []trajNode{}
 	cycles := []trajCycle{}
-	parent := ""
-	for i, ts := range cycleDirs {
+	// Config-aware lineage (same model as the variant path): a run continues the
+	// branch of its CONFIGURATION SIGNATURE (model + data + prompts); a new
+	// signature forks off the chronologically-previous run; reverting to a prior
+	// signature continues that branch. The first run is the root (no baseline node
+	// in the degraded view).
+	type ref struct {
+		id    string
+		depth int
+	}
+	var prevOverall *ref
+	lastBySig := map[string]ref{}
+	for _, ts := range cycleDirs {
+		sig := branchKeyForNode(appDir, loop, ts, ts, runModels, declaredDataVer)
+		var parent string
+		depth := 0
+		if r, ok := lastBySig[sig]; ok {
+			parent, depth = r.id, r.depth+1 // continue this config's branch
+		} else if prevOverall != nil {
+			parent, depth = prevOverall.id, prevOverall.depth+1 // fork the new config off the last run
+		}
 		score, scored := cycleScore(appDir, loop, ts)
 		n := trajNode{
-			ID:       "run:" + ts,
-			Kind:     "run",
-			CycleTs:  ts,
-			RunTs:    ts,
-			Depth:    i,
-			ParentID: parent,
-			Label:    shortDate(ts),
-			Scored:   scored,
+			ID:           "run:" + ts,
+			Kind:         "run",
+			CycleTs:      ts,
+			RunTs:        ts,
+			Depth:        depth,
+			ParentID:     parent,
+			Label:        shortDate(ts),
+			Scored:       scored,
+			// Mark each run a champion of its (model) branch so the UI collapses
+			// long same-config stretches into a "+N cycles" badge instead of
+			// rendering one node per cycle (these loops can have 100+ cycles).
+			IsChampion:   true,
+			AgentVersion: agentVersionAt(memTimes, ts),
+			DataVersion:  dataVersionAtRunTs(appDir, loop, ts, declaredDataVer),
+			Model:        modelForNode(appDir, loop, ts, ts, runModels),
+			Learned:      learnedAtRunTs(appDir, loop, ts),
 		}
 		if scored {
 			sc := score
@@ -676,7 +1134,7 @@ func linearRunChain(appDir, loop string, cycleDirs []string, durCache map[string
 			n.DurationS = &dur
 		}
 		nodes = append(nodes, n)
-		cyc := trajCycle{Ts: ts, NVariants: 1, ChampionID: n.ID, Learned: learnedAtRunTs(appDir, loop, ts)}
+		cyc := trajCycle{Ts: ts, NVariants: 1, ChampionID: n.ID, Learned: n.Learned}
 		if scored {
 			sc := score
 			cyc.ChampionScore = &sc
@@ -686,7 +1144,9 @@ func linearRunChain(appDir, loop string, cycleDirs []string, durCache map[string
 			cyc.DurationS = &dv
 		}
 		cycles = append(cycles, cyc)
-		parent = n.ID
+		cur := ref{n.ID, depth}
+		lastBySig[sig] = cur
+		prevOverall = &cur
 	}
 	return nodes, cycles
 }

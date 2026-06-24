@@ -15,6 +15,7 @@ var toolDataScopes = map[string][]string{
 	// loop / workflow execution + schedule
 	"run_loop":     {"runs", "cycles", "loops", "workflows"},
 	"run_loop_now": {"runs", "cycles", "loops", "workflows"},
+	"stop_loop":    {"runs", "cycles", "loops", "workflows"},
 	"patch_loop":   {"loops", "workflows"},
 	"pause_workflow": {"loops", "workflows"},
 	"delete_loop":  {"loops", "workflows", "apps"},

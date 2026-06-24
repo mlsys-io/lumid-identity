@@ -171,6 +171,17 @@ type meLoopRunBody struct {
 	FromRunTs   string         `json:"from_run_ts,omitempty"`
 	Variant     map[string]any `json:"variant,omitempty"`
 	BranchLabel string         `json:"branch_label,omitempty"`
+	// "Next Run" composer (Phases B/C/D). All optional; threaded into the
+	// jobs.jsonl payload so the scheduler's drain_oneshots passes them into
+	// app_runner.cycle() / the trajectory engine.
+	//   Criteria    — Phase B: success criteria for this run (judge prompt).
+	//   AutoPromote — Phase B: auto-promote the produced run if it wins.
+	//   Cases       — Phase C: casebook case ids to evaluate this run against.
+	//   NotBefore   — Phase D: ISO-8601 earliest-start gate (deferred run).
+	Criteria    string   `json:"criteria,omitempty"`
+	AutoPromote bool     `json:"auto_promote,omitempty"`
+	Cases       []string `json:"cases,omitempty"`
+	NotBefore   string   `json:"not_before,omitempty"`
 }
 
 // POST /api/v1/me/loops/:app/:loop/run
@@ -209,6 +220,22 @@ func MeLoopRunNow(c *gin.Context) {
 			"branch_label": body.BranchLabel,
 		},
 	}
+	// "Next Run" composer fields — add only when set (snake_case keys matching
+	// the cross-layer contract; omitempty so plain run-now rows stay unchanged).
+	if payload, ok := row["payload"].(map[string]any); ok {
+		if body.Criteria != "" {
+			payload["criteria"] = body.Criteria
+		}
+		if body.AutoPromote {
+			payload["auto_promote"] = true
+		}
+		if len(body.Cases) > 0 {
+			payload["cases"] = body.Cases
+		}
+		if body.NotBefore != "" {
+			payload["not_before"] = body.NotBefore
+		}
+	}
 	if err := appendJobRow(row); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "append jobs.jsonl: "+err.Error())
 		return
@@ -244,12 +271,15 @@ func MeLoopStop(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	// 1. Write the cooperative stop signal (runner aborts on its next LLM call).
-	controlDir := filepath.Join(appDir, "data", "control")
-	_ = os.MkdirAll(controlDir, 0o755)
+	// 1. Write the cooperative stop signal where the runner WATCHES it. The runner
+	//    resolves data/control → .lumid/control (the runtime dir) and exposes that
+	//    via LUMID_CYCLE_STOP_FILE, so writing only data/control was never seen.
+	//    Write BOTH to cover the dual read/write layout.
 	sig := map[string]any{"loop": loop, "by": userID, "at": time.Now().UTC().Format(time.RFC3339)}
-	if b, err := json.Marshal(sig); err == nil {
-		_ = os.WriteFile(filepath.Join(controlDir, "stop."+loop+".signal"), b, 0o644)
+	sigBytes, _ := json.Marshal(sig)
+	for _, base := range []string{filepath.Join(appDir, ".lumid", "control"), filepath.Join(appDir, "data", "control")} {
+		_ = os.MkdirAll(base, 0o755)
+		_ = os.WriteFile(filepath.Join(base, "stop."+loop+".signal"), sigBytes, 0o644)
 	}
 	// 2. Append a journal event so the live session shows "stopped by user".
 	jrow := map[string]any{
@@ -264,8 +294,11 @@ func MeLoopStop(c *gin.Context) {
 		}
 	}
 	// 3. Stamp the newest in-flight cycle dir (no cycle.json yet) as interrupted.
+	//    Resolve the RUNTIME cycles dir (.lumid/cycles) — that's where the runner
+	//    creates the in-flight cycle, so data/cycles would miss it.
 	stopped := ""
-	cyclesDir := filepath.Join(appDir, "data", "cycles", loop)
+	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
+	cyclesDir := filepath.Join(cyclesRoot, loop)
 	if entries, err := os.ReadDir(cyclesDir); err == nil {
 		newest := ""
 		for _, e := range entries {

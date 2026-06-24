@@ -1941,7 +1941,20 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "run_loop_now",
-			"description": "Fire a one-shot cycle of a loop without waiting for the schedule.",
+			"description": "Fire a one-shot cycle of a loop without waiting for the schedule. Optional `cases` scopes the run to a subset (e.g. one case_id or a comma-separated list) for apps whose loop templates {{ args.cases }} (e.g. mbb-ai's regression_sweep) — omit to run the full set.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":   map[string]any{"type": "string"},
+					"loop":  map[string]any{"type": "string"},
+					"cases": map[string]any{"type": "string", "description": "Optional run scope — a case_id (e.g. 'Case_019') or comma-separated ids. Omit for all cases."},
+				},
+				"required": []string{"app", "loop"},
+			},
+		},
+		{
+			"name":        "stop_loop",
+			"description": "Cooperatively stop a RUNNING workflow cycle (the inverse of run_loop_now). The runner aborts at its next LLM call and the run is marked interrupted. Use when the user says 'stop', 'cancel', 'halt' a running workflow. Safe + reversible — just re-run to restart.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -3193,11 +3206,29 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if app == "" || loop == "" {
 			return map[string]any{"error": "app and loop required"}, false
 		}
-		jobID, err := agentEnqueueOneshot(userID, app, loop)
+		// Optional run scope → threaded as args.cases (the loop template
+		// expands {{ args.cases }}); empty = full set.
+		var oneshotArgs map[string]any
+		if cases, _ := args["cases"].(string); cases != "" {
+			oneshotArgs = map[string]any{"cases": cases}
+		}
+		jobID, err := agentEnqueueOneshot(userID, app, loop, oneshotArgs)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, false
 		}
 		return map[string]any{"job_id": jobID, "state": "queued"}, true
+
+	case "stop_loop":
+		app, _ := args["app"].(string)
+		loop, _ := args["loop"].(string)
+		if app == "" || loop == "" {
+			return map[string]any{"error": "app and loop required"}, false
+		}
+		stopped, err := agentStopLoop(userID, app, loop)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		return map[string]any{"app": app, "loop": loop, "stopped_cycle": stopped, "state": "stopping"}, true
 
 	case "cycle_detail":
 		app, _ := args["app"].(string)
@@ -3455,9 +3486,11 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if v, ok := args["limit"].(float64); ok {
 			limit = int(v)
 		}
-		if query == "" {
-			return map[string]any{"error": "query required"}, false
-		}
+		// An empty query is a BROWSE, not an error — toolSearchMarketplace
+		// returns a catalog listing when query=="". Erroring on missing query
+		// made models (notably gemma4, which often fires search_marketplace
+		// with no args for "what's available" intents) report a tool error;
+		// browsing the catalog is the right, useful behavior.
 		return toolSearchMarketplace(c, query, forApp, limit), true
 
 	case "compose_workflow":

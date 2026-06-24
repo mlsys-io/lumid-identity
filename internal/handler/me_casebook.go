@@ -299,30 +299,40 @@ func casebookScoresFromExperiments(appDir string, allowed map[string]bool, stric
 				ts = asStr(row["ts"])
 			}
 
-			// Pick the row's score: the experiment's primary metric if present,
-			// else the per-question score, else the first numeric metric.
-			score, scoreKey := pickScore(metrics, primaryMetric)
-
-			// Per-case history (keyed by dims.case_id).
-			if dims, ok := row["dims"].(map[string]any); ok {
-				if caseID := asStr(dims["case_id"]); caseID != "" && scoreKey != "" {
-					scores[caseID] = append(scores[caseID], casebookScorePoint{Ts: ts, Score: score})
-				}
+			// Per-question rows (dims.q_id present) are SUB-scores. Including them
+			// mixes the per-question `question_score` (0.77, 0.65, 0, 0.4 …) with
+			// the case's aggregate `avg_question_score` (0.45) and plots several
+			// points per cycle — that's the "bogus curve". The case score AND the
+			// metric trajectory use ONLY the per-case AGGREGATE rows (case_id, no
+			// q_id), which carry the primary metric.
+			dims, _ := row["dims"].(map[string]any)
+			caseID := ""
+			perQuestion := false
+			if dims != nil {
+				caseID = asStr(dims["case_id"])
+				_, perQuestion = dims["q_id"]
+			}
+			if perQuestion {
+				continue
 			}
 
-			// Metric evolution: every numeric metric, averaged per cycle_ts.
-			if ts != "" {
-				for k, v := range metrics {
-					fv, ok := toFloat(v)
-					if !ok {
-						continue
-					}
-					if _, seen := metricByCycle[k]; !seen {
-						metricByCycle[k] = map[string][]float64{}
-						metricOrder = append(metricOrder, k)
-					}
-					metricByCycle[k][ts] = append(metricByCycle[k][ts], fv)
+			// The row's score = the experiment's primary metric (avg_question_score).
+			score, scoreKey := pickScore(metrics, primaryMetric)
+
+			// Per-case history — one clean point per cycle (the aggregate score).
+			if caseID != "" && scoreKey != "" {
+				scores[caseID] = append(scores[caseID], casebookScorePoint{Ts: ts, Score: score})
+			}
+
+			// Metric evolution — the primary/score metric only, averaged across
+			// cases per cycle. Skip bookkeeping counts (questions / regressed_
+			// questions / delta_*) so the trajectory is one real series, not a blend.
+			if ts != "" && scoreKey != "" && !isBookkeepingMetric(scoreKey) {
+				if _, seen := metricByCycle[scoreKey]; !seen {
+					metricByCycle[scoreKey] = map[string][]float64{}
+					metricOrder = append(metricOrder, scoreKey)
 				}
+				metricByCycle[scoreKey][ts] = append(metricByCycle[scoreKey][ts], score)
 			}
 		}
 		f.Close()
@@ -367,6 +377,19 @@ func casebookScoresFromExperiments(appDir string, allowed map[string]bool, stric
 		scoredVia = ""
 	}
 	return scores, evo, scoredVia
+}
+
+// isBookkeepingMetric reports whether a metric key is a count / bookkeeping
+// value (not a score) that must not be charted as a trajectory — e.g.
+// `questions`, `regressed_questions`, `delta_keypoints`, sample counts.
+func isBookkeepingMetric(k string) bool {
+	k = strings.ToLower(k)
+	switch k {
+	case "questions", "regressed_questions", "n", "samples", "count", "total":
+		return true
+	}
+	return strings.HasPrefix(k, "delta_") || strings.HasPrefix(k, "n_") ||
+		strings.HasSuffix(k, "_count") || strings.HasSuffix(k, "_n")
 }
 
 // pickScore returns (value, keyUsed) for the score to attribute to a result

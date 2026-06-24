@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -181,6 +182,78 @@ func readAppVersion(appDir string) string {
 	return ""
 }
 
+// appAgentMemoryCount sums the memories banked across the app's memory_agents
+// (cheap line count of each bank.jsonl) — the agent's CURRENT version magnitude.
+// Tenant bank first (~/.tenants/<sub>/.xp/kg), then the operator bank.
+func appAgentMemoryCount(userID, appDir string) int {
+	specPath, _ := ResolveSpecPath(appDir)
+	total := 0
+	for _, ag := range readYamlMemoryAgents(specPath) {
+		bankPath := ""
+		if d, ok := tenantKGBankDir(userID, ag); ok {
+			bankPath = filepath.Join(d, "bank.jsonl")
+		} else if d, ok := KGBankDir(ag); ok {
+			bankPath = filepath.Join(d, "bank.jsonl")
+		}
+		if bankPath == "" {
+			continue
+		}
+		f, err := os.Open(bankPath)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 64*1024), 2*1024*1024)
+		for sc.Scan() {
+			if len(strings.TrimSpace(sc.Text())) > 0 {
+				total++
+			}
+		}
+		f.Close()
+	}
+	return total
+}
+
+// DatasetRef — one mounted dataset repo with its own version (an independently
+// versioned xpio DATASET repo, distinct from the app's AGENT repo).
+type DatasetRef struct {
+	ID      string `json:"id,omitempty"`
+	Repo    string `json:"repo,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// readAppDatasets parses the app's TOP-LEVEL `datasets:` block (xpcloud.yaml) —
+// each is a SEPARATE, independently-versioned xpio DATASET repo the app mounts
+// (e.g. mbb-ai → a3f48236/mbb-casebook v0.7.6). Distinct from the app's own
+// AGENT repo (readAppVersion). Powers the Data tab's "this dataset is its own
+// versioned repo" header. Loop-level `loops[].datasets` (string refs) stays as
+// row.Datasets; this is the richer repo+version detail.
+func readAppDatasets(appDir string) []DatasetRef {
+	specPath, _ := ResolveSpecPath(appDir)
+	b, err := os.ReadFile(specPath)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Datasets []struct {
+			ID      string `yaml:"id"`
+			Repo    string `yaml:"repo"`
+			Version string `yaml:"version"`
+		} `yaml:"datasets"`
+	}
+	if yaml.Unmarshal(b, &doc) != nil {
+		return nil
+	}
+	out := make([]DatasetRef, 0, len(doc.Datasets))
+	for _, d := range doc.Datasets {
+		if d.ID == "" && d.Repo == "" {
+			continue
+		}
+		out = append(out, DatasetRef{ID: d.ID, Repo: d.Repo, Version: d.Version})
+	}
+	return out
+}
+
 // showcaseApps returns the set of operator-shared app slugs that should
 // appear on the home grid for every user (the curated demo set). Backend-
 // driven so the list can change WITHOUT a frontend rebuild — the old
@@ -263,6 +336,15 @@ type WorkflowRow struct {
 	Goal *WorkflowGoal `json:"goal,omitempty"`
 	// Datasets — dataset ids/refs the loop runs against (xpcloud.yaml).
 	Datasets []string `json:"datasets,omitempty"`
+	// DatasetsDetail — the app's top-level dataset repos with their own
+	// version (each a separate, independently-versioned xpio DATASET repo).
+	// Lets the Data tab show "this dataset is its own versioned repo".
+	DatasetsDetail []DatasetRef `json:"datasets_detail,omitempty"`
+	// AgentVersion — the workflow's agent at its CURRENT version: "v<N>" where
+	// N = memories banked across the app's memory_agents. The agent attaches to
+	// the workflow and evolves; this is its "now" version (the run tree shows the
+	// per-run versions). Empty when the app has no memory agents.
+	AgentVersion string `json:"agent_version,omitempty"`
 	// MemoryAgents — the app's knowledge agents (xpcloud.yaml top-level
 	// memory_agents + roles[].memory_agent). Powers the learning-history
 	// timeline (what the app has banked over time). App-level, repeated on
@@ -384,7 +466,13 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				continue
 			}
 			memAgents := readYamlMemoryAgents(specPath)
+			appDatasets := readAppDatasets(appDir)
 			appVersion := readAppVersion(appDir)
+			// The workflow's agent at its current version ("v<N>" memories).
+			agentVer := ""
+			if n := appAgentMemoryCount(userID, appDir); n > 0 {
+				agentVer = "v" + strconv.Itoa(n)
+			}
 			// Runtime artifacts now live under .lumid/ (legacy data/ still
 			// honored). Resolve once per app; .lumid/ wins when present.
 			journalPath, _ := ResolveRuntimeReadPath(appDir, "data/journal.jsonl")
@@ -474,6 +562,8 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.Goal.Primary = gv
 				}
 				row.Datasets = []string(L.Datasets)
+				row.DatasetsDetail = appDatasets
+				row.AgentVersion = agentVer
 				row.MemoryAgents = memAgents
 				if s.LastOk != nil {
 					b := *s.LastOk

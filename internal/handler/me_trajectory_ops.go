@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -199,4 +200,81 @@ func meRunMark(c *gin.Context, verb string) {
 		return
 	}
 	ok(c, verb+"d", obj)
+}
+
+// meLoopEnqueueBody — fan-out a batch of variants into the trajectory queue.
+// Each variant becomes one queued run (count 1). The shared knobs
+// (from_run_ts / branch_label / criteria / priority) apply to every variant.
+type meLoopEnqueueBody struct {
+	FromRunTs   string           `json:"from_run_ts,omitempty"`
+	BranchLabel string           `json:"branch_label,omitempty"`
+	Criteria    string           `json:"criteria,omitempty"`
+	Priority    int              `json:"priority,omitempty"`
+	Variants    []map[string]any `json:"variants"`
+}
+
+// MeLoopEnqueue — POST /me/apps/:app/loops/:loop/enqueue
+//
+// Fan-out (Phase C): for EACH variant in the body, shell `lumid-trajectory
+// enqueue` once (count 1) so the trajectory engine queues a run with that
+// variant baked in. Best-effort per variant — we attempt them all and report
+// how many were successfully queued. HOME is bound to the caller's tenant root
+// (via runTrajectoryCLI), and every arg is passed as an exec arg (never
+// shell-interpolated), so :app/:loop and the variant JSON can't inject.
+func MeLoopEnqueue(c *gin.Context) {
+	userSub, authed := currentUserID(c)
+	if !authed {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	loop := c.Param("loop")
+	if !slugRe.MatchString(app) || strings.ContainsAny(app, "/\\") || strings.Contains(app, "..") {
+		fail(c, http.StatusBadRequest, 1400, "invalid app name")
+		return
+	}
+	if !slugRe.MatchString(loop) || strings.ContainsAny(loop, "/\\") || strings.Contains(loop, "..") {
+		fail(c, http.StatusBadRequest, 1400, "invalid loop name")
+		return
+	}
+	var body meLoopEnqueueBody
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	if len(body.Variants) == 0 {
+		fail(c, http.StatusBadRequest, 1400, "variants must be a non-empty array")
+		return
+	}
+
+	priority := body.Priority
+	queued := 0
+	for _, variant := range body.Variants {
+		vjson, err := json.Marshal(variant)
+		if err != nil {
+			continue // skip un-marshalable variant; best-effort
+		}
+		args := []string{
+			"enqueue",
+			"--app", app,
+			"--loop", loop,
+			"--count", "1",
+			"--priority", strconv.Itoa(priority),
+			"--variant-json", string(vjson),
+		}
+		if body.FromRunTs != "" {
+			args = append(args, "--from-run-ts", body.FromRunTs)
+		}
+		if body.BranchLabel != "" {
+			args = append(args, "--branch-label", body.BranchLabel)
+		}
+		if body.Criteria != "" {
+			args = append(args, "--criteria", body.Criteria)
+		}
+		args = append(args, "--by", userSub)
+		if _, err, _ := runTrajectoryCLI(userSub, args...); err == nil {
+			queued++
+		}
+	}
+	ok(c, "queued", gin.H{"queued": queued})
 }

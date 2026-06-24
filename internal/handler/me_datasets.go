@@ -236,3 +236,96 @@ func MeAppDatasetFile(c *gin.Context) {
 		},
 	})
 }
+
+// MeCaseReport — GET /me/apps/:app/case-report?case_id=
+// Returns the case's latest interview report — the full per-case evaluation
+// record the runner writes to data/outbox/<case_id>/<ts>/interview_report_*.md
+// (per-Q triangulated scores: LLM judge / embed / structure / quant verify,
+// cited evidence, cross-cycle regressions). This is the "entire log" for a case
+// in a sweep run, which is otherwise only on disk.
+func MeCaseReport(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	caseID := c.Query("case_id")
+	if !slugRe.MatchString(app) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app")
+		return
+	}
+	if caseID == "" || strings.ContainsAny(caseID, "/\\") || strings.Contains(caseID, "..") {
+		fail(c, http.StatusBadRequest, 1400, "invalid case_id")
+		return
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		fail(c, http.StatusNotFound, 1404, "app not found")
+		return
+	}
+	// Optional run filter: when ?ts=<cycle_ts> is given, prefer the report from
+	// THAT run (the per-case outbox dir is named <cycle_ts>_<µs>, so it shares
+	// the cycle_ts prefix). Falls back to the newest report when none matches.
+	wantTs := strings.TrimSuffix(c.Query("ts"), "Z")
+	// Reports split across the canonical .lumid/outbox and legacy data/outbox —
+	// scan BOTH; track the newest overall AND the newest matching ?ts.
+	bestTs, bestPath, bestName := "", "", ""
+	matchTs, matchPath, matchName := "", "", ""
+	for _, root := range []string{filepath.Join(appDir, ".lumid", "outbox"), filepath.Join(appDir, "data", "outbox")} {
+		caseDir := filepath.Join(root, caseID)
+		tsDirs, derr := os.ReadDir(caseDir)
+		if derr != nil {
+			continue
+		}
+		for _, d := range tsDirs {
+			if !d.IsDir() {
+				continue
+			}
+			var report string
+			ents, eerr := os.ReadDir(filepath.Join(caseDir, d.Name()))
+			if eerr != nil {
+				continue
+			}
+			for _, e := range ents {
+				if !e.IsDir() && strings.HasPrefix(e.Name(), "interview_report") && strings.HasSuffix(e.Name(), ".md") {
+					report = e.Name()
+					break
+				}
+			}
+			if report == "" {
+				continue
+			}
+			full := filepath.Join(caseDir, d.Name(), report)
+			if d.Name() > bestTs {
+				bestTs, bestPath, bestName = d.Name(), full, report
+			}
+			if wantTs != "" && strings.HasPrefix(d.Name(), wantTs) && d.Name() > matchTs {
+				matchTs, matchPath, matchName = d.Name(), full, report
+			}
+		}
+	}
+	if matchPath != "" {
+		bestTs, bestPath, bestName = matchTs, matchPath, matchName
+	}
+	if bestPath == "" {
+		fail(c, http.StatusNotFound, 1404, "no report for this case")
+		return
+	}
+	b, rerr := os.ReadFile(bestPath)
+	if rerr != nil {
+		fail(c, http.StatusNotFound, 1404, "report unreadable")
+		return
+	}
+	const maxBytes = 128 * 1024
+	content := string(b)
+	truncated := false
+	if len(content) > maxBytes {
+		content = content[:maxBytes]
+		truncated = true
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{"case_id": caseID, "ts": bestTs, "name": bestName, "content": content, "truncated": truncated},
+	})
+}

@@ -364,12 +364,16 @@ func Register(r *gin.Engine) {
 			// Grep a single cycle's run-log + issues (transcript + journal +
 			// step errors) for a query string.
 			me.GET("/cycles/:app/:loop/:ts/search", MeCycleLogSearch)
+			// Per-run PROVENANCE — the versioned assets this run used.
+			me.GET("/cycles/:app/:loop/:ts/provenance", MeCycleProvenance)
 			// Dataset / casebook explorer for the app-overview page.
 			me.GET("/apps/:app/datasets",      MeAppDatasets)
 			me.GET("/apps/:app/dataset-file",  MeAppDatasetFile)
 			me.GET("/apps/:app/casebook",      MeCasebook)
 			// Per-case data↔metric mapping log (AI labeling/scoring records).
 			me.GET("/apps/:app/casebook/case-log", MeCaseLog)
+			// A case's full evaluation report (per-Q breakdown + cited evidence).
+			me.GET("/apps/:app/case-report", MeCaseReport)
 			// Live execution feed — tail journal.jsonl for a running cycle.
 			me.GET("/apps/:app/cycle-log",     MeCycleLog)
 			// Variant trajectory tree (baseline → per-cycle variants → champion trunk).
@@ -383,6 +387,7 @@ func Register(r *gin.Engine) {
 			// lumid-trajectory CLI; HOME bound to the caller's tenant root).
 			me.GET("/apps/:app/next-actions",            MeNextActions)         // recommender: what to do next
 			me.GET("/apps/:app/loops/:loop/lineage",     MeLoopLineage)         // branch tree (parent_run_id edges)
+			me.POST("/apps/:app/loops/:loop/enqueue",    MeLoopEnqueue)         // Phase C: fan-out variants → trajectory queue
 			me.POST("/apps/:app/runs/:ts/promote",       MeRunPromote)          // mark chosen branch
 			me.POST("/apps/:app/runs/:ts/discard",       MeRunDiscard)          // grey out a run
 			// Hard-remove a single workflow (loop) from one of the caller's apps.

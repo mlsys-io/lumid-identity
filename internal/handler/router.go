@@ -254,6 +254,10 @@ func Register(r *gin.Engine) {
 			me.PATCH("/loops/:app/:loop",     MeLoopPatch)
 			me.POST("/loops/:app/:loop/run",  MeLoopRunNow)
 			me.POST("/loops/:app/:loop/stop", MeLoopStop)
+			// Manage planned runs — list/cancel still-queued one-shots (the
+			// counterpart to Plan-next/run). :loop="_" lists across all loops.
+			me.GET("/loops/:app/:loop/planned",         MePlannedRuns)
+			me.POST("/loops/:app/:loop/planned/cancel", MeCancelPlanned)
 			me.GET("/loops/health",           MeLoopsHealth)
 
 			// Per-(app, key) secrets.

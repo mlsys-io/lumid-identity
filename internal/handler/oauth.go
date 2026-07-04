@@ -238,7 +238,7 @@ func tokenAuthCode(c *gin.Context) {
 	// id_token — carries identity claims the OIDC relying-party needs.
 	// aud MUST equal client_id per the spec; that's what
 	// oauth2-proxy (and every other RP) verifies.
-	idTok, _, err := common.IssueIDToken(u.ID, u.Email, u.Name, client.ClientID, u.EmailVerified)
+	idTok, _, err := common.IssueIDToken(u.ID, u.Email, u.Name, u.Role, client.ClientID, u.EmailVerified)
 	if err != nil {
 		tokenErr(c, "server_error", "issue id_token: "+err.Error())
 		return
@@ -333,6 +333,8 @@ func OAuthUserinfoHandler(c *gin.Context) {
 		"name":               u.Name,
 		"preferred_username": u.Email,
 		"picture":            u.AvatarURL,
+		"role":               u.Role,
+		"groups":             []string{u.Role},
 	})
 }
 

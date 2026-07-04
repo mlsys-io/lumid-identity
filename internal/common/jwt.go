@@ -131,7 +131,14 @@ func IssueBridgeJWT(userID, email, role, audience string, scopes []string, ttl t
 // IssueIDToken signs an OIDC id_token whose `aud` is the requesting
 // client_id (required by the spec, and verified by oauth2-proxy et al).
 // Returns (token, exp).
-func IssueIDToken(userID, email, name, clientID string, emailVerified bool) (string, time.Time, error) {
+//
+// The id_token carries the caller's `role` (user|admin|super_admin) both
+// as a scalar `role` claim and inside a single-element `groups` array.
+// This lets relying parties that only understand OIDC group-mapping
+// (e.g. Argo CD's RBAC `g, <group>, role:admin`) authorize on the lum.id
+// role without any bespoke integration. Existing RPs (oauth2-proxy for
+// Umami/Grafana) ignore the extra claims, so this is additive and safe.
+func IssueIDToken(userID, email, name, role, clientID string, emailVerified bool) (string, time.Time, error) {
 	k := Keys.Active()
 	if k == nil {
 		return "", time.Time{}, fmt.Errorf("no active signing key")
@@ -158,6 +165,10 @@ func IssueIDToken(userID, email, name, clientID string, emailVerified bool) (str
 		"email":          email,
 		"email_verified": emailVerified,
 		"name":           name,
+	}
+	if role != "" {
+		claims["role"] = role
+		claims["groups"] = []string{role}
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	tok.Header["kid"] = k.Kid

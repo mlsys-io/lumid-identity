@@ -28,8 +28,10 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN lacks write to the org-owned ghcr package (403); use the
+          # org write PAT (repo secret) so the push to ghcr.io/mlsys-io/* succeeds.
+          username: ${{ secrets.GHCR_USER }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
       - name: Extract metadata
         id: meta
@@ -42,6 +44,11 @@ jobs:
             type=sha,prefix=sha-
             # latest for default branch only
             type=raw,value=latest,enable={{is_default_branch}}
+            # CD lanes (see deploy_infra k8s-lift/cd/POLICY.md): a git tag vX.Y.Z emits
+            # :vX.Y.Z (via type=ref,event=tag above) -> prod (semver) lane; a merge to dev
+            # emits :nightly-<short-sha> -> nightly lane (Image Updater newest-build on
+            # ^nightly-).
+            type=sha,prefix=nightly-,enable=${{ github.ref == 'refs/heads/dev' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6

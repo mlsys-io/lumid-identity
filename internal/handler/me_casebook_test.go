@@ -22,11 +22,15 @@ func writeCasebookFixture(t *testing.T, loopsYAML string) string {
 	}
 	// state.json declares the primary metric; results.jsonl scores one case
 	// across two cycles (≥2 points so the metric trajectory also materializes).
+	// These are per-case AGGREGATE rows (dims.case_id, NO q_id): the scorer
+	// intentionally skips per-question sub-score rows (those carry q_id) so the
+	// case score + metric trajectory use only the aggregate primary metric — see
+	// casebookScoresFromExperiments' perQuestion filter.
 	if err := os.WriteFile(filepath.Join(expDir, "state.json"), []byte(`{"metric":"avg_question_score"}`), 0644); err != nil {
 		t.Fatalf("write state: %v", err)
 	}
-	results := `{"ts":"2026-06-01T00:00:00Z","cycle_ts":"20260601T000000Z","variant_id":"current","metrics":{"avg_question_score":0.6},"dims":{"case_id":"Case_001","q_id":"Q1"}}
-{"ts":"2026-06-02T00:00:00Z","cycle_ts":"20260602T000000Z","variant_id":"current","metrics":{"avg_question_score":0.8},"dims":{"case_id":"Case_001","q_id":"Q1"}}
+	results := `{"ts":"2026-06-01T00:00:00Z","cycle_ts":"20260601T000000Z","variant_id":"current","metrics":{"avg_question_score":0.6},"dims":{"case_id":"Case_001"}}
+{"ts":"2026-06-02T00:00:00Z","cycle_ts":"20260602T000000Z","variant_id":"current","metrics":{"avg_question_score":0.8},"dims":{"case_id":"Case_001"}}
 `
 	if err := os.WriteFile(filepath.Join(expDir, "results.jsonl"), []byte(results), 0644); err != nil {
 		t.Fatalf("write results: %v", err)

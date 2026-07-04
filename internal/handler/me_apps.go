@@ -185,14 +185,14 @@ func MeAppsList(c *gin.Context) {
 		return
 	}
 	type appCard struct {
-		Name      string `json:"name"`
-		HasMfst   bool   `json:"has_manifest"`
-		HasXPCld  bool   `json:"has_xpcloud"`
-		HasOverr  bool   `json:"has_user_overrides"`
-		Tenant    bool   `json:"tenant"`         // true = this user's tenant root; false = operator-shared
-		Status    string `json:"status"`         // "ready" | "installing" | "failed"
-		Error     string `json:"error,omitempty"`
-		UI        *appUI `json:"ui,omitempty"`   // optional Studio sidebar + surface declaration (xpcloud.yaml::ui)
+		Name     string `json:"name"`
+		HasMfst  bool   `json:"has_manifest"`
+		HasXPCld bool   `json:"has_xpcloud"`
+		HasOverr bool   `json:"has_user_overrides"`
+		Tenant   bool   `json:"tenant"` // true = this user's tenant root; false = operator-shared
+		Status   string `json:"status"` // "ready" | "installing" | "failed"
+		Error    string `json:"error,omitempty"`
+		UI       *appUI `json:"ui,omitempty"` // optional Studio sidebar + surface declaration (xpcloud.yaml::ui)
 	}
 	out := make([]appCard, 0, 16)
 	onDisk := map[string]bool{} // names backed by a real install (dedupe vs pending intents)
@@ -241,10 +241,10 @@ func MeAppsList(c *gin.Context) {
 	// across users, so an unfiltered scan would leak other tenants' installs.
 	for _, pc := range pendingInstallCards(userID, onDisk) {
 		out = append(out, appCard{
-			Name:    pc.name,
-			Tenant:  true,
-			Status:  pc.status,
-			Error:   pc.err,
+			Name:   pc.name,
+			Tenant: true,
+			Status: pc.status,
+			Error:  pc.err,
 		})
 	}
 
@@ -387,7 +387,6 @@ func installAppName(payload map[string]any) string {
 	}
 	return strings.TrimSuffix(slug, "-draft")
 }
-
 
 // GET /api/v1/me/intents/:id — fetch intent status + result.
 // Result file is written by the scheduler-side picker (separate task).

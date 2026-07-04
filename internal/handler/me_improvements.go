@@ -42,14 +42,14 @@ import (
 // improvementEvent — one row of the ledger. See me_improvements.go
 // header comment for which fields are required vs optional.
 type improvementEvent struct {
-	ID        string `json:"id"`
-	Ts        string `json:"ts"`
-	App       string `json:"app"`
-	Loop      string `json:"loop,omitempty"`
-	CycleTs   string `json:"cycle_ts,omitempty"`
+	ID      string `json:"id"`
+	Ts      string `json:"ts"`
+	App     string `json:"app"`
+	Loop    string `json:"loop,omitempty"`
+	CycleTs string `json:"cycle_ts,omitempty"`
 	// Axis ∈ {examples, standard, recipe, pieces, memory, rules}.
 	// Map to user-facing labels at render time.
-	Axis      string `json:"axis"`
+	Axis string `json:"axis"`
 	// Verb ∈ {added, removed, swapped, scored, distilled, tuned}.
 	Verb      string `json:"verb"`
 	Label     string `json:"label"`
@@ -59,10 +59,10 @@ type improvementEvent struct {
 	// Optional knock-on effect on another axis.
 	Effect any `json:"effect,omitempty"`
 	// Source ∈ {user, cycle, scheduler, agent}.
-	Source    string `json:"source"`
+	Source string `json:"source"`
 	// OutputID — when feedback ties to a specific output (cycle
 	// artifact, draft message). Lets the UI link back.
-	OutputID  string `json:"output_id,omitempty"`
+	OutputID string `json:"output_id,omitempty"`
 }
 
 // validAxes — the six user-facing improvement dimensions. Reject
@@ -209,10 +209,10 @@ func readImprovements(userID, app, loop, since string, limit int) ([]improvement
 // so the UI card + narrative panel can render without re-walking
 // the ledger.
 type axisMovement struct {
-	Axis    string  `json:"axis"`
-	Count   int     `json:"count"`           // # events on this axis in the window
-	Net     float64 `json:"net,omitempty"`   // sum of `delta.after - delta.before` when numeric
-	Latest  string  `json:"latest,omitempty"` // most-recent label on this axis
+	Axis   string  `json:"axis"`
+	Count  int     `json:"count"`            // # events on this axis in the window
+	Net    float64 `json:"net,omitempty"`    // sum of `delta.after - delta.before` when numeric
+	Latest string  `json:"latest,omitempty"` // most-recent label on this axis
 }
 
 func summarizeImprovements(events []improvementEvent) []axisMovement {
@@ -251,7 +251,9 @@ func summarizeImprovements(events []improvementEvent) []axisMovement {
 
 // MeFeedbackSave — POST /api/v1/me/feedback
 // Body: {app, loop?, cycle_ts?, output_id?, kind: good|edit|wrong,
-//        note?, label?, ...}
+//
+//	note?, label?, ...}
+//
 // Maps the kind to (axis, verb): all three map to axis="examples"
 // with verb=kind. The cycle hook side appends OTHER axes
 // (memory/rules/standard/pieces/recipe) as separate events.
@@ -294,9 +296,12 @@ func MeFeedbackSave(c *gin.Context) {
 	label := body.Label
 	if label == "" {
 		switch body.Kind {
-		case "good":  label = "user 👍 on output"
-		case "edit":  label = "user ✏️ — edited then accepted"
-		case "wrong": label = "user 👎 on output"
+		case "good":
+			label = "user 👍 on output"
+		case "edit":
+			label = "user ✏️ — edited then accepted"
+		case "wrong":
+			label = "user 👎 on output"
 		}
 	}
 

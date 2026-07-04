@@ -63,11 +63,11 @@ func toolWorkflowDetail(c *gin.Context, userID, slug string) map[string]any {
 			return map[string]any{"error": "n8n: " + err.Error()}
 		}
 		return map[string]any{
-			"slug":        slug,
-			"kind":        "visual",
-			"name":        wf.Name,
-			"step_count":  len(wf.Nodes),
-			"active":      wf.Active,
+			"slug":       slug,
+			"kind":       "visual",
+			"name":       wf.Name,
+			"step_count": len(wf.Nodes),
+			"active":     wf.Active,
 		}
 	}
 	loops, src := readLoopsFromAnywhere(userID, parts[0])
@@ -81,17 +81,17 @@ func toolWorkflowDetail(c *gin.Context, userID, slug string) map[string]any {
 				}
 			}
 			return map[string]any{
-				"slug":          slug,
-				"kind":          "scheduled",
-				"app":           parts[0],
-				"loop":          L.Name,
-				"source":        src,
-				"schedule":      L.Schedule,
-				"description":   L.Description,
-				"primary_role":  L.PrimaryRole,
-				"engine":        engine,
-				"step_count":    len(L.Steps),
-				"skills":        L.Skills,
+				"slug":         slug,
+				"kind":         "scheduled",
+				"app":          parts[0],
+				"loop":         L.Name,
+				"source":       src,
+				"schedule":     L.Schedule,
+				"description":  L.Description,
+				"primary_role": L.PrimaryRole,
+				"engine":       engine,
+				"step_count":   len(L.Steps),
+				"skills":       L.Skills,
 			}
 		}
 	}
@@ -124,15 +124,15 @@ func toolListRuns(c *gin.Context, userID, stateFilter, workflowFilter string, li
 	slim := make([]map[string]any, 0, len(filtered))
 	for _, r := range filtered {
 		slim = append(slim, map[string]any{
-			"run_id":         r.RunID,
-			"workflow_slug":  r.WorkflowSlug,
-			"kind":           r.Kind,
-			"name":           r.Name,
-			"app":            r.App,
-			"state":          r.State,
-			"started_iso":    r.StartedISO,
-			"duration_s":     r.DurationSec,
-			"reason":         r.Reason,
+			"run_id":        r.RunID,
+			"workflow_slug": r.WorkflowSlug,
+			"kind":          r.Kind,
+			"name":          r.Name,
+			"app":           r.App,
+			"state":         r.State,
+			"started_iso":   r.StartedISO,
+			"duration_s":    r.DurationSec,
+			"reason":        r.Reason,
 		})
 	}
 	return map[string]any{
@@ -268,10 +268,10 @@ func toolSearchMarketplace(c *gin.Context, query, forApp string, limit int) map[
 		}
 		suggestions, _ := resp["suggestions"].([]any)
 		return map[string]any{
-			"query":       query,
-			"scorer":      resp["scorer"],
-			"results":     trimSuggestions(suggestions, limit),
-			"count":       len(suggestions),
+			"query":   query,
+			"scorer":  resp["scorer"],
+			"results": trimSuggestions(suggestions, limit),
+			"count":   len(suggestions),
 		}
 	}
 
@@ -428,15 +428,15 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 		note = "No catalog skill matched this intent yet — staged an empty draft. Add skills in the composer (or ask me to search the marketplace), then Save to install."
 	}
 	return map[string]any{
-		"draft_slug":     slug + "-draft",
-		"draft_dir":      draftDir,
-		"intent":         intent,
-		"for_app":        forApp,
-		"skills_picked":  pickedSkills,
+		"draft_slug":      slug + "-draft",
+		"draft_dir":       draftDir,
+		"intent":          intent,
+		"for_app":         forApp,
+		"skills_picked":   pickedSkills,
 		"skill_summaries": skillSummaries,
-		"no_match":       noMatch,
-		"review_url":     "/studio/workflows/" + slug + "-draft:" + slug,
-		"note":           note,
+		"no_match":        noMatch,
+		"review_url":      "/studio/workflows/" + slug + "-draft:" + slug,
+		"note":            note,
 	}
 }
 
@@ -583,9 +583,9 @@ func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
 		_ = os.Remove(xpcloudPath)
 	}
 	return map[string]any{
-		"slug":   slug,
-		"added":  skillName,
-		"note":   "Added to skill_imports[]. Re-install the app (app_update) or run a cycle to pick it up.",
+		"slug":  slug,
+		"added": skillName,
+		"note":  "Added to skill_imports[]. Re-install the app (app_update) or run a cycle to pick it up.",
 	}
 }
 

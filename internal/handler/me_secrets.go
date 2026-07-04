@@ -79,10 +79,10 @@ func MeSecretPut(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "stored",
 		"data": gin.H{
-			"app":         app,
-			"key":         key,
-			"is_set":      true,
-			"updated_at":  now.Format(time.RFC3339),
+			"app":        app,
+			"key":        key,
+			"is_set":     true,
+			"updated_at": now.Format(time.RFC3339),
 		},
 	})
 }

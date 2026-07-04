@@ -29,9 +29,9 @@ import (
 )
 
 const (
-	chatsKeep        = 200       // soft cap; oldest pruned in background after save
-	chatMaxBytes     = 2_000_000 // 2 MB per chat file (cap on transcript size)
-	chatTitleMaxLen  = 60
+	chatsKeep       = 200       // soft cap; oldest pruned in background after save
+	chatMaxBytes    = 2_000_000 // 2 MB per chat file (cap on transcript size)
+	chatTitleMaxLen = 60
 )
 
 var chatIDRe = regexp.MustCompile(`^chat-[a-f0-9]{16}$`)

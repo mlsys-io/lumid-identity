@@ -47,15 +47,15 @@ type PortfolioWorkflow struct {
 	Label string `json:"label,omitempty"` // declared goal.primary, if any
 	// health mirrors the dot the rest of Studio shows:
 	//   healthy | needs_attention | recovered | paused | never
-	Health        string  `json:"health"`
-	LastRunTS     float64 `json:"last_run_ts,omitempty"`
-	LastRunOK     *bool   `json:"last_run_ok,omitempty"`
-	Runs30d       int     `json:"runs_30d"`
-	CostUSD30d    float64 `json:"cost_usd_30d"`
+	Health         string  `json:"health"`
+	LastRunTS      float64 `json:"last_run_ts,omitempty"`
+	LastRunOK      *bool   `json:"last_run_ok,omitempty"`
+	Runs30d        int     `json:"runs_30d"`
+	CostUSD30d     float64 `json:"cost_usd_30d"`
 	TotalTokens30d float64 `json:"total_tokens_30d"`
-	Learned30d    int     `json:"learned_30d"`     // sum of memories pushed across the window's cycles
-	AvgDurationS  float64 `json:"avg_duration_s"`  // mean cycle duration over the window (0 when no timed runs)
-	ScanCapped    bool    `json:"scan_capped,omitempty"` // window may undercount: >cap cycles in 30d
+	Learned30d     int     `json:"learned_30d"`           // sum of memories pushed across the window's cycles
+	AvgDurationS   float64 `json:"avg_duration_s"`        // mean cycle duration over the window (0 when no timed runs)
+	ScanCapped     bool    `json:"scan_capped,omitempty"` // window may undercount: >cap cycles in 30d
 }
 
 // PortfolioTotals is the fleet headline.
@@ -157,11 +157,13 @@ func MePortfolio(c *gin.Context) {
 
 // portfolioHealth maps a WorkflowRow's live fields onto the same five-state
 // health vocabulary the dots use elsewhere:
-//   paused          — workflow disabled
-//   never           — no completed run yet
-//   recovered       — last run succeeded only via a retry/fallback self-heal
-//   needs_attention — last run failed (and hasn't recovered)
-//   healthy         — last run clean
+//
+//	paused          — workflow disabled
+//	never           — no completed run yet
+//	recovered       — last run succeeded only via a retry/fallback self-heal
+//	needs_attention — last run failed (and hasn't recovered)
+//	healthy         — last run clean
+//
 // (A running cycle keeps the prior health; the fleet view is a rollup, not a
 // live light board — /studio/runs owns the live "running" state.)
 func portfolioHealth(w WorkflowRow) string {

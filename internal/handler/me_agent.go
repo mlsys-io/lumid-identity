@@ -50,11 +50,11 @@ import (
 )
 
 const (
-	anthropicEndpoint    = "https://api.anthropic.com/v1/messages"
-	anthropicVersion     = "2023-06-01"
-	anthropicModel       = "claude-haiku-4-5-20251001"
-	maxToolLoopIterations = 50 // Claude Code parity — long refactors routinely need dozens of steps
-	maxTokensPerTurn     = 16384 // default per-turn output cap; providers may override via maxOutputTokens
+	anthropicEndpoint     = "https://api.anthropic.com/v1/messages"
+	anthropicVersion      = "2023-06-01"
+	anthropicModel        = "claude-haiku-4-5-20251001"
+	maxToolLoopIterations = 50    // Claude Code parity — long refactors routinely need dozens of steps
+	maxTokensPerTurn      = 16384 // default per-turn output cap; providers may override via maxOutputTokens
 )
 
 // ── Tool approval registry ──────────────────────────────────────────────────
@@ -62,9 +62,9 @@ const (
 // approve or deny via POST /api/v1/me/agent/chat/tool-approve.
 
 var (
-	toolApprovals    sync.Map            // approval_id → chan bool
+	toolApprovals    sync.Map                 // approval_id → chan bool
 	sandboxSemaphore = make(chan struct{}, 6) // global cap: 6 concurrent bash sandboxes
-	userSandboxMu    sync.Map            // userID → chan struct{} (per-user cap: 1)
+	userSandboxMu    sync.Map                 // userID → chan struct{} (per-user cap: 1)
 	userExecRateMu   sync.Mutex
 	userExecCounts   = map[string][]int64{} // userID → slice of Unix timestamps (last 60s)
 )
@@ -73,12 +73,12 @@ var (
 // execution. Includes both built-in mutating tools and LumidOS ops that push
 // or run live state.
 var destructiveTools = map[string]bool{
-	"bash_exec":      true,
-	"write_file":     true,
-	"edit_file":      true,
-	"multi_edit":     true,
-	"app_push":       true,
-	"app_install":    true,
+	"bash_exec":   true,
+	"write_file":  true,
+	"edit_file":   true,
+	"multi_edit":  true,
+	"app_push":    true,
+	"app_install": true,
 	// Phase 4 (app -> agent) canonical names. The old app_* names stay above
 	// as aliases so in-flight clients/prompts keep working; both route to the
 	// same LumidOS bridge handler (see agentToolAlias + dispatchTool).
@@ -92,7 +92,7 @@ var destructiveTools = map[string]bool{
 	// mutations (push/install/delete/billing/submit_workflow/live-trade) stay
 	// gated below.
 	"submit_workflow": true,
-	"xp_ingest":      true,
+	"xp_ingest":       true,
 	// C3 observability/action tools that mutate state.
 	"review_action":  true,
 	"app_config_set": true,
@@ -697,9 +697,9 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true, // multimodal; image blocks verified via kv.run
-		minRole:             "user", // everyone
-		maxOutputTokens:     16384, // 262K ctx, free local GPU — let answers/structured output run
+		supportsVision:      true,      // multimodal; image blocks verified via kv.run
+		minRole:             "user",    // everyone
+		maxOutputTokens:     16384,     // 262K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens:   2_000_000, // generous backstop; local GPU has no per-call cost
 	},
 	{
@@ -714,9 +714,9 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      false, // MiniMax is text-only
+		supportsVision:      false,   // MiniMax is text-only
 		minRole:             "admin", // admin + super_admin
-		maxOutputTokens:     16384, // 196K ctx, free local GPU
+		maxOutputTokens:     16384,   // 196K ctx, free local GPU
 		dailyBudgetTokens:   2_000_000,
 	},
 	{
@@ -725,7 +725,7 @@ var llmProviders = []llmProvider{
 		// Opus; admins get a frontier model without the super_admin gate).
 		id:             "claude-code-sonnet",
 		displayName:    "Claude Sonnet 4.6 (Code)",
-		endpoint:       "", // no HTTP endpoint — subprocess via proxy
+		endpoint:       "",       // no HTTP endpoint — subprocess via proxy
 		upstreamModel:  "sonnet", // claude CLI --model alias
 		authHeader:     "",
 		authPrefix:     "",
@@ -739,7 +739,7 @@ var llmProviders = []llmProvider{
 		// No ANTHROPIC_API_KEY needed; auth from ~/.claude/ credentials.
 		id:             "claude-code-opus",
 		displayName:    "Claude Opus 4.8 (Code)",
-		endpoint:       "", // no HTTP endpoint — subprocess via proxy
+		endpoint:       "",     // no HTTP endpoint — subprocess via proxy
 		upstreamModel:  "opus", // claude CLI --model alias
 		authHeader:     "",
 		authPrefix:     "",
@@ -1034,29 +1034,29 @@ type chatMessage struct {
 // chatAttachment — one file the user dropped into the chat input.
 //
 //   - kind=image:    Mime + DataB64. Anthropic source.media_type expects
-//                    "image/png" | "image/jpeg" | "image/gif" | "image/webp".
+//     "image/png" | "image/jpeg" | "image/gif" | "image/webp".
 //   - kind=text:     Text carries the raw content (txt, md, csv, json, yaml,
-//                    log, etc — anything the frontend can read as a string).
+//     log, etc — anything the frontend can read as a string).
 //   - kind=document: Mime + DataB64 for binary documents. Server routes
-//                    by Mime through extractDocumentText():
-//                      application/pdf                   → pdftotext
-//                      application/vnd.openxmlformats-...
-//                                          .wordprocess  → pandoc (docx)
-//                      application/vnd.openxmlformats-...
-//                                          .spreadsheet  → openpyxl (xlsx)
-//                      application/vnd.openxmlformats-...
-//                                          .presentation → pandoc (pptx)
-//                      application/rtf, application/vnd.oasis.opendocument.*,
-//                      application/epub+zip              → pandoc
-//                    On Claude (Anthropic) provider, PDFs ship as a native
-//                    `document` content block instead of going through
-//                    extraction — preserves tables, layout, embedded images.
+//     by Mime through extractDocumentText():
+//     application/pdf                   → pdftotext
+//     application/vnd.openxmlformats-...
+//     .wordprocess  → pandoc (docx)
+//     application/vnd.openxmlformats-...
+//     .spreadsheet  → openpyxl (xlsx)
+//     application/vnd.openxmlformats-...
+//     .presentation → pandoc (pptx)
+//     application/rtf, application/vnd.oasis.opendocument.*,
+//     application/epub+zip              → pandoc
+//     On Claude (Anthropic) provider, PDFs ship as a native
+//     `document` content block instead of going through
+//     extraction — preserves tables, layout, embedded images.
 type chatAttachment struct {
-	Kind     string `json:"kind"`               // "image" | "text" | "document"
-	Name     string `json:"name,omitempty"`     // filename hint
-	Mime     string `json:"mime,omitempty"`     // image + document
-	DataB64  string `json:"data_b64,omitempty"` // image + document — base64-encoded bytes
-	Text     string `json:"text,omitempty"`     // text-files only — raw content
+	Kind    string `json:"kind"`               // "image" | "text" | "document"
+	Name    string `json:"name,omitempty"`     // filename hint
+	Mime    string `json:"mime,omitempty"`     // image + document
+	DataB64 string `json:"data_b64,omitempty"` // image + document — base64-encoded bytes
+	Text    string `json:"text,omitempty"`     // text-files only — raw content
 }
 
 type meAgentChatBody struct {
@@ -1500,9 +1500,9 @@ func MeAgentChat(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"reply":      finalText,
-			"tool_calls": toolCalls,
-			"model_used": provider.id,
+			"reply":       finalText,
+			"tool_calls":  toolCalls,
+			"model_used":  provider.id,
 			"auto_routed": autoRouted,
 			"usage": gin.H{
 				"input_tokens":  totalInputTokens,
@@ -2141,9 +2141,9 @@ func buildToolDefs() []map[string]any {
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"query":    map[string]any{"type": "string", "description": "search terms — keyword match for now"},
-					"agent":    map[string]any{"type": "string", "description": "optional: scope to a specific agent (e.g. 'admin-personal-assistant')"},
-					"limit":    map[string]any{"type": "integer", "default": 6},
+					"query": map[string]any{"type": "string", "description": "search terms — keyword match for now"},
+					"agent": map[string]any{"type": "string", "description": "optional: scope to a specific agent (e.g. 'admin-personal-assistant')"},
+					"limit": map[string]any{"type": "integer", "default": 6},
 				},
 				"required": []string{"query"},
 			},
@@ -2154,7 +2154,7 @@ func buildToolDefs() []map[string]any {
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"source_slug":      map[string]any{"type": "string", "description": "xp.io repo slug of the bank to subscribe to (owner_sub/bank-name)"},
+					"source_slug":     map[string]any{"type": "string", "description": "xp.io repo slug of the bank to subscribe to (owner_sub/bank-name)"},
 					"target_agent_id": map[string]any{"type": "string", "description": "local agent id that should receive the imported memories. If absent, defaults to the agent whose name matches the source bank's name."},
 				},
 				"required": []string{"source_slug"},
@@ -2165,8 +2165,8 @@ func buildToolDefs() []map[string]any {
 		// language commands users reach for: "send Alice's draft",
 		// "pause cc_watcher for the weekend", "what's pending?".
 		{
-			"name":        "today_summary",
-			"description": "Return the user's headlines + recent cycles + drafts-pending count in one shot. Use when the user asks 'what's pending', 'what's new', or 'what did my AI do today?'.",
+			"name":         "today_summary",
+			"description":  "Return the user's headlines + recent cycles + drafts-pending count in one shot. Use when the user asks 'what's pending', 'what's new', or 'what did my AI do today?'.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
@@ -2319,7 +2319,7 @@ func buildToolDefs() []map[string]any {
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"intent":   map[string]any{"type": "string", "description": "plain-English description, e.g. 'watch my Slack every hour and draft replies'"},
+					"intent":  map[string]any{"type": "string", "description": "plain-English description, e.g. 'watch my Slack every hour and draft replies'"},
 					"for_app": map[string]any{"type": "string", "description": "which xpio shape to target — personal-agent is the default for assistant-style intents"},
 					"name":    map[string]any{"type": "string", "description": "optional — friendly name for the new workflow (defaults to a slug derived from the intent)"},
 				},
@@ -2623,8 +2623,8 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "list_tasks",
-			"description": "List your background bash tasks (from bash_exec with background=true): id, status (running|done|error|timeout), command, started/finished times, exit code.",
+			"name":         "list_tasks",
+			"description":  "List your background bash tasks (from bash_exec with background=true): id, status (running|done|error|timeout), command, started/finished times, exit code.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
@@ -2640,8 +2640,8 @@ func buildToolDefs() []map[string]any {
 		},
 		// ── LumidOS ops tools (proxied to schedule server :9100) ────────────
 		{
-			"name":        "xp_status",
-			"description": "Return the status of the local XP.io knowledge graph: which agents exist, memory counts, last sync.",
+			"name":         "xp_status",
+			"description":  "Return the status of the local XP.io knowledge graph: which agents exist, memory counts, last sync.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
@@ -2658,15 +2658,15 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "xp_agents",
-			"description": "List all XP.io knowledge agents on this host.",
+			"name":         "xp_agents",
+			"description":  "List all XP.io knowledge agents on this host.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
 			"name":        "xp_memories",
 			"description": "Return recent memories for a specific XP.io agent.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"agent_id": map[string]any{"type": "string"}},
 				"required":   []string{"agent_id"},
 			},
@@ -2724,15 +2724,15 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "xp_remotes",
-			"description": "List remote knowledge agents this host subscribes to.",
+			"name":         "xp_remotes",
+			"description":  "List remote knowledge agents this host subscribes to.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
 			"name":        "xp_share",
 			"description": "Push a local knowledge agent's bank to xp.io cloud.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"agent_id": map[string]any{"type": "string"}},
 				"required":   []string{"agent_id"},
 			},
@@ -2741,7 +2741,7 @@ func buildToolDefs() []map[string]any {
 			"name":        "xp_pull",
 			"description": "Pull updates from a remote knowledge agent into the local bank.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"agent_id": map[string]any{"type": "string"}},
 				"required":   []string{"agent_id"},
 			},
@@ -2782,8 +2782,8 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "list_loops",
-			"description": "HOST/operator-scope: scheduled jobs on the LumidOS schedule server (not the caller's apps). For the USER's own installed app workflows and their health/last-run/status, use list_workflows or loops_health instead — those are tenant-scoped and are what 'my workflows / my autoresearch' refers to.",
+			"name":         "list_loops",
+			"description":  "HOST/operator-scope: scheduled jobs on the LumidOS schedule server (not the caller's apps). For the USER's own installed app workflows and their health/last-run/status, use list_workflows or loops_health instead — those are tenant-scoped and are what 'my workflows / my autoresearch' refers to.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
@@ -2823,15 +2823,15 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "agent_list",
-			"description": "List all xpio agents installed on this host.",
+			"name":         "agent_list",
+			"description":  "List all xpio agents installed on this host.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
 			// Alias of agent_list (legacy name). Kept so in-flight clients/prompts
 			// calling app_list keep working; both dispatch to the same op.
-			"name":        "app_list",
-			"description": "Alias of agent_list (legacy name). List all xpio agents installed on this host.",
+			"name":         "app_list",
+			"description":  "Alias of agent_list (legacy name). List all xpio agents installed on this host.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
@@ -2860,7 +2860,7 @@ func buildToolDefs() []map[string]any {
 			"name":        "agent_detail",
 			"description": "Get metadata and schema for a specific xpio agent from the marketplace.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"slug": map[string]any{"type": "string"}},
 				"required":   []string{"slug"},
 			},
@@ -2869,7 +2869,7 @@ func buildToolDefs() []map[string]any {
 			"name":        "app_detail",
 			"description": "Alias of agent_detail (legacy name). Get metadata and schema for a specific xpio agent from the marketplace.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"slug": map[string]any{"type": "string"}},
 				"required":   []string{"slug"},
 			},
@@ -2986,7 +2986,7 @@ func buildToolDefs() []map[string]any {
 			"name":        "agent_validate",
 			"description": "Validate an installed xpio agent's manifest and config before pushing.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
 				"required":   []string{"name"},
 			},
@@ -2995,7 +2995,7 @@ func buildToolDefs() []map[string]any {
 			"name":        "app_validate",
 			"description": "Alias of agent_validate (legacy name). Validate an installed xpio agent's manifest and config before pushing.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
 				"required":   []string{"name"},
 			},
@@ -3004,7 +3004,7 @@ func buildToolDefs() []map[string]any {
 			"name":        "agent_update",
 			"description": "Pull the latest version of an installed agent from xp.io.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
 				"required":   []string{"name"},
 			},
@@ -3013,7 +3013,7 @@ func buildToolDefs() []map[string]any {
 			"name":        "app_update",
 			"description": "Alias of agent_update (legacy name). Pull the latest version of an installed agent from xp.io.",
 			"input_schema": map[string]any{
-				"type": "object",
+				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},
 				"required":   []string{"name"},
 			},
@@ -3030,8 +3030,8 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "list_workers",
-			"description": "List available FlowMesh compute workers and their current status.",
+			"name":         "list_workers",
+			"description":  "List available FlowMesh compute workers and their current status.",
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{

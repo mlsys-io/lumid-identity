@@ -8,14 +8,14 @@ import "time"
 // stored lowercased to make MySQL's case-sensitive collation behave
 // like Postgres citext.
 type User struct {
-	ID            string    `gorm:"type:varchar(36);primaryKey" json:"id"`
-	Email         string    `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
-	EmailVerified bool      `gorm:"default:false" json:"email_verified"`
-	PasswordHash  string    `gorm:"type:varchar(255)" json:"-"` // bcrypt; may be empty for OAuth-only users
-	Name          string    `gorm:"type:varchar(255)" json:"name,omitempty"`
-	AvatarURL     string    `gorm:"type:mediumtext" json:"avatar_url,omitempty"` // may be http URL or base64 data URL
-	Role          string    `gorm:"type:varchar(32);default:'user'" json:"role"`
-	Status        string    `gorm:"type:varchar(16);default:'active'" json:"status"` // active | suspended | pending
+	ID            string `gorm:"type:varchar(36);primaryKey" json:"id"`
+	Email         string `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
+	EmailVerified bool   `gorm:"default:false" json:"email_verified"`
+	PasswordHash  string `gorm:"type:varchar(255)" json:"-"` // bcrypt; may be empty for OAuth-only users
+	Name          string `gorm:"type:varchar(255)" json:"name,omitempty"`
+	AvatarURL     string `gorm:"type:mediumtext" json:"avatar_url,omitempty"` // may be http URL or base64 data URL
+	Role          string `gorm:"type:varchar(32);default:'user'" json:"role"`
+	Status        string `gorm:"type:varchar(16);default:'active'" json:"status"` // active | suspended | pending
 	// InvitationCodeUsed preserves LQA's existing invitation gating.
 	// Migrated from tbl_user.invitation_code; may drop in Phase 8.
 	InvitationCodeUsed string    `gorm:"type:varchar(64)" json:"invitation_code_used,omitempty"`

@@ -42,23 +42,23 @@ const (
 // mutating tools (send_email, install_app, etc.) are intentionally
 // excluded; parent agent owns those.
 var subAgentDefaultTools = map[string]bool{
-	"web_search":          true,
-	"web_fetch":           true,
-	"deep_research":       true,
-	"query_findata":       true,
-	"query_my_knowledge":  true,
-	"code_run":            true,
-	"list_apps":           true,
-	"list_drafts":         true,
-	"list_recent_cycles":  true,
-	"list_marketplace":    true,
-	"list_workflows":      true,
-	"workflow_detail":     true,
-	"list_runs":           true,
-	"run_detail":          true,
-	"workflow_report_card":true,
-	"today_summary":       true,
-	"search_marketplace":  true,
+	"web_search":           true,
+	"web_fetch":            true,
+	"deep_research":        true,
+	"query_findata":        true,
+	"query_my_knowledge":   true,
+	"code_run":             true,
+	"list_apps":            true,
+	"list_drafts":          true,
+	"list_recent_cycles":   true,
+	"list_marketplace":     true,
+	"list_workflows":       true,
+	"workflow_detail":      true,
+	"list_runs":            true,
+	"run_detail":           true,
+	"workflow_report_card": true,
+	"today_summary":        true,
+	"search_marketplace":   true,
 }
 
 // filterTools returns a tool-defs slice containing only entries whose
@@ -79,10 +79,11 @@ func filterTools(all []map[string]any, allowed map[string]bool) []map[string]any
 }
 
 // toolSpawnAgent — me_agent tool implementation. Args:
-//   task         string  required — the focused job for the sub-agent
-//   tools        []string optional — whitelist; default = subAgentDefaultTools
-//   agent_id     string  optional — ground the sub-agent in this xpio agent
-//   max_iter     int     optional — cap on tool-use loop (default 5, max 5)
+//
+//	task         string  required — the focused job for the sub-agent
+//	tools        []string optional — whitelist; default = subAgentDefaultTools
+//	agent_id     string  optional — ground the sub-agent in this xpio agent
+//	max_iter     int     optional — cap on tool-use loop (default 5, max 5)
 func toolSpawnAgent(c *gin.Context, userID string, args map[string]any) (map[string]any, bool) {
 	task, _ := args["task"].(string)
 	task = strings.TrimSpace(task)
@@ -145,10 +146,10 @@ func toolSpawnAgent(c *gin.Context, userID string, args map[string]any) (map[str
 	)
 	if runErr != nil {
 		return map[string]any{
-			"error":       runErr.Error(),
-			"reply":       finalText, // partial reply if any
-			"tool_calls":  toolCalls,
-			"input_tokens": inTok,
+			"error":         runErr.Error(),
+			"reply":         finalText, // partial reply if any
+			"tool_calls":    toolCalls,
+			"input_tokens":  inTok,
 			"output_tokens": outTok,
 		}, false
 	}

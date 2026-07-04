@@ -8,12 +8,12 @@
 // recognizes the admin aliases (`*`, `flowmesh:*`, `flowmesh:admin`)
 // plus per-resource scopes:
 //
-//   flowmesh:workflows:{read,write}
-//   flowmesh:tasks:read
-//   flowmesh:results:{read,write}
-//   flowmesh:nodes:{read,write}
-//   flowmesh:workers:{read,write}
-//   flowmesh:system:read
+//	flowmesh:workflows:{read,write}
+//	flowmesh:tasks:read
+//	flowmesh:results:{read,write}
+//	flowmesh:nodes:{read,write}
+//	flowmesh:workers:{read,write}
+//	flowmesh:system:read
 //
 // `flowmesh:read` / `flowmesh:write` (which the UI mints today) match
 // none of those and would fail closed at the plugin. So we expand

@@ -30,8 +30,8 @@ import (
 
 // codebaseRepo is one source-tree git repo on disk.
 type codebaseRepo struct {
-	Path           string `json:"path"`           // mount-relative
-	Name           string `json:"name"`           // last segment
+	Path           string `json:"path"`            // mount-relative
+	Name           string `json:"name"`            // last segment
 	Group          string `json:"group,omitempty"` // parent dir (e.g. "quantarena")
 	Branch         string `json:"branch,omitempty"`
 	HeadShortSHA   string `json:"head_short_sha,omitempty"`
@@ -47,7 +47,7 @@ type codebaseRepo struct {
 	Deprecated     bool   `json:"deprecated,omitempty"`
 	// Composite verdict for the tile:
 	// "clean" | "dirty" | "ahead" | "behind" | "diverged" | "no_upstream" | "detached"
-	Status         string `json:"status"`
+	Status string `json:"status"`
 }
 
 // codebaseRoot is the host path /proj exposed inside the container.

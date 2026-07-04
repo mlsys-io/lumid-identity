@@ -54,7 +54,7 @@ type patMintReq struct {
 
 type patMintResp struct {
 	ID        string     `json:"id"`
-	Token     string     `json:"token"`  // cleartext, once only
+	Token     string     `json:"token"` // cleartext, once only
 	Prefix    string     `json:"prefix"`
 	Name      string     `json:"name"`
 	Scopes    []string   `json:"scopes"`

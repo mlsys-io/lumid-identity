@@ -29,10 +29,10 @@ import (
 )
 
 const (
-	DefaultCyclesDaily      = 100
-	DefaultLLMTokensDaily   = 500_000
-	DefaultGmailSendsDaily  = 200
-	DefaultSlackPostsDaily  = 100
+	DefaultCyclesDaily     = 100
+	DefaultLLMTokensDaily  = 500_000
+	DefaultGmailSendsDaily = 200
+	DefaultSlackPostsDaily = 100
 )
 
 // Limits captures the headline numbers the UI surfaces alongside today's totals.

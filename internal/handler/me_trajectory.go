@@ -254,9 +254,10 @@ func modelForNode(appDir, loop, cycleTs, runTs string, runModels map[string]stri
 
 // branchKeyForNode computes a run's CONFIGURATION SIGNATURE — the set of axes
 // whose change forks a new branch in the run tree:
-//   • model (gemma / claude / …)
-//   • dataset version it ran on
-//   • the prompt set (content SHAs) from cycle.json assets_used, when recorded
+//   - model (gemma / claude / …)
+//   - dataset version it ran on
+//   - the prompt set (content SHAs) from cycle.json assets_used, when recorded
+//
 // Switching ANY of these = a branch; an unchanged signature = continue the same
 // branch; returning to a prior signature continues THAT branch. Deliberately
 // EXCLUDED: the agent's knowledge-bank version (it grows every run — that's
@@ -363,55 +364,55 @@ func agentVersionAt(times []float64, cycleTs string) string {
 }
 
 type trajNode struct {
-	ID         string         `json:"id"`
-	Kind       string         `json:"kind"` // baseline | variant | run
-	VariantID  string         `json:"variant_id,omitempty"`
-	CycleTs    string         `json:"cycle_ts,omitempty"`
-	RunTs      string         `json:"run_ts,omitempty"`
-	Depth      int            `json:"depth"`
-	ParentID   string         `json:"parent_id,omitempty"`
-	Label      string         `json:"label"`
-	Config     map[string]any `json:"config,omitempty"`
-	Score      *float64       `json:"score,omitempty"`
-	Scored     bool           `json:"scored"`
-	DeltaVsBaseline *float64  `json:"delta_vs_baseline,omitempty"`
-	IsChampion bool           `json:"is_champion,omitempty"`
-	DurationS  *float64       `json:"duration_s,omitempty"`
+	ID              string         `json:"id"`
+	Kind            string         `json:"kind"` // baseline | variant | run
+	VariantID       string         `json:"variant_id,omitempty"`
+	CycleTs         string         `json:"cycle_ts,omitempty"`
+	RunTs           string         `json:"run_ts,omitempty"`
+	Depth           int            `json:"depth"`
+	ParentID        string         `json:"parent_id,omitempty"`
+	Label           string         `json:"label"`
+	Config          map[string]any `json:"config,omitempty"`
+	Score           *float64       `json:"score,omitempty"`
+	Scored          bool           `json:"scored"`
+	DeltaVsBaseline *float64       `json:"delta_vs_baseline,omitempty"`
+	IsChampion      bool           `json:"is_champion,omitempty"`
+	DurationS       *float64       `json:"duration_s,omitempty"`
 	// NeedsDecision: the run has pending advisor suggestions / offers or a
 	// held review_queue item awaiting a human decision (drives the canvas
 	// "needs-attention" badge).
-	NeedsDecision bool        `json:"needs_decision,omitempty"`
+	NeedsDecision bool `json:"needs_decision,omitempty"`
 	// AgentVersion: this node's version in the agent's history — "v<N>", N = the
 	// run's 1-based chronological rank in this trajectory (assignNodeVersions).
 	// The run tree IS the version history, so every node is a distinct version;
 	// versions are global + unique across branches. (Supersedes the old
 	// bank-memory-count derivation, which collapsed to one version when runs
 	// banked nothing new.)
-	AgentVersion string      `json:"agent_version,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
 	// DataVersion: the dataset version this run was evaluated on ("v<semver>").
 	// Authoritative from cycle.json assets_used; falls back to the workflow's
 	// declared dataset version (the repo is fixed per workflow, version pinned
 	// per run). The metric on this node is scored on this data version.
-	DataVersion string       `json:"data_version,omitempty"`
+	DataVersion string `json:"data_version,omitempty"`
 	// Model: the LLM this run used (short label — "gemma" / "claude" / …), so
 	// gemma vs claude runs are distinguishable at a glance. From the run's
 	// interview report (analyst_model) or cycle.json cost.by_model. A change of
 	// model forks a new branch; the same model continues its own branch.
-	Model string             `json:"model,omitempty"`
+	Model string `json:"model,omitempty"`
 	// Learned: memories this run banked (auto_publish pushed). Carried on the node
 	// itself so the UI doesn't have to index cycles[] by depth — depth is no
 	// longer the cycle index once runs branch by model.
-	Learned int              `json:"learned,omitempty"`
+	Learned int `json:"learned,omitempty"`
 }
 
 type trajCycle struct {
-	Ts             string   `json:"ts"`
-	NVariants      int      `json:"n_variants"`
-	ChampionID     string   `json:"champion_id,omitempty"`
-	ChampionScore  *float64 `json:"champion_score,omitempty"`
-	Learned        int      `json:"learned"`
-	BestDelta      *float64 `json:"best_delta,omitempty"`
-	DurationS      *float64 `json:"duration_s,omitempty"`
+	Ts            string   `json:"ts"`
+	NVariants     int      `json:"n_variants"`
+	ChampionID    string   `json:"champion_id,omitempty"`
+	ChampionScore *float64 `json:"champion_score,omitempty"`
+	Learned       int      `json:"learned"`
+	BestDelta     *float64 `json:"best_delta,omitempty"`
+	DurationS     *float64 `json:"duration_s,omitempty"`
 }
 
 // one variant trial after grouping (a single best-scored representative per
@@ -1109,14 +1110,14 @@ func linearRunChain(appDir, loop string, cycleDirs []string, durCache map[string
 		}
 		score, scored := cycleScore(appDir, loop, ts)
 		n := trajNode{
-			ID:           "run:" + ts,
-			Kind:         "run",
-			CycleTs:      ts,
-			RunTs:        ts,
-			Depth:        depth,
-			ParentID:     parent,
-			Label:        shortDate(ts),
-			Scored:       scored,
+			ID:       "run:" + ts,
+			Kind:     "run",
+			CycleTs:  ts,
+			RunTs:    ts,
+			Depth:    depth,
+			ParentID: parent,
+			Label:    shortDate(ts),
+			Scored:   scored,
 			// Mark each run a champion of its (model) branch so the UI collapses
 			// long same-config stretches into a "+N cycles" badge instead of
 			// rendering one node per cycle (these loops can have 100+ cycles).

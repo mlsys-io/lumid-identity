@@ -32,18 +32,18 @@ import (
 // ---- shapes ----
 
 type userRow struct {
-	ID                 string     `json:"id"`
-	Email              string     `json:"email"`
-	EmailVerified      bool       `json:"email_verified"`
-	Name               string     `json:"name,omitempty"`
-	AvatarURL          string     `json:"avatar_url,omitempty"`
-	Role               string     `json:"role"`
-	Status             string     `json:"status"`
-	InvitationCodeUsed string     `json:"invitation_code_used,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID                 string    `json:"id"`
+	Email              string    `json:"email"`
+	EmailVerified      bool      `json:"email_verified"`
+	Name               string    `json:"name,omitempty"`
+	AvatarURL          string    `json:"avatar_url,omitempty"`
+	Role               string    `json:"role"`
+	Status             string    `json:"status"`
+	InvitationCodeUsed string    `json:"invitation_code_used,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 	// Derived on read only.
-	ActiveTokenCount int       `json:"active_token_count"`
+	ActiveTokenCount int        `json:"active_token_count"`
 	LastLoginAt      *time.Time `json:"last_login_at,omitempty"`
 }
 

@@ -32,28 +32,28 @@ import (
 // presentation (icon, color) but the message text is server-authored
 // so wording stays consistent across the web + future CLI surfaces.
 type todayHeadline struct {
-	Kind    string `json:"kind"`              // brief | drafts | quota_paused | cycle_ok | cycle_failed
+	Kind    string `json:"kind"` // brief | drafts | quota_paused | cycle_ok | cycle_failed
 	App     string `json:"app,omitempty"`
 	Loop    string `json:"loop,omitempty"`
-	Ts      string `json:"ts,omitempty"`      // ISO8601; empty for ambient items like "drafts"
-	Summary string `json:"summary"`           // one short sentence
-	Detail  string `json:"detail,omitempty"`  // optional second line
+	Ts      string `json:"ts,omitempty"`     // ISO8601; empty for ambient items like "drafts"
+	Summary string `json:"summary"`          // one short sentence
+	Detail  string `json:"detail,omitempty"` // optional second line
 }
 
 type todayCycleRow struct {
-	App         string  `json:"app"`
-	Loop        string  `json:"loop"`
-	OK          bool    `json:"ok"`
-	Ts          string  `json:"ts"`
-	DurationS   float64 `json:"duration_s,omitempty"`
-	Skipped     bool    `json:"skipped,omitempty"`
-	SkipReason  string  `json:"skip_reason,omitempty"`
-	LastError   string  `json:"last_error,omitempty"`
+	App        string  `json:"app"`
+	Loop       string  `json:"loop"`
+	OK         bool    `json:"ok"`
+	Ts         string  `json:"ts"`
+	DurationS  float64 `json:"duration_s,omitempty"`
+	Skipped    bool    `json:"skipped,omitempty"`
+	SkipReason string  `json:"skip_reason,omitempty"`
+	LastError  string  `json:"last_error,omitempty"`
 	// Engine-revamp observability (B0): the cycle's outcome + how many
 	// items are held for human review / offered as compound recall.
-	Outcome     string  `json:"outcome,omitempty"`      // ran | no_change | awaiting_review | no_setup
-	ReviewCount int     `json:"review_count,omitempty"`
-	OffersCount int     `json:"offers_count,omitempty"`
+	Outcome     string `json:"outcome,omitempty"` // ran | no_change | awaiting_review | no_setup
+	ReviewCount int    `json:"review_count,omitempty"`
+	OffersCount int    `json:"offers_count,omitempty"`
 }
 
 // MeToday serves GET /api/v1/me/today.
@@ -77,7 +77,7 @@ func MeToday(c *gin.Context) {
 	// OR no state entry).
 	if n := countPendingDraftsForUser(userID); n > 0 {
 		headlines = append(headlines, todayHeadline{
-			Kind: "drafts",
+			Kind:    "drafts",
 			Summary: pluralize(n, "draft is waiting for you.", "drafts are waiting for you."),
 		})
 	}

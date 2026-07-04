@@ -42,8 +42,8 @@ const (
 	// (longer polls, narrowed refetch scopes) + in-flight GET dedup, normal
 	// dashboard use sits well under this; a runaway still trips it. (Was 1200
 	// as an emergency ceiling during the 429 incident; 60 originally.)
-	defaultRateLimit    = 300
-	defaultRateWindowS  = 60
+	defaultRateLimit   = 300
+	defaultRateWindowS = 60
 )
 
 // rateLimitScript — INCR the counter and, if it has no expiry yet (new key OR a

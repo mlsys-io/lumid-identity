@@ -43,65 +43,65 @@ import (
 // are best-effort — missing files don't 500.
 
 type loopRow struct {
-	App                  string   `json:"app"`
-	Loop                 string   `json:"loop"`
-	Schedule             string   `json:"schedule"`
-	DeclaredIn           string   `json:"declared_in"`
-	LastRunTS            float64  `json:"last_run_ts"`
-	LastOk               *bool    `json:"last_ok,omitempty"`
-	ConsecutiveFailures  int      `json:"consecutive_failures"`
-	LastDurationSeconds  float64  `json:"last_duration_s"`
-	Status               string   `json:"status"` // "never" | "ok" | "failing" | "stale" | "manual"
+	App                 string  `json:"app"`
+	Loop                string  `json:"loop"`
+	Schedule            string  `json:"schedule"`
+	DeclaredIn          string  `json:"declared_in"`
+	LastRunTS           float64 `json:"last_run_ts"`
+	LastOk              *bool   `json:"last_ok,omitempty"`
+	ConsecutiveFailures int     `json:"consecutive_failures"`
+	LastDurationSeconds float64 `json:"last_duration_s"`
+	Status              string  `json:"status"` // "never" | "ok" | "failing" | "stale" | "manual"
 	// Detail fields populated on click; cheap enough to ship inline so
 	// the tile doesn't need a second fetch when a row expands.
-	Description          string   `json:"description,omitempty"`
-	PrimaryRole          string   `json:"primary_role,omitempty"`
-	KnowledgeAgent       string   `json:"knowledge_agent,omitempty"`
-	Mode                 string   `json:"mode,omitempty"`
-	Skills               []string `json:"skills,omitempty"`
-	Steps                []loopStep `json:"steps,omitempty"`
-	Datasets             []string `json:"datasets,omitempty"`
-	GoalPrimary          string   `json:"goal_primary,omitempty"`
-	GoalTracked          []string `json:"goal_tracked,omitempty"`
-	LatestCycleDir       string   `json:"latest_cycle_dir,omitempty"`
-	LatestCycleTS        string   `json:"latest_cycle_ts,omitempty"`
+	Description    string     `json:"description,omitempty"`
+	PrimaryRole    string     `json:"primary_role,omitempty"`
+	KnowledgeAgent string     `json:"knowledge_agent,omitempty"`
+	Mode           string     `json:"mode,omitempty"`
+	Skills         []string   `json:"skills,omitempty"`
+	Steps          []loopStep `json:"steps,omitempty"`
+	Datasets       []string   `json:"datasets,omitempty"`
+	GoalPrimary    string     `json:"goal_primary,omitempty"`
+	GoalTracked    []string   `json:"goal_tracked,omitempty"`
+	LatestCycleDir string     `json:"latest_cycle_dir,omitempty"`
+	LatestCycleTS  string     `json:"latest_cycle_ts,omitempty"`
 	// Failing-loop diagnostics — populated only when the loop's last
 	// run errored. ``last_errors`` reads step_errors.json from the
 	// most recent cycle dir; ``last_journal`` is the trailing entry of
 	// journal.jsonl when the app keeps one (useful when the cycle
 	// errored before reaching the per-step wrapper).
-	LastErrors           []loopErrorRow `json:"last_errors,omitempty"`
-	LastJournal          string         `json:"last_journal,omitempty"`
+	LastErrors  []loopErrorRow `json:"last_errors,omitempty"`
+	LastJournal string         `json:"last_journal,omitempty"`
 	// Engine pattern (Pattern A = runner_steps, Pattern B = command).
 	// When command-driven, EngineModule names the verb the runner
 	// dispatches into; SkillsInvoked is the documentation list of
 	// what the verb actually calls.
-	Engine               string         `json:"engine,omitempty"`
-	EngineModule         string         `json:"engine_module,omitempty"`
-	SkillsInvoked        []string       `json:"skills_invoked,omitempty"`
+	Engine        string   `json:"engine,omitempty"`
+	EngineModule  string   `json:"engine_module,omitempty"`
+	SkillsInvoked []string `json:"skills_invoked,omitempty"`
 	// Cycle outcome — hydrated from score.json / insight.md / proposal.json
 	// in the latest cycle dir. Present when any of those files exist.
-	Outcome              *loopOutcome   `json:"outcome,omitempty"`
+	Outcome *loopOutcome `json:"outcome,omitempty"`
 }
 
 // loopOutcome surfaces the most recent cycle's key metrics so the
 // dashboard tile can show α / benchmark / sharpe without the operator
 // drilling into a cycle dir.
 type loopOutcome struct {
-	AlphaPP      *float64 `json:"alpha_pp,omitempty"`      // realized_alpha_pp from score.json
-	Benchmark    string   `json:"benchmark,omitempty"`     // benchmark_label from score.json
-	Sharpe       *float64 `json:"sharpe,omitempty"`        // sharpe from score.json
-	MaxDD        *float64 `json:"max_dd,omitempty"`        // max_dd from score.json
-	InsightHead  string   `json:"insight_head,omitempty"`  // first 5 lines of insight.md
+	AlphaPP      *float64      `json:"alpha_pp,omitempty"`      // realized_alpha_pp from score.json
+	Benchmark    string        `json:"benchmark,omitempty"`     // benchmark_label from score.json
+	Sharpe       *float64      `json:"sharpe,omitempty"`        // sharpe from score.json
+	MaxDD        *float64      `json:"max_dd,omitempty"`        // max_dd from score.json
+	InsightHead  string        `json:"insight_head,omitempty"`  // first 5 lines of insight.md
 	LastProposal *loopProposal `json:"last_proposal,omitempty"` // from proposal.json
 
 	// Trading-cycle metrics derived from trades.json. Optional — observer
 	// loops (regime_detector, competitor_observer) skip act/execute and
 	// produce no trades.
-	TradesCount    *int     `json:"trades_count,omitempty"`     // # of trades placed this cycle
-	PnL            *float64 `json:"pnl,omitempty"`              // sum of per-trade pnl
-	WinRate        *float64 `json:"win_rate,omitempty"`         // wins / total (0..1)
-	MaxLoss        *float64 `json:"max_single_trade_loss,omitempty"`
+	TradesCount *int     `json:"trades_count,omitempty"` // # of trades placed this cycle
+	PnL         *float64 `json:"pnl,omitempty"`          // sum of per-trade pnl
+	WinRate     *float64 `json:"win_rate,omitempty"`     // wins / total (0..1)
+	MaxLoss     *float64 `json:"max_single_trade_loss,omitempty"`
 
 	// Downstream jobs submitted during this cycle. Populated by scanning
 	// ~/.lumilake/jobs.jsonl for rows tagged with this loop's name.
@@ -110,10 +110,10 @@ type loopOutcome struct {
 }
 
 type loopProposal struct {
-	Strategy  string  `json:"strategy,omitempty"`
-	Symbol    string  `json:"symbol,omitempty"`
-	Direction string  `json:"direction,omitempty"`
-	SizePctNAV float64 `json:"size_pct_nav,omitempty"`
+	Strategy   string   `json:"strategy,omitempty"`
+	Symbol     string   `json:"symbol,omitempty"`
+	Direction  string   `json:"direction,omitempty"`
+	SizePctNAV float64  `json:"size_pct_nav,omitempty"`
 	Confidence *float64 `json:"confidence,omitempty"`
 }
 
@@ -146,9 +146,9 @@ type loopErrorRow struct {
 // (Theme I — strategy-grid-first layout). Fields map 1:1 with what the
 // auto-quant runner writes after each cycle.
 type strategyState struct {
-	Name           string  `json:"name"`
-	LifecycleStage string  `json:"lifecycle_stage,omitempty"` // smoke_test|explore|paper|semi|live|retired
-	CycleCount     int     `json:"cycle_count,omitempty"`
+	Name           string   `json:"name"`
+	LifecycleStage string   `json:"lifecycle_stage,omitempty"` // smoke_test|explore|paper|semi|live|retired
+	CycleCount     int      `json:"cycle_count,omitempty"`
 	RecentSharpe   *float64 `json:"recent_sharpe,omitempty"`
 	LifetimePnL    *float64 `json:"lifetime_pnl,omitempty"`
 }
@@ -419,9 +419,11 @@ type rawGoal struct {
 
 // loadLoopDetail walks the app dir to fetch detail-fields for one
 // loop. Best-effort — every field is optional. Reads in order:
-//   xpcloud.yaml::loops[name=loop]    (canonical runtime source)
-//   manifest.json::loops[name=loop]   (legacy mirror)
-//   autoresearch.yaml                  (ops/xpio-ops single-loop shape)
+//
+//	xpcloud.yaml::loops[name=loop]    (canonical runtime source)
+//	manifest.json::loops[name=loop]   (legacy mirror)
+//	autoresearch.yaml                  (ops/xpio-ops single-loop shape)
+//
 // Also resolves the most recent cycle dir under data/cycles/<loop>/<ts>/
 // or data/outbox/<case>/<ts>/ when present.
 func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
@@ -939,9 +941,9 @@ func loadAppGitStatus(home, app string) appGitStatus {
 	originPath, _ := ResolveRuntimeReadPath(appDir, "origin.json")
 	if b, err := os.ReadFile(originPath); err == nil {
 		var o struct {
-			Slug    string `json:"slug"`
-			Owner   string `json:"owner_sub"`
-			Name    string `json:"name"`
+			Slug  string `json:"slug"`
+			Owner string `json:"owner_sub"`
+			Name  string `json:"name"`
 		}
 		if json.Unmarshal(b, &o) == nil {
 			if o.Slug != "" {
@@ -1217,11 +1219,11 @@ func AdminLoops(c *gin.Context) {
 	})
 
 	ok(c, "ok", gin.H{
-		"loops":                 rows,
-		"apps":                  apps_status,
-		"summary":               summary,
-		"scheduler_daemon":      scheduler,
-		"operator_home":         home,
-		"generated_at":          time.Now().UTC(),
+		"loops":            rows,
+		"apps":             apps_status,
+		"summary":          summary,
+		"scheduler_daemon": scheduler,
+		"operator_home":    home,
+		"generated_at":     time.Now().UTC(),
 	})
 }

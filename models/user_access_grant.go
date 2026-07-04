@@ -5,10 +5,10 @@ import "time"
 // UserAccessGrant is an admin-applied per-service access level override.
 //
 // Precedence in computeAccess:
-//   1. suspended → none (status overrides everything)
-//   2. role=admin → admin (role still trumps grants)
-//   3. explicit grant exists for user × service → use grant.level
-//   4. fall through to role("user") default + PAT-scope upgrades
+//  1. suspended → none (status overrides everything)
+//  2. role=admin → admin (role still trumps grants)
+//  3. explicit grant exists for user × service → use grant.level
+//  4. fall through to role("user") default + PAT-scope upgrades
 //
 // A grant with level="none" is the admin's way to revoke default read
 // access for a regular user on one service without suspending the

@@ -20,11 +20,11 @@ import (
 // Exactly one key is "active" (signs new JWTs); all keys are published
 // to JWKS so in-flight JWTs from a just-rotated key still verify.
 type SigningKey struct {
-	Kid        string
-	Private    *rsa.PrivateKey
-	Public     *rsa.PublicKey
-	Active     bool
-	CreatedAt  time.Time
+	Kid       string
+	Private   *rsa.PrivateKey
+	Public    *rsa.PublicKey
+	Active    bool
+	CreatedAt time.Time
 }
 
 type Keyring struct {

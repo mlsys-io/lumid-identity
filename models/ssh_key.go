@@ -11,13 +11,13 @@ import "time"
 // Uploading a key here is useful today for commit-signature verification
 // + future SSH push.
 type SSHKey struct {
-	ID          uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
-	UserID      string    `gorm:"type:varchar(36);index;not null" json:"user_id"`
-	Title       string    `gorm:"type:varchar(128);not null" json:"title"`
-	PublicKey   string    `gorm:"type:text;not null" json:"public_key"`
-	Fingerprint string    `gorm:"type:varchar(64);uniqueIndex;not null" json:"fingerprint"`
-	KeyType     string    `gorm:"type:varchar(32);not null" json:"key_type"` // "ssh-ed25519", "ssh-rsa", …
-	CreatedAt   time.Time `gorm:"autoCreateTime" json:"created_at"`
+	ID          uint64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID      string     `gorm:"type:varchar(36);index;not null" json:"user_id"`
+	Title       string     `gorm:"type:varchar(128);not null" json:"title"`
+	PublicKey   string     `gorm:"type:text;not null" json:"public_key"`
+	Fingerprint string     `gorm:"type:varchar(64);uniqueIndex;not null" json:"fingerprint"`
+	KeyType     string     `gorm:"type:varchar(32);not null" json:"key_type"` // "ssh-ed25519", "ssh-rsa", …
+	CreatedAt   time.Time  `gorm:"autoCreateTime" json:"created_at"`
 	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
 }
 

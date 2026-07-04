@@ -139,8 +139,8 @@ func MeAgentChatStream(c *gin.Context) {
 		// just hop to a standard model automatically when asked.
 		if role == "admin" || role == "super_admin" {
 			emit(map[string]any{
-				"type":    "notice",
-				"level":   "info",
+				"type":  "notice",
+				"level": "info",
 				"message": "Claude Code mode uses Claude's own file/shell tools. Ask it to install, " +
 					"run, publish, or edit something and that action auto-runs on a standard model — " +
 					"no need to switch manually.",
@@ -311,10 +311,10 @@ func MeAgentChatStream(c *gin.Context) {
 // a sequence of partial_json deltas; we accumulate and parse at
 // content_block_stop.
 type streamingToolUse struct {
-	id       string
-	name     string
-	jsonBuf  strings.Builder
-	input    map[string]any
+	id      string
+	name    string
+	jsonBuf strings.Builder
+	input   map[string]any
 }
 
 // streamOneAnthropicTurn POSTs to /v1/messages with stream:true, reads
@@ -353,7 +353,7 @@ func streamOneAnthropicTurn(
 	}
 
 	// Parser state — Anthropic's SSE has fields by content_block index.
-	currentBlocks := map[int]string{}     // index -> "text" | "tool_use"
+	currentBlocks := map[int]string{} // index -> "text" | "tool_use"
 	toolUses := map[int]*streamingToolUse{}
 	assistantBlocks := []map[string]any{} // text + tool_use blocks for next-turn reinjection
 	stopReason := ""

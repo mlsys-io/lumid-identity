@@ -16,11 +16,11 @@ import "time"
 // `/api/v1/inbox/power-automate/<raw_token>` — handler hashes the
 // path segment and looks up the matching row.
 type PowerAutomateToken struct {
-	UserSub     string     `gorm:"primaryKey;column:user_sub;size:36" json:"user_sub"`
-	TokenHash   string     `gorm:"column:token_hash;size:64;not null;uniqueIndex" json:"-"`
-	IssuedAt    time.Time  `gorm:"column:issued_at;not null;autoCreateTime" json:"issued_at"`
-	LastUsedAt  *time.Time `gorm:"column:last_used_at" json:"last_used_at,omitempty"`
-	UseCount    int64      `gorm:"column:use_count;not null;default:0" json:"use_count"`
+	UserSub    string     `gorm:"primaryKey;column:user_sub;size:36" json:"user_sub"`
+	TokenHash  string     `gorm:"column:token_hash;size:64;not null;uniqueIndex" json:"-"`
+	IssuedAt   time.Time  `gorm:"column:issued_at;not null;autoCreateTime" json:"issued_at"`
+	LastUsedAt *time.Time `gorm:"column:last_used_at" json:"last_used_at,omitempty"`
+	UseCount   int64      `gorm:"column:use_count;not null;default:0" json:"use_count"`
 }
 
 func (PowerAutomateToken) TableName() string { return "power_automate_tokens" }

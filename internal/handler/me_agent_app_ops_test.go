@@ -62,12 +62,12 @@ func TestSafeAppJoin(t *testing.T) {
 // "home" falls back to the legacy Surface block; unknown names → ok=false.
 func TestResolveSurfacePaths(t *testing.T) {
 	cases := []struct {
-		name        string
-		ui          *appUI
-		surface     string
-		wantMD      string
-		wantPage    string
-		wantOK      bool
+		name     string
+		ui       *appUI
+		surface  string
+		wantMD   string
+		wantPage string
+		wantOK   bool
 	}{
 		{
 			name:     "home-surface-markdown",

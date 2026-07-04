@@ -122,10 +122,10 @@ type casebookScorePoint struct {
 }
 
 type casebookCase struct {
-	ID           string             `json:"id"`
-	Label        string             `json:"label"`
-	Fields       map[string]any     `json:"fields,omitempty"`
-	LatestScore  *float64           `json:"latest_score,omitempty"`
+	ID           string               `json:"id"`
+	Label        string               `json:"label"`
+	Fields       map[string]any       `json:"fields,omitempty"`
+	LatestScore  *float64             `json:"latest_score,omitempty"`
 	ScoreHistory []casebookScorePoint `json:"score_history,omitempty"`
 }
 
@@ -217,8 +217,10 @@ func MeCasebook(c *gin.Context) {
 // returns (a) per-case score history keyed by dims.case_id, and (b) the
 // per-metric evolution series (one point per cycle_ts, the cross-case mean).
 // Rows look like:
-//   {"ts":"…Z","variant_id":"current","metrics":{"question_score":0.65,…},
-//    "cycle_ts":"20260612T112000Z","dims":{"case_id":"Case_001…","q_id":"Q2"}}
+//
+//	{"ts":"…Z","variant_id":"current","metrics":{"question_score":0.65,…},
+//	 "cycle_ts":"20260612T112000Z","dims":{"case_id":"Case_001…","q_id":"Q2"}}
+//
 // allowed/strict bind metrics to the selected workflow: when strict, only the
 // loop's declared experiments contribute scores (different loops can share the
 // DATA but never each other's metrics).

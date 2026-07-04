@@ -34,13 +34,13 @@ var (
 	// limited and stops any future leak of e.g. credentials.toml that
 	// could otherwise land in a cycle dir.
 	_allowedArtifacts = map[string]bool{
-		"insight.md":       true,
-		"signals.csv":      true,
-		"trades.json":      true,
-		"proposal.json":    true,
-		"score.json":       true,
-		"step_errors.json": true,
-		"observations.json": true,
+		"insight.md":          true,
+		"signals.csv":         true,
+		"trades.json":         true,
+		"proposal.json":       true,
+		"score.json":          true,
+		"step_errors.json":    true,
+		"observations.json":   true,
 		"features_trace.json": true,
 	}
 

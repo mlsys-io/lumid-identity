@@ -18,23 +18,23 @@ import (
 // token prefix went in — this is the whole point of consolidating
 // auth on lum.id.
 type IntrospectResponse struct {
-	Active    bool     `json:"active"`
-	Sub       string   `json:"sub,omitempty"`        // canonical user id
-	Username  string   `json:"username,omitempty"`
-	Email     string   `json:"email,omitempty"`
+	Active   bool   `json:"active"`
+	Sub      string `json:"sub,omitempty"` // canonical user id
+	Username string `json:"username,omitempty"`
+	Email    string `json:"email,omitempty"`
 	// Role from the user record — "user" or "admin". Downstream
 	// services (Runmesh admin UI via lum.id, etc.) read this to
 	// decide whether a lum.id-issued token is allowed to hit admin
 	// endpoints without an extra permission map of their own.
 	Role      string   `json:"role,omitempty"`
 	Scopes    []string `json:"scopes,omitempty"`
-	Scope     string   `json:"scope,omitempty"`      // space-separated, RFC 7662 shape
+	Scope     string   `json:"scope,omitempty"` // space-separated, RFC 7662 shape
 	ClientID  string   `json:"client_id,omitempty"`
 	TokenType string   `json:"token_type,omitempty"` // pat | jwt
 	Exp       int64    `json:"exp,omitempty"`
 	Iat       int64    `json:"iat,omitempty"`
-	Source    string   `json:"source,omitempty"`     // native | legacy-lqa | legacy-runmesh
-	Reason    string   `json:"reason,omitempty"`     // why active=false
+	Source    string   `json:"source,omitempty"` // native | legacy-lqa | legacy-runmesh
+	Reason    string   `json:"reason,omitempty"` // why active=false
 }
 
 // Introspect — POST /oauth/introspect (form or JSON body).
@@ -157,11 +157,11 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 	// user_id, token_hash, scopes, expires_at, revoked_at, name.
 	// We query by raw SQL to avoid importing LQA's GORM models.
 	var row struct {
-		UserID    int64   `gorm:"column:user_id"`
-		Scopes    string  `gorm:"column:scopes"`
-		ExpiresAt *int64  `gorm:"column:expires_at"`
-		RevokedAt *int64  `gorm:"column:revoked_at"`
-		Name      string  `gorm:"column:name"`
+		UserID    int64  `gorm:"column:user_id"`
+		Scopes    string `gorm:"column:scopes"`
+		ExpiresAt *int64 `gorm:"column:expires_at"`
+		RevokedAt *int64 `gorm:"column:revoked_at"`
+		Name      string `gorm:"column:name"`
 	}
 	err := common.LegacyDB.Raw(`
 		SELECT user_id, scopes, expires_at, revoked_at, name

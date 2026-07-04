@@ -35,8 +35,8 @@ import (
 type RunRow struct {
 	RunID        string  `json:"run_id"`
 	WorkflowSlug string  `json:"workflow_slug"`
-	Kind         string  `json:"kind"`  // "scheduled" | "visual"
-	Name         string  `json:"name"`  // workflow display name
+	Kind         string  `json:"kind"` // "scheduled" | "visual"
+	Name         string  `json:"name"` // workflow display name
 	App          string  `json:"app,omitempty"`
 	State        string  `json:"state"` // "succeeded" | "failed" | "running" | "skipped" | "canceled"
 	StartedAt    float64 `json:"started_at"`
@@ -171,12 +171,12 @@ func MeRunMark(c *gin.Context) {
 	}
 
 	entry := map[string]any{
-		"ts":        time.Now().UTC().Format(time.RFC3339),
-		"loop":      loop,
-		"ok":        body.State == "succeeded",
-		"manual_mark": true,
+		"ts":              time.Now().UTC().Format(time.RFC3339),
+		"loop":            loop,
+		"ok":              body.State == "succeeded",
+		"manual_mark":     true,
 		"original_run_ts": ts,
-		"marked_by": userID,
+		"marked_by":       userID,
 	}
 	if cycleDir != "" {
 		entry["cycle_dir"] = cycleDir
@@ -198,9 +198,9 @@ func MeRunMark(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"run_id":   runID,
+			"run_id":    runID,
 			"new_state": body.State,
-			"note":     "Manual override recorded. Next scheduler refresh picks it up.",
+			"note":      "Manual override recorded. Next scheduler refresh picks it up.",
 		},
 	})
 }
@@ -245,9 +245,9 @@ func MeRunDetail(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
 			"data": gin.H{
-				"run_id":      runID,
-				"kind":        "visual",
-				"execution":   exec,
+				"run_id":    runID,
+				"kind":      "visual",
+				"execution": exec,
 			},
 		})
 		return
@@ -389,6 +389,7 @@ func journalRowToRun(app string, r map[string]any) RunRow {
 //   - "ts" as a JSON number (float seconds since epoch) — older entries
 //   - "ts" as an ISO 8601 string with fractional seconds (current)
 //   - "iso" fallback as an ISO string
+//
 // Returns 0 when no parseable timestamp is present.
 func rowUnixTs(row map[string]any) float64 {
 	if v, ok := row["ts"].(float64); ok && v != 0 {

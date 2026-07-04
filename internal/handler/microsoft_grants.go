@@ -59,8 +59,9 @@ const (
 //
 // Body: none (auth via bearer).
 // Returns: {user_code, verification_uri, interval_seconds, expires_at,
-//           message}. The UI shows user_code + URL to the user, then
-//           polls /connect/poll until success.
+//
+//	message}. The UI shows user_code + URL to the user, then
+//	polls /connect/poll until success.
 func MicrosoftConnectInit(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -134,11 +135,12 @@ func MicrosoftConnectInit(c *gin.Context) {
 //
 // Body: none. Reads the user's pending device_code, polls Microsoft
 // once. Returns:
-//   { status: "pending" }     — keep polling
-//   { status: "connected" }   — refresh-token stored
-//   { status: "expired"  }    — flow timed out; re-run /init
-//   { status: "denied" }      — user declined consent
-//   { status: "error", error: "..." }
+//
+//	{ status: "pending" }     — keep polling
+//	{ status: "connected" }   — refresh-token stored
+//	{ status: "expired"  }    — flow timed out; re-run /init
+//	{ status: "denied" }      — user declined consent
+//	{ status: "error", error: "..." }
 //
 // The UI calls this every `interval_seconds` from the /init response
 // (Microsoft typically returns 5). We don't poll on a server-side

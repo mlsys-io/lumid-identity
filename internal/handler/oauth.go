@@ -327,12 +327,12 @@ func OAuthUserinfoHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"sub":            u.ID,
-		"email":          u.Email,
-		"email_verified": u.EmailVerified,
-		"name":           u.Name,
+		"sub":                u.ID,
+		"email":              u.Email,
+		"email_verified":     u.EmailVerified,
+		"name":               u.Name,
 		"preferred_username": u.Email,
-		"picture":        u.AvatarURL,
+		"picture":            u.AvatarURL,
 	})
 }
 

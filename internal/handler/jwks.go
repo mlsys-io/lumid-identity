@@ -19,8 +19,8 @@ type JWK struct {
 	Use string `json:"use"` // sig
 	Alg string `json:"alg"` // RS256
 	Kid string `json:"kid"`
-	N   string `json:"n"`   // modulus (base64url)
-	E   string `json:"e"`   // exponent (base64url)
+	N   string `json:"n"` // modulus (base64url)
+	E   string `json:"e"` // exponent (base64url)
 }
 
 type JWKS struct {

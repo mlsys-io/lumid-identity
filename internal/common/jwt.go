@@ -16,7 +16,7 @@ import (
 type JWTClaims struct {
 	Scopes string `json:"scope,omitempty"` // space-separated, standard OAuth shape
 	Email  string `json:"email,omitempty"`
-	Role   string `json:"role,omitempty"`   // "user" | "admin"
+	Role   string `json:"role,omitempty"` // "user" | "admin"
 	jwt.RegisteredClaims
 }
 
@@ -74,11 +74,11 @@ func IssueJWT(userID, email, role string, scopes []string) (string, string, time
 // downstream service (runmesh.ai, etc.) where the HttpOnly `.lum.id`
 // session cookie can't reach. Distinct from IssueJWT in three ways:
 //
-//   1. Caller controls TTL (sessions are 24h; bridge tokens are 10m).
-//   2. Caller picks a service-specific audience (session JWTs carry
-//      `lumid-ecosystem`; bridge JWTs carry e.g. `runmesh`).
-//   3. Caller supplies a narrow scope set so XSS that steals the
-//      bearer can't do more than the specific bridge allows.
+//  1. Caller controls TTL (sessions are 24h; bridge tokens are 10m).
+//  2. Caller picks a service-specific audience (session JWTs carry
+//     `lumid-ecosystem`; bridge JWTs carry e.g. `runmesh`).
+//  3. Caller supplies a narrow scope set so XSS that steals the
+//     bearer can't do more than the specific bridge allows.
 //
 // Still signed by the same keyring so downstream services verifying
 // against our JWKS accept it unchanged.

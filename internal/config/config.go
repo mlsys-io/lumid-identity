@@ -60,8 +60,8 @@ type Config struct {
 		// During the shadow phase we read from QuantArena's MySQL so
 		// existing rm_pat_* tokens keep working without a data migration.
 		// Flip `enabled` off once Phase 3 ships.
-		Enabled       bool   `yaml:"enabled"`
-		DSN           string `yaml:"dsn"` // trading_community MySQL DSN
+		Enabled bool   `yaml:"enabled"`
+		DSN     string `yaml:"dsn"` // trading_community MySQL DSN
 	} `yaml:"legacy"`
 
 	// Email / SMTP — used for verification codes, password-reset

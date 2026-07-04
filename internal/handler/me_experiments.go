@@ -28,17 +28,17 @@ import (
 const expResultsTailCap = 500
 
 type expDecl struct {
-	ID         string         `yaml:"id" json:"id"`
-	Hypothesis string         `yaml:"hypothesis" json:"hypothesis"`
-	Kind       string         `yaml:"kind" json:"kind"`
-	DatasetID  string         `yaml:"dataset_id" json:"dataset_id,omitempty"`
-	Benchmark  string         `yaml:"benchmark_id" json:"benchmark_id,omitempty"`
-	Metric     map[string]any `yaml:"metric" json:"metric,omitempty"`
+	ID         string           `yaml:"id" json:"id"`
+	Hypothesis string           `yaml:"hypothesis" json:"hypothesis"`
+	Kind       string           `yaml:"kind" json:"kind"`
+	DatasetID  string           `yaml:"dataset_id" json:"dataset_id,omitempty"`
+	Benchmark  string           `yaml:"benchmark_id" json:"benchmark_id,omitempty"`
+	Metric     map[string]any   `yaml:"metric" json:"metric,omitempty"`
 	Arms       []map[string]any `yaml:"arms" json:"arms,omitempty"`
-	Baseline   any            `yaml:"baseline" json:"baseline,omitempty"`
-	Criteria   string         `yaml:"success_criteria" json:"success_criteria,omitempty"`
-	MinSamples int            `yaml:"min_samples" json:"min_samples,omitempty"`
-	Status     string         `yaml:"status" json:"status,omitempty"`
+	Baseline   any              `yaml:"baseline" json:"baseline,omitempty"`
+	Criteria   string           `yaml:"success_criteria" json:"success_criteria,omitempty"`
+	MinSamples int              `yaml:"min_samples" json:"min_samples,omitempty"`
+	Status     string           `yaml:"status" json:"status,omitempty"`
 }
 
 type expManifest struct {
@@ -166,9 +166,9 @@ func loadAppExperiments(appDir string) []gin.H {
 			"dataset_id": d.DatasetID, "metric": d.Metric,
 			"benchmark_id": d.Benchmark, "baseline": d.Baseline,
 			"success_criteria": d.Criteria, "min_samples": d.MinSamples,
-			"status":     strOr(d.Status, "active"),
-			"loops":      loops[d.ID],
-			"n_results":  0,
+			"status":       strOr(d.Status, "active"),
+			"loops":        loops[d.ID],
+			"n_results":    0,
 			"criteria_met": false,
 		}
 		for _, k := range []string{
@@ -294,9 +294,9 @@ func loadExperimentDetail(appDir, id string) (gin.H, bool) {
 		"dataset_id": decl.DatasetID, "metric": decl.Metric,
 		"metric_name": metricName, "baseline": decl.Baseline,
 		"success_criteria": decl.Criteria, "min_samples": decl.MinSamples,
-		"status": strOr(decl.Status, "active"),
-		"loops":  expLoops(m)[decl.ID],
-		"state":  st,
+		"status":  strOr(decl.Status, "active"),
+		"loops":   expLoops(m)[decl.ID],
+		"state":   st,
 		"results": rows,
 		"series":  series,
 		"cases":   cases,

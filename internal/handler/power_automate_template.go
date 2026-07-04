@@ -30,9 +30,10 @@ import (
 // to visit the connect page first to set up the token).
 //
 // Package structure (the minimal one PA's import accepts):
-//   manifest.json
-//   Microsoft.Flow/flows/<guid>/definition.json
-//   Microsoft.Flow/flows/<guid>/apisMap.json
+//
+//	manifest.json
+//	Microsoft.Flow/flows/<guid>/definition.json
+//	Microsoft.Flow/flows/<guid>/apisMap.json
 func MePowerAutomateFlowTemplate(c *gin.Context) {
 	userSub, ok := currentUserID(c)
 	if !ok {
@@ -189,26 +190,26 @@ func buildManifest(flowGUID string) map[string]any {
 	return map[string]any{
 		"schema": "1.0",
 		"details": map[string]any{
-			"displayName":       "Lumid Outlook Bridge",
-			"description":       "Forwards new Outlook email to Lumid via webhook",
-			"createdTime":       time.Now().UTC().Format(time.RFC3339),
+			"displayName":        "Lumid Outlook Bridge",
+			"description":        "Forwards new Outlook email to Lumid via webhook",
+			"createdTime":        time.Now().UTC().Format(time.RFC3339),
 			"packageTelemetryId": "lumid-outlook-bridge",
-			"creator":           "Lumid",
-			"sourceEnvironment": "",
+			"creator":            "Lumid",
+			"sourceEnvironment":  "",
 		},
 		"resources": map[string]any{
 			flowGUID: map[string]any{
-				"id":                  nil,
-				"name":                flowGUID,
-				"type":                "Microsoft.Flow/flows",
+				"id":                    nil,
+				"name":                  flowGUID,
+				"type":                  "Microsoft.Flow/flows",
 				"suggestedCreationType": "New",
-				"creationType":        "New",
+				"creationType":          "New",
 				"details": map[string]any{
 					"displayName": "Lumid Outlook Bridge",
 				},
-				"configurableBy":     "User",
-				"hierarchy":          "Root",
-				"dependsOn":          []string{},
+				"configurableBy": "User",
+				"hierarchy":      "Root",
+				"dependsOn":      []string{},
 			},
 		},
 	}
@@ -249,8 +250,8 @@ func buildFlowDefinition(webhookURL string) map[string]any {
 				},
 				"triggers": map[string]any{
 					"When_a_new_email_arrives_(V3)": map[string]any{
-						"type":     "OpenApiConnectionNotification",
-						"splitOn":  "@triggerOutputs()?['body/value']",
+						"type":    "OpenApiConnectionNotification",
+						"splitOn": "@triggerOutputs()?['body/value']",
 						"inputs": map[string]any{
 							"host": map[string]any{
 								"connectionName": "shared_office365",

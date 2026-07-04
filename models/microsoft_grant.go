@@ -41,13 +41,13 @@ func (MicrosoftGrant) TableName() string { return "microsoft_grants" }
 // pending row. Rows older than the flow's expires_at are pruned by
 // the poll handler.
 type MicrosoftGrantPending struct {
-	UserSub      string    `gorm:"primaryKey;column:user_sub;size:36" json:"user_sub"`
-	DeviceCode   string    `gorm:"column:device_code;type:text;not null" json:"-"`
-	UserCode     string    `gorm:"column:user_code;size:32;not null" json:"user_code"`
-	VerificationURI string `gorm:"column:verification_uri;size:512;not null" json:"verification_uri"`
-	Interval     int       `gorm:"column:interval_seconds;not null" json:"interval_seconds"`
-	ExpiresAt    time.Time `gorm:"column:expires_at;not null" json:"expires_at"`
-	StartedAt    time.Time `gorm:"column:started_at;not null;autoCreateTime" json:"started_at"`
+	UserSub         string    `gorm:"primaryKey;column:user_sub;size:36" json:"user_sub"`
+	DeviceCode      string    `gorm:"column:device_code;type:text;not null" json:"-"`
+	UserCode        string    `gorm:"column:user_code;size:32;not null" json:"user_code"`
+	VerificationURI string    `gorm:"column:verification_uri;size:512;not null" json:"verification_uri"`
+	Interval        int       `gorm:"column:interval_seconds;not null" json:"interval_seconds"`
+	ExpiresAt       time.Time `gorm:"column:expires_at;not null" json:"expires_at"`
+	StartedAt       time.Time `gorm:"column:started_at;not null;autoCreateTime" json:"started_at"`
 }
 
 func (MicrosoftGrantPending) TableName() string { return "microsoft_grant_pendings" }

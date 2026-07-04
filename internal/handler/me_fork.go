@@ -7,13 +7,13 @@
 // short-lived user-scoped JWT (aud=xpcloud) and calls xpcloud AS the
 // user — forks land under the caller's sub, never the operator's.
 //
-//   POST /me/apps/:app/fork     {name?}          → fork upstream repo +
-//                                                  queue install of the fork
-//   POST /me/apps/:app/publish  {summary?}       → queue app_push of the
-//                                                  caller's tenant tree to
-//                                                  their own repo
-//   POST /me/apps/:app/propose  {title?, body?}  → open a pull request on
-//                                                  the upstream (fork_of)
+//	POST /me/apps/:app/fork     {name?}          → fork upstream repo +
+//	                                               queue install of the fork
+//	POST /me/apps/:app/publish  {summary?}       → queue app_push of the
+//	                                               caller's tenant tree to
+//	                                               their own repo
+//	POST /me/apps/:app/propose  {title?, body?}  → open a pull request on
+//	                                               the upstream (fork_of)
 package handler
 
 import (
@@ -270,8 +270,8 @@ func MeAppPropose(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "pull request opened",
 		"data": gin.H{
-			"upstream": upstream,
-			"pull":     resp,
+			"upstream":  upstream,
+			"pull":      resp,
 			"pulls_url": "https://xp.io/" + upstream + "/pulls",
 		},
 	})

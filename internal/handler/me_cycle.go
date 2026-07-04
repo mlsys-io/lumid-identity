@@ -27,16 +27,16 @@ import (
 )
 
 type cycleListItem struct {
-	App      string `json:"app"`
-	Loop     string `json:"loop"`
-	Ts       string `json:"ts"`
-	OK       bool   `json:"ok"`
+	App  string `json:"app"`
+	Loop string `json:"loop"`
+	Ts   string `json:"ts"`
+	OK   bool   `json:"ok"`
 	// Running marks a cycle dir with no cycle.json yet whose dir is
 	// recent — the run is still in flight (engines write cycle.json at
 	// completion). Without this the list showed in-flight runs as ok.
-	Running  bool   `json:"running,omitempty"`
-	Duration float64 `json:"duration_s,omitempty"`
-	StepCount int   `json:"step_count"`
+	Running   bool    `json:"running,omitempty"`
+	Duration  float64 `json:"duration_s,omitempty"`
+	StepCount int     `json:"step_count"`
 	// Per-cycle LLM cost headline (aggregated by the runner into
 	// cycle.json's `cost` block). Lets the run list show cost/tokens
 	// without a detail fetch per row.
@@ -150,16 +150,16 @@ func MeCyclesList(c *gin.Context) {
 }
 
 type cycleStep struct {
-	StepID   string         `json:"step_id"`
-	Skill    string         `json:"skill,omitempty"`
-	Stage    string         `json:"stage,omitempty"`
-	OK       bool           `json:"ok"`
-	OutputSummary string    `json:"output_summary,omitempty"`
-	Output   map[string]any `json:"output,omitempty"`
-	Error    string         `json:"error,omitempty"`
-	Duration float64        `json:"duration_s,omitempty"`
-	PromptSHA  string       `json:"prompt_sha,omitempty"`
-	PromptPreview string    `json:"prompt_preview,omitempty"`
+	StepID        string         `json:"step_id"`
+	Skill         string         `json:"skill,omitempty"`
+	Stage         string         `json:"stage,omitempty"`
+	OK            bool           `json:"ok"`
+	OutputSummary string         `json:"output_summary,omitempty"`
+	Output        map[string]any `json:"output,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	Duration      float64        `json:"duration_s,omitempty"`
+	PromptSHA     string         `json:"prompt_sha,omitempty"`
+	PromptPreview string         `json:"prompt_preview,omitempty"`
 }
 
 // MeCycleDetail serves GET /api/v1/me/cycles/:app/:loop/:ts
@@ -518,11 +518,11 @@ func MeLoopMetricSeries(c *gin.Context) {
 		// Per-LOOP shape so workflows don't all look alike: seed base/slope/
 		// curvature/noise/items-range from the loop name (deterministic).
 		seed := tsHash(app + ":" + loop)
-		base := 0.50 + float64(seed%24)*0.01            // start 0.50..0.73
-		rise := 0.05 + float64((seed/7)%14)*0.01        // gentle climb 0.05..0.18
-		noiseAmp := 0.008 + float64((seed/13)%4)*0.006  // jitter 0.008..0.026
-		concave := seed%2 == 0                          // half plateau (ease-out), half linear
-		itemsBase := 3 + (seed/3)%9                     // 3..11 baseline items
+		base := 0.50 + float64(seed%24)*0.01           // start 0.50..0.73
+		rise := 0.05 + float64((seed/7)%14)*0.01       // gentle climb 0.05..0.18
+		noiseAmp := 0.008 + float64((seed/13)%4)*0.006 // jitter 0.008..0.026
+		concave := seed%2 == 0                         // half plateau (ease-out), half linear
+		itemsBase := 3 + (seed/3)%9                    // 3..11 baseline items
 		acc := make([]pt, 0, n)
 		items := make([]pt, 0, n)
 		for i, d := range dirs {
@@ -565,12 +565,12 @@ func MeLoopMetricSeries(c *gin.Context) {
 	if len(out) == 0 && len(dirs) >= 2 && (strings.Contains(app, "quant") || strings.Contains(app, "trad")) {
 		n := len(dirs)
 		seed := tsHash(app + ":" + loop)
-		aBase := -1.0 + float64(seed%30)*0.1          // start -1.0..+1.9 % alpha
-		aRise := 6.0 + float64((seed/7)%9)             // climb +6..+14 %
-		aNoise := 0.3 + float64((seed/13)%4)*0.25      // jitter 0.3..1.05
-		concave := seed%2 == 0                          // half ease-out, half linear
-		hrBase := 0.40 + float64((seed/3)%20)*0.01     // risk-approval 0.40..0.59
-		hrRise := 0.15 + float64((seed/11)%15)*0.01    // climb 0.15..0.29
+		aBase := -1.0 + float64(seed%30)*0.1        // start -1.0..+1.9 % alpha
+		aRise := 6.0 + float64((seed/7)%9)          // climb +6..+14 %
+		aNoise := 0.3 + float64((seed/13)%4)*0.25   // jitter 0.3..1.05
+		concave := seed%2 == 0                      // half ease-out, half linear
+		hrBase := 0.40 + float64((seed/3)%20)*0.01  // risk-approval 0.40..0.59
+		hrRise := 0.15 + float64((seed/11)%15)*0.01 // climb 0.15..0.29
 		alpha := make([]pt, 0, n)
 		hit := make([]pt, 0, n)
 		for i, d := range dirs {

@@ -23,7 +23,8 @@ import (
 // browser.
 //
 // Body (all optional with defaults):
-//   {"to": "...", "subject": "...", "body": "..."}
+//
+//	{"to": "...", "subject": "...", "body": "..."}
 //
 // Defaults: to=caller's email, subject="Lumid test", body=link to docs.
 type outlookPATestBody struct {
@@ -114,12 +115,12 @@ func MeOutlookPATestSend(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"sent_to":      body.To,
-			"subject":      body.Subject,
-			"flow_status":  resp.StatusCode,
-			"flow_ok":      resp.StatusCode < 400,
+			"sent_to":               body.To,
+			"subject":               body.Subject,
+			"flow_status":           resp.StatusCode,
+			"flow_ok":               resp.StatusCode < 400,
 			"flow_response_preview": preview,
-			"note": "Check your Outlook inbox + Sent folder. Latency: 1–30s.",
+			"note":                  "Check your Outlook inbox + Sent folder. Latency: 1–30s.",
 		},
 	})
 }

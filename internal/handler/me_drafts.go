@@ -43,7 +43,7 @@ const (
 
 // draftState is the per-draft state row in drafts-state.json.
 type draftState struct {
-	State    string `json:"state"`              // pending | sent | dismissed
+	State    string `json:"state"` // pending | sent | dismissed
 	ActedAt  string `json:"acted_at,omitempty"`
 	IntentID string `json:"intent_id,omitempty"` // when state=sent
 }

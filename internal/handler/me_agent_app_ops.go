@@ -74,7 +74,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "show_app_surface",
 			"description": "Render an app's home surface inline in the chat as a live, interactive card (the same tables/forms/stats the app page shows). Use when the user wants to SEE or work with an app's page without leaving the chat.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":     map[string]any{"type": "string", "description": "app slug"},
 					"surface": map[string]any{"type": "string", "description": "optional named surface (defaults to home)"},
@@ -86,7 +86,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "app_action",
 			"description": "Invoke an app's declared form-action (a mutation — e.g. gpu_rental.create, gpu_rental.cancel). Get the exact verb + field names from app_actions first. Requires user approval. For paid/destructive actions, state the cost/effect in your message before calling so the approval prompt is informed.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"action": map[string]any{"type": "string", "description": "form-action verb, e.g. gpu_rental.create"},
 					"values": map[string]any{"type": "object", "description": "field values for the action (strings ok; the backend coerces)"},
@@ -98,7 +98,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "qa_call",
 			"description": "Invoke a QuantArena write that an app surface declares via submit_qa/qa_post/qa_delete (e.g. join a competition, register a strategy). Only allowlisted paths are permitted. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"method": map[string]any{"type": "string", "description": "POST or DELETE"},
 					"path":   map[string]any{"type": "string", "description": "QuantArena path, e.g. /api/v1/competitions/28/join"},
@@ -111,7 +111,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "app_ui_get",
 			"description": "Read the EDITABLE source of an app's page (its Studio surface) so you can modify it. Returns {format: markdown|page.yaml, source, sha}. Call this before app_ui_set so you have the current source + sha (the sha is the optimistic lock). No approval needed (read-only).",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":     map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"surface": map[string]any{"type": "string", "description": "named surface (defaults to home)"},
@@ -122,7 +122,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "app_ui_set",
 			"description": "Write/replace the source of an app's page (its Studio surface) — this is how you EDIT an app's UI from chat. Send `markdown` for a markdown surface or `spec` (raw page.yaml text) for a structured page surface; app_ui_get tells you which `format` the surface is. Pass `base_sha` from app_ui_get to avoid clobbering a concurrent edit. Only your OWN installed apps are editable (operator-shared apps are read-only — fork first). page.yaml specs are validated before saving. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":      map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"surface":  map[string]any{"type": "string", "description": "named surface (defaults to home)"},
@@ -137,7 +137,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "app_ui_generate",
 			"description": "AI-generate (or regenerate + improve) an app's page from its config + skills, producing a validated structured page.yaml and making it the home surface. Use when the user wants a page built or refreshed for them rather than hand-editing. Writes to your OWN installed app only. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app": map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 				},
@@ -147,7 +147,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "run_promote",
 			"description": "Promote one of an app's runs — mark it as the chosen branch (advisory; never rewrites run history). Use when the user picks a winning/champion run. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"ts":   map[string]any{"type": "string", "description": "run timestamp id, e.g. 20060102T150405Z"},
@@ -160,7 +160,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "run_discard",
 			"description": "Discard one of an app's runs — grey it out (advisory; never deletes run history). Use when the user wants a bad/abandoned run set aside. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"ts":   map[string]any{"type": "string", "description": "run timestamp id, e.g. 20060102T150405Z"},
@@ -181,7 +181,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "app_prompt_get",
 			"description": "Read one of an app's prompt cards (its markdown content) so you can review or edit it. Returns {content, source, sha, editable}. The sha is the optimistic lock for app_prompt_set. No approval needed (read-only).",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"name": map[string]any{"type": "string", "description": "prompt file name, e.g. judge_score_qual.md"},
@@ -193,7 +193,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "app_prompt_set",
 			"description": "Write/replace an app's prompt card — this is how you EDIT an analyst or judge prompt from chat. Writes a LOCAL override in your OWN installed app (the shared skill prompt is never mutated; operator-shared apps are read-only — fork first). Pass `base_sha` from app_prompt_get to avoid clobbering a concurrent edit. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":      map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"name":     map[string]any{"type": "string", "description": "prompt file name, e.g. judge_score_qual.md"},
@@ -207,7 +207,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "app_prompt_reset",
 			"description": "Reset an app's prompt card to its inherited shared default by removing the LOCAL override (the shared skill prompt is never touched). Use when the user wants to discard their prompt edits. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"name": map[string]any{"type": "string", "description": "prompt file name, e.g. judge_score_qual.md"},
@@ -219,7 +219,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "branch_run",
 			"description": "Branch from an existing run with an exploration intention — records a 'branch from here' control signal carrying a free-text note ('what should this attempt explore?') plus an optional config variant. The proposer/hypothesize stage reads the note as its directive on the next run. Use when the user wants to try a new direction off a prior run. Requires user approval.",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":     map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"loop":    map[string]any{"type": "string", "description": "workflow name the run belongs to"},
@@ -234,7 +234,7 @@ func appOpsToolDefs() []map[string]any {
 			"name":        "search_run_log",
 			"description": "Search a single run's logs/issues — its LLM transcript, stage journal, and step errors — for a query string. Use to answer 'find the errors in the last run', 'where did it mention X'. Optional `type` narrows to llm | stage | error. Returns matches with snippets. No approval needed (read-only).",
 			"input_schema": map[string]any{
-				"type":       "object",
+				"type": "object",
 				"properties": map[string]any{
 					"app":  map[string]any{"type": "string", "description": "app slug (defaults to the app you're viewing)"},
 					"loop": map[string]any{"type": "string", "description": "workflow name the run belongs to"},

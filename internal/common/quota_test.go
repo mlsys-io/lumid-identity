@@ -107,8 +107,8 @@ func TestQuota_LLMTokens(t *testing.T) {
 	// Burn exactly the budget across two calls.
 	res, err := CheckAndCharge(db, ChargeReq{
 		UserSub: sub, Kind: "cycle_llm",
-		Endpoint: "personal-agent.morning_brief",
-		Model:    "claude-haiku-4-5",
+		Endpoint:    "personal-agent.morning_brief",
+		Model:       "claude-haiku-4-5",
 		InputTokens: 200_000, OutputTokens: 50_000,
 	})
 	if err != nil || !res.Allowed {

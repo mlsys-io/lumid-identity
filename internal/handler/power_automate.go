@@ -152,7 +152,9 @@ func MePowerAutomateTokenRevoke(c *gin.Context) {
 // InboxPowerAutomateReceive — POST /api/v1/inbox/power-automate/:token
 // Unauthenticated by Authorization header; the token IS the auth.
 // Body is the JSON Power Automate sends per the schema in the flow:
-//   { id, from, to, subject, body, html, received_at, ... }
+//
+//	{ id, from, to, subject, body, html, received_at, ... }
+//
 // We write the payload verbatim (with a small wrapper) into the
 // user's tenant inbox dir for xpio apps to pick up.
 //

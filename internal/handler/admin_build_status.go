@@ -35,8 +35,8 @@ type buildServiceRow struct {
 }
 
 type buildStatusSnapshot struct {
-	GeneratedAt string             `json:"generated_at"`
-	Services    []buildServiceRow  `json:"services"`
+	GeneratedAt string            `json:"generated_at"`
+	Services    []buildServiceRow `json:"services"`
 }
 
 func AdminBuildStatus(c *gin.Context) {
@@ -45,10 +45,10 @@ func AdminBuildStatus(c *gin.Context) {
 	data, err := os.ReadFile(snapshotPath)
 	if err != nil {
 		ok(c, "ok", gin.H{
-			"services":      []any{},
-			"generated_at":  time.Now().UTC(),
-			"snapshot_age":  -1,
-			"note":          "snapshot not yet available; collect-build-status.sh hasn't run",
+			"services":     []any{},
+			"generated_at": time.Now().UTC(),
+			"snapshot_age": -1,
+			"note":         "snapshot not yet available; collect-build-status.sh hasn't run",
 		})
 		return
 	}

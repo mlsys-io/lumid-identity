@@ -37,15 +37,15 @@ type skillUsedBy struct {
 }
 
 type meSkillRow struct {
-	Repo             string        `json:"repo"` // owner/name
-	Name             string        `json:"name"`
-	Summary          string        `json:"summary,omitempty"`
-	Tags             []string      `json:"tags,omitempty"`
-	VersionInstalled string        `json:"version_installed,omitempty"`
-	VersionLatest    string        `json:"version_latest,omitempty"`
-	UpdateAvailable  bool          `json:"update_available"`
-	InstalledOnDisk  bool          `json:"installed_on_disk"`
-	UsedBy           []skillUsedBy `json:"used_by"`
+	Repo             string         `json:"repo"` // owner/name
+	Name             string         `json:"name"`
+	Summary          string         `json:"summary,omitempty"`
+	Tags             []string       `json:"tags,omitempty"`
+	VersionInstalled string         `json:"version_installed,omitempty"`
+	VersionLatest    string         `json:"version_latest,omitempty"`
+	UpdateAvailable  bool           `json:"update_available"`
+	InstalledOnDisk  bool           `json:"installed_on_disk"`
+	UsedBy           []skillUsedBy  `json:"used_by"`
 	Health           map[string]any `json:"health,omitempty"` // adapter_status / ci_status / ci_last_run
 }
 
@@ -66,7 +66,7 @@ type appSkillDecl struct {
 		Version string `yaml:"version"`
 	} `yaml:"skill_imports"`
 	Loops []struct {
-		Name          string `yaml:"name"`
+		Name          string          `yaml:"name"`
 		SkillsInvoked flexYamlStrings `yaml:"skills_invoked"`
 		Steps         []struct {
 			Skill string `yaml:"skill"`

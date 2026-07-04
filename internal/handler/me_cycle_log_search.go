@@ -6,10 +6,10 @@
 // matching rows so the UI can offer a search box with click-to-scroll.
 //
 // Sources (mirrors cycleConversation's path patterns):
-//   1. <cycle dir>/.llm_conversation.jsonl — the LLM turns (prompt/response/thinking)
-//   2. data/journal.jsonl                  — stage/tool events, filtered to this
-//      loop AND to this cycle's time window (ts >= the cycle's start)
-//   3. <cycle dir>/step_errors.json        — the cycle's recorded step errors
+//  1. <cycle dir>/.llm_conversation.jsonl — the LLM turns (prompt/response/thinking)
+//  2. data/journal.jsonl                  — stage/tool events, filtered to this
+//     loop AND to this cycle's time window (ts >= the cycle's start)
+//  3. <cycle dir>/step_errors.json        — the cycle's recorded step errors
 //
 // `type` narrows the sources: "llm" → conversation only, "stage" → journal only,
 // "error" → step_errors only; empty/other → all three. Matching is

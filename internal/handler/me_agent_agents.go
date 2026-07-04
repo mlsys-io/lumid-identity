@@ -90,15 +90,15 @@ func parseRFC3339Unix(s string) (float64, error) {
 // agentInfo — per-agent metadata for the picker.
 type agentInfo struct {
 	ID           string  `json:"id"`
-	Scope        string  `json:"scope"`          // "tenant" | "shared"
+	Scope        string  `json:"scope"` // "tenant" | "shared"
 	RowCount     int     `json:"row_count"`
 	LastMemoryTs float64 `json:"last_memory_ts"` // unix seconds; 0 if empty/unknown
 	// Role metadata — populated when the agent is declared in some
 	// installed xpio app's xpcloud.yaml::roles[]. Empty otherwise.
-	App          string  `json:"app,omitempty"`
-	Role         string  `json:"role,omitempty"`
-	Description  string  `json:"description,omitempty"`
-	DefaultModel string  `json:"default_model,omitempty"`
+	App          string `json:"app,omitempty"`
+	Role         string `json:"role,omitempty"`
+	Description  string `json:"description,omitempty"`
+	DefaultModel string `json:"default_model,omitempty"`
 }
 
 // agentBankPaths returns (path, scope) candidates for the given

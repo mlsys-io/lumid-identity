@@ -32,21 +32,21 @@ import (
 )
 
 const (
-	personasKeep       = 50          // soft cap per user
-	personaMaxPrompt   = 16 * 1024   // 16 KB system prompt cap
+	personasKeep     = 50        // soft cap per user
+	personaMaxPrompt = 16 * 1024 // 16 KB system prompt cap
 )
 
 var personaIDRe = regexp.MustCompile(`^per-[a-f0-9]{16}$`)
 
 type persona struct {
-	ID            string   `json:"id"`
-	Name          string   `json:"name"`             // human label, e.g. "Code Reviewer"
-	Icon          string   `json:"icon,omitempty"`   // optional emoji
-	SystemPrompt  string   `json:"system_prompt"`
-	AllowedTools  []string `json:"allowed_tools,omitempty"` // empty = full catalog
-	PreferredModel string  `json:"preferred_model,omitempty"`
-	CreatedAt     string   `json:"created_at"`
-	UpdatedAt     string   `json:"updated_at"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`           // human label, e.g. "Code Reviewer"
+	Icon           string   `json:"icon,omitempty"` // optional emoji
+	SystemPrompt   string   `json:"system_prompt"`
+	AllowedTools   []string `json:"allowed_tools,omitempty"` // empty = full catalog
+	PreferredModel string   `json:"preferred_model,omitempty"`
+	CreatedAt      string   `json:"created_at"`
+	UpdatedAt      string   `json:"updated_at"`
 }
 
 func personasDir(userID string) string {
@@ -113,13 +113,13 @@ func MePersonasList(c *gin.Context) {
 		return
 	}
 	type row struct {
-		ID            string   `json:"id"`
-		Name          string   `json:"name"`
-		Icon          string   `json:"icon,omitempty"`
-		AllowedTools  []string `json:"allowed_tools,omitempty"`
-		PreferredModel string  `json:"preferred_model,omitempty"`
-		PromptLen     int      `json:"prompt_len"`
-		UpdatedAt     string   `json:"updated_at"`
+		ID             string   `json:"id"`
+		Name           string   `json:"name"`
+		Icon           string   `json:"icon,omitempty"`
+		AllowedTools   []string `json:"allowed_tools,omitempty"`
+		PreferredModel string   `json:"preferred_model,omitempty"`
+		PromptLen      int      `json:"prompt_len"`
+		UpdatedAt      string   `json:"updated_at"`
 	}
 	rows := []row{}
 	for _, e := range entries {
@@ -135,13 +135,13 @@ func MePersonasList(c *gin.Context) {
 			continue
 		}
 		rows = append(rows, row{
-			ID:            p.ID,
-			Name:          p.Name,
-			Icon:          p.Icon,
-			AllowedTools:  p.AllowedTools,
+			ID:             p.ID,
+			Name:           p.Name,
+			Icon:           p.Icon,
+			AllowedTools:   p.AllowedTools,
 			PreferredModel: p.PreferredModel,
-			PromptLen:     len(p.SystemPrompt),
-			UpdatedAt:     p.UpdatedAt,
+			PromptLen:      len(p.SystemPrompt),
+			UpdatedAt:      p.UpdatedAt,
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].UpdatedAt > rows[j].UpdatedAt })
@@ -177,12 +177,12 @@ func MePersonaSave(c *gin.Context) {
 		return
 	}
 	var body struct {
-		ID            string   `json:"id"`
-		Name          string   `json:"name"`
-		Icon          string   `json:"icon"`
-		SystemPrompt  string   `json:"system_prompt"`
-		AllowedTools  []string `json:"allowed_tools"`
-		PreferredModel string  `json:"preferred_model"`
+		ID             string   `json:"id"`
+		Name           string   `json:"name"`
+		Icon           string   `json:"icon"`
+		SystemPrompt   string   `json:"system_prompt"`
+		AllowedTools   []string `json:"allowed_tools"`
+		PreferredModel string   `json:"preferred_model"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())

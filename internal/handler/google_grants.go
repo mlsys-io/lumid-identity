@@ -26,7 +26,7 @@ const (
 
 // connectRedirectURL derives the public URL Google should redirect to
 // after consent. Built from the same origin as the existing sign-in
-// callback (``cfg.RedirectURI``, e.g. ``https://lum.id/auth/callback``)
+// callback (“cfg.RedirectURI“, e.g. “https://lum.id/auth/callback“)
 // — we keep just the scheme+host and append our backend path. That
 // origin must already be on the OAuth client's "Authorized redirect
 // URIs" list (one-time admin step in Google Cloud Console).
@@ -79,10 +79,10 @@ func GoogleConnectInit(c *gin.Context) {
 	}
 
 	q := url.Values{
-		"client_id":              {cfg.ClientID},
-		"redirect_uri":           {connectRedirect},
-		"response_type":          {"code"},
-		"scope":                  {strings.Join([]string{
+		"client_id":     {cfg.ClientID},
+		"redirect_uri":  {connectRedirect},
+		"response_type": {"code"},
+		"scope": {strings.Join([]string{
 			"openid", "email", "profile", gmailScope, calendarScope,
 		}, " ")},
 		"access_type":            {"offline"},
@@ -180,7 +180,7 @@ func GoogleConnectCallback(c *gin.Context) {
 }
 
 // GET /api/v1/identity/google-token — bearer-gated (accepts JWT
-// session OR ``lm_pat_*`` PAT; both resolve via currentUserID()).
+// session OR “lm_pat_*“ PAT; both resolve via currentUserID()).
 // Returns the user's stored refresh-token + client-id so the
 // personal-agent CLI can mint access-tokens locally.
 func GoogleTokenFetch(c *gin.Context) {
@@ -290,15 +290,16 @@ func optionalTime(t *time.Time) any {
 // Request body: empty (the user_sub comes from the bearer; the
 // refresh-token is already on the server). Response:
 //
-//   {"access_token": "ya29...", "expires_in": 3599, "token_type": "Bearer",
-//    "scopes": ["...gmail.modify", "...calendar"]}
+//	{"access_token": "ya29...", "expires_in": 3599, "token_type": "Bearer",
+//	 "scopes": ["...gmail.modify", "...calendar"]}
 //
 // Errors:
-//   401 — no bearer
-//   404 — no grant for this user
-//   410 — grant revoked
-//   502 — Google rejected the refresh (token revoked at Google's end,
-//          rate-limit, etc); body carries Google's error verbatim.
+//
+//	401 — no bearer
+//	404 — no grant for this user
+//	410 — grant revoked
+//	502 — Google rejected the refresh (token revoked at Google's end,
+//	       rate-limit, etc); body carries Google's error verbatim.
 func GoogleAccessToken(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -425,4 +426,3 @@ func GoogleTokenRevoke(c *gin.Context) {
 	}
 	ok(c, "revoked", gin.H{"revoked_at": now.Format(time.RFC3339)})
 }
-

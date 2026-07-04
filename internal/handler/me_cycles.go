@@ -47,7 +47,8 @@ type meCycleFeedbackBody struct {
 // POST /api/v1/me/cycles/feedback
 //
 // Body: {"app":"personal-agent","loop":"morning_brief",
-//        "ts":"20260522T150000Z","rating":1,"note":"perfect — keep this format"}
+//
+//	"ts":"20260522T150000Z","rating":1,"note":"perfect — keep this format"}
 //
 // The agent's give_feedback tool (P4) calls this with the same shape,
 // so the natural-language path and a future UI button share one

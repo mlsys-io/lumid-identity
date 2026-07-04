@@ -88,10 +88,10 @@ func toolTodaySummary(userID string) map[string]any {
 		return todayKindOrder(headlines[i]["kind"].(string)) < todayKindOrder(headlines[j]["kind"].(string))
 	})
 	return map[string]any{
-		"headlines":       headlines,
-		"cycles":          cycles,
-		"drafts_pending":  pending,
-		"as_of":           time.Now().UTC().Format(time.RFC3339),
+		"headlines":      headlines,
+		"cycles":         cycles,
+		"drafts_pending": pending,
+		"as_of":          time.Now().UTC().Format(time.RFC3339),
 	}
 }
 
@@ -266,9 +266,9 @@ func toolPatchLoop(userID, app, loop string, patch map[string]any) map[string]an
 		return map[string]any{"error": "write overrides: " + err.Error()}
 	}
 	return map[string]any{
-		"app":  app,
-		"loop": loop,
+		"app":       app,
+		"loop":      loop,
 		"overrides": loopOver,
-		"note": "Override saved. Scheduler picks it up on next refresh tick (≤60s).",
+		"note":      "Override saved. Scheduler picks it up on next refresh tick (≤60s).",
 	}
 }

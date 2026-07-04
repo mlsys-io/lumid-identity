@@ -97,9 +97,9 @@ func TestControlIntent(t *testing.T) {
 // recent user turn (not earlier history, not assistant turns).
 func TestControlIntentScansLastUserMessage(t *testing.T) {
 	msgs := []chatMessage{
-		{Role: "user", Content: "publish the app"}, // earlier — must be ignored
+		{Role: "user", Content: "publish the app"},          // earlier — must be ignored
 		{Role: "assistant", Content: "install the app foo"}, // assistant — must be ignored
-		{Role: "user", Content: "thanks!"}, // latest user — the one that counts
+		{Role: "user", Content: "thanks!"},                  // latest user — the one that counts
 	}
 	if controlIntent(msgs) {
 		t.Errorf("controlIntent should scan only the LAST user message (%q), not earlier turns", "thanks!")

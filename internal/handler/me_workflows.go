@@ -284,25 +284,25 @@ func showcaseApps() map[string]bool {
 
 // WorkflowRow is the unified per-workflow record the UI consumes.
 type WorkflowRow struct {
-	Slug         string `json:"slug"`           // unique within tenant: "<app>:<name>" or "n8n:<id>"
-	Kind         string `json:"kind"`           // "scheduled" | "visual"
-	Name         string `json:"name"`           // display name (loop name or n8n workflow name)
-	App          string `json:"app,omitempty"`  // for scheduled
-	Trigger      string `json:"trigger"`        // human-readable
-	Enabled      bool   `json:"enabled"`
-	Tenant       bool   `json:"tenant"`         // true = tenant-installed; false = operator-shared
-	Showcase     bool   `json:"showcase"`       // operator-shared app on the backend showcase list (curates the home grid without a frontend rebuild)
-	Version      string `json:"version,omitempty"` // app version (manifest.json/xpcloud.yaml) — surfaced so EVERY card shows a version badge, incl. tenant apps loadAppGitStatus can't see
+	Slug     string `json:"slug"`          // unique within tenant: "<app>:<name>" or "n8n:<id>"
+	Kind     string `json:"kind"`          // "scheduled" | "visual"
+	Name     string `json:"name"`          // display name (loop name or n8n workflow name)
+	App      string `json:"app,omitempty"` // for scheduled
+	Trigger  string `json:"trigger"`       // human-readable
+	Enabled  bool   `json:"enabled"`
+	Tenant   bool   `json:"tenant"`            // true = tenant-installed; false = operator-shared
+	Showcase bool   `json:"showcase"`          // operator-shared app on the backend showcase list (curates the home grid without a frontend rebuild)
+	Version  string `json:"version,omitempty"` // app version (manifest.json/xpcloud.yaml) — surfaced so EVERY card shows a version badge, incl. tenant apps loadAppGitStatus can't see
 	// Experiments this workflow is attached to (steps[].experiment /
 	// engine.experiment) — drives the flask chip in the detail card.
 	ExperimentIDs []string `json:"experiment_ids,omitempty"`
-	LastRunTS    float64 `json:"last_run_ts,omitempty"`
-	LastRunOK    *bool   `json:"last_run_ok,omitempty"`
-	NextRunTS    float64 `json:"next_run_ts,omitempty"`
-	Description  string `json:"description,omitempty"`
-	Engine       string `json:"engine,omitempty"`        // "runner_steps" | "command:<verb>" (scheduled)
-	StepCount    int    `json:"step_count,omitempty"`
-	N8nID        string `json:"n8n_id,omitempty"`        // for kind=visual
+	LastRunTS     float64  `json:"last_run_ts,omitempty"`
+	LastRunOK     *bool    `json:"last_run_ok,omitempty"`
+	NextRunTS     float64  `json:"next_run_ts,omitempty"`
+	Description   string   `json:"description,omitempty"`
+	Engine        string   `json:"engine,omitempty"` // "runner_steps" | "command:<verb>" (scheduled)
+	StepCount     int      `json:"step_count,omitempty"`
+	N8nID         string   `json:"n8n_id,omitempty"` // for kind=visual
 	// Sparkline of recent run states (W5+ visual polish). One char per
 	// run, oldest→newest, last 14 runs max. Encoding: "."=skipped,
 	// "✓"=succeeded, "✗"=failed, "·"=running. The UI renders these as
@@ -425,7 +425,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 	// row-build loop below.
 	costMap := fetchCostsByEndpoint(userID)
 
-	showcase := showcaseApps()        // backend-driven home-grid curation
+	showcase := showcaseApps()          // backend-driven home-grid curation
 	seenTenantApps := map[string]bool{} // dedupe: tenant app shadows operator-shared
 	privileged := userIsAdmin(userID)   // admins see all operator loops; users only showcase
 
@@ -788,7 +788,10 @@ func buildRunSparkDetailed(journalPath, cyclesLoopDir, loop string, limit int) (
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	type pair struct{ ts float64; ch byte }
+	type pair struct {
+		ts float64
+		ch byte
+	}
 	rows := []pair{}
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -851,7 +854,10 @@ func buildRunSparkDetailed(journalPath, cyclesLoopDir, loop string, limit int) (
 	// loop's cycle dirs once, parse names → start unix, sort ascending,
 	// then for each run pick the dir with the largest start ≤ completion.
 	runs := make([]SparkRun, len(rows))
-	type cdir struct{ start float64; id string }
+	type cdir struct {
+		start float64
+		id    string
+	}
 	var dirs []cdir
 	if cyclesLoopDir != "" {
 		if ents, err := os.ReadDir(cyclesLoopDir); err == nil {
@@ -981,12 +987,12 @@ func MeWorkflowDetail(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
 				"ret_code": 0, "message": "ok",
 				"data": gin.H{
-					"slug":         slug,
-					"kind":         "scheduled",
-					"app":          app,
-					"loop":         loop,
-					"source":       src,
-					"definition":   L,
+					"slug":       slug,
+					"kind":       "scheduled",
+					"app":        app,
+					"loop":       loop,
+					"source":     src,
+					"definition": L,
 				},
 			})
 			return
@@ -1012,8 +1018,8 @@ func MeImportFromN8n(c *gin.Context) {
 		return
 	}
 	var body struct {
-		N8nID       string `json:"n8n_id"`
-		TargetSlug  string `json:"target_slug"`
+		N8nID      string `json:"n8n_id"`
+		TargetSlug string `json:"target_slug"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.N8nID == "" {
 		fail(c, http.StatusBadRequest, 1400, "n8n_id required")
@@ -1057,11 +1063,11 @@ func MeImportFromN8n(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"draft_slug":         slug,
-			"draft_dir":          draftDir,
-			"n8n_id":             body.N8nID,
-			"unsupported_nodes":  unsupported,
-			"note":               "Promoted as a draft. Open /studio/workflows to install + adjust.",
+			"draft_slug":        slug,
+			"draft_dir":         draftDir,
+			"n8n_id":            body.N8nID,
+			"unsupported_nodes": unsupported,
+			"note":              "Promoted as a draft. Open /studio/workflows to install + adjust.",
 		},
 	})
 }

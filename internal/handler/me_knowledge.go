@@ -63,11 +63,11 @@ func tenantKGBankDir(userID, agentID string) (string, bool) {
 }
 
 type knowledgeAgent struct {
-	ID            string `json:"id"`
-	MemoryCount   int    `json:"memory_count"`
-	LastMemoryTs  string `json:"last_memory_ts,omitempty"`
-	BankPath      string `json:"bank_path"` // server-relative; UI debugging
-	AutoPublish   bool   `json:"auto_publish_published_today,omitempty"`
+	ID           string `json:"id"`
+	MemoryCount  int    `json:"memory_count"`
+	LastMemoryTs string `json:"last_memory_ts,omitempty"`
+	BankPath     string `json:"bank_path"` // server-relative; UI debugging
+	AutoPublish  bool   `json:"auto_publish_published_today,omitempty"`
 }
 
 // MeKnowledgeAgents serves GET /api/v1/me/knowledge/agents
@@ -259,12 +259,12 @@ func MeKnowledgeMemories(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"agent":   agent,
-			"total":   total,
-			"offset":  offset,
-			"limit":   limit,
+			"agent":    agent,
+			"total":    total,
+			"offset":   offset,
+			"limit":    limit,
 			"memories": all[offset:end],
-			"as_of":   time.Now().UTC().Format(time.RFC3339),
+			"as_of":    time.Now().UTC().Format(time.RFC3339),
 		},
 	})
 }

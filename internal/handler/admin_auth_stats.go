@@ -18,11 +18,11 @@ import (
 // no client-side bucketing.
 
 type authStatsResp struct {
-	Window   string             `json:"window"`           // e.g. "24h"
-	Generated time.Time         `json:"generated_at"`
-	Login    statsBucket        `json:"login"`
-	OAuth    statsBucket        `json:"oauth"`
-	Hourly   []hourBucket       `json:"hourly"`           // last 24, oldest first
+	Window    string       `json:"window"` // e.g. "24h"
+	Generated time.Time    `json:"generated_at"`
+	Login     statsBucket  `json:"login"`
+	OAuth     statsBucket  `json:"oauth"`
+	Hourly    []hourBucket `json:"hourly"` // last 24, oldest first
 }
 
 type statsBucket struct {
@@ -31,9 +31,9 @@ type statsBucket struct {
 }
 
 type hourBucket struct {
-	Hour    string `json:"hour"`     // "2026-05-08T13:00:00Z"
-	Total   int64  `json:"total"`
-	Failed  int64  `json:"failed"`
+	Hour   string `json:"hour"` // "2026-05-08T13:00:00Z"
+	Total  int64  `json:"total"`
+	Failed int64  `json:"failed"`
 }
 
 func AdminAuthStats(c *gin.Context) {

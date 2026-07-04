@@ -13,13 +13,13 @@ import (
 // sessionListItem is what the UI sees: no JTI/JWT material, just what's
 // needed to show a row and revoke it.
 type sessionListItem struct {
-	ID         string  `json:"id"`
-	ClientID   string  `json:"client_id"`
-	UserAgent  string  `json:"user_agent"`
-	IP         string  `json:"ip"`
-	CreatedAt  int64   `json:"created_at"`
-	ExpiresAt  int64   `json:"expires_at"`
-	Current    bool    `json:"current"`   // true if this is the session that made the request
+	ID        string `json:"id"`
+	ClientID  string `json:"client_id"`
+	UserAgent string `json:"user_agent"`
+	IP        string `json:"ip"`
+	CreatedAt int64  `json:"created_at"`
+	ExpiresAt int64  `json:"expires_at"`
+	Current   bool   `json:"current"` // true if this is the session that made the request
 }
 
 // SessionsListHandler returns the caller's own active (non-revoked) sessions.

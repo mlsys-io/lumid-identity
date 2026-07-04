@@ -24,17 +24,17 @@ import (
 )
 
 type tenantRow struct {
-	Sub          string  `json:"sub"`
-	Email        string  `json:"email"`
-	Role         string  `json:"role"`
-	CreatedAt    string  `json:"created_at"`
-	Apps         int     `json:"apps"`
-	AppNames     []string `json:"app_names,omitempty"`
-	StorageMB    float64 `json:"storage_mb"`
-	CyclesToday  int     `json:"cycles_today"`
-	LLMTokens    int     `json:"llm_tokens_today"`
-	GmailToday   int     `json:"gmail_today"`
-	LastCycleTS  string  `json:"last_cycle_ts,omitempty"`
+	Sub         string   `json:"sub"`
+	Email       string   `json:"email"`
+	Role        string   `json:"role"`
+	CreatedAt   string   `json:"created_at"`
+	Apps        int      `json:"apps"`
+	AppNames    []string `json:"app_names,omitempty"`
+	StorageMB   float64  `json:"storage_mb"`
+	CyclesToday int      `json:"cycles_today"`
+	LLMTokens   int      `json:"llm_tokens_today"`
+	GmailToday  int      `json:"gmail_today"`
+	LastCycleTS string   `json:"last_cycle_ts,omitempty"`
 }
 
 // AdminTenants serves GET /api/v1/admin/tenants — RequireAdmin gates
@@ -49,12 +49,12 @@ func AdminTenants(c *gin.Context) {
 	// One grouped query for today's per-user totals — cheaper than
 	// FetchTodayTotals(sub) N times.
 	type usageAgg struct {
-		UserSub      string
-		Kind         string
-		Endpoint     string
-		Tokens       int
-		Cnt          int
-		LastTs       time.Time
+		UserSub  string
+		Kind     string
+		Endpoint string
+		Tokens   int
+		Cnt      int
+		LastTs   time.Time
 	}
 	var aggs []usageAgg
 	common.DB.Raw(`
@@ -131,9 +131,9 @@ func AdminTenants(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"tenants":  out,
-			"count":    len(out),
-			"as_of":    time.Now().UTC().Format(time.RFC3339),
+			"tenants": out,
+			"count":   len(out),
+			"as_of":   time.Now().UTC().Format(time.RFC3339),
 		},
 	})
 }

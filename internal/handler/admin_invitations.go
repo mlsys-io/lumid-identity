@@ -77,10 +77,10 @@ func RequireSuperAdmin() gin.HandlerFunc {
 // ---- handlers ----
 
 type mintInviteReq struct {
-	Count     int    `json:"count"`      // how many distinct codes; default 1
-	MaxUses   int    `json:"max_uses"`   // per code; default 1 (0 = unlimited)
-	Note      string `json:"note"`
-	TTLDays   int    `json:"ttl_days"`   // 0 = no expiry
+	Count   int    `json:"count"`    // how many distinct codes; default 1
+	MaxUses int    `json:"max_uses"` // per code; default 1 (0 = unlimited)
+	Note    string `json:"note"`
+	TTLDays int    `json:"ttl_days"` // 0 = no expiry
 }
 
 type inviteRow struct {

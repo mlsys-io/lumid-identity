@@ -10,22 +10,23 @@ package handler
 // closing the "forgot to wire the tool into TOOL_EFFECTS → stale UI" bug class.
 //
 // Scope vocabulary mirrors the frontend DataScope union (chat/effects.ts):
-//   apps workflows loops runs cycles drafts knowledge config experiments users ui prompts
+//
+//	apps workflows loops runs cycles drafts knowledge config experiments users ui prompts
 var toolDataScopes = map[string][]string{
 	// loop / workflow execution + schedule
-	"run_loop":     {"runs", "cycles", "loops", "workflows"},
-	"run_loop_now": {"runs", "cycles", "loops", "workflows"},
-	"stop_loop":    {"runs", "cycles", "loops", "workflows"},
-	"patch_loop":   {"loops", "workflows"},
+	"run_loop":       {"runs", "cycles", "loops", "workflows"},
+	"run_loop_now":   {"runs", "cycles", "loops", "workflows"},
+	"stop_loop":      {"runs", "cycles", "loops", "workflows"},
+	"patch_loop":     {"loops", "workflows"},
 	"pause_workflow": {"loops", "workflows"},
-	"delete_loop":  {"loops", "workflows", "apps"},
+	"delete_loop":    {"loops", "workflows", "apps"},
 	// app lifecycle
-	"install_app":            {"apps", "workflows", "loops"},
-	"uninstall_app":          {"apps", "workflows", "loops"},
-	"fork_app":               {"apps"},
-	"app_update":             {"apps", "workflows"},
-	"compose_workflow":       {"workflows", "drafts"},
-	"add_skill_to_workflow":  {"workflows", "apps"},
+	"install_app":           {"apps", "workflows", "loops"},
+	"uninstall_app":         {"apps", "workflows", "loops"},
+	"fork_app":              {"apps"},
+	"app_update":            {"apps", "workflows"},
+	"compose_workflow":      {"workflows", "drafts"},
+	"add_skill_to_workflow": {"workflows", "apps"},
 	// drafts / inbox
 	"send_draft":    {"drafts"},
 	"edit_draft":    {"drafts"},
@@ -47,8 +48,8 @@ var toolDataScopes = map[string][]string{
 	// branch-with-intention records a control signal the run/lineage views read.
 	"branch_run": {"runs", "cycles", "workflows"},
 	// knowledge
-	"xp_ingest":        {"knowledge"},
-	"xp_feedback":      {"knowledge"},
+	"xp_ingest":         {"knowledge"},
+	"xp_feedback":       {"knowledge"},
 	"subscribe_to_bank": {"knowledge"},
 	// admin control plane
 	"admin_set_user_role":   {"users"},

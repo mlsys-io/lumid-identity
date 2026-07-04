@@ -49,14 +49,14 @@ func NewN8nClient() *N8nClient {
 // N8nWorkflow is the slim shape we read from /rest/workflows.
 // n8n returns far more fields; we keep only what the aggregator needs.
 type N8nWorkflow struct {
-	ID        string                 `json:"id"`
-	Name      string                 `json:"name"`
-	Active    bool                   `json:"active"`
-	CreatedAt string                 `json:"createdAt"`
-	UpdatedAt string                 `json:"updatedAt"`
-	Tags      []map[string]any       `json:"tags,omitempty"`
-	Settings  map[string]any         `json:"settings,omitempty"`
-	Nodes     []N8nNode              `json:"nodes,omitempty"`
+	ID        string           `json:"id"`
+	Name      string           `json:"name"`
+	Active    bool             `json:"active"`
+	CreatedAt string           `json:"createdAt"`
+	UpdatedAt string           `json:"updatedAt"`
+	Tags      []map[string]any `json:"tags,omitempty"`
+	Settings  map[string]any   `json:"settings,omitempty"`
+	Nodes     []N8nNode        `json:"nodes,omitempty"`
 }
 
 // N8nNode — just enough to count steps + render the DAG label.
@@ -70,14 +70,14 @@ type N8nNode struct {
 
 // N8nExecution is the slim shape we read from /rest/executions.
 type N8nExecution struct {
-	ID            string `json:"id"`
-	WorkflowID    string `json:"workflowId"`
-	Status        string `json:"status"`         // "success" | "error" | "running" | "waiting" | "canceled"
-	Mode          string `json:"mode,omitempty"` // "manual" | "trigger" | "webhook" | ...
-	StartedAt     string `json:"startedAt"`
-	StoppedAt     string `json:"stoppedAt,omitempty"`
-	Finished      bool   `json:"finished"`
-	RetryOf       string `json:"retryOf,omitempty"`
+	ID             string `json:"id"`
+	WorkflowID     string `json:"workflowId"`
+	Status         string `json:"status"`         // "success" | "error" | "running" | "waiting" | "canceled"
+	Mode           string `json:"mode,omitempty"` // "manual" | "trigger" | "webhook" | ...
+	StartedAt      string `json:"startedAt"`
+	StoppedAt      string `json:"stoppedAt,omitempty"`
+	Finished       bool   `json:"finished"`
+	RetryOf        string `json:"retryOf,omitempty"`
 	RetrySuccessID string `json:"retrySuccessId,omitempty"`
 }
 

@@ -63,13 +63,13 @@ func MeMindWorkflow(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"slug":         slug,
-			"app":          app,
-			"loop":         loop,
-			"this_month":   thisMonthStats,
-			"prev_month":   prevMonthStats,
-			"deltas":       deltas,
-			"as_of":        now.Format(time.RFC3339),
+			"slug":       slug,
+			"app":        app,
+			"loop":       loop,
+			"this_month": thisMonthStats,
+			"prev_month": prevMonthStats,
+			"deltas":     deltas,
+			"as_of":      now.Format(time.RFC3339),
 		},
 	})
 }
@@ -144,10 +144,10 @@ func MeMindSkills(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"skill":  skill,
-			"rows":   rows,
-			"count":  len(rows),
-			"as_of":  time.Now().UTC().Format(time.RFC3339),
+			"skill": skill,
+			"rows":  rows,
+			"count": len(rows),
+			"as_of": time.Now().UTC().Format(time.RFC3339),
 		},
 	})
 }
@@ -184,11 +184,11 @@ func MeMindEvaluate(c *gin.Context) {
 	}
 
 	entry := map[string]any{
-		"skill":       body.SkillName,
-		"for_app":     body.ForApp,
+		"skill":        body.SkillName,
+		"for_app":      body.ForApp,
 		"requested_by": userID,
 		"requested_at": time.Now().UTC().Format(time.RFC3339),
-		"status":      "queued",
+		"status":       "queued",
 	}
 	row, _ := json.Marshal(entry)
 	f, err := os.OpenFile(queuePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
@@ -204,24 +204,24 @@ func MeMindEvaluate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"queued":      true,
-			"skill":       body.SkillName,
-			"for_app":     body.ForApp,
-			"note":        "skill-roster picks up the queue within 60s; attestation lands on xpcloud once scoring completes.",
+			"queued":  true,
+			"skill":   body.SkillName,
+			"for_app": body.ForApp,
+			"note":    "skill-roster picks up the queue within 60s; attestation lands on xpcloud once scoring completes.",
 		},
 	})
 }
 
 // LoopStats — what we summarise per workflow over a time window.
 type LoopStats struct {
-	RunCount       int     `json:"run_count"`
-	SuccessCount   int     `json:"success_count"`
-	FailureCount   int     `json:"failure_count"`
-	SkippedCount   int     `json:"skipped_count"`
-	SuccessRate    float64 `json:"success_rate"`
-	AvgDurationSec float64 `json:"avg_duration_s"`
-	DraftsCreated  int     `json:"drafts_created,omitempty"`
-	DraftsAccepted int     `json:"drafts_accepted,omitempty"`
+	RunCount        int     `json:"run_count"`
+	SuccessCount    int     `json:"success_count"`
+	FailureCount    int     `json:"failure_count"`
+	SkippedCount    int     `json:"skipped_count"`
+	SuccessRate     float64 `json:"success_rate"`
+	AvgDurationSec  float64 `json:"avg_duration_s"`
+	DraftsCreated   int     `json:"drafts_created,omitempty"`
+	DraftsAccepted  int     `json:"drafts_accepted,omitempty"`
 	DraftAcceptRate float64 `json:"draft_accept_rate,omitempty"`
 }
 

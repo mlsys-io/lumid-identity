@@ -172,9 +172,9 @@ func toolWebFetch(url string) (map[string]any, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), tavilyTimeout)
 	defer cancel()
 	resp, err := tavilyPOST(ctx, tavilyExtractEndpoint, apiKey, map[string]any{
-		"urls":             []string{url},
-		"extract_depth":    "basic",
-		"include_images":   false,
+		"urls":           []string{url},
+		"extract_depth":  "basic",
+		"include_images": false,
 	})
 	if err != nil {
 		return map[string]any{"error": err.Error()}, false
@@ -221,13 +221,13 @@ func toolDeepResearch(question string, maxResults int) (map[string]any, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	resp, err := tavilyPOST(ctx, tavilySearchEndpoint, apiKey, map[string]any{
-		"query":                 question,
-		"search_depth":          "advanced",
-		"topic":                 "general",
-		"max_results":           maxResults,
-		"include_answer":        "advanced",
-		"include_raw_content":   false,
-		"chunks_per_source":     3,
+		"query":               question,
+		"search_depth":        "advanced",
+		"topic":               "general",
+		"max_results":         maxResults,
+		"include_answer":      "advanced",
+		"include_raw_content": false,
+		"chunks_per_source":   3,
 	})
 	if err != nil {
 		return map[string]any{"error": err.Error()}, false

@@ -24,9 +24,9 @@ import (
 // plus operator-shared, each with a tenant flag.
 func toolListApps(userID string) map[string]any {
 	type appCard struct {
-		Name     string `json:"name"`
-		Tenant   bool   `json:"tenant"`
-		HasMfst  bool   `json:"has_manifest"`
+		Name    string `json:"name"`
+		Tenant  bool   `json:"tenant"`
+		HasMfst bool   `json:"has_manifest"`
 	}
 	out := []appCard{}
 	walk := func(root string, isTenant bool) {

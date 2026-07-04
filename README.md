@@ -4,7 +4,9 @@
 
 ## Status
 
-Phase 1 — **shadow** deployment. The service runs at `identity.lum.id:9900` and mirrors the auth data from QuantArena's `trading_community` DB. Consumers (LQA, Runmesh, …) haven't cut over yet; this service just has to answer introspect queries identically so we can flip traffic in Phase 3.
+**Live — sole token authority.** lumid-identity at `https://lum.id` is the single auth authority for the ecosystem: it issues JWTs + `lm_pat_*` PATs (legacy `rm_pat_*` still accepted), validates them via introspect, and hosts the OIDC endpoints. Every other service (QuantArena, Runmesh, FlowMesh, Lumilake, xpcloud) is a bearer-auth consumer that delegates here. As of 2026-07 the stack runs on UpCloud Managed Kubernetes (`lumid-prod2`, sg-sin1); domains are served via the UpCloud LB with acme.sh certs.
+
+> **Historical:** this doc originally described a Phase-1 *shadow* deployment mirroring QuantArena's `trading_community` DB before consumers cut over. That cutover is long complete — the auth-consolidation is GA. See `/proj/CLAUDE.md` "Auth Architecture — one authority on lum.id" for the current contract.
 
 ## Stack
 
@@ -12,7 +14,7 @@ Phase 1 — **shadow** deployment. The service runs at `identity.lum.id:9900` an
 - **MySQL** for persistence (new database `lumid_identity` on the existing `trading_mysql` instance — dedicated Postgres is a Phase 8 consideration)
 - **Redis** for session blacklist + introspect cache (shared with LQA for now)
 - **RS256** JWTs; keys rotated monthly via `signing_keys` table
-- **argon2id** for PAT hashing (upgrade from LQA's plain SHA-256)
+- PAT hashing via **SHA-256** hash lookup today (argon2id is planned, not yet in place)
 
 ## Run
 
@@ -22,7 +24,7 @@ go run cmd/identity/main.go -c configs/identity.yaml
 # default port 9900
 ```
 
-## Endpoints (target)
+## Endpoints (live)
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -40,6 +42,6 @@ go run cmd/identity/main.go -c configs/identity.yaml
 | DELETE | `/api/v1/identity/personal-access-tokens/:id` | revoke |
 | POST | `/api/v1/send-verification-code` | email OTP for registration |
 
-## Plan reference
+## Reference
 
-Full phased migration: `.claude_junyi/plans/parsed-dancing-yeti.md`.
+Current auth contract (roles, token formats, session cookie, SSO bridge, Google OAuth for apps): see `/proj/CLAUDE.md` → "Auth Architecture — one authority on lum.id". Additional handlers not shown above: `google_grants.go` (server-mediated Google OAuth), `admin_loops.go` (super-admin loops dashboard), `admin_oauth_clients.go`.

@@ -572,11 +572,42 @@ func containsStr(ss []string, v string) bool {
 	return false
 }
 
+// capabilityScopes is the allowlist of opaque, non-platform "capability" scope
+// tags a plain authenticated user may mint on a PAT. These are NOT service
+// access levels: parseScope() deliberately does not recognise them, so they
+// never appear in computeAccess()/the access matrix and never widen a user's
+// role or per-service level. They are least-privilege capability tags that a
+// downstream *consumer* (not this auth authority) interprets — e.g. the LQT
+// mailbox-consumer authorizes the `universe.refresh` topic when a PAT carries
+// `lqt:universe:refresh`, and nothing else. Adding a tag here lets it be minted
+// + persisted + returned by introspection verbatim, with zero platform-access
+// side effects. Keep this list NARROW (one entry per real capability), never a
+// wildcard.
+var capabilityScopes = map[string]bool{
+	// LQT monitored-universe refresh — authorizes ONLY the `universe.refresh`
+	// mailbox topic in lqt-auth (crates/lqt-auth/src/authz.rs). Not a wildcard.
+	"lqt:universe:refresh": true,
+}
+
+// isCapabilityScope reports whether a raw scope is an opaque LQT-style
+// capability tag on the allowlist (see capabilityScopes). Such scopes are
+// grantable by any active authenticated user and carry no platform access.
+func isCapabilityScope(rawScope string) bool {
+	return capabilityScopes[rawScope]
+}
+
 // canGrant reports whether the calling user is allowed to mint a PAT
 // with the given scope, based on their matrix row for the target service.
 // Admin role can always grant anything (matches the matrix's role=admin
 // → admin-everywhere rule). Global wildcards require admin role.
 func canGrant(u models.User, toks []models.Token, rawScope string) bool {
+	// Opaque capability tags (e.g. lqt:universe:refresh) are grantable by any
+	// active authenticated user: they confer no platform access (parseScope
+	// ignores them, so computeAccess is unchanged) and are enforced by the
+	// downstream consumer. This is strictly additive to the matrix logic below.
+	if isCapabilityScope(rawScope) {
+		return u.Status == "active"
+	}
 	svc, lvl := parseScope(rawScope)
 	if svc == "" {
 		return false

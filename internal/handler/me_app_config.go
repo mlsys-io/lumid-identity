@@ -19,6 +19,7 @@ package handler
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"net/http"
 	"os"
@@ -26,6 +27,36 @@ import (
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
+
+// fetchRepoSpecYAML reads the app's xpcloud.yaml from the caller's xp.io repo.
+// Cross-node fallback: on UKS identity (service tier) can't see the scheduler's
+// app PVC (compute tier, RWO), so the local file read 404s. identity CAN reach
+// xpcloud, and the published bundle carries the same spec — so the Config/Manage
+// surfaces (config_schema, loops, etc.) work without a shared filesystem.
+// Best-effort; ("", false) on any miss. Owner is assumed to be the caller (the
+// common case: a user manages their own installed app).
+func fetchRepoSpecYAML(userID, app string) ([]byte, bool) {
+	bearer, err := xpcloudUserJWT(userID)
+	if err != nil {
+		return nil, false
+	}
+	for _, p := range []string{".xpcloud.yaml", "xpcloud.yaml"} {
+		url := xpcloudBaseURL() + "/api/v1/repos/" + userID + "/" + app + "/blob/main/" + p
+		code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
+		if err != nil || code >= 300 || resp == nil {
+			continue
+		}
+		content, _ := resp["content"].(string)
+		if content == "" {
+			continue
+		}
+		if dec, derr := base64.StdEncoding.DecodeString(content); derr == nil && len(dec) > 0 {
+			return dec, true
+		}
+		return []byte(content), true
+	}
+	return nil, false
+}
 
 func contentSHA(b []byte) string {
 	h := sha256.Sum256(b)
@@ -46,14 +77,20 @@ func MeAppConfig(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app")
 		return
 	}
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
-		return
+	var b []byte
+	if appDir := resolveAppDir(userID, app); appDir != "" {
+		if yamlPath, _ := ResolveSpecPath(appDir); yamlPath != "" {
+			b, _ = os.ReadFile(yamlPath)
+		}
 	}
-	yamlPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(yamlPath)
-	if err != nil {
+	// Cross-node fallback: read the spec from the caller's xp.io repo when the
+	// local file isn't visible (identity ≠ scheduler node; see fetchRepoSpecYAML).
+	if len(b) == 0 {
+		if fetched, ok := fetchRepoSpecYAML(userID, app); ok {
+			b = fetched
+		}
+	}
+	if len(b) == 0 {
 		fail(c, http.StatusNotFound, 1404, "xpcloud.yaml not found")
 		return
 	}

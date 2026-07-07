@@ -187,3 +187,35 @@ func MeSecretFetchValue(c *gin.Context) {
 		"data": gin.H{"value": pt},
 	})
 }
+
+// InternalAppSecretsFetch — POST /api/v1/internal/app-secrets/fetch
+// (X-Bridge-Secret). Body: {user_sub, app}. Returns the DECRYPTED
+// {key: value} map of that user's secrets for the app, for the scheduler
+// to inject into the cycle env. Service-to-service only — never user-facing
+// (the user-facing routes only ever surface is_set, never plaintext).
+func InternalAppSecretsFetch(c *gin.Context) {
+	var body struct {
+		UserSub string `json:"user_sub" binding:"required"`
+		App     string `json:"app"      binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	var rows []models.AppSecret
+	if err := common.DB.Where("user_sub = ? AND app_slug = ?", body.UserSub, body.App).
+		Find(&rows).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "lookup: "+err.Error())
+		return
+	}
+	out := map[string]string{}
+	for i := range rows {
+		if v, err := common.DecryptGrant(rows[i].ValueEncrypted); err == nil {
+			out[rows[i].Key] = v
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{"secrets": out},
+	})
+}

@@ -36,6 +36,7 @@ var actionsNeedingBearer = map[string]bool{
 	"publish_app":    true,
 	"subscribe_bank": true,
 	"add_skill":      true,
+	"run_loop":       true, // cycle's auto_publish pushes to the user's xpcloud repo
 }
 
 const (

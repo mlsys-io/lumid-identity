@@ -458,6 +458,10 @@ func Register(r *gin.Engine) {
 		internal := v1.Group("/internal", RequireBridge())
 		{
 			internal.POST("/usage/charge", InternalUsageCharge)
+			// DB-backed /me/apps intent queue — the scheduler picker claims
+			// pending intents (atomic SKIP LOCKED) + posts results back.
+			internal.POST("/me-intents/claim", InternalMeIntentsClaim)
+			internal.POST("/me-intents/:id/result", InternalMeIntentResult)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The

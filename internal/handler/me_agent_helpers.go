@@ -16,8 +16,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // toolListApps returns the same shape as MeAppsList — caller's tenant
@@ -51,36 +49,14 @@ func toolListApps(userID string) map[string]any {
 	return map[string]any{"apps": out, "count": len(out)}
 }
 
-// writeIntentDirect is writeIntent without the *gin.Context — for the
-// agent path that doesn't need to set HTTP response on failure.
-// Returns the intent UUID or "" on error.
+// writeIntentDirect is writeIntent without the *gin.Context — for the agent
+// path that doesn't need to set an HTTP response on failure. Enqueues into the
+// DB-backed queue (see me_intents_db.go). Returns the intent id or "" on error.
 func writeIntentDirect(userSub, action string, payload map[string]any) string {
-	dir := intentDir()
-	// World-writable so the scheduler can write results regardless of its uid
-	// (see writeIntent for the full rationale — uid mismatch broke 0o775).
-	if err := os.MkdirAll(dir, 0o777); err != nil {
+	id, err := insertIntent(action, userSub, payload)
+	if err != nil {
 		return ""
 	}
-	_ = os.Chmod(dir, 0o777)
-
-	id := uuid.New().String()
-	envelope := map[string]any{
-		"intent_id":  id,
-		"action":     action,
-		"user_sub":   userSub,
-		"created_at": time.Now().UTC().Format(time.RFC3339),
-		"payload":    payload,
-	}
-	body, _ := json.MarshalIndent(envelope, "", "  ")
-	tmp := filepath.Join(dir, id+".json.tmp")
-	final := filepath.Join(dir, id+".json")
-	if err := os.WriteFile(tmp, body, 0o666); err != nil {
-		return ""
-	}
-	if err := os.Rename(tmp, final); err != nil {
-		return ""
-	}
-	_ = os.Chmod(final, 0o666)
 	return id
 }
 

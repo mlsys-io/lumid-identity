@@ -28,15 +28,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-)
 
-// intentDir returns the absolute path to ~/.lumilake/me-intents on the
-// operator host. The directory is created on demand (the bind-mount
-// gives us write access in P0).
-func intentDir() string {
-	return filepath.Join(operatorHome(), ".lumilake", "me-intents")
-}
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
+)
 
 // tenantRoot returns the per-user app root on the operator host.
 // Convention (multi-tenant phase 1, 2026-05-22): each user gets a
@@ -263,67 +258,61 @@ type pendingCard struct {
 	err    string
 }
 
-// pendingInstallCards scans the shared me-intents dir for THIS user's install
-// intents and returns synthetic cards for ones not yet (or never) materialized
-// on disk. user_sub filtering is mandatory — the dir is shared across tenants.
+// pendingInstallCards reads THIS user's install intents from the DB queue and
+// returns synthetic My-Apps cards. On UKS identity can't see the scheduler's
+// apps PVC (different node, RWO), so `onDisk` is usually empty and the DB queue
+// doubles as the node-agnostic install registry: a `done` row surfaces as a
+// `ready` card here even though the file isn't locally visible. user_sub
+// filtering is mandatory. Newest intent per app name wins.
 func pendingInstallCards(userSub string, onDisk map[string]bool) []pendingCard {
-	dir := intentDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	var rows []models.MeAppIntent
+	if err := common.DB.
+		Where("user_sub = ? AND action = ?", userSub, "install").
+		Order("created_at desc").
+		Limit(200).
+		Find(&rows).Error; err != nil {
 		return nil
 	}
 	seen := map[string]bool{}
 	var cards []pendingCard
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".result.json") {
-			continue
+	for i := range rows {
+		r := rows[i]
+		var payload map[string]any
+		if r.Payload != "" {
+			_ = json.Unmarshal([]byte(r.Payload), &payload)
 		}
-		b, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			continue
-		}
-		var env struct {
-			IntentID  string         `json:"intent_id"`
-			Action    string         `json:"action"`
-			UserSub   string         `json:"user_sub"`
-			CreatedAt string         `json:"created_at"`
-			Payload   map[string]any `json:"payload"`
-		}
-		if json.Unmarshal(b, &env) != nil {
-			continue
-		}
-		if env.Action != "install" || env.UserSub != userSub {
-			continue
-		}
-		// Age guard: never surface a stale install card. An install resolves
-		// in well under a minute; anything older than an hour is a dead/
-		// abandoned intent (e.g. an old e2e-test leftover) — skip it so it
-		// doesn't clutter My Apps forever. The user can still see it via the
-		// intent inspector; this is just the optimistic-card surface.
-		if t, err := time.Parse(time.RFC3339, env.CreatedAt); err == nil && time.Since(t) > time.Hour {
-			continue
-		}
-		appName := installAppName(env.Payload)
+		appName := installAppName(payload)
 		if appName == "" || onDisk[appName] || seen[appName] {
 			continue
 		}
-		// Resolved? Read the result to distinguish installing vs failed.
-		resultPath := filepath.Join(dir, env.IntentID+".result.json")
-		if rb, err := os.ReadFile(resultPath); err == nil {
-			ok, errMsg := installResultOK(rb)
+		switch r.Status {
+		case "done":
+			seen[appName] = true
+			ok, msg := true, ""
+			if r.Result != "" {
+				ok, msg = installResultOK([]byte(r.Result))
+			}
 			if ok {
-				// Succeeded but the dir wasn't found above (e.g. installed under
-				// a different name / discovery lag) — let the real card win once
-				// it appears; skip the synthetic one.
+				cards = append(cards, pendingCard{name: appName, status: "ready"})
+			} else {
+				cards = append(cards, pendingCard{name: appName, status: "failed", err: msg})
+			}
+		case "failed":
+			seen[appName] = true
+			_, msg := installResultOK([]byte(r.Result))
+			if msg == "" {
+				msg = "install failed"
+			}
+			cards = append(cards, pendingCard{name: appName, status: "failed", err: msg})
+		default: // pending | claimed
+			// Age guard: skip stale (>1h) unresolved intents so a dead/abandoned
+			// intent doesn't clutter My Apps forever.
+			if time.Since(r.CreatedAt) > time.Hour {
 				continue
 			}
 			seen[appName] = true
-			cards = append(cards, pendingCard{name: appName, status: "failed", err: errMsg})
-			continue
+			cards = append(cards, pendingCard{name: appName, status: "installing"})
 		}
-		seen[appName] = true
-		cards = append(cards, pendingCard{name: appName, status: "installing"})
 	}
 	return cards
 }
@@ -388,37 +377,41 @@ func installAppName(payload map[string]any) string {
 	return strings.TrimSuffix(slug, "-draft")
 }
 
-// GET /api/v1/me/intents/:id — fetch intent status + result.
-// Result file is written by the scheduler-side picker (separate task).
-// In P0 returns "pending" until that picker lands.
+// GET /api/v1/me/intents/:id — fetch intent status + result from the DB queue.
+// Returns status "completed" once the picker posts a result (done|failed),
+// else "pending". The bearer column is NEVER included in the returned
+// envelope (it lives outside `payload`).
 func MeIntentGet(c *gin.Context) {
 	if _, ok := currentUserID(c); !ok {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
 	id := c.Param("id")
-	if !regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`).MatchString(id) {
+	if !meIntentIDRe.MatchString(id) {
 		fail(c, http.StatusBadRequest, 1400, "invalid intent id")
 		return
 	}
-	dir := intentDir()
-	intentPath := filepath.Join(dir, id+".json")
-	resultPath := filepath.Join(dir, id+".result.json")
-
-	// Read the intent envelope so we can return the ts/action even
-	// before the picker has processed it.
-	b, err := os.ReadFile(intentPath)
-	if err != nil {
+	var row models.MeAppIntent
+	if err := common.DB.Where("id = ?", id).First(&row).Error; err != nil {
 		fail(c, http.StatusNotFound, 1404, "intent not found")
 		return
 	}
-	var envelope map[string]any
-	_ = json.Unmarshal(b, &envelope)
-
-	// Did the picker complete it?
-	if rb, err := os.ReadFile(resultPath); err == nil {
+	var payload map[string]any
+	if row.Payload != "" {
+		_ = json.Unmarshal([]byte(row.Payload), &payload)
+	}
+	envelope := gin.H{
+		"intent_id":  row.ID,
+		"action":     row.Action,
+		"user_sub":   row.UserSub,
+		"created_at": row.CreatedAt.UTC().Format(time.RFC3339),
+		"payload":    payload,
+	}
+	if row.Status == "done" || row.Status == "failed" {
 		var result map[string]any
-		_ = json.Unmarshal(rb, &result)
+		if row.Result != "" {
+			_ = json.Unmarshal([]byte(row.Result), &result)
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
 			"data": gin.H{
@@ -457,80 +450,38 @@ func MeInstallIntentDelete(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app name")
 		return
 	}
-	dir := intentDir()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	// Delete THIS user's install intents whose derived app name matches.
+	var rows []models.MeAppIntent
+	if err := common.DB.Where("user_sub = ? AND action = ?", userID, "install").
+		Find(&rows).Error; err != nil {
 		ok_(c, "dismissed", gin.H{"removed": 0})
 		return
 	}
-	removed := 0
-	for _, e := range entries {
-		fn := e.Name()
-		if e.IsDir() || !strings.HasSuffix(fn, ".json") || strings.HasSuffix(fn, ".result.json") {
-			continue
+	var delIDs []string
+	for i := range rows {
+		var payload map[string]any
+		if rows[i].Payload != "" {
+			_ = json.Unmarshal([]byte(rows[i].Payload), &payload)
 		}
-		b, err := os.ReadFile(filepath.Join(dir, fn))
-		if err != nil {
-			continue
+		if installAppName(payload) == name {
+			delIDs = append(delIDs, rows[i].ID)
 		}
-		var env struct {
-			IntentID string         `json:"intent_id"`
-			Action   string         `json:"action"`
-			UserSub  string         `json:"user_sub"`
-			Payload  map[string]any `json:"payload"`
-		}
-		if json.Unmarshal(b, &env) != nil {
-			continue
-		}
-		if env.Action != "install" || env.UserSub != userID || installAppName(env.Payload) != name {
-			continue
-		}
-		_ = os.Remove(filepath.Join(dir, fn))
-		_ = os.Remove(filepath.Join(dir, env.IntentID+".result.json"))
-		removed++
 	}
-	ok_(c, "dismissed", gin.H{"removed": removed})
+	if len(delIDs) > 0 {
+		common.DB.Where("id IN ?", delIDs).Delete(&models.MeAppIntent{})
+	}
+	ok_(c, "dismissed", gin.H{"removed": len(delIDs)})
 }
 
-// writeIntent atomically writes <uuid>.json into ~/.lumilake/me-intents/
-// and returns the uuid. The dir is made WORLD-WRITABLE (0o777) so the
-// lumid-scheduler can write its .result.json next to the intent regardless
-// of which uid it runs as — identity-in-container and the scheduler map to
-// DIFFERENT host uids (the old code chmod'd 0o775 + chown 1001, but the
-// scheduler now runs as 1000, so it lost write and every install stalled
-// with a PermissionError on the result file). UID-agnostic perms avoid that.
-// On write failure it writes a fail() response to c and returns "".
+// writeIntent enqueues an intent into the DB-backed queue (see
+// me_intents_db.go / models.MeAppIntent) and returns its id. Replaces the old
+// pod-local file queue, which never crossed from identity to the scheduler on
+// UKS. On failure it writes a fail() response to c and returns "".
 func writeIntent(c *gin.Context, action, userSub string, payload map[string]any) string {
-	dir := intentDir()
-	if err := os.MkdirAll(dir, 0o777); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "mkdir intents: "+err.Error())
+	id, err := insertIntent(action, userSub, payload)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "queue intent: "+err.Error())
 		return ""
 	}
-	// Idempotently force 0o777 — earlier deploys / this same function used to
-	// set 0o775, which locked out the scheduler's result write. Ignore error.
-	_ = os.Chmod(dir, 0o777)
-
-	id := uuid.New().String()
-	envelope := map[string]any{
-		"intent_id":  id,
-		"action":     action,
-		"user_sub":   userSub,
-		"created_at": time.Now().UTC().Format(time.RFC3339),
-		"payload":    payload,
-	}
-	body, _ := json.MarshalIndent(envelope, "", "  ")
-	// tmp+rename for atomic visibility — the scheduler may scan mid-write.
-	tmp := filepath.Join(dir, id+".json.tmp")
-	final := filepath.Join(dir, id+".json")
-	// 0o666 so the scheduler (any uid) can rewrite/replace if needed.
-	if err := os.WriteFile(tmp, body, 0o666); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write intent: "+err.Error())
-		return ""
-	}
-	if err := os.Rename(tmp, final); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "rename intent: "+err.Error())
-		return ""
-	}
-	_ = os.Chmod(final, 0o666)
 	return id
 }

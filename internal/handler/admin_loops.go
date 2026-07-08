@@ -810,6 +810,14 @@ func readYamlLoops(p string) ([]rawLoop, error) {
 	if err != nil {
 		return nil, err
 	}
+	return readYamlLoopsBytes(b)
+}
+
+// readYamlLoopsBytes parses loops[] from raw spec bytes — lets the cross-node
+// fallback (fetchRepoSpecYAML) build workflow rows for a tenant app whose files
+// identity can't read from disk (svc node ≠ scheduler PVC; kind=agent apps live
+// in .xp/agents).
+func readYamlLoopsBytes(b []byte) ([]rawLoop, error) {
 	var doc struct {
 		Loops []rawLoop `yaml:"loops"`
 	}

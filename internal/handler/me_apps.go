@@ -243,6 +243,25 @@ func MeAppsList(c *gin.Context) {
 		})
 	}
 
+	// Cross-node enrichment: on UKS identity (svc node) can't read the
+	// scheduler's app PVC (compute node, RWO), and kind=agent apps install to
+	// .xp/agents (not the .xp/apps dir walk() scans) — so tenant cards arrive
+	// as bare DB stubs with no ui: block, and the Studio sidebar has nothing to
+	// render. Backfill the ui: (+ mark xpcloud-backed) from the caller's
+	// PUBLISHED xp.io spec, the same fallback MeAppConfig uses. Best-effort;
+	// only for ready tenant cards missing a ui block.
+	for i := range out {
+		if !out[i].Tenant || out[i].Status != "ready" || out[i].UI != nil {
+			continue
+		}
+		if spec, ok := fetchRepoSpecYAML(userID, out[i].Name); ok {
+			if ui := parseAppUI(spec); ui != nil {
+				out[i].UI = ui
+			}
+			out[i].HasXPCld = true
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{"apps": out},

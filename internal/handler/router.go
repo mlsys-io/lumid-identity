@@ -261,6 +261,9 @@ func Register(r *gin.Engine) {
 			me.PUT("/apps/:app/secrets/:key", MeSecretPut)
 			me.DELETE("/apps/:app/secrets/:key", MeSecretDelete)
 			me.GET("/apps/:app/secrets/:key/value", MeSecretFetchValue)
+			// Live-verify a pasted Claude credential against Anthropic + store
+			// it only if it authenticates (backs the "Connect Claude" popup).
+			me.POST("/apps/:app/secrets/claude-verify", MeSecretClaudeVerify)
 
 			// Power Automate inbound webhook lifecycle. The Outlook
 			// bridge workaround for users whose org blocks Microsoft

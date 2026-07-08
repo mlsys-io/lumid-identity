@@ -23,6 +23,25 @@ import (
 
 var secretKeyRe = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
 
+// maskSecret returns a bounded, non-usable preview of a secret: a leading
+// identifier prefix + a short suffix with the middle elided (e.g.
+// "sk-ant-oat01-3tSM…jAAA", "lm_pat_live_2905…"). Reveals at most ~16 chars of
+// long values and progressively less of short ones, so it identifies the
+// credential without leaking it. ASCII-only (all our token formats are ASCII).
+func maskSecret(v string) string {
+	n := len(v)
+	switch {
+	case n == 0:
+		return ""
+	case n <= 6:
+		return v[:1] + "…" // tiny — reveal almost nothing
+	case n <= 16:
+		return v[:n/3] + "…" // short — ≤ 1/3, no suffix
+	default:
+		return v[:12] + "…" + v[n-4:]
+	}
+}
+
 type meSecretPutBody struct {
 	Value string `json:"value" binding:"required"`
 }
@@ -107,9 +126,18 @@ func MeSecretsList(c *gin.Context) {
 	}
 	keys := make([]gin.H, 0, len(rows))
 	for _, r := range rows {
+		// Masked preview so the owner can confirm WHICH credential is stored
+		// (e.g. sk-ant-oat01-3tSM…jAAA) without exposing the secret. Decrypt is
+		// safe here: the row is the caller's own (currentUserID-scoped) and only
+		// a bounded prefix+suffix is returned. Never expose the full value.
+		preview := ""
+		if pt, err := common.DecryptGrant(r.ValueEncrypted); err == nil {
+			preview = maskSecret(pt)
+		}
 		keys = append(keys, gin.H{
 			"key":        r.Key,
 			"is_set":     true,
+			"preview":    preview,
 			"updated_at": r.UpdatedAt.Format(time.RFC3339),
 		})
 	}

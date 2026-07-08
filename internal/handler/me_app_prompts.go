@@ -24,6 +24,7 @@ package handler
 //   - PUT honors an optimistic lock (base_sha) and writes atomically (tmp+rename).
 
 import (
+	"encoding/base64"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -129,6 +130,39 @@ func validPromptName(name string) bool {
 }
 
 // MeAppPrompts — GET /me/apps/:app/prompts
+// publishedPromptNames lists *.md under the app's published repo prompts/ dir
+// (authenticated, so private repos resolve). Cross-node read-only fallback.
+func publishedPromptNames(userID, app string) []string {
+	bearer, err := xpcloudUserJWT(userID)
+	if err != nil {
+		return nil
+	}
+	url := xpcloudBaseURL() + "/api/v1/repos/" + userID + "/" + app + "/tree/main/prompts"
+	code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
+	if err != nil || code >= 300 || resp == nil {
+		return nil
+	}
+	entries, _ := resp["entries"].([]any)
+	out := []string{}
+	for _, raw := range entries {
+		e, _ := raw.(map[string]any)
+		if e == nil {
+			continue
+		}
+		name, _ := e["name"].(string)
+		if name == "" {
+			if p, _ := e["path"].(string); p != "" {
+				name = p[strings.LastIndex(p, "/")+1:]
+			}
+		}
+		if strings.HasSuffix(name, ".md") {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func MeAppPrompts(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -142,7 +176,16 @@ func MeAppPrompts(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: identity can't read the tenant PVC. List the app's prompts
+		// from the caller's PUBLISHED xp.io repo (read-only) so the Agents/Prompts
+		// panel works instead of "app not found". Same fallback pattern as config.
+		names := publishedPromptNames(userID, app)
+		prompts := make([]promptInfo, 0, len(names))
+		for _, n := range names {
+			prompts = append(prompts, promptInfo{Name: n, Source: "published", Editable: false})
+		}
+		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
+			"data": gin.H{"app": app, "prompts": prompts}})
 		return
 	}
 	// Writable only when the caller owns the app (tenant install). A shared app's
@@ -224,6 +267,28 @@ func resolvePromptRead(userSub, appDir, name string) (path, source string) {
 }
 
 // MeAppPrompt — GET /me/apps/:app/prompts/:name
+// publishedPromptBlob reads one prompt's bytes from the app's published repo
+// (authenticated). Cross-node read-only fallback for MeAppPrompt.
+func publishedPromptBlob(userID, app, name string) []byte {
+	bearer, err := xpcloudUserJWT(userID)
+	if err != nil {
+		return nil
+	}
+	url := xpcloudBaseURL() + "/api/v1/repos/" + userID + "/" + app + "/blob/main/prompts/" + name
+	code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
+	if err != nil || code >= 300 || resp == nil {
+		return nil
+	}
+	content, _ := resp["content"].(string)
+	if content == "" {
+		return nil
+	}
+	if dec, derr := base64.StdEncoding.DecodeString(content); derr == nil && len(dec) > 0 {
+		return dec
+	}
+	return []byte(content)
+}
+
 func MeAppPrompt(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -242,7 +307,18 @@ func MeAppPrompt(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: read the prompt blob from the published repo (read-only).
+		if body := publishedPromptBlob(userID, app, name); body != nil {
+			if len(body) > promptMaxBytes {
+				body = body[:promptMaxBytes]
+			}
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
+				"data": gin.H{"app": app, "name": name, "content": string(body),
+					"source": "published", "sha": contentSHA(body), "editable": false,
+					"path": filepath.Join(promptDirRel, name)}})
+			return
+		}
+		fail(c, http.StatusNotFound, 1404, "prompt not found: "+name)
 		return
 	}
 	path, source := resolvePromptRead(userID, appDir, name)

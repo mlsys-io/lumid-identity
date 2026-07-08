@@ -638,14 +638,14 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				}
 			}
 			row := WorkflowRow{
-				Slug:        app + ":" + L.Name,
-				Kind:        "scheduled",
-				Name:        L.Name,
-				App:         app,
-				Trigger:     L.Schedule,
-				Enabled:     true,
-				Tenant:      true,
-				Version:     ver.Version,
+				Slug:           app + ":" + L.Name,
+				Kind:           "scheduled",
+				Name:           L.Name,
+				App:            app,
+				Trigger:        L.Schedule,
+				Enabled:        true,
+				Tenant:         true,
+				Version:        ver.Version,
 				Description:    L.Description,
 				Engine:         engine,
 				StepCount:      len(L.Steps),

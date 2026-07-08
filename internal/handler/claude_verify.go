@@ -33,7 +33,7 @@ const claudeDefaultKey = "CLAUDE_CODE_OAUTH_TOKEN"
 
 type claudeVerifyBody struct {
 	Value string `json:"value" binding:"required"`
-	Key   string `json:"key"` // optional; defaults to CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY)
+	Key   string `json:"key"`  // optional; defaults to CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY)
 	Save  *bool  `json:"save"` // optional; default true — store when valid
 }
 

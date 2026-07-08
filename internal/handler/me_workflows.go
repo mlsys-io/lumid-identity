@@ -1078,6 +1078,16 @@ func MeWorkflowDetail(c *gin.Context) {
 	// Read the app's xpcloud.yaml from tenant tree (or operator-shared
 	// as fallback) and surface the matching loop entry verbatim.
 	loops, src := readLoopsFromAnywhere(userID, app)
+	// Cross-node fallback: identity can't read a tenant kind=agent app's PVC,
+	// so readLoopsFromAnywhere is empty → detail 404'd even though the loop
+	// exists. Pull loops from the caller's PUBLISHED xp.io spec.
+	if len(loops) == 0 {
+		if spec, okf := fetchRepoSpecYAML(userID, app); okf {
+			if pl, err := readYamlLoopsBytes(spec); err == nil {
+				loops, src = pl, "xpcloud"
+			}
+		}
+	}
 	for _, L := range loops {
 		if L.Name == loop {
 			c.JSON(http.StatusOK, gin.H{

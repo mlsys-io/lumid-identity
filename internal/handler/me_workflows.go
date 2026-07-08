@@ -235,6 +235,13 @@ func readAppDatasets(appDir string) []DatasetRef {
 	if err != nil {
 		return nil
 	}
+	return readAppDatasetsBytes(b)
+}
+
+// readAppDatasetsBytes parses the top-level datasets[] from raw spec bytes —
+// lets the cross-node fallback populate the Data tab's mounted-dataset detail
+// for a tenant app identity can't read from disk.
+func readAppDatasetsBytes(b []byte) []DatasetRef {
 	var doc struct {
 		Datasets []struct {
 			ID      string `yaml:"id"`
@@ -618,6 +625,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			Version string `yaml:"version"`
 		}
 		_ = yaml.Unmarshal(spec, &ver)
+		dsDetail := readAppDatasetsBytes(spec) // mounted dataset repos → Data tab
 		for _, L := range loops {
 			if L.Name == "" {
 				continue
@@ -638,9 +646,11 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				Enabled:     true,
 				Tenant:      true,
 				Version:     ver.Version,
-				Description: L.Description,
-				Engine:      engine,
-				StepCount:   len(L.Steps),
+				Description:    L.Description,
+				Engine:         engine,
+				StepCount:      len(L.Steps),
+				Datasets:       []string(L.Datasets),
+				DatasetsDetail: dsDetail,
 			}
 			if L.Engine.Experiment != "" {
 				row.ExperimentIDs = []string{L.Engine.Experiment}

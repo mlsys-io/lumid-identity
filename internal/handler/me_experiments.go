@@ -221,6 +221,26 @@ func strOr(s, d string) string {
 	return s
 }
 
+// baselineFromDecl extracts a numeric success threshold from an experiment
+// declaration — `baseline: {value: X}` or `baseline: X`. App-agnostic; used to
+// compute criteria_met from the run-store metric. Returns 0 when unspecified.
+func baselineFromDecl(d expDecl) float64 {
+	switch v := d.Baseline.(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case map[string]any:
+		if x, ok := v["value"].(float64); ok {
+			return x
+		}
+		if x, ok := v["value"].(int); ok {
+			return float64(x)
+		}
+	}
+	return 0
+}
+
 // loadExperimentDetail — state + results tail + per-variant series +
 // per-case grouping (casebook observability). Shared with chat tools.
 func loadExperimentDetail(appDir, id string) (gin.H, bool) {
@@ -386,19 +406,35 @@ func MeAppExperiments(c *gin.Context) {
 		if spec, okf := fetchRepoSpecYAML(userID, app); okf {
 			m := parseExpManifestBytes(spec)
 			loops := expLoops(m)
+			// Overlay run-store metrics (me_app_runs) onto the declaration —
+			// the runtime ledger is PVC-only, so the cross-node run store is the
+			// metric source. App-agnostic. baselineFromDecl reads the declared
+			// success threshold so criteria_met is computed generically.
 			exps := make([]gin.H, 0, len(m.Experiments))
 			for _, d := range m.Experiments {
 				if d.ID == "" {
 					continue
 				}
-				exps = append(exps, gin.H{
+				row := gin.H{
 					"id": d.ID, "hypothesis": d.Hypothesis, "kind": d.Kind,
 					"dataset_id": d.DatasetID, "metric": d.Metric,
 					"benchmark_id": d.Benchmark, "baseline": d.Baseline,
 					"success_criteria": d.Criteria, "min_samples": d.MinSamples,
 					"status": strOr(d.Status, "active"), "loops": loops[d.ID],
 					"n_results": 0, "criteria_met": false,
-				})
+				}
+				mname := ""
+				if d.Metric != nil {
+					if s, ok := d.Metric["name"].(string); ok {
+						mname = s
+					}
+				}
+				if st := expStateFromRuns(appRunsFor(userID, app, ""), mname, baselineFromDecl(d)); st != nil {
+					for k, v := range st {
+						row[k] = v
+					}
+				}
+				exps = append(exps, row)
 			}
 			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps)})
 			return

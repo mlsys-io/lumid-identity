@@ -468,6 +468,10 @@ func Register(r *gin.Engine) {
 			// Decrypted per-(user,app) secrets for the scheduler to inject
 			// into the cycle env (pure-UI credential path).
 			internal.POST("/app-secrets/fetch", InternalAppSecretsFetch)
+			// Cross-node run store — the cycle self-reports each run's metrics
+			// here so the Studio trajectory/experiments surfaces (which can't
+			// read the scheduler PVC) can reconstruct run history. App-agnostic.
+			internal.POST("/app-runs", InternalAppRunRecord)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The

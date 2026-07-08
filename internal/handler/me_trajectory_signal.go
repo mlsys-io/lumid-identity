@@ -143,7 +143,9 @@ func MeTrajectorySignals(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userSub, app)
 	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: signals are runtime control files on the PVC. Graceful
+		// empty (200) instead of a console 404.
+		ok(c, "ok", gin.H{"signals": []any{}, "count": 0})
 		return
 	}
 

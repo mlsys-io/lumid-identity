@@ -450,7 +450,12 @@ func MeTrajectory(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: trajectory is pure runtime (cycle dirs on the PVC identity
+		// can't read). Graceful empty (200) instead of a console 404 — the UI
+		// shows "No run trajectory yet".
+		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+			"has_variants": false, "nodes": []any{}, "cycles": []any{},
+		}})
 		return
 	}
 

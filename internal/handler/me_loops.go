@@ -203,46 +203,37 @@ func MeLoopRunNow(c *gin.Context) {
 	var body meLoopRunBody
 	_ = c.ShouldBindJSON(&body) // optional body
 
-	jobID := fmt.Sprintf("oneshot-%d", time.Now().UnixNano())
-	row := map[string]any{
-		"job_id":         jobID,
-		"source":         "loop_cycle",
-		"submitter_app":  app,
-		"submitter_loop": loop,
-		"state":          "queued",
-		"submitted_at":   time.Now().UTC().Format(time.RFC3339),
-		"submitted_by":   userID,
-		"payload": map[string]any{
-			"oneshot":      true,
-			"args":         body.Args,
-			"from_run_ts":  body.FromRunTs,
-			"variant":      body.Variant,
-			"branch_label": body.BranchLabel,
-		},
+	// Enqueue a run_loop intent in the DB-backed queue (me_app_intents) — NOT
+	// the old ~/.lumilake/jobs.jsonl, which is pod-local on identity and never
+	// reaches the scheduler on UKS (same cross-pod defect as the install queue).
+	// The scheduler picker's run_loop action invokes app_runner.cycle.
+	payload := map[string]any{
+		"app":          app,
+		"loop":         loop,
+		"args":         body.Args,
+		"from_run_ts":  body.FromRunTs,
+		"variant":      body.Variant,
+		"branch_label": body.BranchLabel,
 	}
-	// "Next Run" composer fields — add only when set (snake_case keys matching
-	// the cross-layer contract; omitempty so plain run-now rows stay unchanged).
-	if payload, ok := row["payload"].(map[string]any); ok {
-		if body.Criteria != "" {
-			payload["criteria"] = body.Criteria
-		}
-		if body.AutoPromote {
-			payload["auto_promote"] = true
-		}
-		if len(body.Cases) > 0 {
-			payload["cases"] = body.Cases
-		}
-		if body.NotBefore != "" {
-			payload["not_before"] = body.NotBefore
-		}
+	if body.Criteria != "" {
+		payload["criteria"] = body.Criteria
 	}
-	if err := appendJobRow(row); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "append jobs.jsonl: "+err.Error())
-		return
+	if body.AutoPromote {
+		payload["auto_promote"] = true
+	}
+	if len(body.Cases) > 0 {
+		payload["cases"] = body.Cases
+	}
+	if body.NotBefore != "" {
+		payload["not_before"] = body.NotBefore
+	}
+	id := writeIntent(c, "run_loop", userID, payload)
+	if id == "" {
+		return // writeIntent already wrote the error response
 	}
 	c.JSON(http.StatusAccepted, gin.H{
 		"ret_code": 0, "message": "one-shot queued",
-		"data": gin.H{"job_id": jobID, "state": "queued"},
+		"data": gin.H{"job_id": id, "state": "queued"},
 	})
 }
 

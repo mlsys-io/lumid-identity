@@ -163,7 +163,13 @@ func MeCasebook(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: identity can't read the tenant PVC (casebook is runtime
+		// data written by cycles). Graceful empty (200) instead of a console
+		// 404 — the UI renders a clean "no cases yet" state.
+		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+			"app": app, "loop": loop, "cases": []any{},
+			"version_history": []any{}, "metrics_evolution": []any{}, "scored_via": "",
+		}})
 		return
 	}
 

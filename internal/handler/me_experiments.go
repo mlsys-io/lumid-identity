@@ -55,10 +55,32 @@ type expManifest struct {
 }
 
 func readExpManifest(appDir string) expManifest {
-	var m expManifest
 	if specPath, ok := ResolveSpecPath(appDir); ok {
 		if b, err := os.ReadFile(specPath); err == nil {
-			_ = yaml.Unmarshal(b, &m)
+			return parseExpManifestBytes(b)
+		}
+	}
+	return expManifest{}
+}
+
+// parseExpManifestBytes parses the experiments block from raw spec bytes,
+// accepting BOTH shapes: the list form `experiments: [{id: x, …}]` and the map
+// form `experiments: {x: {…}}` (the key is the id). Lets the cross-node fallback
+// build the experiments surface for a tenant app identity can't read on disk.
+func parseExpManifestBytes(b []byte) expManifest {
+	var m expManifest
+	_ = yaml.Unmarshal(b, &m) // list form + loops[]
+	if len(m.Experiments) == 0 {
+		var mm struct {
+			Experiments map[string]expDecl `yaml:"experiments"`
+		}
+		if yaml.Unmarshal(b, &mm) == nil {
+			for id, d := range mm.Experiments {
+				if d.ID == "" {
+					d.ID = id
+				}
+				m.Experiments = append(m.Experiments, d)
+			}
 		}
 	}
 	return m
@@ -357,7 +379,33 @@ func MeAppExperiments(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: identity can't read the tenant PVC (svc node ≠ scheduler
+		// node; kind=agent apps in .xp/agents). Fall back to the published spec
+		// for the experiment DECLARATIONS (runtime ledger state stays absent —
+		// that's PVC-only). Kills the hard 404 + surfaces declared experiments.
+		if spec, okf := fetchRepoSpecYAML(userID, app); okf {
+			m := parseExpManifestBytes(spec)
+			loops := expLoops(m)
+			exps := make([]gin.H, 0, len(m.Experiments))
+			for _, d := range m.Experiments {
+				if d.ID == "" {
+					continue
+				}
+				exps = append(exps, gin.H{
+					"id": d.ID, "hypothesis": d.Hypothesis, "kind": d.Kind,
+					"dataset_id": d.DatasetID, "metric": d.Metric,
+					"benchmark_id": d.Benchmark, "baseline": d.Baseline,
+					"success_criteria": d.Criteria, "min_samples": d.MinSamples,
+					"status": strOr(d.Status, "active"), "loops": loops[d.ID],
+					"n_results": 0, "criteria_met": false,
+				})
+			}
+			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps)})
+			return
+		}
+		// Not resolvable anywhere — graceful empty (the app may still be
+		// installing); the UI renders a clean empty state, not a console 404.
+		ok(c, "ok", gin.H{"experiments": []gin.H{}, "count": 0})
 		return
 	}
 	exps := loadAppExperiments(appDir)

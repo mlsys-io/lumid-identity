@@ -92,6 +92,13 @@ func readAppUI(appDir string) *appUI {
 	if err != nil {
 		return nil
 	}
+	return parseAppUI(b)
+}
+
+// parseAppUI extracts the ui: block from a spec's raw bytes. Lets the
+// cross-node fallback (fetchRepoSpecYAML) build a sidebar entry for a tenant
+// app whose files identity can't read from disk (svc node ≠ scheduler PVC).
+func parseAppUI(b []byte) *appUI {
 	var doc struct {
 		UI *appUI `yaml:"ui"`
 	}

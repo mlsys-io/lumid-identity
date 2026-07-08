@@ -33,6 +33,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"lumid_identity/internal/common"
+	"lumid_identity/models"
 )
 
 // MeLoopDelete hard-removes a single workflow (loop) from one of the caller's
@@ -234,6 +235,13 @@ func readAppDatasets(appDir string) []DatasetRef {
 	if err != nil {
 		return nil
 	}
+	return readAppDatasetsBytes(b)
+}
+
+// readAppDatasetsBytes parses the top-level datasets[] from raw spec bytes —
+// lets the cross-node fallback populate the Data tab's mounted-dataset detail
+// for a tenant app identity can't read from disk.
+func readAppDatasetsBytes(b []byte) []DatasetRef {
 	var doc struct {
 		Datasets []struct {
 			ID      string `yaml:"id"`
@@ -587,7 +595,95 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 	// Tenant first so Studio shows the user's own workflows on top.
 	scan(tenantAppsDir(userID), true)
 	scan(filepath.Join(operatorHome(), ".xp", "apps"), false)
+
+	// Cross-node fallback: on UKS identity can't read the scheduler's app PVC,
+	// and kind=agent apps install to .xp/agents (not the .xp/apps dir scanned
+	// above), so a tenant app's loops never surface here — /me/workflows comes
+	// back empty even though the app runs. Backfill loops from the caller's
+	// PUBLISHED xp.io spec (same fallback MeAppConfig/MeAppsList use) for any
+	// installed tenant app not already represented. Run/next-run state is
+	// omitted (identity can't read the journal cross-node) — best-effort.
+	covered := map[string]bool{}
+	for _, r := range out {
+		if r.App != "" {
+			covered[r.App] = true
+		}
+	}
+	for _, app := range tenantInstalledAppNames(userID) {
+		if covered[app] {
+			continue
+		}
+		spec, ok := fetchRepoSpecYAML(userID, app)
+		if !ok {
+			continue
+		}
+		loops, err := readYamlLoopsBytes(spec)
+		if err != nil {
+			continue
+		}
+		var ver struct {
+			Version string `yaml:"version"`
+		}
+		_ = yaml.Unmarshal(spec, &ver)
+		dsDetail := readAppDatasetsBytes(spec) // mounted dataset repos → Data tab
+		for _, L := range loops {
+			if L.Name == "" {
+				continue
+			}
+			engine := "runner_steps"
+			if L.Engine.Type != "" {
+				engine = L.Engine.Type
+				if L.Engine.Module != "" {
+					engine += ":" + L.Engine.Module
+				}
+			}
+			row := WorkflowRow{
+				Slug:           app + ":" + L.Name,
+				Kind:           "scheduled",
+				Name:           L.Name,
+				App:            app,
+				Trigger:        L.Schedule,
+				Enabled:        true,
+				Tenant:         true,
+				Version:        ver.Version,
+				Description:    L.Description,
+				Engine:         engine,
+				StepCount:      len(L.Steps),
+				Datasets:       []string(L.Datasets),
+				DatasetsDetail: dsDetail,
+			}
+			if L.Engine.Experiment != "" {
+				row.ExperimentIDs = []string{L.Engine.Experiment}
+			}
+			out = append(out, row)
+		}
+	}
 	return out
+}
+
+// tenantInstalledAppNames returns the caller's installed app names from the
+// me-intents DB queue (the node-agnostic install registry). Used by the
+// cross-node workflow fallback since identity can't enumerate the tenant PVC.
+func tenantInstalledAppNames(userSub string) []string {
+	var rows []models.MeAppIntent
+	if err := common.DB.
+		Where("user_sub = ? AND action = ? AND status = ?", userSub, "install", "done").
+		Order("created_at desc").Limit(200).Find(&rows).Error; err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var names []string
+	for i := range rows {
+		var payload map[string]any
+		if rows[i].Payload != "" {
+			_ = json.Unmarshal([]byte(rows[i].Payload), &payload)
+		}
+		if n := installAppName(payload); n != "" && !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	return names
 }
 
 // visualWorkflows hits the n8n REST API and maps the result to
@@ -982,6 +1078,16 @@ func MeWorkflowDetail(c *gin.Context) {
 	// Read the app's xpcloud.yaml from tenant tree (or operator-shared
 	// as fallback) and surface the matching loop entry verbatim.
 	loops, src := readLoopsFromAnywhere(userID, app)
+	// Cross-node fallback: identity can't read a tenant kind=agent app's PVC,
+	// so readLoopsFromAnywhere is empty → detail 404'd even though the loop
+	// exists. Pull loops from the caller's PUBLISHED xp.io spec.
+	if len(loops) == 0 {
+		if spec, okf := fetchRepoSpecYAML(userID, app); okf {
+			if pl, err := readYamlLoopsBytes(spec); err == nil {
+				loops, src = pl, "xpcloud"
+			}
+		}
+	}
 	for _, L := range loops {
 		if L.Name == loop {
 			c.JSON(http.StatusOK, gin.H{

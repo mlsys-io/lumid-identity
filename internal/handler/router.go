@@ -261,6 +261,9 @@ func Register(r *gin.Engine) {
 			me.PUT("/apps/:app/secrets/:key", MeSecretPut)
 			me.DELETE("/apps/:app/secrets/:key", MeSecretDelete)
 			me.GET("/apps/:app/secrets/:key/value", MeSecretFetchValue)
+			// Live-verify a pasted Claude credential against Anthropic + store
+			// it only if it authenticates (backs the "Connect Claude" popup).
+			me.POST("/apps/:app/secrets/claude-verify", MeSecretClaudeVerify)
 
 			// Power Automate inbound webhook lifecycle. The Outlook
 			// bridge workaround for users whose org blocks Microsoft
@@ -458,6 +461,13 @@ func Register(r *gin.Engine) {
 		internal := v1.Group("/internal", RequireBridge())
 		{
 			internal.POST("/usage/charge", InternalUsageCharge)
+			// DB-backed /me/apps intent queue — the scheduler picker claims
+			// pending intents (atomic SKIP LOCKED) + posts results back.
+			internal.POST("/me-intents/claim", InternalMeIntentsClaim)
+			internal.POST("/me-intents/:id/result", InternalMeIntentResult)
+			// Decrypted per-(user,app) secrets for the scheduler to inject
+			// into the cycle env (pure-UI credential path).
+			internal.POST("/app-secrets/fetch", InternalAppSecretsFetch)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The

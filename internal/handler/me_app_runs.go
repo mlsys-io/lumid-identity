@@ -58,7 +58,8 @@ func InternalAppRunRecord(c *gin.Context) {
 		UserSub: b.UserSub, App: b.App, Loop: b.Loop, RunTs: b.RunTs,
 		Model: b.Model, Ok: b.Ok, DurationS: b.DurationS, Metrics: mj, Source: src,
 	}
-	res := common.DB.Where("user_sub = ? AND app = ? AND loop = ? AND run_ts = ?",
+	// `loop` is a MySQL reserved word — must be backtick-quoted in raw SQL.
+	res := common.DB.Where("user_sub = ? AND app = ? AND `loop` = ? AND run_ts = ?",
 		b.UserSub, b.App, b.Loop, b.RunTs).Assign(row).FirstOrCreate(&models.MeAppRun{})
 	if res.Error != nil {
 		fail(c, http.StatusInternalServerError, 1500, "save: "+res.Error.Error())
@@ -107,7 +108,7 @@ func appRunsFor(userSub, app, loop string) []models.MeAppRun {
 	var rows []models.MeAppRun
 	q := common.DB.Where("user_sub = ? AND app = ?", userSub, app)
 	if loop != "" {
-		q = q.Where("loop = ?", loop)
+		q = q.Where("`loop` = ?", loop) // reserved word — backtick-quote
 	}
 	if q.Order("run_ts ASC").Find(&rows).Error != nil {
 		return nil

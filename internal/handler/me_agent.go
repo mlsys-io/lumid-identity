@@ -686,39 +686,31 @@ type llmProvider struct {
 // fleet is already paid for), Anthropic as the hosted fallback.
 var llmProviders = []llmProvider{
 	{
-		// kv.run:5000 gemma4 — default. Same Anthropic /v1/messages
-		// gateway, model id from GET kv.run:5000/v1/models. Reasoning
-		// model (emits thinking deltas, handled by the SSE parser).
+		// lumid-llm gemma4 — default. The dedicated cloud LLM load-balancer
+		// (deploy_infra k8s-lift/lumid-llm) speaks Anthropic /v1/messages
+		// including SSE streaming and auths with a Lumid PAT. Base is
+		// LUMID_LLM_BASE (in-cluster: http://lumid-llm:8088), default the
+		// public https://lum.id/llm. The old kv.run:5000 gateway is RETIRED
+		// (cut over 2026-07-10) — pointing here dead-ended every chat turn.
+		// Reasoning model (emits thinking deltas, handled by the SSE parser).
 		id:                  "kvrun-gemma4",
-		displayName:         "Gemma-4-26B-A4B (kv.run GPU)",
-		endpoint:            "https://kv.run:5000/v1/messages",
-		upstreamModel:       "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL",
+		displayName:         "Gemma-4-26B-A4B (Lumid LLM)",
+		endpoint:            lumidLLMBase() + "/v1/messages",
+		upstreamModel:       "nvidia/Gemma-4-26B-A4B-NVFP4",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,      // multimodal; image blocks verified via kv.run
+		supportsVision:      true,      // multimodal; image blocks verified via the gateway
 		minRole:             "user",    // everyone
 		maxOutputTokens:     16384,     // 262K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens:   2_000_000, // generous backstop; local GPU has no per-call cost
 	},
-	{
-		// kv.run:5000 in-cluster inference gateway. Speaks Anthropic
-		// /v1/messages including SSE streaming — drop-in for the
-		// existing parser. See /proj/CLAUDE.md "Cloud LLM inference".
-		id:                  "kvrun-minimax",
-		displayName:         "MiniMax-M2.7 (kv.run GPU)",
-		endpoint:            "https://kv.run:5000/v1/messages",
-		upstreamModel:       "cyankiwi/MiniMax-M2.7-AWQ-4bit",
-		authHeader:          "Authorization",
-		authPrefix:          "Bearer ",
-		keyFn:               kvrunPAT,
-		addAnthropicVersion: false,
-		supportsVision:      false,   // MiniMax is text-only
-		minRole:             "admin", // admin + super_admin
-		maxOutputTokens:     16384,   // 196K ctx, free local GPU
-		dailyBudgetTokens:   2_000_000,
-	},
+	// kvrun-minimax RETIRED with the kv.run:5000 gateway (2026-07-10): the
+	// lumid-llm fleet does not serve MiniMax, and its other model
+	// (qwen3.6-27b) is served at n_ctx 2048 — too small for agentic turns
+	// (the tool catalog alone overflows it). Re-add an admin-tier entry
+	// when the fleet serves a second long-context model.
 	{
 		// claude-code-sonnet — operator's Claude Code subscription via the
 		// host proxy, Sonnet tier. Available to admin+ (cheaper/faster than
@@ -788,10 +780,13 @@ func currentUserRole(c *gin.Context) string {
 }
 
 // defaultProviderFor returns the preferred provider for the caller's role.
-// super_admin defaults to claude-opus (full Anthropic access); everyone
-// else gets gemma4 (in-cluster GPU, no per-call cost).
+// super_admin defaults to claude-opus (full Anthropic access) — but ONLY
+// when a claude-proxy is actually configured (CLAUDE_PROXY_URL set):
+// in-cluster there is no host-side claude-proxy, and defaulting to a dead
+// transport left super_admin chats broken even while gemma4 worked.
+// Everyone else gets gemma4 (in-cluster GPU, no per-call cost).
 func defaultProviderFor(role string) llmProvider {
-	if role == "super_admin" {
+	if role == "super_admin" && strings.TrimSpace(os.Getenv("CLAUDE_PROXY_URL")) != "" {
 		for _, p := range llmProviders {
 			if p.id == "claude-code-opus" {
 				return p
@@ -1600,9 +1595,21 @@ func anthropicKey() (string, error) {
 	return "", fmt.Errorf("no ANTHROPIC_API_KEY set")
 }
 
-// kvrunPAT resolves the operator's Lumid PAT used to authenticate
-// against kv.run:5000/v1/*. Env first (KVRUN_LLM_TOKEN), then
-// /home/webmaster/.lumilake/pat on disk.
+// lumidLLMBase returns the LLM gateway base URL. In-cluster the identity
+// Deployment sets LUMID_LLM_BASE=http://lumid-llm:8088 (skips the LB
+// round-trip); the default is the public route. Read once at package init
+// (llmProviders is a package-level var) — a change needs a pod restart.
+func lumidLLMBase() string {
+	if u := strings.TrimSpace(os.Getenv("LUMID_LLM_BASE")); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return "https://lum.id/llm"
+}
+
+// kvrunPAT resolves the Lumid PAT used to authenticate against the
+// lumid-llm gateway (which introspects it via lumid-identity itself).
+// Env first (KVRUN_LLM_TOKEN — name kept from the kv.run:5000 era), then
+// /home/webmaster/.lumilake/pat on disk (dev-box fallback; absent in-cluster).
 func kvrunPAT() (string, error) {
 	if k := strings.TrimSpace(os.Getenv("KVRUN_LLM_TOKEN")); k != "" {
 		return k, nil

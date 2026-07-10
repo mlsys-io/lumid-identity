@@ -226,7 +226,7 @@ func MeAgentChatStream(c *gin.Context) {
 			// via DELETE /me/agent/tool-grants/:name).
 			if destructiveTools[tu.name] && !hasToolGrant(userID, tu.name) {
 				approvalID := uuid.New().String()
-				ch := requestApproval(approvalID)
+				ch := requestApproval(approvalID, userID, tu.name)
 				emit(map[string]any{
 					"type":        "tool_approval_required",
 					"id":          tu.id,
@@ -234,14 +234,10 @@ func MeAgentChatStream(c *gin.Context) {
 					"name":        tu.name,
 					"args":        tu.input,
 				})
-				approved := false
-				select {
-				case approved = <-ch:
-				case <-time.After(10 * time.Minute):
-					toolApprovals.Delete(approvalID)
-				case <-ctx.Done():
-					toolApprovals.Delete(approvalID)
-				}
+				// Hybrid wait: local channel (same-pod) OR 1s DB poll (the
+				// approve POST may land on the other replica), 10-min deadline.
+				// awaitApproval tears down channel + row on every exit path.
+				approved := awaitApproval(ctx, approvalID, ch)
 				if !approved {
 					// Audit the denial/timeout — dispatchTool never runs, so the
 					// [app-ops] audit line can't cover this. Greppable as [me-agent].

@@ -62,7 +62,7 @@ const (
 // approve or deny via POST /api/v1/me/agent/chat/tool-approve.
 
 var (
-	toolApprovals    sync.Map                 // approval_id → chan bool
+	toolApprovals    sync.Map                 // approval_id → chan bool (same-pod fast path; cross-replica path is the me_tool_approvals row)
 	sandboxSemaphore = make(chan struct{}, 6) // global cap: 6 concurrent bash sandboxes
 	userSandboxMu    sync.Map                 // userID → chan struct{} (per-user cap: 1)
 	userExecRateMu   sync.Mutex
@@ -592,15 +592,67 @@ func checkExecRateLimit(userID string) bool {
 
 // ── Approval gate ─────────────────────────────────────────────────────────────
 // For destructive tools: emit tool_approval_required SSE, then block until
-// the user approves or 30 s pass. The approval is delivered via a separate
-// HTTP endpoint (MeAgentToolApprove).
+// the user approves or 10 minutes pass. The approval is delivered via a
+// separate HTTP endpoint (MeAgentToolApprove) — which, with replicas=2, may
+// land on the pod that ISN'T holding the paused stream. Hence the hybrid:
+// an in-memory channel (instant same-pod fast path) PLUS a me_tool_approvals
+// row polled by awaitApproval (cross-replica path).
 
 // requestApproval registers a pending approval and returns the channel.
 // The caller must call emit before reading from the channel.
-func requestApproval(approvalID string) chan bool {
+func requestApproval(approvalID, userID, tool string) chan bool {
 	ch := make(chan bool, 1)
 	toolApprovals.Store(approvalID, ch)
+	// Cross-replica handshake row. Best-effort: on DB error, log and keep
+	// the channel-only (same-pod) behavior instead of failing the tool.
+	row := models.MeToolApproval{ID: approvalID, UserSub: userID, Tool: tool, Status: "pending"}
+	if err := common.DB.Create(&row).Error; err != nil {
+		log.Printf("[me-agent] approval row insert failed id=%s tool=%s: %v", approvalID, tool, err)
+	} else {
+		// Lazy hygiene: sweep rows that outlived any possible waiter (the
+		// 10-min deadline) by a wide margin — no cron needed.
+		common.DB.Where("created_at < ?", time.Now().Add(-time.Hour)).Delete(&models.MeToolApproval{})
+	}
 	return ch
+}
+
+// awaitApproval blocks until the pending approval is decided. Resolution:
+//   - local channel: the approve POST hit THIS pod (instant fast path)
+//   - 1s DB poll: the approve POST hit the other replica and flipped the row
+//   - 10-minute deadline or client disconnect → denied
+//
+// Every exit path tears down both sides of the handshake (channel + row).
+func awaitApproval(ctx context.Context, approvalID string, ch chan bool) bool {
+	defer func() {
+		toolApprovals.Delete(approvalID)
+		common.DB.Where("id = ?", approvalID).Delete(&models.MeToolApproval{})
+	}()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	deadline := time.NewTimer(10 * time.Minute)
+	defer deadline.Stop()
+	for {
+		select {
+		case approved := <-ch:
+			return approved
+		case <-ticker.C:
+			var row models.MeToolApproval
+			err := common.DB.Select("status").Where("id = ?", approvalID).First(&row).Error
+			if err != nil {
+				continue // transient DB error (or insert failed) — the channel path still works
+			}
+			switch row.Status {
+			case "approved":
+				return true
+			case "denied":
+				return false
+			}
+		case <-deadline.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
 }
 
 // MeAgentToolApprove — POST /api/v1/me/agent/chat/tool-approve
@@ -625,22 +677,40 @@ func MeAgentToolApprove(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "approval_id required")
 		return
 	}
+	// Cross-replica decision: atomically flip the pending row — the pod
+	// holding the paused stream sees it on its next 1s poll (awaitApproval).
+	// The `status='pending'` guard makes double-approves race-safe on the DB
+	// path the same way LoadAndDelete does on the channel path.
+	status := "denied"
+	if body.Approved {
+		status = "approved"
+	}
+	now := time.Now()
+	res := common.DB.Model(&models.MeToolApproval{}).
+		Where("id = ? AND status = 'pending'", body.ApprovalID).
+		Updates(map[string]any{"status": status, "decided_at": &now})
+	decided := res.Error == nil && res.RowsAffected > 0
 	// LoadAndDelete is atomic — two concurrent approve POSTs for the same id
 	// can't both Load-then-send (which would block the second forever on the
-	// cap-1 channel and leak a goroutine). The loser gets the 404 below.
+	// cap-1 channel and leak a goroutine). The loser gets the 404 below
+	// (unless it won the DB race instead).
 	ch, ok := toolApprovals.LoadAndDelete(body.ApprovalID)
-	if !ok {
+	if !decided && !ok {
 		fail(c, http.StatusNotFound, 1404, "approval not found (may have timed out)")
 		return
 	}
 	if body.Approved && body.Always && destructiveTools[body.Tool] {
 		_ = grantTool(userID, body.Tool)
 	}
+	// Same-pod fast path: feed the local channel when it's here so the stream
+	// unblocks instantly instead of waiting for the next poll tick.
 	// Non-blocking send: if the waiting stream already gave up (10-min timeout
 	// or client disconnect), there's no reader — don't block this request.
-	select {
-	case ch.(chan bool) <- body.Approved:
-	default:
+	if ok {
+		select {
+		case ch.(chan bool) <- body.Approved:
+		default:
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

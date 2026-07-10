@@ -26,6 +26,7 @@ var AllTables = []interface{}{
 	&GpuRental{},
 	&MeAppIntent{},
 	&MeAppRun{},
+	&MeDoc{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

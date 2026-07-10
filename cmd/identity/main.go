@@ -27,6 +27,12 @@ func main() {
 	if err := models.AutoMigrate(common.DB); err != nil {
 		log.Fatalf("automigrate: %v", err)
 	}
+	// Heal pod-local legacy file stores (chats/personas/artifacts) into
+	// me_docs. Idempotent; non-fatal — a failed import just means old docs
+	// stay invisible until the next boot.
+	if err := handler.ImportLegacyMeDocs(); err != nil {
+		log.Printf("me_docs legacy import failed (continuing): %v", err)
+	}
 	if err := common.OpenRedis(cfg); err != nil {
 		log.Fatalf("open redis: %v", err)
 	}

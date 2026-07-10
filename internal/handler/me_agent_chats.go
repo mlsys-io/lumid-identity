@@ -1,10 +1,12 @@
 package handler
 
-// Persistent chat history — every conversation is one file under
-//   ~/.tenants/<userID>/.chats/<id>.json
+// Persistent chat history — every conversation is one me_docs row
+// (kind="chat", doc_id=<id>). Formerly one file per chat under
+// ~/.tenants/<userID>/.chats/<id>.json; moved to the DB so both HA
+// replicas see the same store (see models/me_doc.go).
 //
 // The frontend POSTs the full transcript at the end of each turn,
-// so the file is always up-to-date with the in-memory session. List
+// so the row is always up-to-date with the in-memory session. List
 // + get + delete are read paths for the sidebar.
 //
 // Title is inferred from the first user message (first 60 chars,
@@ -15,11 +17,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -30,13 +29,13 @@ import (
 
 const (
 	chatsKeep       = 200       // soft cap; oldest pruned in background after save
-	chatMaxBytes    = 2_000_000 // 2 MB per chat file (cap on transcript size)
+	chatMaxBytes    = 2_000_000 // 2 MB per chat doc (cap on transcript size)
 	chatTitleMaxLen = 60
 )
 
 var chatIDRe = regexp.MustCompile(`^chat-[a-f0-9]{16}$`)
 
-// chatRecord — what we serialize on disk. Messages are intentionally
+// chatRecord — what we serialize into the doc. Messages are intentionally
 // JSON-as-is (whatever the frontend sends) so we don't have to keep
 // the wire format in lockstep with the message type as it evolves.
 type chatRecord struct {
@@ -58,14 +57,6 @@ type chatRecord struct {
 	// session picker can group/switch by app and re-open the right workspace.
 	// Empty = a general (non-app) chat from the home.
 	App string `json:"app,omitempty"`
-}
-
-func chatsDir(userID string) string {
-	return filepath.Join(tenantRoot(userID), ".chats")
-}
-
-func chatPath(userID, id string) string {
-	return filepath.Join(chatsDir(userID), id+".json")
 }
 
 func newChatID() string {
@@ -110,14 +101,9 @@ func MeChatsList(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
-	dir := chatsDir(userID)
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"chats": []any{}}})
-		return
-	}
+	docs, err := meDocList(userID, meDocKindChat)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "readdir: "+err.Error())
+		fail(c, http.StatusInternalServerError, 1500, "list: "+err.Error())
 		return
 	}
 	type listRow struct {
@@ -130,18 +116,10 @@ func MeChatsList(c *gin.Context) {
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
 	}
-	rows := make([]listRow, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		b, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
+	rows := make([]listRow, 0, len(docs))
+	for _, d := range docs {
 		var r chatRecord
-		if err := json.Unmarshal(b, &r); err != nil {
+		if err := json.Unmarshal([]byte(d.Doc), &r); err != nil {
 			continue
 		}
 		rows = append(rows, listRow{
@@ -172,23 +150,17 @@ func MeChatGet(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid chat id")
 		return
 	}
-	path := chatPath(userID, id)
-	abs, _ := filepath.Abs(path)
-	if !strings.HasPrefix(abs, chatsDir(userID)+string(os.PathSeparator)) {
-		fail(c, http.StatusBadRequest, 1400, "invalid path")
-		return
-	}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		fail(c, http.StatusNotFound, 1404, "not found")
-		return
-	}
+	doc, found, err := meDocGet(userID, meDocKindChat, id)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "read: "+err.Error())
 		return
 	}
+	if !found {
+		fail(c, http.StatusNotFound, 1404, "not found")
+		return
+	}
 	var r chatRecord
-	if err := json.Unmarshal(b, &r); err != nil {
+	if err := json.Unmarshal([]byte(doc), &r); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "parse: "+err.Error())
 		return
 	}
@@ -198,7 +170,7 @@ func MeChatGet(c *gin.Context) {
 // MeChatSave — POST /api/v1/me/chats — upsert.
 // Body: {id?, messages: [...], model?, mode?}
 // If id is empty or missing → server mints a new one.
-// If id is provided but file doesn't exist → 404. (Keeps the
+// If id is provided but the row doesn't exist → 404. (Keeps the
 // frontend honest: never POST a stale localStorage id.)
 func MeChatSave(c *gin.Context) {
 	userID, ok := currentUserID(c)
@@ -238,17 +210,16 @@ func MeChatSave(c *gin.Context) {
 			return
 		}
 		// Load existing to preserve CreatedAt.
-		path := chatPath(userID, body.ID)
-		b, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			fail(c, http.StatusNotFound, 1404, "chat not found — omit id to create a new one")
-			return
-		}
+		doc, found, err := meDocGet(userID, meDocKindChat, body.ID)
 		if err != nil {
 			fail(c, http.StatusInternalServerError, 1500, "read: "+err.Error())
 			return
 		}
-		if err := json.Unmarshal(b, &rec); err != nil {
+		if !found {
+			fail(c, http.StatusNotFound, 1404, "chat not found — omit id to create a new one")
+			return
+		}
+		if err := json.Unmarshal([]byte(doc), &rec); err != nil {
 			rec = chatRecord{ID: body.ID, CreatedAt: now}
 		}
 	}
@@ -267,10 +238,6 @@ func MeChatSave(c *gin.Context) {
 	rec.Title = inferTitle(body.Messages)
 	rec.UpdatedAt = now
 
-	if err := os.MkdirAll(chatsDir(userID), 0o755); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "mkdir: "+err.Error())
-		return
-	}
 	buf, err := json.Marshal(rec)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "marshal: "+err.Error())
@@ -280,19 +247,13 @@ func MeChatSave(c *gin.Context) {
 		fail(c, http.StatusRequestEntityTooLarge, 1413, fmt.Sprintf("chat exceeds %d bytes — split into a new thread", chatMaxBytes))
 		return
 	}
-	tmp := chatPath(userID, rec.ID) + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
+	if err := meDocSave(userID, meDocKindChat, rec.ID, string(buf)); err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "write: "+err.Error())
-		return
-	}
-	if err := os.Rename(tmp, chatPath(userID, rec.ID)); err != nil {
-		_ = os.Remove(tmp)
-		fail(c, http.StatusInternalServerError, 1500, "rename: "+err.Error())
 		return
 	}
 
 	if isNew {
-		go pruneChats(userID, chatsKeep)
+		go meDocPrune(userID, meDocKindChat, chatsKeep)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -319,45 +280,14 @@ func MeChatDelete(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid chat id")
 		return
 	}
-	err := os.Remove(chatPath(userID, id))
-	if errors.Is(err, os.ErrNotExist) {
-		fail(c, http.StatusNotFound, 1404, "not found")
-		return
-	}
+	found, err := meDocDelete(userID, meDocKindChat, id)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "remove: "+err.Error())
 		return
 	}
+	if !found {
+		fail(c, http.StatusNotFound, 1404, "not found")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"id": id}})
-}
-
-// pruneChats deletes the oldest files when the user has more than
-// `keep`. Best-effort. Mirrors the artifact-pruning pattern.
-func pruneChats(userID string, keep int) {
-	entries, err := os.ReadDir(chatsDir(userID))
-	if err != nil {
-		return
-	}
-	type item struct {
-		name string
-		mod  time.Time
-	}
-	rows := make([]item, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		rows = append(rows, item{e.Name(), info.ModTime()})
-	}
-	if len(rows) <= keep {
-		return
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].mod.Before(rows[j].mod) })
-	for _, r := range rows[:len(rows)-keep] {
-		_ = os.Remove(filepath.Join(chatsDir(userID), r.name))
-	}
 }

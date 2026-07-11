@@ -24,7 +24,7 @@ package handler
 //   - PUT honors an optimistic lock (base_sha) and writes atomically (tmp+rename).
 
 import (
-	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -117,6 +117,65 @@ func readMdNames(dir string) []string {
 	return out
 }
 
+// ── cross-node prompt overrides (DB) ─────────────────────────────────────────
+//
+// On UKS the tenant install lives on the SCHEDULER pod's PVC, which identity
+// can't mount (RWO, different node) — so the on-disk local-override write path
+// is unreachable and PUT used to dead-end. When the bundle isn't on this pod's
+// disk, overrides land in me_docs instead (the same replica-safe store that
+// fixed chats/personas), keyed deterministically per (app, prompt). Reads on
+// the cross-node path prefer the DB override over the published-repo blob, so
+// GET-after-PUT round-trips. NOTE: like the casebook/trajectory fallbacks this
+// is a Studio-surface fix — the scheduler's runtime prompt resolver still reads
+// the PVC files, so a DB override doesn't reach cycle execution yet (the
+// remaining half of the cross-node tenant-app-files gap).
+
+// meDocKindPrompt — MeDoc kind for cross-node prompt overrides.
+const meDocKindPrompt = "app_prompt"
+
+// promptOverrideDoc is the me_docs payload for one override.
+type promptOverrideDoc struct {
+	App     string `json:"app"`
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+// promptOverrideID — deterministic doc_id for (app, name). sha256 hex is
+// exactly 64 chars (the me_docs key width); app+name raw can exceed it.
+func promptOverrideID(app, name string) string {
+	return contentSHA([]byte(app + "/" + name))
+}
+
+// promptOverrideGet returns the override content for (app, name), if any.
+func promptOverrideGet(userSub, app, name string) (string, bool) {
+	doc, found, err := meDocGet(userSub, meDocKindPrompt, promptOverrideID(app, name))
+	if err != nil || !found {
+		return "", false
+	}
+	var d promptOverrideDoc
+	if json.Unmarshal([]byte(doc), &d) != nil {
+		return "", false
+	}
+	return d.Content, true
+}
+
+// promptOverridesForApp returns name → content for all of the caller's
+// overrides on one app.
+func promptOverridesForApp(userSub, app string) map[string]string {
+	rows, err := meDocList(userSub, meDocKindPrompt)
+	if err != nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, r := range rows {
+		var d promptOverrideDoc
+		if json.Unmarshal([]byte(r.Doc), &d) == nil && d.App == app && validPromptName(d.Name) {
+			out[d.Name] = d.Content
+		}
+	}
+	return out
+}
+
 // validPromptName gates the :name path segment: a plain .md filename, no
 // traversal / separators (it flows into safeAppJoin under prompts/).
 func validPromptName(name string) bool {
@@ -133,33 +192,12 @@ func validPromptName(name string) bool {
 // publishedPromptNames lists *.md under the app's published repo prompts/ dir
 // (authenticated, so private repos resolve). Cross-node read-only fallback.
 func publishedPromptNames(userID, app string) []string {
-	bearer, err := xpcloudUserJWT(userID)
-	if err != nil {
-		return nil
-	}
-	url := xpcloudBaseURL() + "/api/v1/repos/" + userID + "/" + app + "/tree/main/prompts"
-	code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
-	if err != nil || code >= 300 || resp == nil {
-		return nil
-	}
-	entries, _ := resp["entries"].([]any)
 	out := []string{}
-	for _, raw := range entries {
-		e, _ := raw.(map[string]any)
-		if e == nil {
-			continue
-		}
-		name, _ := e["name"].(string)
-		if name == "" {
-			if p, _ := e["path"].(string); p != "" {
-				name = p[strings.LastIndex(p, "/")+1:]
-			}
-		}
+	for _, name := range publishedTreeBlobs(userID, app, promptDirRel) {
 		if strings.HasSuffix(name, ".md") {
 			out = append(out, name)
 		}
 	}
-	sort.Strings(out)
 	return out
 }
 
@@ -177,12 +215,32 @@ func MeAppPrompts(c *gin.Context) {
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
 		// Cross-node: identity can't read the tenant PVC. List the app's prompts
-		// from the caller's PUBLISHED xp.io repo (read-only) so the Agents/Prompts
-		// panel works instead of "app not found". Same fallback pattern as config.
+		// from the caller's PUBLISHED xp.io repo, shadowed by any DB overrides
+		// (a same-named override flips source to "local", like the disk path).
+		// Editable is true — PUT works cross-node via the me_docs override store.
 		names := publishedPromptNames(userID, app)
-		prompts := make([]promptInfo, 0, len(names))
+		ovr := promptOverridesForApp(userID, app)
+		seen := map[string]bool{}
+		prompts := make([]promptInfo, 0, len(names)+len(ovr))
 		for _, n := range names {
-			prompts = append(prompts, promptInfo{Name: n, Source: "published", Editable: false})
+			seen[n] = true
+			pi := promptInfo{Name: n, Source: "published", Editable: true}
+			if content, has := ovr[n]; has {
+				pi.Source = "local"
+				pi.SHA = contentSHA([]byte(content))
+			}
+			prompts = append(prompts, pi)
+		}
+		extras := []string{}
+		for n := range ovr {
+			if !seen[n] {
+				extras = append(extras, n)
+			}
+		}
+		sort.Strings(extras)
+		for _, n := range extras {
+			prompts = append(prompts, promptInfo{
+				Name: n, Source: "local", Editable: true, SHA: contentSHA([]byte(ovr[n]))})
 		}
 		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
 			"data": gin.H{"app": app, "prompts": prompts}})
@@ -270,23 +328,7 @@ func resolvePromptRead(userSub, appDir, name string) (path, source string) {
 // publishedPromptBlob reads one prompt's bytes from the app's published repo
 // (authenticated). Cross-node read-only fallback for MeAppPrompt.
 func publishedPromptBlob(userID, app, name string) []byte {
-	bearer, err := xpcloudUserJWT(userID)
-	if err != nil {
-		return nil
-	}
-	url := xpcloudBaseURL() + "/api/v1/repos/" + userID + "/" + app + "/blob/main/prompts/" + name
-	code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
-	if err != nil || code >= 300 || resp == nil {
-		return nil
-	}
-	content, _ := resp["content"].(string)
-	if content == "" {
-		return nil
-	}
-	if dec, derr := base64.StdEncoding.DecodeString(content); derr == nil && len(dec) > 0 {
-		return dec
-	}
-	return []byte(content)
+	return publishedRepoBlob(userID, app, promptDirRel+"/"+name)
 }
 
 func MeAppPrompt(c *gin.Context) {
@@ -307,14 +349,26 @@ func MeAppPrompt(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		// Cross-node: read the prompt blob from the published repo (read-only).
+		// Cross-node: a DB override (written by the cross-node PUT) wins over
+		// the published-repo blob — same local-shadows-shared precedence as disk.
+		if content, has := promptOverrideGet(userID, app, name); has {
+			b := []byte(content)
+			if len(b) > promptMaxBytes {
+				b = b[:promptMaxBytes]
+			}
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
+				"data": gin.H{"app": app, "name": name, "content": string(b),
+					"source": "local", "sha": contentSHA(b), "editable": true,
+					"path": filepath.Join(promptDirRel, name)}})
+			return
+		}
 		if body := publishedPromptBlob(userID, app, name); body != nil {
 			if len(body) > promptMaxBytes {
 				body = body[:promptMaxBytes]
 			}
 			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
 				"data": gin.H{"app": app, "name": name, "content": string(body),
-					"source": "published", "sha": contentSHA(body), "editable": false,
+					"source": "published", "sha": contentSHA(body), "editable": true,
 					"path": filepath.Join(promptDirRel, name)}})
 			return
 		}
@@ -388,7 +442,37 @@ func MeUpdateAppPrompt(c *gin.Context) {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return
 		}
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: the tenant install lives on the scheduler PVC this pod
+		// can't see. Accept the override into the DB store when the app resolves
+		// as the caller's own published repo (the ownership proxy fetchRepoSpecYAML
+		// already uses for config reads); a bogus app name still 404s.
+		if _, okSpec := fetchRepoSpecYAML(userID, app); !okSpec {
+			fail(c, http.StatusNotFound, 1404, "app not found")
+			return
+		}
+		// Optimistic lock against the existing DB override only — a first-time
+		// override starts from the published baseline (mirrors the disk path,
+		// which only enforces when a local file already exists).
+		if body.BaseSHA != "" {
+			if cur, has := promptOverrideGet(userID, app, name); has && contentSHA([]byte(cur)) != body.BaseSHA {
+				fail(c, http.StatusConflict, 1409,
+					"this prompt changed since you loaded it — reload to pick up the other edit, then reapply yours")
+				return
+			}
+		}
+		doc, err := json.Marshal(promptOverrideDoc{App: app, Name: name, Content: body.Content})
+		if err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "could not encode prompt override")
+			return
+		}
+		if err := meDocSave(userID, meDocKindPrompt, promptOverrideID(app, name), string(doc)); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "could not save prompt override")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"saved": true, "sha": contentSHA([]byte(body.Content))},
+		})
 		return
 	}
 
@@ -449,7 +533,20 @@ func MeDeleteAppPrompt(c *gin.Context) {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return
 		}
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: remove the DB override (no-op success when none exists,
+		// matching the disk path's semantics).
+		if _, okSpec := fetchRepoSpecYAML(userID, app); !okSpec {
+			fail(c, http.StatusNotFound, 1404, "app not found")
+			return
+		}
+		if _, err := meDocDelete(userID, meDocKindPrompt, promptOverrideID(app, name)); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "cannot remove prompt override")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"reverted": true},
+		})
 		return
 	}
 	abs, err := safeAppJoin(appDir, filepath.Join(promptDirRel, name))

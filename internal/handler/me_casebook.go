@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -163,12 +164,16 @@ func MeCasebook(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
-		// Cross-node: identity can't read the tenant PVC (casebook is runtime
-		// data written by cycles). Graceful empty (200) instead of a console
-		// 404 — the UI renders a clean "no cases yet" state.
+		// Cross-node (UKS): the bundle + runtime files live on the scheduler
+		// PVC. Reconstruct what we can instead of a blanket empty (the WS-4
+		// regression): case roster from the caller's PUBLISHED repo (same
+		// folder priority as the local scan) + the metric trajectory from the
+		// cross-node run store — the same source the trajectory view uses.
+		cases, versionHistory, metricEvo, scoredVia := crossNodeCasebook(userID, app, loop)
 		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
-			"app": app, "loop": loop, "cases": []any{},
-			"version_history": []any{}, "metrics_evolution": []any{}, "scored_via": "",
+			"app": app, "loop": loop, "cases": cases,
+			"version_history": versionHistory, "metrics_evolution": metricEvo,
+			"scored_via": scoredVia,
 		}})
 		return
 	}
@@ -217,6 +222,120 @@ func MeCasebook(c *gin.Context) {
 			"scored_via": scoredVia,
 		},
 	})
+}
+
+// crossNodeCasebook reconstructs the casebook when the app bundle isn't on
+// this pod's disk (UKS: identity ≠ scheduler node). Sources:
+//
+//   - roster: per-case *.json files from the caller's PUBLISHED repo, walking
+//     casebookCaseDirs in the same priority order as the local scan; when no
+//     per-case files exist, flat *.jsonl casebooks (the fixed casebookFlatFiles
+//     paths plus any .jsonl shipped inside a roster folder, e.g. data/seed/).
+//   - metric trajectory: the cross-node run store (me_app_runs), keyed by the
+//     loop's own declared metric — scored_via "run_store".
+//
+// Per-case score history is mined from runtime experiment files on the
+// scheduler PVC, which identity can't reach — so cross-node cases carry no
+// per-case sparkline yet (the remaining half of the tenant-app-files gap).
+func crossNodeCasebook(userID, app, loop string) ([]casebookCase, []casebookVersionPoint, []casebookMetricEvolution, string) {
+	cases := []casebookCase{}
+
+	// 1. Per-case roster — first folder with *.json files wins (mirrors the
+	//    local scan). Any *.jsonl seen on the way becomes a flat candidate.
+	flatCandidates := append([]string{}, casebookFlatFiles...)
+	for _, rel := range casebookCaseDirs {
+		names := publishedTreeBlobs(userID, app, rel)
+		if len(names) == 0 {
+			continue
+		}
+		for _, n := range names {
+			switch strings.ToLower(filepath.Ext(n)) {
+			case ".json":
+				stem := strings.TrimSuffix(n, filepath.Ext(n))
+				cases = append(cases, casebookCase{ID: stem, Label: stem})
+			case ".jsonl":
+				flatCandidates = append(flatCandidates, rel+"/"+n)
+			}
+		}
+		if len(cases) > 0 {
+			break
+		}
+	}
+	// Flat single-file casebooks when no per-case files exist.
+	if len(cases) == 0 {
+		for _, rel := range flatCandidates {
+			b := publishedRepoBlob(userID, app, rel)
+			if len(b) == 0 {
+				continue
+			}
+			if cases = casesFromJSONL(b); len(cases) > 0 {
+				break
+			}
+		}
+	}
+
+	// 2. Metric trajectory from the run store — one point per run, the loop's
+	//    declared metric (same Ts shape as the trajectory fallback: epoch str).
+	evo := []casebookMetricEvolution{}
+	scoredVia := ""
+	if mname := loopMetricName(userID, app, loop); mname != "" {
+		pts := []casebookMetricPoint{}
+		for _, r := range appRunsFor(userID, app, loop) {
+			if v := metricFromBlob(r.Metrics, mname); v != nil {
+				pts = append(pts, casebookMetricPoint{Ts: strconv.FormatInt(r.RunTs, 10), V: roundN(*v, 4)})
+			}
+		}
+		if len(pts) >= 2 { // a trajectory needs at least two points (local rule)
+			evo = append(evo, casebookMetricEvolution{Metric: strings.ReplaceAll(mname, "_", " "), Points: pts})
+			scoredVia = "run_store"
+		}
+	}
+
+	// 3. Declared dataset versions from the published spec (lead note only —
+	//    per-cycle regression sidecars are PVC runtime data).
+	versionHistory := []casebookVersionPoint{}
+	if spec, okSpec := fetchRepoSpecYAML(userID, app); okSpec {
+		if ds := datasetsFromSpecYAML(spec); len(ds) > 0 {
+			versionHistory = append(versionHistory, casebookVersionPoint{Ts: "", Note: "declared: " + strings.Join(ds, ", ")})
+		}
+	}
+
+	return cases, versionHistory, evo, scoredVia
+}
+
+// casesFromJSONL parses a flat jsonl casebook (one case per line) into case
+// rows — the bytes-based twin of the local flat-file scan. Capped defensively.
+func casesFromJSONL(b []byte) []casebookCase {
+	const maxRows = 500
+	out := []casebookCase{}
+	i := 0
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var raw map[string]any
+		if json.Unmarshal([]byte(line), &raw) != nil {
+			continue
+		}
+		i++
+		id := asStr(raw["id"])
+		if id == "" {
+			id = asStr(raw["case_id"])
+		}
+		if id == "" {
+			id = "row_" + itoa(int64(i))
+		}
+		cc := casebookCase{ID: id, Label: id, Fields: caseFieldsPreview(raw)}
+		if lbl := caseLabel(raw); lbl != "" {
+			cc.Label = lbl
+		}
+		out = append(out, cc)
+		if len(out) >= maxRows {
+			break
+		}
+	}
+	return out
 }
 
 // casebookScoresFromExperiments walks data/experiments/<id>/results.jsonl and
@@ -688,32 +807,38 @@ func declaredDatasets(appDir string) []string {
 			}
 		}
 	}
-	// xpcloud.yaml fallback — a light line scan (no YAML dep in this package):
-	// collect `- id: <x>` entries under a `datasets:` block.
+	// xpcloud.yaml fallback.
 	specPath, _ := ResolveSpecPath(appDir)
 	if b, err := os.ReadFile(specPath); err == nil {
-		out := []string{}
-		inDS := false
-		for _, raw := range strings.Split(string(b), "\n") {
-			line := strings.TrimRight(raw, "\r")
-			trimmed := strings.TrimSpace(line)
-			if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
-				// a new top-level key — entering/leaving the datasets block
-				inDS = strings.HasPrefix(trimmed, "datasets:")
-				continue
-			}
-			if inDS && strings.HasPrefix(trimmed, "- id:") {
-				id := strings.TrimSpace(strings.TrimPrefix(trimmed, "- id:"))
-				if id != "" {
-					out = append(out, id)
-				}
-			}
-		}
-		if len(out) > 0 {
+		if out := datasetsFromSpecYAML(b); len(out) > 0 {
 			return out
 		}
 	}
 	return nil
+}
+
+// datasetsFromSpecYAML collects `- id: <x>` entries under a top-level
+// `datasets:` block via a light line scan (no YAML dep needed for this).
+// Shared by the on-disk and published-repo (cross-node) paths.
+func datasetsFromSpecYAML(b []byte) []string {
+	out := []string{}
+	inDS := false
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			// a new top-level key — entering/leaving the datasets block
+			inDS = strings.HasPrefix(trimmed, "datasets:")
+			continue
+		}
+		if inDS && strings.HasPrefix(trimmed, "- id:") {
+			id := strings.TrimSpace(strings.TrimPrefix(trimmed, "- id:"))
+			if id != "" {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }
 
 // ── small local helpers (kept handler-local to avoid clashing with the

@@ -749,6 +749,14 @@ type llmProvider struct {
 	// GPU models are free at the margin, so they carry a generous backstop
 	// rather than the tight Anthropic-cost default.
 	dailyBudgetTokens int
+	// needsToolHints — append the compact intent→tool routing block
+	// (toolHintSuffix) to the system prompt for this provider. Smaller open
+	// models under-fire the control-plane tools from descriptions alone
+	// (credentialed sweep on gemma4: "autoresearch" fired neither list_loops
+	// nor loop_status; "run X loop" fired no run tool; "show my experiments"
+	// fired list_apps instead of list_experiments). Claude-tier models route
+	// fine unhinted — leave them false so their behavior doesn't change.
+	needsToolHints bool
 }
 
 // First entry is the default (defaultProvider() returns llmProviders[0]).
@@ -775,6 +783,7 @@ var llmProviders = []llmProvider{
 		minRole:             "user",    // everyone
 		maxOutputTokens:     16384,     // 262K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens:   2_000_000, // generous backstop; local GPU has no per-call cost
+		needsToolHints:      true,      // 26B open model — steer control-intent tool routing
 	},
 	// kvrun-minimax RETIRED with the kv.run:5000 gateway (2026-07-10): the
 	// lumid-llm fleet does not serve MiniMax, and its other model
@@ -1274,6 +1283,41 @@ func modeSystemSuffix(mode string) string {
 	return ""
 }
 
+// toolRoutingHints — intent-family → tool guidance, rendered into the system
+// prompt only for providers flagged needsToolHints (gemma4 today). Data-driven
+// on purpose: one row per intent family, tool names EXACTLY as they appear in
+// the tools[] catalog (this list only references the catalog — it never
+// defines or renames tools). Keep it compact; prose sprawl dilutes the signal
+// for exactly the models that need it.
+var toolRoutingHints = []struct{ intent, tools string }{
+	{"run / execute / trigger an app's loop or cycle now", "run_loop_now (or branch_run to explore a variant from a specific run)"},
+	{"experiments — 'show my experiments', experiment metrics or status", "list_experiments first, then experiment_status for one"},
+	{"autoresearch / research loops — loop health, schedules, what's running", "list_loops first, then loop_status for one"},
+	{"marketplace — discover or find apps to install", "search_marketplace (or list_marketplace to browse)"},
+	{"the user's own installed apps", "list_apps"},
+	{"run history / recent runs of an app", "list_runs, then run_detail for one"},
+	{"install an app from the marketplace", "install_app"},
+}
+
+// toolHintSuffix renders the intent→tool routing block for providers whose
+// tool selection needs steering (p.needsToolHints). Empty for everything else
+// — claude-code and Anthropic providers see an unchanged system prompt.
+func toolHintSuffix(p llmProvider) string {
+	if !p.needsToolHints {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\nTOOL ROUTING — when the user's request matches an intent below, call the mapped tool (do not answer from memory, do not substitute a different tool):\n")
+	for _, r := range toolRoutingHints {
+		b.WriteString("- ")
+		b.WriteString(r.intent)
+		b.WriteString(" → ")
+		b.WriteString(r.tools)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 type toolCallResult struct {
 	Name   string         `json:"name"`
 	Args   map[string]any `json:"args"`
@@ -1341,7 +1385,7 @@ func MeAgentChat(c *gin.Context) {
 	}
 
 	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body)
-	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
+	systemPrompt := basePrompt + modeSystemSuffix(body.Mode) + toolHintSuffix(provider)
 	toolCalls := []toolCallResult{}
 	totalInputTokens := 0
 	totalOutputTokens := 0

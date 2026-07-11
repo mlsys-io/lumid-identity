@@ -108,7 +108,7 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body)
-	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
+	systemPrompt := basePrompt + modeSystemSuffix(body.Mode) + toolHintSuffix(provider)
 	totalInputTokens := 0
 	totalOutputTokens := 0
 

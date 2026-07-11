@@ -153,6 +153,14 @@ func MeAgentChatStream(c *gin.Context) {
 		return
 	}
 
+	// Constrained tool_choice — providers that under-fire tools (gemma4)
+	// MUST answer a clear control intent with a tool call. First model turn
+	// only: after tool results come back the model needs a free choice to
+	// compose the final text answer. Gated on needsToolHints so Claude-tier
+	// providers see a byte-identical request. (Verified live: the lumid-llm
+	// gateway honors tool_choice on the SSE path, 2026-07-10.)
+	forceToolTurn := provider.needsToolHints && len(tools) > 0 && toolForceIntent(body.Messages)
+
 	for i := 0; i < maxToolLoopIterations; i++ {
 		// Stop the moment the client is gone — otherwise the loop keeps making
 		// upstream LLM calls and dispatching (possibly destructive) tools for a
@@ -174,6 +182,9 @@ func MeAgentChatStream(c *gin.Context) {
 			"messages":   anthMsgs,
 			"tools":      tools,
 			"stream":     true,
+		}
+		if forceToolTurn && i == 0 {
+			req["tool_choice"] = map[string]any{"type": "any"}
 		}
 		if body.Think && provider.addAnthropicVersion {
 			req["thinking"] = map[string]any{

@@ -1055,6 +1055,146 @@ var controlIntentPhrases = []string{
 	"grant access", "suspend the user", "suspend user",
 }
 
+// toolForceIntent reports whether the latest user turn is a clear
+// platform-CONTROL intent — an imperative or status command against a known
+// platform noun (loop/workflow/experiment/app/run/cycle). A hit lets the
+// caller set Anthropic `tool_choice: {"type":"any"}` on the FIRST model turn
+// so providers that under-fire tools from descriptions alone (needsToolHints,
+// gemma4 today) MUST answer with a tool call instead of prose-from-memory
+// (the credentialed-sweep failure mode: "run X loop" fired no run tool,
+// "show my experiments" fired nothing or the wrong list).
+//
+// PRECISION over recall — a false positive here force-fires a tool on a
+// general question and degrades chat, while a false negative just falls back
+// to today's behavior (routing hints only). Guards, in order:
+//   - only the most recent user message is scanned;
+//   - long messages (> 200 chars) never force — commands are short;
+//   - explanatory/interrogative phrasings ("how do I…", "what is…",
+//     "explain…") never force, even when they name platform nouns;
+//   - otherwise require BOTH a control verb and a platform noun as whole
+//     words (or a curated controlIntentPhrases hit, or a bare ≤3-word noun
+//     query like "autoresearch" / "my loops" — the sweep's silent misses).
+func toolForceIntent(msgs []chatMessage) bool {
+	text := ""
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			text = strings.ToLower(strings.TrimSpace(msgs[i].Content))
+			break
+		}
+	}
+	if text == "" || len(text) > 200 {
+		return false
+	}
+	for _, q := range toolForceExclusions {
+		if strings.Contains(text, q) {
+			return false
+		}
+	}
+	// Curated platform imperatives (install/publish/promote/…) are already
+	// precision-tuned for the claude-code re-route — reuse them verbatim.
+	for _, kw := range controlIntentPhrases {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	// Imperative launch with explicit immediacy — "run the morning brief
+	// now" names no platform noun (the loop's own name isn't one) but the
+	// leading launch verb + trailing "now" make it unambiguous.
+	if strings.HasSuffix(text, " now") || strings.Contains(text, " now ") {
+		for _, v := range toolForceLaunchVerbs {
+			if strings.HasPrefix(text, v+" ") {
+				return true
+			}
+		}
+	}
+	noun := false
+	for _, n := range toolForceNouns {
+		if containsWord(text, n) {
+			noun = true
+			break
+		}
+	}
+	if !noun {
+		return false
+	}
+	// Bare noun-only query ("autoresearch", "my loops", "experiments?") —
+	// the user is asking for that surface; ≤3 words keeps this unambiguous.
+	if len(strings.Fields(text)) <= 3 {
+		return true
+	}
+	for _, v := range toolForceVerbs {
+		if containsWord(text, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// toolForceExclusions — phrasings that make a turn a QUESTION/DISCUSSION even
+// when platform nouns appear. Any hit vetoes tool-forcing (the model stays
+// free to answer in prose). Substring match on the lowercased message.
+var toolForceExclusions = []string{
+	"how do", "how to", "how does", "how can", "how would", "how should",
+	"what is", "what's a", "what's an", "what are", "what does", "what would",
+	"why ", "why?", "explain", "difference between", "tell me about",
+	"help me understand", "can you describe", "describe how",
+	"should i", "would you recommend", "do you think", "documentation", "docs",
+	"write a", "write me", "draft", "poem", "summarize", "translate",
+}
+
+// toolForceVerbs / toolForceNouns — the verb×noun co-occurrence grid for
+// toolForceIntent. Whole-word matched. Verbs are the control/status set the
+// platform is driven by; nouns are the me_agent tool surfaces. Deliberately
+// SMALL — every addition must be argued from an observed miss, not padded
+// for recall (precision contract above).
+var toolForceVerbs = []string{
+	"run", "execute", "launch", "start", "stop", "cancel", "pause", "resume",
+	"trigger", "rerun", "re-run", "kick",
+	"list", "show", "status", "health", "healthy", "check", "running", "failing",
+}
+
+// toolForceLaunchVerbs — the message-INITIAL imperative subset used by the
+// "<verb> … now" rule (no platform noun required there, so keep this to
+// unambiguous launch/halt verbs only — no list/show/status).
+var toolForceLaunchVerbs = []string{
+	"run", "execute", "launch", "start", "stop", "pause", "resume",
+	"trigger", "rerun", "re-run",
+}
+
+var toolForceNouns = []string{
+	"loop", "loops", "workflow", "workflows", "experiment", "experiments",
+	"autoresearch", "app", "apps", "runs", "cycle", "cycles",
+}
+
+// containsWord reports whether w appears in text as a whole word (bounded by
+// non-alphanumeric on both sides). strings.Contains alone would let "run"
+// match "prune" and "app" match "apple" — word bounds keep the classifier's
+// precision contract.
+func containsWord(text, w string) bool {
+	for start := 0; ; {
+		i := strings.Index(text[start:], w)
+		if i < 0 {
+			return false
+		}
+		i += start
+		leftOK := i == 0 || !isWordChar(text[i-1])
+		j := i + len(w)
+		rightOK := j >= len(text) || !isWordChar(text[j])
+		if leftOK && rightOK {
+			return true
+		}
+		start = i + 1
+	}
+}
+
+// isWordChar — letters + digits only. Underscore is deliberately a BOUNDARY,
+// not a word char: loop/step identifiers like "case_cycle" / "morning_brief"
+// should split into their tokens so "run mbb-ai's case_cycle" still reads as
+// verb=run noun=cycle.
+func isWordChar(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+}
+
 // groundedDrillIn reports whether the turn's viewing context points at a
 // specific run / step / case (vs a bare app-level view) — i.e. a question
 // that needs the me_agent observability tools to answer.
@@ -1290,12 +1430,14 @@ func modeSystemSuffix(mode string) string {
 // defines or renames tools). Keep it compact; prose sprawl dilutes the signal
 // for exactly the models that need it.
 var toolRoutingHints = []struct{ intent, tools string }{
-	{"run / execute / trigger an app's loop or cycle now", "run_loop_now (or branch_run to explore a variant from a specific run)"},
-	{"experiments — 'show my experiments', experiment metrics or status", "list_experiments first, then experiment_status for one"},
-	{"autoresearch / research loops — loop health, schedules, what's running", "list_loops first, then loop_status for one"},
+	{"run / execute / launch / start / trigger a loop, workflow, or cycle now (a plain one-shot 'run it')", "run_loop_now — NOT branch_run (branch_run is ONLY for exploring a variant branched off one specific existing run)"},
+	{"stop / cancel a cycle that is currently running", "stop_loop"},
+	{"experiments — 'show/list my experiments', experiment metrics or status ('experiments' NEVER means list_apps)", "list_experiments first, then experiment_status for one"},
+	{"autoresearch / research loops — loop list, schedules, what exists", "list_loops first, then loop_status for one"},
+	{"health / status overview — 'are my loops/workflows ok', 'anything failing?'", "loops_health"},
 	{"marketplace — discover or find apps to install", "search_marketplace (or list_marketplace to browse)"},
-	{"the user's own installed apps", "list_apps"},
-	{"run history / recent runs of an app", "list_runs, then run_detail for one"},
+	{"the user's own installed apps ('apps' means installed apps, not experiments)", "list_apps"},
+	{"run history / recent runs / 'did it run?' for an app", "list_runs, then run_detail for one"},
 	{"install an app from the marketplace", "install_app"},
 }
 
@@ -1476,6 +1618,13 @@ func MeAgentChat(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 600*time.Second)
 	defer cancel()
 
+	// Constrained tool_choice — providers that under-fire tools (gemma4)
+	// MUST answer a clear control intent with a tool call. First model turn
+	// only: after tool results come back the model needs a free choice to
+	// compose the final text answer. Gated on needsToolHints so Claude-tier
+	// providers see a byte-identical request.
+	forceToolTurn := provider.needsToolHints && len(tools) > 0 && toolForceIntent(body.Messages)
+
 	// Tool-use loop.
 	for i := 0; i < maxToolLoopIterations; i++ {
 		maxTok := maxTokensPerTurn
@@ -1491,6 +1640,11 @@ func MeAgentChat(c *gin.Context) {
 			"system":     systemPrompt,
 			"messages":   anthMsgs,
 			"tools":      tools,
+		}
+		if forceToolTurn && i == 0 {
+			// Verified live against the lumid-llm gateway (vLLM Anthropic
+			// shim honors tool_choice on stream + non-stream, 2026-07-10).
+			req["tool_choice"] = map[string]any{"type": "any"}
 		}
 		if body.Think && provider.addAnthropicVersion {
 			req["thinking"] = map[string]any{

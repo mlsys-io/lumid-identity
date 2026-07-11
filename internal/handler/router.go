@@ -472,6 +472,13 @@ func Register(r *gin.Engine) {
 			// here so the Studio trajectory/experiments surfaces (which can't
 			// read the scheduler PVC) can reconstruct run history. App-agnostic.
 			internal.POST("/app-runs", InternalAppRunRecord)
+			// Read half of the cross-node tenant-app edits (WS-4/5): the
+			// scheduler pulls DB-backed prompt overrides + pending trajectory
+			// control signals down to the PVC at cycle start
+			// (app_runner._sync_identity_overlays). Claim → append → ack.
+			internal.POST("/app-prompt-overrides/fetch", InternalAppPromptOverridesFetch)
+			internal.POST("/app-signals/claim", InternalAppSignalsClaim)
+			internal.POST("/app-signals/ack", InternalAppSignalsAck)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The

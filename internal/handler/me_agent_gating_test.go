@@ -149,7 +149,11 @@ func TestFirstToolCapableProvider(t *testing.T) {
 // TestProviderAllowed sanity-checks the role gate the selection logic relies
 // on. Post-minimax-retirement (v0.3.14) the tiers are: gemma4 (minRole "user")
 // open to all; claude-code-sonnet admin+; claude-code-opus super_admin only.
+// claude-code providers additionally require a configured proxy: with
+// CLAUDE_PROXY_URL unset they are hidden for every role (transport-dead
+// models must not be offered), so the role-tier cases here pin the proxy env.
 func TestProviderAllowed(t *testing.T) {
+	t.Setenv("CLAUDE_PROXY_URL", "http://claude-proxy.test:9201")
 	var gemma, sonnet, opus llmProvider
 	for _, p := range llmProviders {
 		switch p.id {
@@ -187,4 +191,15 @@ func TestProviderAllowed(t *testing.T) {
 			}
 		})
 	}
+
+	// No proxy configured → claude-code hidden for EVERY role; gemma unaffected.
+	t.Run("no-proxy/claude-code-hidden", func(t *testing.T) {
+		t.Setenv("CLAUDE_PROXY_URL", "")
+		if providerAllowed("super_admin", opus) || providerAllowed("admin", sonnet) {
+			t.Error("claude-code providers must be hidden when CLAUDE_PROXY_URL is unset")
+		}
+		if !providerAllowed("user", gemma) {
+			t.Error("gemma must remain available without a claude proxy")
+		}
+	})
 }

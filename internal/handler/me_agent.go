@@ -836,7 +836,15 @@ func roleRank(role string) int {
 }
 
 // providerAllowed reports whether a caller of the given role may select p.
+// Besides role gating, claude-code providers are hidden entirely when no
+// claude-proxy is configured (CLAUDE_PROXY_URL empty) — in-cluster there is
+// no host-side proxy, and offering a transport-dead model in the catalog
+// meant every selection of it 502'd (the chat_transport probe pages this).
 func providerAllowed(userRole string, p llmProvider) bool {
+	if p.endpoint == "" && strings.TrimSpace(os.Getenv("CLAUDE_PROXY_URL")) == "" {
+		// endpoint=="" marks the subprocess/proxy providers (claude-code-*).
+		return false
+	}
 	return roleRank(userRole) >= roleRank(p.minRole)
 }
 
@@ -1430,12 +1438,13 @@ func modeSystemSuffix(mode string) string {
 // defines or renames tools). Keep it compact; prose sprawl dilutes the signal
 // for exactly the models that need it.
 var toolRoutingHints = []struct{ intent, tools string }{
-	{"run / execute / launch / start / trigger a loop, workflow, or cycle now (a plain one-shot 'run it')", "run_loop_now — NOT branch_run (branch_run is ONLY for exploring a variant branched off one specific existing run)"},
-	{"stop / cancel a cycle that is currently running", "stop_loop"},
+	{"run / execute / launch / start / trigger a loop, workflow, or cycle now (a plain one-shot 'run it')", "run_loop_now — call it IMMEDIATELY with the app/workflow the user named (an unknown name just returns a safe error you can recover from; do NOT list apps/workflows first), and NOT branch_run (branch_run is ONLY for exploring a variant branched off one specific existing run)"},
+	{"stop / cancel a cycle that is currently running", "stop_loop — call it directly with the workflow the user named (do NOT list first)"},
+	{"pause / resume a workflow's schedule", "pause_workflow"},
 	{"experiments — 'show/list my experiments', experiment metrics or status ('experiments' NEVER means list_apps)", "list_experiments first, then experiment_status for one"},
-	{"autoresearch / research loops — loop list, schedules, what exists", "list_loops first, then loop_status for one"},
+	{"'my loops' / 'my workflows' / 'autoresearch' (even as a bare word) — list what exists, schedules", "list_workflows (the tenant-scoped list; list_loops is host-scheduler scope only), then workflow_detail or loop_status for one — NEVER the marketplace tools for this"},
 	{"health / status overview — 'are my loops/workflows ok', 'anything failing?'", "loops_health"},
-	{"marketplace — discover or find apps to install", "search_marketplace (or list_marketplace to browse)"},
+	{"marketplace — discover or find NEW apps to install (only when the user explicitly asks to browse/find/install)", "search_marketplace (or list_marketplace to browse)"},
 	{"the user's own installed apps ('apps' means installed apps, not experiments)", "list_apps"},
 	{"run history / recent runs / 'did it run?' for an app", "list_runs, then run_detail for one"},
 	{"install an app from the marketplace", "install_app"},

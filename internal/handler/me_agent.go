@@ -781,9 +781,13 @@ var llmProviders = []llmProvider{
 		addAnthropicVersion: false,
 		supportsVision:      true,      // multimodal; image blocks verified via the gateway
 		minRole:             "user",    // everyone
-		maxOutputTokens:     16384,     // 262K ctx, free local GPU — let answers/structured output run
-		dailyBudgetTokens:   2_000_000, // generous backstop; local GPU has no per-call cost
-		needsToolHints:      true,      // 26B open model — steer control-intent tool routing
+		maxOutputTokens:     16384, // 262K ctx, free local GPU — let answers/structured output run
+		// No daily budget: the gemma fleet is already-paid local GPU with its
+		// own gateway rate limit (6000/min authed) as the abuse guard. The old
+		// 2M rolling-24h backstop 429'd the qa-sentinel harness on a heavy
+		// sweep day (2026-07-11) while metering nothing that costs money.
+		dailyBudgetTokens: -1,
+		needsToolHints:    true, // 26B open model — steer control-intent tool routing
 	},
 	// kvrun-minimax RETIRED with the kv.run:5000 gateway (2026-07-10): the
 	// lumid-llm fleet does not serve MiniMax, and its other model

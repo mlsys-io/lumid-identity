@@ -179,7 +179,14 @@ func MeAppPublish(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app")
 		return
 	}
-	if st, err := os.Stat(filepath.Join(tenantAppsDir(userID), app)); err != nil || !st.IsDir() {
+	// Cross-node existence check (ITEM 1). The old os.Stat(tenantAppsDir/app)
+	// precondition 404'd on UKS, where the bundle lives on the scheduler PVC
+	// identity can't see — a self-reinforcing block: publish never ran, so the
+	// published-repo read fallbacks stayed empty. The PICKER (which HAS the PVC)
+	// re-validates the tree before pushing, so identity only needs to confirm
+	// the app is in the caller's installed SET (disk OR a DB install intent OR a
+	// materialized spec row). A bogus app name still 404s.
+	if !appInstalledForUser(userID, app) {
 		fail(c, http.StatusNotFound, 1404, "app not installed in your account")
 		return
 	}

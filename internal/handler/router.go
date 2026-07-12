@@ -479,6 +479,15 @@ func Register(r *gin.Engine) {
 			internal.POST("/app-prompt-overrides/fetch", InternalAppPromptOverridesFetch)
 			internal.POST("/app-signals/claim", InternalAppSignalsClaim)
 			internal.POST("/app-signals/ack", InternalAppSignalsAck)
+			// Cross-node app-file store — the scheduler POSTs an installed
+			// bundle's spec + ui files post-install so identity can resolve
+			// installed-not-published apps without the PVC (models.MeAppSpec).
+			internal.POST("/app-spec", InternalAppSpecUpsert)
+			// Config + loop overrides, read at cycle start by the scheduler —
+			// me_docs kinds app_config_override / app_loop_override (the write
+			// half is the PUT /me/apps/:app/config + PATCH /me/loops handlers).
+			internal.POST("/app-config-override/fetch", InternalAppConfigOverrideFetch)
+			internal.POST("/app-loop-overrides/fetch", InternalAppLoopOverridesFetch)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The

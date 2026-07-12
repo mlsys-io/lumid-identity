@@ -94,6 +94,94 @@ func InternalAppSignalsClaim(c *gin.Context) {
 	ok(c, "ok", gin.H{"signals": out})
 }
 
+// appSpecUpsertReq is the body the scheduler install-picker posts after it
+// materializes a bundle on its PVC — the DB-backed copy identity reads
+// cross-node (see models.MeAppSpec).
+type appSpecUpsertReq struct {
+	UserSub  string            `json:"user_sub" binding:"required"`
+	App      string            `json:"app"      binding:"required"`
+	SpecYAML string            `json:"spec_yaml"`
+	UIFiles  map[string]string `json:"ui_files"` // repo-relative path → content (ui/*.md, ui/*.yaml)
+}
+
+// InternalAppSpecUpsert — POST /api/v1/internal/app-spec (X-Bridge-Secret).
+// The scheduler calls this post-install so identity can resolve an installed
+// app's spec + ui surfaces without mounting the scheduler PVC. Idempotent
+// upsert on (user_sub, app).
+func InternalAppSpecUpsert(c *gin.Context) {
+	var body appSpecUpsertReq
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	if !slugRe.MatchString(body.App) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app")
+		return
+	}
+	if err := meAppSpecSave(body.UserSub, body.App, body.SpecYAML, body.UIFiles); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "save spec: "+err.Error())
+		return
+	}
+	ok(c, "ok", gin.H{"app": body.App, "ui_files": len(body.UIFiles)})
+}
+
+// InternalAppConfigOverrideFetch — POST /api/v1/internal/app-config-override/fetch
+// Body {user_sub, app}. Returns the caller's config override JSON for the app
+// (me_docs kind app_config_override), or null when none exists. The scheduler
+// reads this at cycle start to overlay the config on the base spec.
+func InternalAppConfigOverrideFetch(c *gin.Context) {
+	var body overlayReq
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	if !slugRe.MatchString(body.App) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app")
+		return
+	}
+	raw, has := appConfigOverrideGet(body.UserSub, body.App)
+	if !has {
+		ok(c, "ok", gin.H{"override": nil})
+		return
+	}
+	// The stored body is a JSON string of the config map — hand it back parsed
+	// so the caller gets a JSON object, not a double-encoded string.
+	var parsed any
+	if json.Unmarshal([]byte(raw), &parsed) != nil {
+		ok(c, "ok", gin.H{"override": nil})
+		return
+	}
+	ok(c, "ok", gin.H{"override": parsed})
+}
+
+// InternalAppLoopOverridesFetch — POST /api/v1/internal/app-loop-overrides/fetch
+// Body {user_sub, app}. Returns [{loop, override}] for every loop the caller
+// has an override on (me_docs kind app_loop_override). The scheduler applies
+// these (schedule/model/runtime/goal/enabled) at cycle start.
+func InternalAppLoopOverridesFetch(c *gin.Context) {
+	var body overlayReq
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	if !slugRe.MatchString(body.App) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app")
+		return
+	}
+	out := []gin.H{}
+	for loop, raw := range appLoopOverridesForApp(body.UserSub, body.App) {
+		var parsed any
+		if json.Unmarshal([]byte(raw), &parsed) != nil {
+			continue
+		}
+		out = append(out, gin.H{"loop": loop, "override": parsed})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i]["loop"].(string) < out[j]["loop"].(string)
+	})
+	ok(c, "ok", gin.H{"overrides": out})
+}
+
 // InternalAppSignalsAck — POST /api/v1/internal/app-signals/ack
 // Body {user_sub, ids[]}. Deletes the acked signal docs (idempotent — a
 // missing doc is a no-op, matching meDocDelete semantics).

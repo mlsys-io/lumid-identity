@@ -56,8 +56,8 @@ func kindInstallPointer(kind, slug string) string {
 	switch kind {
 	case "skill":
 		return "this is a skill — skills are imported by apps, not installed standalone. Use 'Add to app…' on the marketplace, or add it to an app's xpcloud.yaml skill_imports[]"
-	case "agent":
-		return "this is a knowledge agent — subscribe instead of installing. Use 'Subscribe' on the marketplace, or `lumid xp subscribe --source-slug " + slug + "`"
+	case "memory":
+		return "this is a knowledge bank — subscribe instead of installing. Use 'Subscribe' on the marketplace, or `lumid xp subscribe --source-slug " + slug + "`"
 	case "dataset":
 		return "this is a dataset — datasets are mounted by apps via xpcloud.yaml datasets[], not installed standalone"
 	case "strategy":

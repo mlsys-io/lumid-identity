@@ -90,12 +90,17 @@ func MeAppsInstall(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid 'as' name")
 		return
 	}
-	// Kind gate — only kind=app (and legacy autoresearch) is installable.
-	// Skills are imported by apps, agents are subscribed, datasets are
-	// mounted, strategy/workflow are browse-only. Fail-OPEN when the kind
-	// can't be resolved (bare slugs, drafts, xpcloud down) — the Python
-	// installer re-checks authoritatively and returns the same pointers.
-	if kind := marketplaceRepoKind(c, body.Slug); kind != "" && kind != "app" && kind != "autoresearch" {
+	// Kind gate — installable ACTOR kinds only. Post the unified-component
+	// rename (sdk/kinds.py): `agent` is the deployable actor (was `app`;
+	// normalize_kind folds app→agent), so BOTH are installable; `memory` is
+	// the knowledge-bank kind you subscribe to (was the old `agent`). Skills
+	// are imported, datasets mounted, strategy/workflow browse-only. Fail-OPEN
+	// when the kind can't be resolved (bare slugs, drafts, xpcloud down) — the
+	// Python installer re-checks authoritatively and returns the same pointers.
+	switch kind := marketplaceRepoKind(c, body.Slug); kind {
+	case "", "app", "agent", "autoresearch":
+		// installable — proceed
+	default:
 		fail(c, http.StatusUnprocessableEntity, 1422, kindInstallPointer(kind, body.Slug))
 		return
 	}

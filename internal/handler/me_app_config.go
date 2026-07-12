@@ -21,12 +21,28 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"os"
 
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
+
+// currentConfigSHA computes the sha of the merged spec (base ⊕ override) the
+// GET would return for the cross-node config path — the optimistic-lock token.
+// Returns ("", false) when the base spec can't be resolved.
+func currentConfigSHA(userID, app, overrideJSON string) (string, bool) {
+	base, _, ok := specForApp(userID, app)
+	if !ok {
+		return "", false
+	}
+	merged, ok := overlayConfigOntoSpec(base, overrideJSON)
+	if !ok {
+		return "", false
+	}
+	return contentSHA(merged), true
+}
 
 // fetchRepoSpecYAML reads the app's xpcloud.yaml from the caller's xp.io repo.
 // Cross-node fallback: on UKS identity (service tier) can't see the scheduler's
@@ -83,16 +99,26 @@ func MeAppConfig(c *gin.Context) {
 			b, _ = os.ReadFile(yamlPath)
 		}
 	}
-	// Cross-node fallback: read the spec from the caller's xp.io repo when the
-	// local file isn't visible (identity ≠ scheduler node; see fetchRepoSpecYAML).
+	// Cross-node fallback: read the spec via specForApp (MeAppSpec DB store →
+	// published xp.io repo) when the local file isn't visible (identity ≠
+	// scheduler node). specForApp covers installed-not-published apps too, which
+	// fetchRepoSpecYAML alone missed.
 	if len(b) == 0 {
-		if fetched, ok := fetchRepoSpecYAML(userID, app); ok {
+		if fetched, _, ok := specForApp(userID, app); ok {
 			b = fetched
 		}
 	}
 	if len(b) == 0 {
 		fail(c, http.StatusNotFound, 1404, "xpcloud.yaml not found")
 		return
+	}
+	// Overlay the caller's config override (me_docs app_config_override) onto the
+	// base spec's top-level `config:` map, so a cross-node PUT round-trips through
+	// GET. The override body is the full config map JSON.
+	if raw, has := appConfigOverrideGet(userID, app); has {
+		if merged, ok := overlayConfigOntoSpec(b, raw); ok {
+			b = merged
+		}
 	}
 	if len(b) > configMaxBytes {
 		b = b[:configMaxBytes]
@@ -106,6 +132,29 @@ func MeAppConfig(c *gin.Context) {
 			"sha":   contentSHA(b),
 		},
 	})
+}
+
+// overlayConfigOntoSpec replaces the top-level `config:` map in a spec's YAML
+// bytes with the override (a JSON object). Returns (mergedYAML, true) on
+// success; (nil, false) when either side can't be parsed (caller keeps base).
+func overlayConfigOntoSpec(specYAML []byte, overrideJSON string) ([]byte, bool) {
+	var doc map[string]any
+	if yaml.Unmarshal(specYAML, &doc) != nil {
+		return nil, false
+	}
+	if doc == nil {
+		doc = map[string]any{}
+	}
+	var cfg any
+	if json.Unmarshal([]byte(overrideJSON), &cfg) != nil {
+		return nil, false
+	}
+	doc["config"] = cfg
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // MeUpdateAppConfig — PUT /me/apps/:app/config
@@ -135,7 +184,7 @@ func MeUpdateAppConfig(c *gin.Context) {
 	}
 
 	// Validate: must be parseable YAML before we touch the file.
-	var check interface{}
+	var check map[string]any
 	if err := yaml.Unmarshal([]byte(body.YAML), &check); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid YAML: "+err.Error())
 		return
@@ -149,7 +198,52 @@ func MeUpdateAppConfig(c *gin.Context) {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return
 		}
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node: the tenant install lives on the scheduler PVC this pod
+		// can't see. Store the edit as a config override in me_docs (ITEM 3)
+		// instead of dead-ending on 404 — the scheduler pulls it at cycle start
+		// via /internal/app-config-override/fetch. We persist ONLY the top-level
+		// `config:` map (the user-editable surface); the rest of xpcloud.yaml is
+		// the app author's and stays on the published/DB spec. A bogus app 404s.
+		if _, _, okSpec := specForApp(userID, app); !okSpec {
+			fail(c, http.StatusNotFound, 1404, "app not found")
+			return
+		}
+		cfg := check["config"]
+		if cfg == nil {
+			cfg = map[string]any{}
+		}
+		cfgJSON, err := json.Marshal(cfg)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "could not encode config override")
+			return
+		}
+		// Optimistic lock against the existing override only — a first-time
+		// override starts from the published/DB baseline (mirrors the disk path).
+		if body.BaseSHA != "" {
+			if cur, has := appConfigOverrideGet(userID, app); has {
+				if merged, ok := currentConfigSHA(userID, app, cur); ok && merged != body.BaseSHA {
+					fail(c, http.StatusConflict, 1409,
+						"config changed since you loaded it — reload to pick up the other edit, then reapply yours")
+					return
+				}
+			}
+		}
+		if err := appConfigOverrideSave(userID, app, string(cfgJSON)); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "could not save config override")
+			return
+		}
+		// Echo the sha of the merged spec (base ⊕ override) so the editor can
+		// chain further saves without a reload — matches the GET's sha source.
+		newSHA := ""
+		if base, _, ok := specForApp(userID, app); ok {
+			if merged, ok := overlayConfigOntoSpec(base, string(cfgJSON)); ok {
+				newSHA = contentSHA(merged)
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"ok": true, "bytes": len(body.YAML), "sha": newSHA},
+		})
 		return
 	}
 	// Read against whichever file currently exists (dotfile or legacy) for

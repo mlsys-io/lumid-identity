@@ -32,6 +32,7 @@ package handler
 // xpcloud.yaml to point to it (detaches the fork from the template).
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -448,7 +449,56 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return
 		}
-		fail(c, http.StatusNotFound, 1404, "app not found")
+		// Cross-node (ITEM 3): the tenant install lives on the scheduler PVC this
+		// pod can't see. Store the surface markdown as an override in me_docs
+		// (kind app_surface_override); serveAppSurfaceFromRepo prefers it over the
+		// declared file. Page-spec surfaces (edit the raw .yaml) aren't supported
+		// cross-node yet — the spec lives on the PVC. A bogus app 404s.
+		specBytes, _, okSpec := specForApp(userID, app)
+		if !okSpec {
+			fail(c, http.StatusNotFound, 1404, "app not found")
+			return
+		}
+		if body.Markdown == "" {
+			fail(c, http.StatusBadRequest, 1400, "cross-node surface edits need `markdown` (page-spec edits are not supported off-node yet)")
+			return
+		}
+		// Reject a markdown edit against a surface the app declares as a page
+		// spec — the client must send `spec` for those (PVC-only cross-node).
+		if ui := parseAppUI(specBytes); ui != nil {
+			decl := ""
+			if p, has := ui.Surfaces[name]; has {
+				decl = p
+			} else if name == "home" && ui.Surface != nil {
+				decl = ui.Surface.Page
+				if decl == "" {
+					decl = ui.Surface.Markdown
+				}
+			}
+			if low := strings.ToLower(decl); strings.HasSuffix(low, ".yaml") || strings.HasSuffix(low, ".yml") {
+				fail(c, http.StatusBadRequest, 1400,
+					"this surface is a structured page spec — off-node spec edits aren't supported yet (edit on the app's home node)")
+				return
+			}
+		}
+		// Optimistic lock against the existing override only (first-time override
+		// starts from the published/DB baseline — mirrors the disk path).
+		if body.BaseSHA != "" {
+			if cur, has := appSurfaceOverrideGet(userID, app, name); has && contentSHA([]byte(cur)) != body.BaseSHA {
+				fail(c, http.StatusConflict, 1409,
+					"this page changed since you loaded it — reload to pick up the other edit, then reapply yours")
+				return
+			}
+		}
+		if err := appSurfaceOverrideSave(userID, app, name, body.Markdown); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "could not save surface override")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"ok": true, "path": ".ui/" + name + ".md", "bytes": len(body.Markdown),
+				"sha": contentSHA([]byte(body.Markdown))},
+		})
 		return
 	}
 
@@ -704,7 +754,9 @@ func patchXpcloudUISurface(appDir, surfaceName, newPath string) error {
 // caller (publishedRepoBlob's assumption — the publish-and-install-own case,
 // which is how first-party app cards are used today).
 func serveAppSurfaceFromRepo(c *gin.Context, userID, app, name string) bool {
-	specBytes, ok := fetchRepoSpecYAML(userID, app)
+	// specForApp = MeAppSpec DB store → published xp.io repo. Covers
+	// installed-not-published apps that fetchRepoSpecYAML alone missed.
+	specBytes, blobReader, ok := specForApp(userID, app)
 	if !ok {
 		return false
 	}
@@ -717,6 +769,29 @@ func serveAppSurfaceFromRepo(c *gin.Context, userID, app, name string) bool {
 	}
 	_ = yaml.Unmarshal(specBytes, &cfgDoc)
 	appCfg := cfgDoc.Config
+	// Overlay the caller's config override (cross-node PUT /config) so the
+	// surface receives the same config the disk path would after an edit.
+	if raw, has := appConfigOverrideGet(userID, app); has {
+		var over map[string]any
+		if json.Unmarshal([]byte(raw), &over) == nil {
+			appCfg = over
+		}
+	}
+
+	// A markdown-surface override written cross-node (PUT /ui) wins over the
+	// declared file — same local-shadows-published precedence as disk.
+	if ovr, has := appSurfaceOverrideGet(userID, app, name); has {
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"app": app, "surface": name, "path": ".ui/" + name + ".md",
+				"markdown": ovr, "bytes": len(ovr), "truncated": false,
+				"nav": ui.Nav, "config": appCfg, "sha": contentSHA([]byte(ovr)),
+				"source": "local",
+			},
+		})
+		return true
+	}
 
 	var mdPath, native, pagePath string
 	if p, ok := ui.Surfaces[name]; ok {
@@ -739,7 +814,7 @@ func serveAppSurfaceFromRepo(c *gin.Context, userID, app, name string) bool {
 		if strings.Contains(pagePath, "..") || filepath.IsAbs(pagePath) {
 			return false
 		}
-		pb := publishedRepoBlob(userID, app, pagePath)
+		pb := blobReader(pagePath)
 		if pb == nil {
 			return false
 		}
@@ -770,11 +845,11 @@ func serveAppSurfaceFromRepo(c *gin.Context, userID, app, name string) bool {
 		return true
 	}
 
-	// Markdown surface — read the blob from the published repo.
+	// Markdown surface — read the blob (DB ui-file store, else published repo).
 	if strings.Contains(mdPath, "..") || filepath.IsAbs(mdPath) || strings.ToLower(filepath.Ext(mdPath)) != ".md" {
 		return false
 	}
-	body := publishedRepoBlob(userID, app, mdPath)
+	body := blobReader(mdPath)
 	if body == nil {
 		return false
 	}

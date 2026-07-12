@@ -75,40 +75,56 @@ func MeLoopPatch(c *gin.Context) {
 		return
 	}
 
-	// Resolve the app dir: caller's tenant first, then operator-shared
-	// fallback so user-overrides for operator-shared apps land in the
-	// caller's tenant tree (their override doesn't mutate the shared
-	// install).
-	appDir := filepath.Join(tenantAppsDir(userID), app)
-	if st, err := os.Stat(appDir); err != nil || !st.IsDir() {
-		// Try operator-shared, then write overrides under the tenant root.
-		shared := filepath.Join(operatorHome(), ".xp", "apps", app)
-		if st2, err2 := os.Stat(shared); err2 == nil && st2.IsDir() {
-			// Synthesize a tenant app dir for the overrides file only.
-			// The actual code lives in `shared`; the tenant override is a
-			// thin shim. `os.MkdirAll` is idempotent.
-			if err := os.MkdirAll(appDir, 0o775); err != nil {
-				fail(c, http.StatusInternalServerError, 1500, "tenant mkdir: "+err.Error())
-				return
-			}
-		} else {
-			fail(c, http.StatusNotFound, 1404, "app not installed at "+appDir+" (or shared)")
+	// Resolve the app dir: caller's tenant first, then operator-shared. When
+	// neither is on this pod's disk (UKS: bundle on the scheduler PVC), we skip
+	// the disk write entirely and rely on the DB override below — the app must
+	// still be in the caller's installed set (specForApp / install intent) so a
+	// bogus name 404s.
+	tenantDir := filepath.Join(tenantAppsDir(userID), app)
+	appDir := ""
+	if st, err := os.Stat(tenantDir); err == nil && st.IsDir() {
+		appDir = tenantDir
+	} else if shared := filepath.Join(operatorHome(), ".xp", "apps", app); func() bool {
+		st2, err2 := os.Stat(shared)
+		return err2 == nil && st2.IsDir()
+	}() {
+		// Operator-shared: synthesize a tenant override dir (the code lives in
+		// `shared`; the override is a thin shim). os.MkdirAll is idempotent.
+		if err := os.MkdirAll(tenantDir, 0o775); err == nil {
+			appDir = tenantDir
+		}
+	}
+	crossNode := appDir == ""
+	if crossNode {
+		if !appInstalledForUser(userID, app) {
+			fail(c, http.StatusNotFound, 1404, "app not installed in your account")
 			return
 		}
 	}
-	overridesPath := filepath.Join(appDir, ".user-overrides.yaml")
 
-	// Read existing overrides into a forgiving map (preserve any keys
-	// we don't know about so user edits via CLI survive a PATCH).
-	overrides := readSimpleOverrides(overridesPath)
-	if overrides["loops"] == nil {
-		overrides["loops"] = map[string]any{}
+	// Build the effective loop-override map from the request, merged over any
+	// existing on-disk overrides (so unknown/CLI-set keys survive) or, cross-node,
+	// the existing DB override.
+	loopOver := map[string]any{}
+	if crossNode {
+		if raw, has := appLoopOverrideGet(userID, app, loop); has {
+			_ = json.Unmarshal([]byte(raw), &loopOver)
+		}
 	}
-	loopsMap, _ := overrides["loops"].(map[string]any)
-	loopOver, _ := loopsMap[loop].(map[string]any)
-	if loopOver == nil {
-		loopOver = map[string]any{}
+	var overrides map[string]any
+	var overridesPath string
+	if !crossNode {
+		overridesPath = filepath.Join(appDir, ".user-overrides.yaml")
+		overrides = readSimpleOverrides(overridesPath)
+		if overrides["loops"] == nil {
+			overrides["loops"] = map[string]any{}
+		}
+		loopsMap, _ := overrides["loops"].(map[string]any)
+		if lo, _ := loopsMap[loop].(map[string]any); lo != nil {
+			loopOver = lo
+		}
 	}
+
 	if body.Runtime != nil {
 		loopOver["runtime"] = *body.Runtime
 	}
@@ -139,18 +155,33 @@ func MeLoopPatch(c *gin.Context) {
 			loopOver["model"] = m
 		}
 	}
-	loopsMap[loop] = loopOver
-	overrides["loops"] = loopsMap
-	// Audit trail — the file gets re-written every PATCH so we record
-	// the last write timestamp + last-touched user.
-	overrides["_meta"] = map[string]any{
-		"last_modified_at": time.Now().UTC().Format(time.RFC3339),
-		"last_modified_by": userID,
-	}
 
-	if err := writeSimpleOverrides(overridesPath, overrides); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write overrides: "+err.Error())
-		return
+	if crossNode {
+		// Store the loop override in me_docs (kind app_loop_override); the
+		// scheduler pulls it at cycle start via /internal/app-loop-overrides/fetch.
+		ojson, err := json.Marshal(loopOver)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "encode override: "+err.Error())
+			return
+		}
+		if err := appLoopOverrideSave(userID, app, loop, string(ojson)); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "save override: "+err.Error())
+			return
+		}
+	} else {
+		loopsMap, _ := overrides["loops"].(map[string]any)
+		loopsMap[loop] = loopOver
+		overrides["loops"] = loopsMap
+		// Audit trail — the file gets re-written every PATCH so we record
+		// the last write timestamp + last-touched user.
+		overrides["_meta"] = map[string]any{
+			"last_modified_at": time.Now().UTC().Format(time.RFC3339),
+			"last_modified_by": userID,
+		}
+		if err := writeSimpleOverrides(overridesPath, overrides); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "write overrides: "+err.Error())
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",

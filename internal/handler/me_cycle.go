@@ -134,6 +134,29 @@ func MeCyclesList(c *gin.Context) {
 			}
 		}
 	}
+	// Cross-node backfill (ITEM 4): on UKS the cycle dirs live on the scheduler
+	// PVC, so the disk scan above is empty. Synthesize one row per run from the
+	// run store (me_app_runs) — the same source MeTrajectory reconstructs from —
+	// for any (app, loop) the disk scan didn't already cover. Step artifacts stay
+	// PVC-only; this gives the run list its rows + headline ok/duration.
+	haveTs := map[string]bool{}
+	for _, r := range rows {
+		haveTs[r.App+"\x00"+r.Loop+"\x00"+r.Ts] = true
+	}
+	if appFilter != "" {
+		for _, run := range appRunsFor(userID, appFilter, loopFilter) {
+			ts := runTsToCycleTs(run.RunTs)
+			if haveTs[run.App+"\x00"+run.Loop+"\x00"+ts] {
+				continue
+			}
+			item := cycleListItem{App: run.App, Loop: run.Loop, Ts: ts, OK: run.Ok, StepCount: 0}
+			if run.DurationS != nil {
+				item.Duration = *run.DurationS
+			}
+			rows = append(rows, item)
+		}
+	}
+
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Ts != rows[j].Ts {
 			return rows[i].Ts > rows[j].Ts
@@ -147,6 +170,13 @@ func MeCyclesList(c *gin.Context) {
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{"cycles": rows, "count": len(rows)},
 	})
+}
+
+// runTsToCycleTs renders a run-store epoch-seconds RunTs as the canonical cycle
+// timestamp string (20060102T150405Z) the on-disk cycle dirs use, so a
+// synthesized row's ts is drill-in compatible with MeCycleDetail's fallback.
+func runTsToCycleTs(runTs int64) string {
+	return time.Unix(runTs, 0).UTC().Format("20060102T150405Z")
 }
 
 type cycleStep struct {
@@ -179,10 +209,54 @@ func MeCycleDetail(c *gin.Context) {
 	}
 	data, found := cycleDetailForUser(userID, app, loop, ts)
 	if !found {
+		// Cross-node (ITEM 4): the cycle dir lives on the scheduler PVC. Fall
+		// back to the run-store row for headline metrics + status (step artifacts
+		// stay PVC-only — the detail carries an empty steps[] with a note).
+		if d, ok := cycleDetailFromRun(userID, app, loop, ts); ok {
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": d})
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "cycle not found")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
+}
+
+// cycleDetailFromRun reconstructs a cycle's headline view from the run store
+// (me_app_runs) when the on-disk cycle dir isn't visible cross-node. The ts is
+// the canonical cycle-ts string; we match it against each run's rendered ts.
+// Steps are PVC-only, so steps[] is empty and a note explains why. (nil, false)
+// when no run matches.
+func cycleDetailFromRun(userID, app, loop, ts string) (gin.H, bool) {
+	for _, r := range appRunsFor(userID, app, loop) {
+		if runTsToCycleTs(r.RunTs) != ts {
+			continue
+		}
+		summary := gin.H{"ok": r.Ok, "app": app, "loop": loop}
+		if r.DurationS != nil {
+			summary["duration_s"] = *r.DurationS
+		}
+		if r.Model != "" {
+			summary["model"] = r.Model
+		}
+		// Surface the run's own metrics blob under summary.metrics so the
+		// inspector's headline still renders (best-effort parse).
+		if r.Metrics != "" && r.Metrics != "{}" {
+			var m any
+			if json.Unmarshal([]byte(r.Metrics), &m) == nil {
+				summary["metrics"] = m
+			}
+		}
+		return gin.H{
+			"app": app, "loop": loop, "ts": ts,
+			"summary": summary,
+			"steps":   []cycleStep{},
+			"files":   gin.H{},
+			"source":  "run_store",
+			"note":    "step artifacts are on the run's home node (not replicated off-node)",
+		}, true
+	}
+	return nil, false
 }
 
 // cycleDetailForUser is MeCycleDetail's core, shared with the chat tool

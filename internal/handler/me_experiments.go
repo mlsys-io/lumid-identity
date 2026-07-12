@@ -462,6 +462,14 @@ func MeAppExperiment(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
+		// Cross-node (ITEM 4): the runtime ledger is PVC-only. Reconstruct the
+		// experiment declaration from the published/DB spec and overlay run-store
+		// metrics (me_app_runs) — the same source the LIST endpoint uses. Per-case
+		// series stays PVC-only (no results.jsonl off-node).
+		if detail, ok2 := crossNodeExperimentDetail(userID, app, id); ok2 {
+			ok(c, "ok", detail)
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
@@ -471,6 +479,51 @@ func MeAppExperiment(c *gin.Context) {
 		return
 	}
 	ok(c, "ok", detail)
+}
+
+// crossNodeExperimentDetail rebuilds one experiment's detail from the published/
+// DB spec (declaration) overlaid with run-store metrics (state). No results/
+// series/cases — those are PVC runtime data. (nil, false) when the app or the
+// experiment id can't be resolved.
+func crossNodeExperimentDetail(userID, app, id string) (gin.H, bool) {
+	spec, _, ok2 := specForApp(userID, app)
+	if !ok2 {
+		return nil, false
+	}
+	m := parseExpManifestBytes(spec)
+	var decl *expDecl
+	for i := range m.Experiments {
+		if m.Experiments[i].ID == id {
+			decl = &m.Experiments[i]
+			break
+		}
+	}
+	if decl == nil {
+		return nil, false
+	}
+	mname := ""
+	if decl.Metric != nil {
+		if s, ok := decl.Metric["name"].(string); ok {
+			mname = s
+		}
+	}
+	detail := gin.H{
+		"id": decl.ID, "hypothesis": decl.Hypothesis, "kind": decl.Kind,
+		"dataset_id": decl.DatasetID, "metric": decl.Metric,
+		"metric_name": mname, "baseline": decl.Baseline,
+		"success_criteria": decl.Criteria, "min_samples": decl.MinSamples,
+		"status": strOr(decl.Status, "active"),
+		"loops":  expLoops(m)[decl.ID],
+		// PVC-only runtime shapes → clean empties (the UI iterates these).
+		"results": []gin.H{}, "series": []gin.H{}, "cases": []gin.H{},
+		"source": "run_store",
+	}
+	if st := expStateFromRuns(appRunsFor(userID, app, ""), mname, baselineFromDecl(*decl)); st != nil {
+		detail["state"] = st
+	} else {
+		detail["state"] = gin.H{}
+	}
+	return detail, true
 }
 
 // MeAppExperimentCase — the per-case drill: that case's rows, q-level
@@ -490,6 +543,17 @@ func MeAppExperimentCase(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
+		// Cross-node (ITEM 4): per-case rows are runtime data on the PVC. Return
+		// a clean empty (the experiment resolves cross-node, but its per-case
+		// results don't) rather than a console 404.
+		if _, _, resolved := specForApp(userID, app); resolved {
+			ok(c, "ok", gin.H{
+				"case_id": caseID, "rows": []expRow{}, "latest_by_question": gin.H{},
+				"source": "run_store",
+				"note":   "per-case results are on the run's home node (not replicated off-node)",
+			})
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}

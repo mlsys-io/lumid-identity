@@ -119,6 +119,16 @@ func MeAppDatasets(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
+		// Cross-node (ITEM 4): the bundle lives on the scheduler PVC. Enumerate
+		// dataset files from the caller's published repo tree (mirrors
+		// crossNodeCasebook) instead of a blanket 404.
+		if groups, ok := crossNodeDatasets(userID, app); ok {
+			c.JSON(http.StatusOK, gin.H{
+				"ret_code": 0, "message": "ok",
+				"data": gin.H{"app": app, "datasets": groups, "count": len(groups)},
+			})
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
@@ -182,6 +192,53 @@ func MeAppDatasets(c *gin.Context) {
 	})
 }
 
+// crossNodeDatasets enumerates dataset files from the caller's cross-node app
+// tree (specForApp's published/DB reader) when the bundle isn't on this pod's
+// disk. Walks the same datasetDirs the local scan does, listing published-repo
+// blobs per folder. bytes is unknown from a tree listing → 0. ok is false only
+// when the app can't be resolved cross-node at all.
+func crossNodeDatasets(userID, app string) ([]gin.H, bool) {
+	if _, _, resolved := specForApp(userID, app); !resolved {
+		return nil, false
+	}
+	groups := []gin.H{}
+	for _, d := range datasetDirs {
+		names := publishedTreeBlobs(userID, app, d.rel)
+		if len(names) == 0 {
+			continue
+		}
+		files := []gin.H{}
+		for _, name := range names {
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			ext := strings.ToLower(filepath.Ext(name))
+			match := false
+			for _, x := range d.exts {
+				if ext == x {
+					match = true
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			files = append(files, gin.H{
+				"path": filepath.Join(d.rel, name), "name": name,
+				"bytes": 0, "kind": datasetKind(name),
+			})
+		}
+		if len(files) == 0 {
+			continue
+		}
+		sort.Slice(files, func(i, j int) bool {
+			return files[i]["name"].(string) < files[j]["name"].(string)
+		})
+		groups = append(groups, gin.H{"group": d.rel, "label": d.label, "files": files})
+	}
+	return groups, true
+}
+
 // MeAppDatasetFile — GET /me/apps/:app/dataset-file?path=<rel>
 // Returns the file content capped at 64 KB (with a truncated flag).
 func MeAppDatasetFile(c *gin.Context) {
@@ -198,6 +255,31 @@ func MeAppDatasetFile(c *gin.Context) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
+		// Cross-node (ITEM 4): read the dataset file via the published/DB reader.
+		// Path-guard mirrors the disk path (no traversal / absolute).
+		if strings.Contains(rel, "..") || filepath.IsAbs(rel) || strings.ContainsAny(rel, "\x00") {
+			fail(c, http.StatusBadRequest, 1400, "invalid path")
+			return
+		}
+		if _, blobReader, resolved := specForApp(userID, app); resolved {
+			if b := blobReader(rel); b != nil {
+				const maxBytes = 64 * 1024
+				truncated := false
+				if len(b) > maxBytes {
+					b = b[:maxBytes]
+					truncated = true
+				}
+				c.JSON(http.StatusOK, gin.H{
+					"ret_code": 0, "message": "ok",
+					"data": gin.H{
+						"app": app, "path": rel, "name": filepath.Base(rel),
+						"kind": datasetKind(rel), "bytes": len(b),
+						"truncated": truncated, "content": string(b),
+					},
+				})
+				return
+			}
+		}
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}

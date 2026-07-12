@@ -215,6 +215,15 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
+		// Cross-node fallback: the installed bundle lives on the scheduler
+		// PVC, which the identity pods don't mount (the tenant-app-files gap).
+		// Serve the surface from the caller's PUBLISHED xp.io repo instead —
+		// same source v0.3.17 gave casebook/prompts/signals. Without this,
+		// EVERY installed app's markdown/native/page surface 404'd on the
+		// 2-replica identity, rendering a blank Studio surface.
+		if serveAppSurfaceFromRepo(c, userID, app, name) {
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
@@ -684,4 +693,98 @@ func patchXpcloudUISurface(appDir, surfaceName, newPath string) error {
 		_ = os.Remove(readPath)
 	}
 	return nil
+}
+
+// serveAppSurfaceFromRepo is the cross-node fallback for serveAppSurface: when
+// the installed bundle isn't on this pod's disk (identity ≠ scheduler PVC), it
+// resolves the surface from the caller's PUBLISHED xp.io repo — spec via
+// fetchRepoSpecYAML, surface files via publishedRepoBlob. Mirrors the on-disk
+// response shapes (native / page / markdown). Returns false when the repo or
+// surface can't be resolved so the caller can 404. Owner is assumed to be the
+// caller (publishedRepoBlob's assumption — the publish-and-install-own case,
+// which is how first-party app cards are used today).
+func serveAppSurfaceFromRepo(c *gin.Context, userID, app, name string) bool {
+	specBytes, ok := fetchRepoSpecYAML(userID, app)
+	if !ok {
+		return false
+	}
+	ui := parseAppUI(specBytes)
+	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
+		return false
+	}
+	var cfgDoc struct {
+		Config map[string]any `yaml:"config"`
+	}
+	_ = yaml.Unmarshal(specBytes, &cfgDoc)
+	appCfg := cfgDoc.Config
+
+	var mdPath, native, pagePath string
+	if p, ok := ui.Surfaces[name]; ok {
+		mdPath = p
+	} else if name == "home" && ui.Surface != nil {
+		mdPath, native, pagePath = ui.Surface.Markdown, ui.Surface.Native, ui.Surface.Page
+	} else {
+		return false
+	}
+	if lp := strings.ToLower(mdPath); strings.HasSuffix(lp, ".yaml") || strings.HasSuffix(lp, ".yml") {
+		pagePath, mdPath = mdPath, ""
+	}
+	// @-prefixed inherit/shared paths aren't resolvable cross-node — treat as unresolved.
+	if strings.HasPrefix(mdPath, "@") || strings.HasPrefix(pagePath, "@") {
+		return false
+	}
+
+	// Structured page spec → compile on serve.
+	if pagePath != "" {
+		if strings.Contains(pagePath, "..") || filepath.IsAbs(pagePath) {
+			return false
+		}
+		pb := publishedRepoBlob(userID, app, pagePath)
+		if pb == nil {
+			return false
+		}
+		md, cerr := compilePageSpec(pb)
+		if cerr != nil {
+			return false
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"app": app, "surface": name, "markdown": md, "path": pagePath,
+				"nav": ui.Nav, "config": appCfg,
+				"format": "page", "spec": string(pb), "sha": contentSHA(pb),
+			},
+		})
+		return true
+	}
+
+	// Native escape-hatch: no file read needed, the client resolves the key.
+	if mdPath == "" {
+		if native == "" {
+			return false
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"app": app, "surface": name, "native": native, "nav": ui.Nav, "config": appCfg},
+		})
+		return true
+	}
+
+	// Markdown surface — read the blob from the published repo.
+	if strings.Contains(mdPath, "..") || filepath.IsAbs(mdPath) || strings.ToLower(filepath.Ext(mdPath)) != ".md" {
+		return false
+	}
+	body := publishedRepoBlob(userID, app, mdPath)
+	if body == nil {
+		return false
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"app": app, "surface": name, "path": mdPath,
+			"markdown": string(body), "bytes": len(body), "truncated": false,
+			"nav": ui.Nav, "config": appCfg, "sha": contentSHA(body),
+		},
+	})
+	return true
 }

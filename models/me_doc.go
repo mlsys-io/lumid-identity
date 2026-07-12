@@ -16,8 +16,11 @@ import "time"
 // (user, kind, id) with identical CRUD; handlers marshal/unmarshal their own
 // record shapes. Doc is LONGTEXT: chat message arrays can exceed 64KB.
 type MeDoc struct {
-	UserSub   string    `gorm:"column:user_sub;size:36;not null;primaryKey"`
-	Kind      string    `gorm:"column:kind;size:16;not null;primaryKey"` // chat | persona | artifact
+	UserSub string `gorm:"column:user_sub;size:36;not null;primaryKey"`
+	// Kind widened 16→32 for the app-override kinds (app_config_override,
+	// app_surface_override, app_loop_override) added with the cross-node
+	// app-file store — the longest ("app_surface_override") is 20 chars.
+	Kind      string    `gorm:"column:kind;size:32;not null;primaryKey"` // chat | persona | artifact | app_* overrides
 	DocID     string    `gorm:"column:doc_id;size:64;not null;primaryKey"`
 	Doc       string    `gorm:"column:doc;type:longtext"`
 	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime"`

@@ -74,6 +74,13 @@ func RequireSuperAdmin() gin.HandlerFunc {
 	}
 }
 
+// AdminCheck is a no-op probe gated by RequireAdmin (admin or super_admin).
+// It exists so edge nginx can auth_request against it to gate internal doc
+// routes to admins; reaching here means the role check already passed.
+func AdminCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 // ---- handlers ----
 
 type mintInviteReq struct {

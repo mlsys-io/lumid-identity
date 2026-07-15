@@ -155,6 +155,10 @@ func Register(r *gin.Engine) {
 		// but there's one editable row per person, and it lives here.
 		admin := v1.Group("/admin", RequireAdmin())
 		{
+			// No-op admin-gated probe. Used as an nginx auth_request target to
+			// gate internal doc routes (e.g. lum.id/docs/plugin-image-cd) to
+			// admin/super_admin only — RequireAdmin admits both roles.
+			admin.GET("/check", AdminCheck)
 			admin.POST("/invitation-codes", AdminInviteMint)
 			admin.GET("/invitation-codes", AdminInviteList)
 			admin.DELETE("/invitation-codes/:code", AdminInviteRevoke)

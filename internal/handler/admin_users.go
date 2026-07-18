@@ -587,6 +587,13 @@ var capabilityScopes = map[string]bool{
 	// LQT monitored-universe refresh — authorizes ONLY the `universe.refresh`
 	// mailbox topic in lqt-auth (crates/lqt-auth/src/authz.rs). Not a wildcard.
 	"lqt:universe:refresh": true,
+	// LQT strategy deployment — authorizes the `strategy.deploy` mailbox topic
+	// in lqt-auth (crates/lqt-auth/src/authz.rs::TOPIC_AUTHZ). It lets an LQT
+	// user publish/deploy their own strategy. This is a normal user-grantable
+	// capability tag: it confers NO platform access here (parseScope ignores it)
+	// and does NOT imply admin or real-trade — real-trade is gated separately on
+	// the LQT side (super_admin). Not a wildcard; scoped to strategy.deploy only.
+	"lqt:strategy": true,
 }
 
 // isCapabilityScope reports whether a raw scope is an opaque LQT-style

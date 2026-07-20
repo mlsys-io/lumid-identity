@@ -686,38 +686,55 @@ type llmProvider struct {
 // fleet is already paid for), Anthropic as the hosted fallback.
 var llmProviders = []llmProvider{
 	{
-		// kv.run:5000 gemma4 — default. Same Anthropic /v1/messages
-		// gateway, model id from GET kv.run:5000/v1/models. Reasoning
-		// model (emits thinking deltas, handled by the SSE parser).
+		// gemma4 — default. Served by the in-cluster lumid-llm gateway
+		// (LUMID_LLM_BASE, default http://lumid-llm:8088), which speaks the
+		// Anthropic /v1/messages API incl. SSE. Model id from
+		// GET lum.id/llm/v1/models. Reasoning model (emits thinking deltas,
+		// handled by the SSE parser). The old kv.run:5000 endpoint is dead.
 		id:                  "kvrun-gemma4",
-		displayName:         "Gemma-4-26B-A4B (kv.run GPU)",
-		endpoint:            "https://kv.run:5000/v1/messages",
-		upstreamModel:       "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL",
+		displayName:         "Gemma-4-26B-A4B (Lumid GPU)",
+		endpoint:            lumidLLMBase() + "/v1/messages",
+		upstreamModel:       "nvidia/Gemma-4-26B-A4B-NVFP4",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,      // multimodal; image blocks verified via kv.run
-		minRole:             "user",    // everyone
-		maxOutputTokens:     16384,     // 262K ctx, free local GPU — let answers/structured output run
-		dailyBudgetTokens:   2_000_000, // generous backstop; local GPU has no per-call cost
+		supportsVision:      true,   // multimodal; image blocks verified via lumid-llm
+		minRole:             "user", // everyone
+		maxOutputTokens:     16384,  // 262K ctx, free local GPU — let answers/structured output run
+		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
 	{
-		// kv.run:5000 in-cluster inference gateway. Speaks Anthropic
-		// /v1/messages including SSE streaming — drop-in for the
-		// existing parser. See /proj/CLAUDE.md "Cloud LLM inference".
-		id:                  "kvrun-minimax",
-		displayName:         "MiniMax-M2.7 (kv.run GPU)",
-		endpoint:            "https://kv.run:5000/v1/messages",
-		upstreamModel:       "cyankiwi/MiniMax-M2.7-AWQ-4bit",
+		// qwen3.6-35b-a3b — MoE (35B/A3B), vision-capable, 262K context.
+		// Served by lumid-llm (luyao1 GPU1, llama.cpp). Strong general model.
+		id:                  "lumid-qwen3-35b",
+		displayName:         "Qwen3.6-35B-A3B (Lumid GPU)",
+		endpoint:            lumidLLMBase() + "/v1/messages",
+		upstreamModel:       "qwen3.6-35b-a3b",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      false,   // MiniMax is text-only
-		minRole:             "admin", // admin + super_admin
-		maxOutputTokens:     16384,   // 196K ctx, free local GPU
-		dailyBudgetTokens:   2_000_000,
+		supportsVision:      true,   // mmproj vision on luyao1 GPU1
+		minRole:             "user", // everyone — free local GPU
+		maxOutputTokens:     16384,  // 262K ctx
+		dailyBudgetTokens:   -1,
+	},
+	{
+		// qwen3.6-27b — dense 27B, vision-capable, 32K context.
+		// Served by lumid-llm (luyao1 GPU0, llama.cpp).
+		id:                  "lumid-qwen3-27b",
+		displayName:         "Qwen3.6-27B (Lumid GPU)",
+		endpoint:            lumidLLMBase() + "/v1/messages",
+		upstreamModel:       "qwen3.6-27b",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+		supportsVision:      true,   // both luyao1 models are vision-capable
+		minRole:             "user", // everyone — free local GPU
+		maxOutputTokens:     8192,   // 32K ctx — smaller output budget
+		dailyBudgetTokens:   -1,
 	},
 	{
 		// claude-code-sonnet — operator's Claude Code subscription via the
@@ -906,9 +923,6 @@ func firstToolCapableProvider(role string) (llmProvider, bool) {
 		p := llmProviders[i]
 		if isClaudeCodeProvider(p) || !providerAllowed(role, p) {
 			continue
-		}
-		if p.id == "kvrun-minimax" {
-			return p, true
 		}
 		if fallback == nil {
 			fallback = &p
@@ -1600,9 +1614,24 @@ func anthropicKey() (string, error) {
 	return "", fmt.Errorf("no ANTHROPIC_API_KEY set")
 }
 
-// kvrunPAT resolves the operator's Lumid PAT used to authenticate
-// against kv.run:5000/v1/*. Env first (KVRUN_LLM_TOKEN), then
-// /home/webmaster/.lumilake/pat on disk.
+// lumidLLMBase resolves the base URL of the in-cluster lumid-llm gateway
+// (the model-routed proxy that speaks Anthropic /v1/messages). Reads
+// LUMID_LLM_BASE (e.g. http://lumid-llm:8088), defaulting to that in-cluster
+// Service; any trailing slash or accidental /v1[/messages] suffix is trimmed
+// so callers can safely append "/v1/messages".
+func lumidLLMBase() string {
+	base := strings.TrimSpace(os.Getenv("LUMID_LLM_BASE"))
+	if base == "" {
+		base = "http://lumid-llm:8088"
+	}
+	base = strings.TrimRight(base, "/")
+	base = strings.TrimSuffix(base, "/v1/messages")
+	base = strings.TrimSuffix(base, "/v1")
+	return strings.TrimRight(base, "/")
+}
+
+// kvrunPAT resolves the Lumid PAT used to authenticate against the lumid-llm
+// gateway. Env first (KVRUN_LLM_TOKEN), then /home/webmaster/.lumilake/pat.
 func kvrunPAT() (string, error) {
 	if k := strings.TrimSpace(os.Getenv("KVRUN_LLM_TOKEN")); k != "" {
 		return k, nil

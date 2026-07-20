@@ -116,18 +116,18 @@ func TestControlIntentScansLastUserMessage(t *testing.T) {
 }
 
 // TestFirstToolCapableProvider checks role-gated selection of the tool-running
-// provider. A user can't reach minimax (admin-gated) so they fall back to the
-// first allowed provider (gemma4); admin+ get minimax. In no case may the
-// returned provider be a claude-code provider — those run their own toolset and
-// can't see the me_agent registry.
+// provider. The in-cluster GPU models (gemma4, qwen) are all user-tier, so
+// every role falls to the first one (gemma4). In no case may the returned
+// provider be a claude-code provider — those run their own toolset and can't
+// see the me_agent registry.
 func TestFirstToolCapableProvider(t *testing.T) {
 	cases := []struct {
 		role   string
 		wantID string
 	}{
 		{"user", "kvrun-gemma4"},
-		{"admin", "kvrun-minimax"},
-		{"super_admin", "kvrun-minimax"},
+		{"admin", "kvrun-gemma4"},
+		{"super_admin", "kvrun-gemma4"},
 	}
 	for _, c := range cases {
 		t.Run(c.role, func(t *testing.T) {
@@ -146,19 +146,20 @@ func TestFirstToolCapableProvider(t *testing.T) {
 }
 
 // TestProviderAllowed sanity-checks the role gate the selection logic relies on:
-// gemma4 (minRole "user") is open to all; minimax (minRole "admin") is admin+.
+// gemma4 (minRole "user") is open to all; claude-code-sonnet (minRole "admin")
+// is admin+.
 func TestProviderAllowed(t *testing.T) {
-	var gemma, minimax llmProvider
+	var gemma, adminOnly llmProvider
 	for _, p := range llmProviders {
 		switch p.id {
 		case "kvrun-gemma4":
 			gemma = p
-		case "kvrun-minimax":
-			minimax = p
+		case "claude-code-sonnet":
+			adminOnly = p
 		}
 	}
-	if gemma.id == "" || minimax.id == "" {
-		t.Fatalf("expected gemma4 + minimax in llmProviders; got gemma=%q minimax=%q", gemma.id, minimax.id)
+	if gemma.id == "" || adminOnly.id == "" {
+		t.Fatalf("expected gemma4 + claude-code-sonnet in llmProviders; got gemma=%q adminOnly=%q", gemma.id, adminOnly.id)
 	}
 
 	cases := []struct {
@@ -169,9 +170,9 @@ func TestProviderAllowed(t *testing.T) {
 		{"user", gemma, true},
 		{"admin", gemma, true},
 		{"super_admin", gemma, true},
-		{"user", minimax, false},
-		{"admin", minimax, true},
-		{"super_admin", minimax, true},
+		{"user", adminOnly, false},
+		{"admin", adminOnly, true},
+		{"super_admin", adminOnly, true},
 	}
 	for _, c := range cases {
 		t.Run(c.role+"/"+c.p.id, func(t *testing.T) {

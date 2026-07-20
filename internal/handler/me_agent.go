@@ -120,6 +120,9 @@ var destructiveTools = map[string]bool{
 	"account_revoke_pat":  true,
 	"account_set_profile": true,
 	"delete_loop":         true,
+	// Operator control-plane: remediation mutates live stack state (super_admin
+	// only). operator_healthcheck is read-only and intentionally NOT gated.
+	"operator_remediate": true,
 }
 
 // lumidosToolNames is the set of tool names dispatched to the LumidOS schedule
@@ -1803,6 +1806,11 @@ func buildToolDefsForRole(role string) []map[string]any {
 	if role == "admin" || role == "super_admin" {
 		defs = append(defs, adminToolDefs()...)
 		defs = append(defs, clusterToolDefs()...)
+	}
+	// Operator control-plane (ops-agent healthcheck/remediate) is super_admin-only
+	// — the model never sees it for any lesser role; dispatch re-checks too.
+	if role == "super_admin" {
+		defs = append(defs, operatorToolDefs()...)
 	}
 	return defs
 }
@@ -3699,6 +3707,13 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return toolAdminClusters(userID, role, args)
 	case "admin_set_worker_pricing":
 		return toolAdminSetWorkerPricing(userID, role, args)
+	case "operator_healthcheck":
+		dimension, _ := args["dimension"].(string)
+		return toolOperatorHealthcheck(c, userID, role, dimension)
+	case "operator_remediate":
+		dimension, _ := args["dimension"].(string)
+		dryRun, _ := args["dry_run"].(bool)
+		return toolOperatorRemediate(c, userID, role, dimension, dryRun)
 	case "account_list_pat":
 		return toolAccountListPat(userID)
 	case "account_revoke_pat":

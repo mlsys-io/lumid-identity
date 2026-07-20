@@ -1827,6 +1827,8 @@ func buildToolDefsForRole(role string) []map[string]any {
 	defs := append(buildToolDefs(), appOpsToolDefs()...)
 	// Account self-service (own tokens/profile) — available to every role.
 	defs = append(defs, accountToolDefs()...)
+	// Media generation (image + speech via the lumid-llm gateway) — every role.
+	defs = append(defs, mediaToolDefs()...)
 	// Admin control-plane tools are advertised only to admin/super_admin (the
 	// model never sees them otherwise); dispatch re-checks role as well.
 	if role == "admin" || role == "super_admin" {
@@ -1866,6 +1868,7 @@ You have tools to:
   - search the web (web_search), fetch one URL (web_fetch), or run deep research (deep_research)
   - look up financial data by symbol (query_findata)
   - remember things about the user long-term (remember_about_me) — call this whenever the user shares a preference, fact about themselves, or a working style hint that should persist
+  - generate an image from a prompt (generate_image) or synthesize speech from text (text_to_speech) — call these when the user asks you to draw/render a picture or read something aloud; the result appears inline in their artifact panel
 
 When the user expresses an intent, prefer doing the work via tools over describing how they could do it themselves. Confirm what you did in 1-2 sentences after each action. When the user asks you to run, pause, install, fork, or publish something, you MUST call the matching tool in that same turn — never answer with prose alone, and never claim an action happened without its tool result.
 
@@ -3736,6 +3739,10 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return toolAccountSetProfile(c, userID, args)
 	case "delete_loop":
 		return toolDeleteLoop(userID, args)
+	case "generate_image":
+		return toolGenerateImage(c.Request.Context(), userID, args)
+	case "text_to_speech":
+		return toolTextToSpeech(c.Request.Context(), userID, args)
 	}
 
 	// ── Generic app-ops bridge (operate any app from chat) ────────────────

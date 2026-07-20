@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -103,48 +102,13 @@ func lumidLLMMediaPost(ctx context.Context, path string, body map[string]any) ([
 	return respBody, r.Header.Get("Content-Type"), nil
 }
 
-// persistMediaArtifact writes an image/audio artifact (data-URL content) under
-// the caller's tenant, mirroring toolSaveArtifact's envelope + atomic write but
-// with the larger media ceiling. Returns the same small metadata shape.
+// persistMediaArtifact writes an image/audio artifact (data-URL content) for
+// the caller via the shared DB-backed artifact store, with the larger media
+// content ceiling. Returns the same small metadata shape as save_artifact.
 func persistMediaArtifact(userID, kind, title, dataURL, srcTool string) (map[string]any, bool) {
-	if userID == "" {
-		return map[string]any{"error": "no user"}, false
-	}
-	if len(dataURL) > artifactMaxMedia {
-		return map[string]any{"error": fmt.Sprintf("media too large (max %d bytes)", artifactMaxMedia)}, false
-	}
-	if err := os.MkdirAll(artifactsDir(userID), 0o755); err != nil {
-		return map[string]any{"error": "mkdir: " + err.Error()}, false
-	}
-	a := artifact{
-		ID:         newArtifactID(),
-		Kind:       kind,
-		Title:      truncStr(strings.TrimSpace(title), 200),
-		Content:    dataURL,
-		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
-		SourceTool: srcTool,
-	}
-	buf, err := json.Marshal(a)
-	if err != nil {
-		return map[string]any{"error": "marshal: " + err.Error()}, false
-	}
-	tmp := artifactPath(userID, a.ID) + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
-		return map[string]any{"error": "write: " + err.Error()}, false
-	}
-	if err := os.Rename(tmp, artifactPath(userID, a.ID)); err != nil {
-		_ = os.Remove(tmp)
-		return map[string]any{"error": "rename: " + err.Error()}, false
-	}
-	go pruneArtifacts(userID, artifactsKeep)
-	return map[string]any{
-		"id":         a.ID,
-		"kind":       a.Kind,
-		"title":      a.Title,
-		"created_at": a.CreatedAt,
-		"url":        "/api/v1/me/artifacts/" + a.ID,
-		"bytes":      len(dataURL),
-	}, true
+	return persistArtifact(userID, artifact{
+		Kind: kind, Title: strings.TrimSpace(title), Content: dataURL, SourceTool: srcTool,
+	}, artifactMaxMedia)
 }
 
 // toolGenerateImage — generate_image tool handler.

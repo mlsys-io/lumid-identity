@@ -476,6 +476,9 @@ func Register(r *gin.Engine) {
 			// here so the Studio trajectory/experiments surfaces (which can't
 			// read the scheduler PVC) can reconstruct run history. App-agnostic.
 			internal.POST("/app-runs", InternalAppRunRecord)
+			// Claude Code quota reporter — each account's cron/stop-hook
+			// POSTs here; no user session, only X-Bridge-Secret.
+			internal.POST("/claude-quota/report", InternalClaudeQuotaReport)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The
@@ -490,6 +493,9 @@ func Register(r *gin.Engine) {
 		superAdmin := v1.Group("/admin", RequireSuperAdmin())
 		{
 			superAdmin.GET("/oauth-clients", AdminOAuthClientsList)
+			// Claude Code quota across all org accounts — reads stored
+			// CLAUDE_CODE_OAUTH_TOKEN secrets, fetches live from claude.ai.
+			superAdmin.GET("/claude-quota", AdminClaudeQuota)
 		}
 	}
 }

@@ -29,7 +29,7 @@ import (
 	"lumid_identity/models"
 )
 
-const claudeDefaultKey = "CLAUDE_CODE_OAUTH_TOKEN"
+const claudeDefaultKey = common.ClaudeOAuthSecretKey
 
 type claudeVerifyBody struct {
 	Value string `json:"value" binding:"required"`

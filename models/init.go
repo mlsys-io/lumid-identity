@@ -27,6 +27,7 @@ var AllTables = []interface{}{
 	&MeAppIntent{},
 	&MeAppRun{},
 	&MeArtifact{},
+	&ClaudeQuotaSnapshot{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

@@ -12,6 +12,11 @@ import (
 
 var DB *gorm.DB
 
+// ClaudeOAuthSecretKey is the app_secrets key name used by the Studio
+// "Connect Claude" modal (claude_verify.go). Shared constant so the
+// admin quota poller and the verify handler always agree on the name.
+const ClaudeOAuthSecretKey = "CLAUDE_CODE_OAUTH_TOKEN"
+
 // LegacyDB points at trading_community during shadow phase so
 // introspect can mirror LQA without a data copy. nil after cutover.
 var LegacyDB *gorm.DB

@@ -808,12 +808,13 @@ func currentUserRole(c *gin.Context) string {
 }
 
 // defaultProviderFor returns the preferred provider for the caller's role.
-// super_admin defaults to claude-opus (full Anthropic access); everyone
-// else gets gemma4 (in-cluster GPU, no per-call cost).
+// super_admin defaults to claude-code-sonnet (Claude Code subscription — conserves
+// the Opus quota per operator preference; Opus stays selectable in the picker);
+// everyone else gets gemma4 (in-cluster GPU, no per-call cost).
 func defaultProviderFor(role string) llmProvider {
 	if role == "super_admin" {
 		for _, p := range llmProviders {
-			if p.id == "claude-code-opus" {
+			if p.id == "claude-code-sonnet" {
 				return p
 			}
 		}

@@ -4,7 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,6 +15,60 @@ import (
 	"lumid_identity/internal/common"
 	"lumid_identity/internal/config"
 )
+
+// lastUsedBump throttles the per-token last_used_at UPDATE (id -> last write time.Time).
+var lastUsedBump sync.Map
+
+// ── Introspection cache ──────────────────────────────────────────────────────
+// Validate a token once per short TTL instead of re-running argon2id + the token/
+// user SELECTs on EVERY /oauth/introspect. This is the fix for BOTH failure modes
+// seen in prod: (1) the OOM-under-load (lumid-data-service floods introspect; each
+// call held ~s of slow serial DB + a goroutine, piling up until the pod OOMed) and
+// (2) the ~sub-second per-call latency every authed lum.id/llm request pays. Keyed
+// by sha256(token). TTL is short (default 45s) so a revoked/expired token stops
+// validating within the window — set INTROSPECT_CACHE_TTL_SEC=0 to disable.
+type introCacheEntry struct {
+	resp IntrospectResponse
+	exp  time.Time
+}
+
+var (
+	introCache     sync.Map // sha256hex(token) -> introCacheEntry
+	introSweepOnce sync.Once
+)
+
+func introspectTTL() time.Duration {
+	if s := os.Getenv("INTROSPECT_CACHE_TTL_SEC"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 45 * time.Second
+}
+
+func introCacheKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// introCacheSweep starts one background goroutine that evicts expired entries so
+// the map can't grow unbounded across the token population over time.
+func introCacheSweep() {
+	introSweepOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(2 * time.Minute)
+			for range t.C {
+				now := time.Now()
+				introCache.Range(func(k, v any) bool {
+					if e, ok := v.(introCacheEntry); ok && now.After(e.exp) {
+						introCache.Delete(k)
+					}
+					return true
+				})
+			}
+		}()
+	})
+}
 
 // IntrospectResponse follows RFC 7662 with lum.id-specific extras.
 // Anyone calling introspect gets the same shape regardless of which
@@ -63,31 +120,53 @@ func Introspect(c *gin.Context) {
 	// downstream service + must not block on a DB insert.
 	go recordIntrospectAudit(c.ClientIP(), c.GetHeader("User-Agent"), token)
 
+	// Cache lookup: a hit skips argon2id + the token/user SELECTs entirely.
+	ttl := introspectTTL()
+	var key string
+	if ttl > 0 {
+		introCacheSweep()
+		key = introCacheKey(token)
+		if v, ok := introCache.Load(key); ok {
+			if e, ok := v.(introCacheEntry); ok && time.Now().Before(e.exp) {
+				writeIntrospect(c, e.resp)
+				return
+			}
+		}
+	}
+
+	resp := resolveIntrospect(token)
+
+	// Cache determinate verdicts (active, or a real inactive reason like
+	// revoked/expired). Skip "unknown token" so a not-yet-provisioned token
+	// isn't pinned negative. Revocation/expiry takes effect within the TTL.
+	if ttl > 0 && resp.Reason != "unknown token" {
+		introCache.Store(key, introCacheEntry{resp: resp, exp: time.Now().Add(ttl)})
+	}
+	writeIntrospect(c, resp)
+}
+
+// resolveIntrospect runs the actual (expensive) validation: prefix-routed to the
+// legacy/native/JWT paths. Split out of Introspect so the cache wraps it.
+func resolveIntrospect(token string) IntrospectResponse {
 	// Fast path for legacy prefixes during shadow.
 	if config.G.Legacy.Enabled && strings.HasPrefix(token, "rm_pat_") {
 		if resp := introspectLegacyLQA(token); resp != nil {
-			writeIntrospect(c, *resp)
-			return
+			return *resp
 		}
 	}
-
 	// Native lm_* tokens (Phase 3 onward)
 	if strings.HasPrefix(token, "lm_") {
 		if resp := introspectNative(token); resp != nil {
-			writeIntrospect(c, *resp)
-			return
+			return *resp
 		}
 	}
-
 	// JWT (lm_session cookies, Bearer Authorization headers)
 	if strings.Count(token, ".") == 2 {
 		if resp := introspectJWT(token); resp != nil {
-			writeIntrospect(c, *resp)
-			return
+			return *resp
 		}
 	}
-
-	writeIntrospect(c, IntrospectResponse{Active: false, Reason: "unknown token"})
+	return IntrospectResponse{Active: false, Reason: "unknown token"}
 }
 
 // extractIntrospectToken pulls the token out of form body, JSON body,
@@ -228,8 +307,15 @@ func introspectNative(token string) *IntrospectResponse {
 	if row.ExpiresAt != nil && row.ExpiresAt.Before(now) {
 		return &IntrospectResponse{Active: false, Reason: "expired"}
 	}
-	// async last_used_at bump; don't block the reply
-	go common.DB.Exec(`UPDATE tokens SET last_used_at = ? WHERE id = ?`, now, row.ID)
+	// async last_used_at bump; don't block the reply. THROTTLED per-token (>=60s) so a
+	// high-frequency service token (e.g. lumid-data-service hammering introspect) doesn't
+	// flood the DB with UPDATEs — that write storm contends the synchronous token/user
+	// SELECTs (~2s each observed) and piles up goroutines/connections until OOM. The
+	// dashboard only needs minute-granular "last used", so a 60s cooldown is lossless there.
+	if last, ok := lastUsedBump.Load(row.ID); !ok || now.Sub(last.(time.Time)) >= time.Minute {
+		lastUsedBump.Store(row.ID, now)
+		go common.DB.Exec(`UPDATE tokens SET last_used_at = ? WHERE id = ?`, now, row.ID)
+	}
 
 	// Enrich with email/name for downstream ergonomics.
 	var u struct {
@@ -315,11 +401,19 @@ func recordIntrospectAudit(ip, ua, token string) {
 	case strings.Count(token, ".") == 2:
 		prefix = "jwt"
 	}
-	common.DB.Exec(
-		`INSERT INTO audit_log (event, source, path, detail, ip, user_agent)
-		 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?)`,
-		prefix, `{"prefix":"`+prefix+`"}`, ip, ua,
-	)
+	// Only LEGACY prefixes matter for the deprecation-sunset dashboard. The current
+	// lm_pat/jwt paths are the high-volume hot path (lumid-data-service et al.) — auditing
+	// every hit was a pure write-flood that contended the synchronous token/user SELECTs
+	// and drove the introspect OOM. Skip them; keep recording the legacy prefixes we're
+	// actually trying to retire.
+	switch prefix {
+	case "rm_pat-legacy", "rmk-legacy", "flm-legacy":
+		common.DB.Exec(
+			`INSERT INTO audit_log (event, source, path, detail, ip, user_agent)
+			 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?)`,
+			prefix, `{"prefix":"`+prefix+`"}`, ip, ua,
+		)
+	}
 }
 
 // ensureAdminFlowmeshScopes appends flowmesh:workflows:write for admin/super_admin

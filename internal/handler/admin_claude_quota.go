@@ -4,22 +4,30 @@ package handler
 //
 // GET /api/v1/admin/claude-quota  (RequireSuperAdmin)
 //
-// Reads every app_secrets row whose key matches CLAUDE_CODE_OAUTH_TOKEN
-// (or ANTHROPIC_API_KEY for sk-ant-api03 keys — they don't have quota),
-// decrypts the token, and calls https://claude.ai/api/oauth/usage for
-// each. Results are cached in claude_quota_snapshots; the endpoint
-// returns fresh data when the newest snapshot for an account is >5 min
-// old, otherwise returns cached.
+// Reads every row in claude_quota_tokens (admin-managed, email-keyed),
+// decrypts each token, and calls api.anthropic.com/v1/messages with a
+// 1-token probe to read the unified rate-limit headers:
+//   anthropic-ratelimit-unified-5h-utilization  (0-1 float)
+//   anthropic-ratelimit-unified-7d-utilization
+//   anthropic-ratelimit-unified-5h-reset         (Unix seconds)
+//   anthropic-ratelimit-unified-7d-reset
+//   anthropic-ratelimit-unified-5h-status        (allowed | throttled | exceeded)
+//   anthropic-ratelimit-unified-7d-status
+//
+// Results are cached in claude_quota_snapshots; stale (>5 min) snapshots
+// trigger a fresh probe. api.anthropic.com is not Cloudflare-gated, so this
+// works from K8s pods.
 //
 // POST /api/v1/internal/claude-quota/report  (RequireBridge)
-// Legacy bridge path — kept for any external cron. Upserts a snapshot
-// directly without fetching from claude.ai.
+// Legacy bridge path — kept for any external push reporter.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,192 +39,216 @@ import (
 )
 
 const (
-	claudeUsageURL    = "https://claude.ai/api/oauth/usage"
 	quotaCacheTTL     = 5 * time.Minute
-	quotaFetchTimeout = 10 * time.Second
+	quotaFetchTimeout = 20 * time.Second
+	// Minimal probe model — cheapest, fastest; we only need the response headers.
+	quotaProbeModel = "claude-haiku-4-5-20251001"
 )
 
-// fetchClaudeUsage calls the claude.ai usage endpoint with the given
-// OAuth token and returns the raw JSON body.
-func fetchClaudeUsage(token string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, claudeUsageURL, nil)
+// fetchClaudeUsage calls api.anthropic.com/v1/messages with a 1-token probe
+// and reads the unified rate-limit response headers. Works from any server
+// (no Cloudflare on api.anthropic.com). Returns a partially-filled snapshot
+// (Email + Ts are set by the caller).
+func fetchClaudeUsage(token string) (*models.ClaudeQuotaSnapshot, error) {
+	probeBody := []byte(`{"model":"` + quotaProbeModel + `","max_tokens":1,"messages":[{"role":"user","content":"quota"}]}`)
+	req, err := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(probeBody))
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+
 	cl := &http.Client{Timeout: quotaFetchTimeout}
 	resp, err := cl.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("api.anthropic.com unreachable: %w", err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32768))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("claude.ai returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return body, nil
-}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
-type claudeUsagePayload struct {
-	FiveHour *struct {
-		Utilization float64 `json:"utilization"`
-		ResetsAt    string  `json:"resets_at"`
-	} `json:"five_hour"`
-	SevenDay *struct {
-		Utilization float64 `json:"utilization"`
-		ResetsAt    string  `json:"resets_at"`
-	} `json:"seven_day"`
-	Limits []struct {
-		Severity string `json:"severity"`
-		IsActive bool   `json:"is_active"`
-		ResetsAt string `json:"resets_at"`
-		Percent  int    `json:"percent"`
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return nil, fmt.Errorf("token invalid or unauthorized (HTTP %d)", resp.StatusCode)
+	}
+	// 200=ok, 429=rate-limited (headers still present), 400=keyed but bad body — all usable.
+	if resp.StatusCode != 200 && resp.StatusCode != 429 && resp.StatusCode != 400 {
+		return nil, fmt.Errorf("unexpected HTTP %d from Anthropic API", resp.StatusCode)
+	}
+
+	h := resp.Header
+	get := func(k string) string { return h.Get(k) }
+
+	snap := &models.ClaudeQuotaSnapshot{}
+
+	if u, err := strconv.ParseFloat(get("anthropic-ratelimit-unified-5h-utilization"), 64); err == nil {
+		snap.FiveHourPct = u * 100
+	}
+	if u, err := strconv.ParseFloat(get("anthropic-ratelimit-unified-7d-utilization"), 64); err == nil {
+		snap.SevenDayPct = u * 100
+	}
+	if ts, err := strconv.ParseInt(get("anthropic-ratelimit-unified-5h-reset"), 10, 64); err == nil {
+		snap.FiveHourReset = time.Unix(ts, 0)
+	}
+	if ts, err := strconv.ParseInt(get("anthropic-ratelimit-unified-7d-reset"), 10, 64); err == nil {
+		snap.SevenDayReset = time.Unix(ts, 0)
+	}
+
+	fiveStatus := get("anthropic-ratelimit-unified-5h-status")
+	sevenStatus := get("anthropic-ratelimit-unified-7d-status")
+
+	switch {
+	case fiveStatus == "exceeded" || sevenStatus == "exceeded":
+		snap.Severity = "critical"
+	case fiveStatus == "throttled" || sevenStatus == "throttled" ||
+		snap.FiveHourPct >= 85 || snap.SevenDayPct >= 85:
+		snap.Severity = "warning"
+	default:
+		snap.Severity = "normal"
+	}
+
+	// Build a limits array in the shape the UI expects so the badge row renders.
+	type limitEntry struct {
 		Kind     string `json:"kind"`
-	} `json:"limits"`
+		Percent  int    `json:"percent"`
+		IsActive bool   `json:"is_active"`
+		Severity string `json:"severity"`
+		ResetsAt string `json:"resets_at"`
+	}
+	limits := []limitEntry{
+		{
+			Kind:     "five_hour",
+			Percent:  int(snap.FiveHourPct),
+			IsActive: true,
+			Severity: severityFromStatus(fiveStatus, snap.FiveHourPct),
+			ResetsAt: snap.FiveHourReset.Format(time.RFC3339),
+		},
+		{
+			Kind:     "seven_day",
+			Percent:  int(snap.SevenDayPct),
+			IsActive: true,
+			Severity: severityFromStatus(sevenStatus, snap.SevenDayPct),
+			ResetsAt: snap.SevenDayReset.Format(time.RFC3339),
+		},
+	}
+	raw, _ := json.Marshal(map[string]interface{}{
+		"limits": limits,
+		"meta": map[string]string{
+			"five_hour_status":         fiveStatus,
+			"seven_day_status":         sevenStatus,
+			"representative_claim":     get("anthropic-ratelimit-unified-representative-claim"),
+			"fallback_percentage":      get("anthropic-ratelimit-unified-fallback-percentage"),
+			"source":                   "anthropic_api_headers",
+		},
+	})
+	snap.Raw = string(raw)
+	return snap, nil
 }
 
-func parseSeverity(p *claudeUsagePayload) string {
-	for _, l := range p.Limits {
-		if l.Severity == "critical" {
-			return "critical"
-		}
+func severityFromStatus(status string, pct float64) string {
+	switch status {
+	case "exceeded":
+		return "critical"
+	case "throttled":
+		return "warning"
 	}
-	for _, l := range p.Limits {
-		if l.Severity == "warning" {
-			return "warning"
-		}
+	if pct >= 85 {
+		return "warning"
 	}
 	return "normal"
 }
 
-func parseTime(s string) time.Time {
-	t, _ := time.Parse(time.RFC3339, s)
-	return t
-}
-
-// refreshSnapshot fetches live quota for a token+email pair and upserts
-// a ClaudeQuotaSnapshot row. Returns the fresh snapshot or an error.
+// refreshSnapshot fetches live quota and upserts a ClaudeQuotaSnapshot row.
 func refreshSnapshot(email, token string) (*models.ClaudeQuotaSnapshot, error) {
-	raw, err := fetchClaudeUsage(token)
+	snap, err := fetchClaudeUsage(token)
 	if err != nil {
 		return nil, err
 	}
-	var p claudeUsagePayload
-	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, fmt.Errorf("parse usage: %w", err)
-	}
-	snap := models.ClaudeQuotaSnapshot{
-		Email:    email,
-		Severity: parseSeverity(&p),
-		Raw:      string(raw),
-	}
-	if p.FiveHour != nil {
-		snap.FiveHourPct = p.FiveHour.Utilization
-		snap.FiveHourReset = parseTime(p.FiveHour.ResetsAt)
-	}
-	if p.SevenDay != nil {
-		snap.SevenDayPct = p.SevenDay.Utilization
-		snap.SevenDayReset = parseTime(p.SevenDay.ResetsAt)
-	}
-	if err := common.DB.Create(&snap).Error; err != nil {
+	snap.Email = email
+	if err := common.DB.Create(snap).Error; err != nil {
 		return nil, fmt.Errorf("save snapshot: %w", err)
 	}
-	return &snap, nil
+	return snap, nil
+}
+
+type quotaResult struct {
+	Email         string          `json:"email"`
+	Ts            time.Time       `json:"ts"`
+	FiveHourPct   float64         `json:"five_hour_pct"`
+	SevenDayPct   float64         `json:"seven_day_pct"`
+	FiveHourReset time.Time       `json:"five_hour_reset"`
+	SevenDayReset time.Time       `json:"seven_day_reset"`
+	Severity      string          `json:"severity"`
+	Stale         bool            `json:"stale"`
+	Error         string          `json:"error,omitempty"`
+	Limits        json.RawMessage `json:"limits,omitempty"`
+}
+
+func fillFromSnap(res *quotaResult, snap *models.ClaudeQuotaSnapshot) {
+	res.Ts = snap.Ts
+	res.FiveHourPct = snap.FiveHourPct
+	res.SevenDayPct = snap.SevenDayPct
+	res.FiveHourReset = snap.FiveHourReset
+	res.SevenDayReset = snap.SevenDayReset
+	res.Severity = snap.Severity
+	if snap.Raw != "" {
+		var raw map[string]json.RawMessage
+		if json.Unmarshal([]byte(snap.Raw), &raw) == nil {
+			res.Limits = raw["limits"]
+		}
+	}
 }
 
 // GET /api/v1/admin/claude-quota  (RequireSuperAdmin)
 func AdminClaudeQuota(c *gin.Context) {
-	// 1. Find all entries in claude_quota_tokens (admin-managed, email-keyed).
-	//    This table is written exclusively by AdminClaudeTokenAdd and is
-	//    intentionally separate from app_secrets so lumid-only users who
-	//    connect via Studio settings don't pollute the org-wide quota view.
 	var rows []models.ClaudeQuotaToken
 	if err := common.DB.Order("updated_at DESC").Find(&rows).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query tokens: "+err.Error())
 		return
 	}
 
-	// 2. For each user, return cached snapshot if fresh; otherwise refresh.
-	type result struct {
-		Email         string          `json:"email"`
-		Ts            time.Time       `json:"ts"`
-		FiveHourPct   float64         `json:"five_hour_pct"`
-		SevenDayPct   float64         `json:"seven_day_pct"`
-		FiveHourReset time.Time       `json:"five_hour_reset"`
-		SevenDayReset time.Time       `json:"seven_day_reset"`
-		Severity      string          `json:"severity"`
-		Stale         bool            `json:"stale"`
-		Error         string          `json:"error,omitempty"`
-		Limits        json.RawMessage `json:"limits,omitempty"`
-	}
-
-	results := make([]result, len(rows))
+	results := make([]quotaResult, len(rows))
 	var wg sync.WaitGroup
 	for i, row := range rows {
 		wg.Add(1)
 		go func(i int, row models.ClaudeQuotaToken) {
 			defer wg.Done()
-			res := result{Email: row.Email}
+			res := quotaResult{Email: row.Email}
 
-			// Check for a recent cached snapshot.
 			var snap models.ClaudeQuotaSnapshot
-			cacheHit := common.DB.
+			snapErr := common.DB.
 				Where("email = ?", row.Email).
 				Order("ts DESC").
-				First(&snap).Error == nil &&
-				time.Since(snap.Ts) < quotaCacheTTL
+				First(&snap).Error
+			cacheHit := snapErr == nil && time.Since(snap.Ts) < quotaCacheTTL
 
 			if cacheHit {
-				res.Ts = snap.Ts
-				res.FiveHourPct = snap.FiveHourPct
-				res.SevenDayPct = snap.SevenDayPct
-				res.FiveHourReset = snap.FiveHourReset
-				res.SevenDayReset = snap.SevenDayReset
-				res.Severity = snap.Severity
-				if snap.Raw != "" {
-					var raw map[string]json.RawMessage
-					if json.Unmarshal([]byte(snap.Raw), &raw) == nil {
-						res.Limits = raw["limits"]
-					}
-				}
+				fillFromSnap(&res, &snap)
 				results[i] = res
 				return
 			}
 
-			// Decrypt token and fetch fresh.
 			token, err := common.DecryptGrant(row.ValueEncrypted)
 			if err != nil {
 				res.Error = "decrypt: " + err.Error()
 				res.Stale = true
+				if snapErr == nil {
+					fillFromSnap(&res, &snap)
+				}
 				results[i] = res
 				return
 			}
 			fresh, err := refreshSnapshot(row.Email, token)
 			if err != nil {
-				// Return stale cached data if available, with error annotation.
 				res.Stale = true
 				res.Error = err.Error()
-				if cacheHit {
-					res.Ts = snap.Ts
-					res.FiveHourPct = snap.FiveHourPct
-					res.SevenDayPct = snap.SevenDayPct
-					res.Severity = snap.Severity
+				if snapErr == nil {
+					fillFromSnap(&res, &snap)
 				}
 				results[i] = res
 				return
 			}
-			res.Ts = fresh.Ts
-			res.FiveHourPct = fresh.FiveHourPct
-			res.SevenDayPct = fresh.SevenDayPct
-			res.FiveHourReset = fresh.FiveHourReset
-			res.SevenDayReset = fresh.SevenDayReset
-			res.Severity = fresh.Severity
-			if fresh.Raw != "" {
-				var raw map[string]json.RawMessage
-				if json.Unmarshal([]byte(fresh.Raw), &raw) == nil {
-					res.Limits = raw["limits"]
-				}
-			}
+			fillFromSnap(&res, fresh)
 			results[i] = res
 		}(i, row)
 	}
@@ -232,11 +264,6 @@ func AdminClaudeQuota(c *gin.Context) {
 }
 
 // POST /api/v1/admin/claude-token  (RequireSuperAdmin)
-//
-// Stores a Claude OAuth token for any email — no lumid account required.
-// Uses the claude_quota_tokens table (email-keyed) so org members who
-// have a Claude Code subscription but no lumid account can be tracked,
-// and lumid-only users don't bleed into the org quota view.
 func AdminClaudeTokenAdd(c *gin.Context) {
 	var body struct {
 		Email string `json:"email" binding:"required"`

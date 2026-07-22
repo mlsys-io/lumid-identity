@@ -126,35 +126,14 @@ func refreshSnapshot(email, token string) (*models.ClaudeQuotaSnapshot, error) {
 
 // GET /api/v1/admin/claude-quota  (RequireSuperAdmin)
 func AdminClaudeQuota(c *gin.Context) {
-	// 1. Find all users who have a stored CLAUDE_CODE_OAUTH_TOKEN.
-	//    Group by user_sub to get one token per user (latest update wins).
-	type tokenRow struct {
-		UserSub        string
-		Email          string
-		ValueEncrypted string
-		UpdatedAt      time.Time
-	}
-	var rows []tokenRow
-	err := common.DB.Raw(`
-		SELECT s.user_sub, u.email, s.value_encrypted, s.updated_at
-		FROM app_secrets s
-		JOIN users u ON u.id = s.user_sub
-		WHERE s.key = ?
-		ORDER BY s.updated_at DESC
-	`, common.ClaudeOAuthSecretKey).Scan(&rows).Error
-	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "query secrets: "+err.Error())
+	// 1. Find all entries in claude_quota_tokens (admin-managed, email-keyed).
+	//    This table is written exclusively by AdminClaudeTokenAdd and is
+	//    intentionally separate from app_secrets so lumid-only users who
+	//    connect via Studio settings don't pollute the org-wide quota view.
+	var rows []models.ClaudeQuotaToken
+	if err := common.DB.Order("updated_at DESC").Find(&rows).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "query tokens: "+err.Error())
 		return
-	}
-
-	// Deduplicate by user_sub — keep newest (already sorted).
-	seen := map[string]bool{}
-	var unique []tokenRow
-	for _, r := range rows {
-		if !seen[r.UserSub] {
-			seen[r.UserSub] = true
-			unique = append(unique, r)
-		}
 	}
 
 	// 2. For each user, return cached snapshot if fresh; otherwise refresh.
@@ -171,11 +150,11 @@ func AdminClaudeQuota(c *gin.Context) {
 		Limits        json.RawMessage `json:"limits,omitempty"`
 	}
 
-	results := make([]result, len(unique))
+	results := make([]result, len(rows))
 	var wg sync.WaitGroup
-	for i, row := range unique {
+	for i, row := range rows {
 		wg.Add(1)
-		go func(i int, row tokenRow) {
+		go func(i int, row models.ClaudeQuotaToken) {
 			defer wg.Done()
 			res := result{Email: row.Email}
 
@@ -247,22 +226,21 @@ func AdminClaudeQuota(c *gin.Context) {
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
 			"accounts": results,
-			"count":    len(results),
+			"count":    len(rows),
 		},
 	})
 }
 
 // POST /api/v1/admin/claude-token  (RequireSuperAdmin)
 //
-// Lets super_admin store a Claude OAuth token for any user by email.
-// The token is verified against the Anthropic API before storage.
-// On success the account will appear in the /admin/claude-quota view
-// within the next 5-minute cache cycle.
+// Stores a Claude OAuth token for any email — no lumid account required.
+// Uses the claude_quota_tokens table (email-keyed) so org members who
+// have a Claude Code subscription but no lumid account can be tracked,
+// and lumid-only users don't bleed into the org quota view.
 func AdminClaudeTokenAdd(c *gin.Context) {
 	var body struct {
 		Email string `json:"email" binding:"required"`
 		Token string `json:"token" binding:"required"`
-		App   string `json:"app"` // default "studio"
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -270,50 +248,35 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	}
 	token := strings.TrimSpace(body.Token)
 	email := strings.TrimSpace(strings.ToLower(body.Email))
-	app := strings.TrimSpace(body.App)
-	if app == "" {
-		app = "studio"
-	}
 
-	// Look up user by email.
-	var user models.User
-	if err := common.DB.Where("LOWER(email) = ?", email).First(&user).Error; err != nil {
-		fail(c, http.StatusNotFound, 1404, "user not found: "+email)
-		return
-	}
-
-	// Verify against Anthropic.
+	// Verify against Anthropic before storing.
 	valid, status, reason := verifyAnthropic(token)
 	if !valid {
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "invalid",
 			"data": gin.H{
-				"email": user.Email, "valid": false, "stored": false,
+				"email": email, "valid": false, "stored": false,
 				"upstream_status": status, "reason": reason,
 			},
 		})
 		return
 	}
 
-	// Encrypt and upsert into app_secrets.
+	// Encrypt and upsert into claude_quota_tokens (email is PK).
 	enc, err := common.EncryptGrant(token)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "encrypt: "+err.Error())
 		return
 	}
-	now := time.Now().UTC()
-	sec := models.AppSecret{
-		UserSub: user.ID, AppSlug: app, Key: claudeDefaultKey,
-		ValueEncrypted: enc, CreatedAt: now, UpdatedAt: now,
-	}
-	if err := common.DB.Save(&sec).Error; err != nil {
+	row := models.ClaudeQuotaToken{Email: email, ValueEncrypted: enc}
+	if err := common.DB.Save(&row).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"email": user.Email, "valid": true, "stored": true,
+			"email": email, "valid": true, "stored": true,
 			"upstream_status": status, "reason": reason,
 		},
 	})

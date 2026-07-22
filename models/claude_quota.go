@@ -2,6 +2,19 @@ package models
 
 import "time"
 
+// ClaudeQuotaToken — admin-managed token store for org members' Claude
+// Code OAuth tokens, keyed by email. Intentionally decoupled from the
+// lumid users table so non-lumid Claude Code users (e.g. yuncong@lum.id)
+// can be tracked without requiring a lumid account.
+type ClaudeQuotaToken struct {
+	Email          string    `gorm:"type:varchar(255);primaryKey"       json:"email"`
+	ValueEncrypted string    `gorm:"type:text;not null"                 json:"-"`
+	CreatedAt      time.Time `gorm:"autoCreateTime"                     json:"created_at"`
+	UpdatedAt      time.Time `gorm:"autoUpdateTime"                     json:"updated_at"`
+}
+
+func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }
+
 // ClaudeQuotaSnapshot — one row per account per poll cycle.
 // Stores the latest snapshot from https://claude.ai/api/oauth/usage.
 // The reporter script (run as a cron or stop-hook on each machine)

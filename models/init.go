@@ -27,6 +27,7 @@ var AllTables = []interface{}{
 	&MeAppIntent{},
 	&MeAppRun{},
 	&MeArtifact{},
+	&ClaudeQuotaToken{},
 	&ClaudeQuotaSnapshot{},
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,6 +13,9 @@ import (
 	"lumid_identity/internal/common"
 	"lumid_identity/internal/config"
 )
+
+// lastUsedBump throttles the per-token last_used_at UPDATE (id -> last write time.Time).
+var lastUsedBump sync.Map
 
 // IntrospectResponse follows RFC 7662 with lum.id-specific extras.
 // Anyone calling introspect gets the same shape regardless of which
@@ -228,8 +232,15 @@ func introspectNative(token string) *IntrospectResponse {
 	if row.ExpiresAt != nil && row.ExpiresAt.Before(now) {
 		return &IntrospectResponse{Active: false, Reason: "expired"}
 	}
-	// async last_used_at bump; don't block the reply
-	go common.DB.Exec(`UPDATE tokens SET last_used_at = ? WHERE id = ?`, now, row.ID)
+	// async last_used_at bump; don't block the reply. THROTTLED per-token (>=60s) so a
+	// high-frequency service token (e.g. lumid-data-service hammering introspect) doesn't
+	// flood the DB with UPDATEs — that write storm contends the synchronous token/user
+	// SELECTs (~2s each observed) and piles up goroutines/connections until OOM. The
+	// dashboard only needs minute-granular "last used", so a 60s cooldown is lossless there.
+	if last, ok := lastUsedBump.Load(row.ID); !ok || now.Sub(last.(time.Time)) >= time.Minute {
+		lastUsedBump.Store(row.ID, now)
+		go common.DB.Exec(`UPDATE tokens SET last_used_at = ? WHERE id = ?`, now, row.ID)
+	}
 
 	// Enrich with email/name for downstream ergonomics.
 	var u struct {
@@ -315,11 +326,19 @@ func recordIntrospectAudit(ip, ua, token string) {
 	case strings.Count(token, ".") == 2:
 		prefix = "jwt"
 	}
-	common.DB.Exec(
-		`INSERT INTO audit_log (event, source, path, detail, ip, user_agent)
-		 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?)`,
-		prefix, `{"prefix":"`+prefix+`"}`, ip, ua,
-	)
+	// Only LEGACY prefixes matter for the deprecation-sunset dashboard. The current
+	// lm_pat/jwt paths are the high-volume hot path (lumid-data-service et al.) — auditing
+	// every hit was a pure write-flood that contended the synchronous token/user SELECTs
+	// and drove the introspect OOM. Skip them; keep recording the legacy prefixes we're
+	// actually trying to retire.
+	switch prefix {
+	case "rm_pat-legacy", "rmk-legacy", "flm-legacy":
+		common.DB.Exec(
+			`INSERT INTO audit_log (event, source, path, detail, ip, user_agent)
+			 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?)`,
+			prefix, `{"prefix":"`+prefix+`"}`, ip, ua,
+		)
+	}
 }
 
 // ensureAdminFlowmeshScopes appends flowmesh:workflows:write for admin/super_admin

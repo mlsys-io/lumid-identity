@@ -496,6 +496,7 @@ func Register(r *gin.Engine) {
 			// Claude Code quota across all org accounts — reads stored
 			// CLAUDE_CODE_OAUTH_TOKEN secrets, fetches live from claude.ai.
 			superAdmin.GET("/claude-quota", AdminClaudeQuota)
+			superAdmin.POST("/claude-token", AdminClaudeTokenAdd)
 		}
 	}
 }

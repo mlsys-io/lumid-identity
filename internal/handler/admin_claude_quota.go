@@ -252,6 +252,73 @@ func AdminClaudeQuota(c *gin.Context) {
 	})
 }
 
+// POST /api/v1/admin/claude-token  (RequireSuperAdmin)
+//
+// Lets super_admin store a Claude OAuth token for any user by email.
+// The token is verified against the Anthropic API before storage.
+// On success the account will appear in the /admin/claude-quota view
+// within the next 5-minute cache cycle.
+func AdminClaudeTokenAdd(c *gin.Context) {
+	var body struct {
+		Email string `json:"email" binding:"required"`
+		Token string `json:"token" binding:"required"`
+		App   string `json:"app"` // default "studio"
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	token := strings.TrimSpace(body.Token)
+	email := strings.TrimSpace(strings.ToLower(body.Email))
+	app := strings.TrimSpace(body.App)
+	if app == "" {
+		app = "studio"
+	}
+
+	// Look up user by email.
+	var user models.User
+	if err := common.DB.Where("LOWER(email) = ?", email).First(&user).Error; err != nil {
+		fail(c, http.StatusNotFound, 1404, "user not found: "+email)
+		return
+	}
+
+	// Verify against Anthropic.
+	valid, status, reason := verifyAnthropic(token)
+	if !valid {
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "invalid",
+			"data": gin.H{
+				"email": user.Email, "valid": false, "stored": false,
+				"upstream_status": status, "reason": reason,
+			},
+		})
+		return
+	}
+
+	// Encrypt and upsert into app_secrets.
+	enc, err := common.EncryptGrant(token)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "encrypt: "+err.Error())
+		return
+	}
+	now := time.Now().UTC()
+	sec := models.AppSecret{
+		UserSub: user.ID, AppSlug: app, Key: claudeDefaultKey,
+		ValueEncrypted: enc, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := common.DB.Save(&sec).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"email": user.Email, "valid": true, "stored": true,
+			"upstream_status": status, "reason": reason,
+		},
+	})
+}
+
 // reportBody is the wire shape for the legacy bridge path.
 type claudeQuotaReportBody struct {
 	Email         string  `json:"email"          binding:"required"`

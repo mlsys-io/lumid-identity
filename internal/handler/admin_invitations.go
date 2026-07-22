@@ -19,9 +19,27 @@ import (
 
 // ---- middleware ----
 
-// RequireAdmin blocks callers whose JWT doesn't carry role=admin.
-// Relies on the session cookie (lm_session) or Authorization header,
-// whichever currentUserID resolves through common.VerifyJWT.
+// resolveRole returns (userID, role, ok) for a bearer token.
+// Handles both JWTs (fast, no DB) and lm_pat_* / rm_pat_* tokens
+// (DB lookup for the owning user's role).
+func resolveRole(tok string) (userID, role string, ok bool) {
+	if claims, err := common.VerifyJWT(tok); err == nil {
+		return claims.Subject, claims.Role, true
+	}
+	if strings.HasPrefix(tok, "lm_pat_") || strings.HasPrefix(tok, "rm_pat_") {
+		if row, found := lookupPAT(tok); found {
+			var u models.User
+			if err := common.DB.Select("id, role").Where("id = ?", row.UserID).First(&u).Error; err == nil {
+				return u.ID, u.Role, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// RequireAdmin blocks callers whose credential doesn't carry role=admin.
+// Accepts session JWTs (lm_session cookie or Authorization header) and
+// lm_pat_* / rm_pat_* tokens whose owning account has role=admin|super_admin.
 func RequireAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tok := bearerToken(c)
@@ -30,18 +48,18 @@ func RequireAdmin() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		claims, err := common.VerifyJWT(tok)
-		if err != nil {
+		userID, role, ok := resolveRole(tok)
+		if !ok {
 			fail(c, http.StatusUnauthorized, 1003, "invalid session")
 			c.Abort()
 			return
 		}
-		if claims.Role != "admin" && claims.Role != "super_admin" {
+		if role != "admin" && role != "super_admin" {
 			fail(c, http.StatusForbidden, 1005, "admin required")
 			c.Abort()
 			return
 		}
-		c.Set("admin_user_id", claims.Subject)
+		c.Set("admin_user_id", userID)
 		c.Next()
 	}
 }
@@ -50,6 +68,7 @@ func RequireAdmin() gin.HandlerFunc {
 // accounting routes use this so a regular admin (operations) can't
 // touch money-moving endpoints. super_admin inherits everything
 // admin can do; additional authority is scoped to this gate.
+// Accepts session JWTs and lm_pat_* / rm_pat_* tokens from super_admin accounts.
 func RequireSuperAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tok := bearerToken(c)
@@ -58,20 +77,28 @@ func RequireSuperAdmin() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		claims, err := common.VerifyJWT(tok)
-		if err != nil {
+		userID, role, ok := resolveRole(tok)
+		if !ok {
 			fail(c, http.StatusUnauthorized, 1003, "invalid session")
 			c.Abort()
 			return
 		}
-		if claims.Role != "super_admin" {
+		if role != "super_admin" {
 			fail(c, http.StatusForbidden, 1005, "super_admin required")
 			c.Abort()
 			return
 		}
-		c.Set("admin_user_id", claims.Subject)
+		c.Set("admin_user_id", userID)
 		c.Next()
 	}
+}
+
+// SuperAdminCheck — lightweight probe for nginx auth_request.
+// Returns 200 if caller is super_admin, 401/403 otherwise (handled by the
+// RequireSuperAdmin middleware on this group). nginx forwards the
+// lm_session cookie so browser sessions are checked server-side.
+func SuperAdminCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // AdminCheck is a no-op probe gated by RequireAdmin (admin or super_admin).

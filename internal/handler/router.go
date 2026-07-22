@@ -492,9 +492,11 @@ func Register(r *gin.Engine) {
 		// super_admin-only — billing/accounting/secrets endpoints.
 		superAdmin := v1.Group("/admin", RequireSuperAdmin())
 		{
+			// Lightweight probe for nginx auth_request on /quota and other
+			// super_admin-only pages. Returns 200 if the session cookie or
+			// bearer token belongs to a super_admin, otherwise 401/403.
+			superAdmin.GET("/super-check", SuperAdminCheck)
 			superAdmin.GET("/oauth-clients", AdminOAuthClientsList)
-			// Claude Code quota across all org accounts — reads stored
-			// CLAUDE_CODE_OAUTH_TOKEN secrets, fetches live from claude.ai.
 			superAdmin.GET("/claude-quota", AdminClaudeQuota)
 			superAdmin.POST("/claude-token", AdminClaudeTokenAdd)
 		}

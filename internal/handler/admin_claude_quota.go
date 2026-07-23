@@ -18,6 +18,9 @@ package handler
 // trigger a fresh probe. api.anthropic.com is not Cloudflare-gated, so this
 // works from K8s pods.
 //
+// DELETE /api/v1/admin/claude-token/:email  (RequireSuperAdmin)
+// Removes a Claude token and its snapshots for the given email.
+
 // POST /api/v1/internal/claude-quota/report  (RequireBridge)
 // Legacy bridge path — kept for any external push reporter.
 
@@ -37,6 +40,78 @@ import (
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
 )
+
+const (
+	claudeOAuthTokenURL = "https://platform.claude.com/v1/oauth/token"
+	claudeOAuthClientID = "https://claude.ai/oauth/claude-code-client-metadata"
+)
+
+// tryRefreshToken attempts to exchange a stored refresh token for a new access
+// token. On success it updates the DB row and returns the new access token.
+func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
+	if row.RefreshTokenEncrypted == "" {
+		return "", fmt.Errorf("no refresh token stored")
+	}
+	refreshTok, err := common.DecryptGrant(row.RefreshTokenEncrypted)
+	if err != nil {
+		return "", fmt.Errorf("decrypt refresh token: %w", err)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshTok,
+		"client_id":     claudeOAuthClientID,
+	})
+	req, err := http.NewRequest(http.MethodPost, claudeOAuthTokenURL, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+
+	cl := &http.Client{Timeout: quotaFetchTimeout}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("token refresh network error: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+
+	if resp.StatusCode != 200 {
+		var errResp struct {
+			Error string `json:"error"`
+			Desc  string `json:"error_description"`
+		}
+		_ = json.Unmarshal(raw, &errResp)
+		if errResp.Error != "" {
+			return "", fmt.Errorf("token refresh failed: %s — %s", errResp.Error, errResp.Desc)
+		}
+		return "", fmt.Errorf("token refresh HTTP %d", resp.StatusCode)
+	}
+
+	var tok struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(raw, &tok); err != nil || tok.AccessToken == "" {
+		return "", fmt.Errorf("token refresh: invalid response body")
+	}
+
+	// Persist updated access token (and new refresh token if rotated).
+	newEnc, err := common.EncryptGrant(tok.AccessToken)
+	if err != nil {
+		return tok.AccessToken, fmt.Errorf("encrypt new token: %w", err)
+	}
+	updates := map[string]interface{}{"value_encrypted": newEnc}
+	if tok.RefreshToken != "" && tok.RefreshToken != refreshTok {
+		newRefEnc, _ := common.EncryptGrant(tok.RefreshToken)
+		if newRefEnc != "" {
+			updates["refresh_token_encrypted"] = newRefEnc
+		}
+	}
+	common.DB.Model(row).Updates(updates)
+	return tok.AccessToken, nil
+}
 
 const (
 	quotaCacheTTL     = 5 * time.Minute
@@ -159,12 +234,26 @@ func severityFromStatus(status string, pct float64) string {
 }
 
 // refreshSnapshot fetches live quota and upserts a ClaudeQuotaSnapshot row.
-func refreshSnapshot(email, token string) (*models.ClaudeQuotaSnapshot, error) {
+// If the probe returns 401 and the row has a refresh token, it auto-refreshes
+// the access token and retries once.
+func refreshSnapshot(row *models.ClaudeQuotaToken, token string) (*models.ClaudeQuotaSnapshot, error) {
 	snap, err := fetchClaudeUsage(token)
 	if err != nil {
-		return nil, err
+		// On auth failure, try to refresh if we have a refresh token.
+		if strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403") {
+			newTok, refreshErr := tryRefreshToken(row)
+			if refreshErr != nil {
+				return nil, fmt.Errorf("%w (refresh also failed: %s)", err, refreshErr.Error())
+			}
+			snap, err = fetchClaudeUsage(newTok)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
-	snap.Email = email
+	snap.Email = row.Email
 	if err := common.DB.Create(snap).Error; err != nil {
 		return nil, fmt.Errorf("save snapshot: %w", err)
 	}
@@ -238,7 +327,7 @@ func AdminClaudeQuota(c *gin.Context) {
 				results[i] = res
 				return
 			}
-			fresh, err := refreshSnapshot(row.Email, token)
+			fresh, err := refreshSnapshot(&row, token)
 			if err != nil {
 				res.Stale = true
 				res.Error = err.Error()
@@ -263,11 +352,12 @@ func AdminClaudeQuota(c *gin.Context) {
 	})
 }
 
-// POST /api/v1/admin/claude-token  (RequireSuperAdmin)
+// POST /api/v1/admin/claude-token  (RequireAdmin)
 func AdminClaudeTokenAdd(c *gin.Context) {
 	var body struct {
-		Email string `json:"email" binding:"required"`
-		Token string `json:"token" binding:"required"`
+		Email        string `json:"email"         binding:"required"`
+		Token        string `json:"token"         binding:"required"`
+		RefreshToken string `json:"refresh_token"` // optional; enables auto-refresh on 401
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -275,6 +365,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	}
 	token := strings.TrimSpace(body.Token)
 	email := strings.TrimSpace(strings.ToLower(body.Email))
+	refreshTok := strings.TrimSpace(body.RefreshToken)
 
 	// Verify against Anthropic before storing.
 	valid, status, reason := verifyAnthropic(token)
@@ -296,6 +387,14 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		return
 	}
 	row := models.ClaudeQuotaToken{Email: email, ValueEncrypted: enc}
+	if refreshTok != "" {
+		refEnc, err := common.EncryptGrant(refreshTok)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "encrypt refresh: "+err.Error())
+			return
+		}
+		row.RefreshTokenEncrypted = refEnc
+	}
 	if err := common.DB.Save(&row).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
 		return
@@ -304,9 +403,27 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
 			"email": email, "valid": true, "stored": true,
-			"upstream_status": status, "reason": reason,
+			"has_refresh_token": refreshTok != "",
+			"upstream_status":   status, "reason": reason,
 		},
 	})
+}
+
+// AdminClaudeTokenDelete removes a tracked Claude token (and its snapshots) by email.
+// DELETE /api/v1/admin/claude-token/:email  (RequireSuperAdmin)
+func AdminClaudeTokenDelete(c *gin.Context) {
+	email := strings.TrimSpace(strings.ToLower(c.Param("email")))
+	if email == "" {
+		fail(c, http.StatusBadRequest, 1400, "email required")
+		return
+	}
+	if err := common.DB.Where("email = ?", email).Delete(&models.ClaudeQuotaToken{}).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "delete token: "+err.Error())
+		return
+	}
+	// Best-effort cleanup of historical snapshots.
+	common.DB.Where("email = ?", email).Delete(&models.ClaudeQuotaSnapshot{})
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
 }
 
 // reportBody is the wire shape for the legacy bridge path.

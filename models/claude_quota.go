@@ -7,10 +7,11 @@ import "time"
 // lumid users table so non-lumid Claude Code users (e.g. yuncong@lum.id)
 // can be tracked without requiring a lumid account.
 type ClaudeQuotaToken struct {
-	Email          string    `gorm:"type:varchar(255);primaryKey"       json:"email"`
-	ValueEncrypted string    `gorm:"type:text;not null"                 json:"-"`
-	CreatedAt      time.Time `gorm:"autoCreateTime"                     json:"created_at"`
-	UpdatedAt      time.Time `gorm:"autoUpdateTime"                     json:"updated_at"`
+	Email                 string    `gorm:"type:varchar(255);primaryKey"       json:"email"`
+	ValueEncrypted        string    `gorm:"type:text;not null"                 json:"-"`
+	RefreshTokenEncrypted string    `gorm:"type:text"                          json:"-"`
+	CreatedAt             time.Time `gorm:"autoCreateTime"                     json:"created_at"`
+	UpdatedAt             time.Time `gorm:"autoUpdateTime"                     json:"updated_at"`
 }
 
 func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }

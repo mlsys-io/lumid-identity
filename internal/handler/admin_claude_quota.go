@@ -46,9 +46,38 @@ const (
 	claudeOAuthClientID = "https://claude.ai/oauth/claude-code-client-metadata"
 )
 
+// refreshMutexes serialises token refresh per email. Anthropic rotates the
+// refresh token on every exchange, so two concurrent refreshes with the same
+// refresh token (e.g. a dashboard probe racing a pool lease) would invalidate
+// one side's rotated credentials.
+var refreshMutexes sync.Map // email -> *sync.Mutex
+
+func refreshMutex(email string) *sync.Mutex {
+	m, _ := refreshMutexes.LoadOrStore(email, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // tryRefreshToken attempts to exchange a stored refresh token for a new access
 // token. On success it updates the DB row and returns the new access token.
+// Serialised per email; if another goroutine refreshed within the last 30s the
+// already-rotated access token is returned without a second exchange.
 func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
+	mu := refreshMutex(row.Email)
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Re-read: another goroutine may have refreshed while we waited on the lock.
+	var fresh models.ClaudeQuotaToken
+	if err := common.DB.Where("email = ?", row.Email).First(&fresh).Error; err == nil {
+		if time.Since(fresh.UpdatedAt) < 30*time.Second && fresh.ValueEncrypted != row.ValueEncrypted {
+			if tok, err := common.DecryptGrant(fresh.ValueEncrypted); err == nil {
+				*row = fresh
+				return tok, nil
+			}
+		}
+		*row = fresh
+	}
+
 	if row.RefreshTokenEncrypted == "" {
 		return "", fmt.Errorf("no refresh token stored")
 	}
@@ -424,6 +453,119 @@ func AdminClaudeTokenDelete(c *gin.Context) {
 	// Best-effort cleanup of historical snapshots.
 	common.DB.Where("email = ?", email).Delete(&models.ClaudeQuotaSnapshot{})
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
+}
+
+// InternalClaudeTokenLease hands the claude-proxy service the healthiest
+// pooled account's decrypted access token.
+//
+// POST /api/v1/internal/claude-token/lease  (RequireBridge)
+// Body (all optional): {"prefer_email": "...", "exclude": ["...", ...]}
+//
+// Selection: prefer_email if usable, else lowest 5h utilization among accounts
+// whose latest snapshot isn't critical (5h exceeded). Accounts with a stale
+// (>5 min) or missing snapshot are probed via refreshSnapshot — which also
+// auto-refreshes an expired access token. Unusable accounts are skipped.
+func InternalClaudeTokenLease(c *gin.Context) {
+	var body struct {
+		PreferEmail string   `json:"prefer_email"`
+		Exclude     []string `json:"exclude"`
+	}
+	_ = c.ShouldBindJSON(&body) // empty body is fine
+
+	excluded := map[string]bool{}
+	for _, e := range body.Exclude {
+		excluded[strings.ToLower(strings.TrimSpace(e))] = true
+	}
+	prefer := strings.ToLower(strings.TrimSpace(body.PreferEmail))
+
+	var rows []models.ClaudeQuotaToken
+	if err := common.DB.Find(&rows).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "query tokens: "+err.Error())
+		return
+	}
+
+	type cand struct {
+		row  models.ClaudeQuotaToken
+		snap *models.ClaudeQuotaSnapshot
+	}
+	var cands []cand
+	for _, row := range rows {
+		if excluded[row.Email] {
+			continue
+		}
+		var snap models.ClaudeQuotaSnapshot
+		var sp *models.ClaudeQuotaSnapshot
+		if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil {
+			sp = &snap
+		}
+		// Skip accounts that are known-exceeded on a fresh snapshot; a stale
+		// critical snapshot falls through to a re-probe below.
+		if sp != nil && sp.Severity == "critical" && time.Since(sp.Ts) < quotaCacheTTL {
+			continue
+		}
+		cands = append(cands, cand{row, sp})
+	}
+
+	// Order: prefer_email first, then by remaining headroom — the binding
+	// constraint is whichever window is fuller, so sort by max(5h, 7d)
+	// ascending (an account at 5h=0/7d=99 is nearly spent, not idle).
+	// Accounts without a snapshot sort last — they cost a probe.
+	sortKey := func(cd cand) float64 {
+		if cd.row.Email == prefer {
+			return -1
+		}
+		if cd.snap == nil {
+			return 200
+		}
+		if cd.snap.SevenDayPct > cd.snap.FiveHourPct {
+			return cd.snap.SevenDayPct
+		}
+		return cd.snap.FiveHourPct
+	}
+	for i := 1; i < len(cands); i++ {
+		for j := i; j > 0 && sortKey(cands[j]) < sortKey(cands[j-1]); j-- {
+			cands[j], cands[j-1] = cands[j-1], cands[j]
+		}
+	}
+
+	for _, cd := range cands {
+		row := cd.row
+		token, err := common.DecryptGrant(row.ValueEncrypted)
+		if err != nil {
+			continue
+		}
+		snap := cd.snap
+		if snap == nil || time.Since(snap.Ts) >= quotaCacheTTL {
+			fresh, err := refreshSnapshot(&row, token)
+			if err != nil {
+				continue // dead token with no working refresh — skip
+			}
+			snap = fresh
+			if snap.Severity == "critical" {
+				continue
+			}
+			// refreshSnapshot may have rotated the access token — re-read.
+			var r2 models.ClaudeQuotaToken
+			if common.DB.Where("email = ?", row.Email).First(&r2).Error == nil {
+				if t2, err := common.DecryptGrant(r2.ValueEncrypted); err == nil {
+					token = t2
+				}
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"email":         row.Email,
+				"access_token":  token,
+				"five_hour_pct": snap.FiveHourPct,
+				"seven_day_pct": snap.SevenDayPct,
+				"severity":      snap.Severity,
+			},
+		})
+		return
+	}
+
+	fail(c, http.StatusServiceUnavailable, 1503, "no pooled account with available quota")
 }
 
 // reportBody is the wire shape for the legacy bridge path.

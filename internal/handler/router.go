@@ -479,6 +479,9 @@ func Register(r *gin.Engine) {
 			// Claude Code quota reporter — each account's cron/stop-hook
 			// POSTs here; no user session, only X-Bridge-Secret.
 			internal.POST("/claude-quota/report", InternalClaudeQuotaReport)
+			// Claude account-pool lease — claude-proxy (lum.id/claude) asks
+			// for the healthiest pooled account's access token.
+			internal.POST("/claude-token/lease", InternalClaudeTokenLease)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The
@@ -497,8 +500,14 @@ func Register(r *gin.Engine) {
 			// bearer token belongs to a super_admin, otherwise 401/403.
 			superAdmin.GET("/super-check", SuperAdminCheck)
 			superAdmin.GET("/oauth-clients", AdminOAuthClientsList)
-			superAdmin.GET("/claude-quota", AdminClaudeQuota)
-			superAdmin.POST("/claude-token", AdminClaudeTokenAdd)
+		}
+
+		// admin + super_admin — Claude Code quota dashboard (/quota page).
+		adminQuota := v1.Group("/admin", RequireAdmin())
+		{
+			adminQuota.GET("/claude-quota", AdminClaudeQuota)
+			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
+			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
 		}
 	}
 }

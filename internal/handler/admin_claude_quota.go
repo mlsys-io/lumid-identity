@@ -599,6 +599,28 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		return
 	}
 
+	// Also find users who hold a claude:proxy (or wildcard) PAT used recently
+	// — they show even if chargeUser failed (0/0 token rows).
+	var patHolders []struct {
+		UserSub    string
+		Email      string
+		LastUsedAt time.Time
+	}
+	common.DB.Raw(`
+		SELECT t.user_id AS user_sub, u.email,
+		       MAX(t.last_used_at) AS last_used_at
+		FROM   tokens t
+		JOIN   users u ON u.id = t.user_id
+		WHERE  t.revoked_at IS NULL
+		  AND  t.last_used_at >= ?
+		  AND (t.scopes = '*'
+		       OR t.scopes = 'claude:proxy'
+		       OR t.scopes LIKE 'claude:proxy %'
+		       OR t.scopes LIKE '% claude:proxy'
+		       OR t.scopes LIKE '% claude:proxy %')
+		GROUP  BY t.user_id, u.email`,
+		now.Add(-7*24*time.Hour)).Scan(&patHolders)
+
 	cap5, cap7 := common.ClaudePoolLimits()
 	type userUsage struct {
 		Email       string    `json:"email"`
@@ -623,6 +645,15 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		u.Requests += r.Reqs
 		if r.LastTs.After(u.LastTs) {
 			u.LastTs = r.LastTs
+		}
+	}
+	// Merge PAT holders who haven't charged tokens yet.
+	for _, ph := range patHolders {
+		if _, ok := byUser[ph.UserSub]; !ok {
+			byUser[ph.UserSub] = &userUsage{
+				Email:  ph.Email,
+				LastTs: ph.LastUsedAt,
+			}
 		}
 	}
 	users := make([]userUsage, 0, len(byUser))

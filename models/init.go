@@ -29,6 +29,9 @@ var AllTables = []interface{}{
 	&MeArtifact{},
 	&ClaudeQuotaToken{},
 	&ClaudeQuotaSnapshot{},
+	&ClaudeSession{},
+	&ClaudeSessionTurn{},
+	&ClaudeRecordingPref{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

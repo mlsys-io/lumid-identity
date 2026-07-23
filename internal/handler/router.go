@@ -347,6 +347,14 @@ func Register(r *gin.Engine) {
 			// Writes flow through /internal/usage/charge below.
 			me.GET("/limits", MeLimits)
 
+			// Claude account-pool session recording (lum.id/claude). Owner
+			// reads own transcripts; recording is on by default, opt-out here.
+			me.GET("/claude-sessions", MeClaudeSessions)
+			me.GET("/claude-sessions/:conv", MeClaudeSessionDetail)
+			me.DELETE("/claude-sessions/:conv", MeClaudeSessionDelete)
+			me.GET("/claude-recording", MeClaudeRecordingGet)
+			me.POST("/claude-recording", MeClaudeRecordingSet)
+
 			// Today summary — server-side aggregation of journal
 			// entries + drafts queue + quota state for the /app/loops
 			// "Today" section. One round-trip per page load; UI
@@ -482,6 +490,9 @@ func Register(r *gin.Engine) {
 			// Claude account-pool lease — claude-proxy (lum.id/claude) asks
 			// for the healthiest pooled account's access token.
 			internal.POST("/claude-token/lease", InternalClaudeTokenLease)
+			// Claude session recording — claude-proxy posts each turn's full
+			// request+response; stored delta-compacted (respects opt-out).
+			internal.POST("/claude-transcript", InternalClaudeTranscript)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The
@@ -502,13 +513,18 @@ func Register(r *gin.Engine) {
 			superAdmin.GET("/oauth-clients", AdminOAuthClientsList)
 		}
 
-		// admin + super_admin — Claude Code quota dashboard (/quota page).
+		// admin + super_admin — Claude Code quota dashboard (/quota page) and
+		// pool session transcripts.
 		adminQuota := v1.Group("/admin", RequireAdmin())
 		{
 			adminQuota.GET("/claude-quota", AdminClaudeQuota)
 			adminQuota.GET("/claude-user-usage", AdminClaudeUserUsage)
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
+			// Pool session transcripts — admin can view all users' sessions.
+			adminQuota.GET("/claude-sessions", AdminClaudeSessions)
+			adminQuota.GET("/claude-sessions/:conv", AdminClaudeSessionDetail)
+			adminQuota.DELETE("/claude-sessions/:conv", AdminClaudeSessionDelete)
 		}
 	}
 }

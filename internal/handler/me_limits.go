@@ -113,6 +113,20 @@ func InternalUsageCharge(c *gin.Context) {
 		return
 	}
 	// Return 200 regardless of allowed — the caller branches on res.allowed.
+	// For the claude pool, piggyback the user's recording preference so the
+	// proxy can skip shipping a transcript blob when the user opted out.
+	if body.Kind == "claude_proxy" {
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"allowed": res.Allowed, "deny_reason": res.DenyReason,
+				"today": res.Today, "limits": res.Limits, "reset_at": res.ResetAt,
+				"five_hour_pct": res.FiveHourPct, "seven_day_pct": res.SevenDayPct,
+				"recording": recordingEnabled(body.UserSub),
+			},
+		})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok", "data": res,
 	})

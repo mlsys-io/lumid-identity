@@ -506,6 +506,7 @@ func Register(r *gin.Engine) {
 		adminQuota := v1.Group("/admin", RequireAdmin())
 		{
 			adminQuota.GET("/claude-quota", AdminClaudeQuota)
+			adminQuota.GET("/claude-user-usage", AdminClaudeUserUsage)
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
 		}

@@ -33,6 +33,11 @@ const (
 	DefaultLLMTokensDaily  = 500_000
 	DefaultGmailSendsDaily = 200
 	DefaultSlackPostsDaily = 100
+
+	// Claude account-pool per-user caps — rolling windows mirroring
+	// Anthropic's own 5h/7d shape (uncached input + output tokens).
+	DefaultClaude5hTokens = 2_000_000
+	DefaultClaude7dTokens = 20_000_000
 )
 
 // Limits captures the headline numbers the UI surfaces alongside today's totals.
@@ -141,6 +146,42 @@ type ChargeRes struct {
 	Today      Totals `json:"today"`
 	Limits     Limits `json:"limits"`
 	ResetAt    string `json:"reset_at"`
+	// kind=claude_proxy only: the user's pool utilization after this charge,
+	// as a percentage of the rolling 5h/7d token caps.
+	FiveHourPct *float64 `json:"five_hour_pct,omitempty"`
+	SevenDayPct *float64 `json:"seven_day_pct,omitempty"`
+}
+
+// ClaudePoolLimits reads the env-tunable per-user pool caps.
+func ClaudePoolLimits() (fiveH, sevenD int) {
+	return envIntPos("LUMID_QUOTA_CLAUDE_5H_TOKENS", DefaultClaude5hTokens),
+		envIntPos("LUMID_QUOTA_CLAUDE_7D_TOKENS", DefaultClaude7dTokens)
+}
+
+// ClaudePoolWindows returns one user's claude_proxy token usage over the
+// rolling 5h and 7d windows.
+func ClaudePoolWindows(db *gorm.DB, userSub string) (fiveH, sevenD int, err error) {
+	now := time.Now().UTC()
+	rows := []struct {
+		Win    string
+		Tokens int
+	}{}
+	err = db.Raw(`
+		SELECT CASE WHEN ts >= ? THEN '5h' ELSE '7d' END AS win,
+		       COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens
+		FROM   usage_events
+		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?
+		GROUP  BY win`, now.Add(-5*time.Hour), userSub, now.Add(-7*24*time.Hour)).Scan(&rows).Error
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, r := range rows {
+		if r.Win == "5h" {
+			fiveH += r.Tokens
+		}
+		sevenD += r.Tokens // 5h window is inside the 7d window
+	}
+	return fiveH, sevenD, nil
 }
 
 // CheckAndCharge enforces the four daily caps and (on allowed && !DryRun)
@@ -154,7 +195,25 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 
 	after := totals
 	deny := ""
+	var fivePct, sevenPct *float64
 	switch req.Kind {
+	case "claude_proxy":
+		// Rolling 5h/7d windows (not midnight-daily) — mirrors the Anthropic
+		// account quota shape the pool itself is subject to.
+		cap5, cap7 := ClaudePoolLimits()
+		used5, used7, werr := ClaudePoolWindows(db, req.UserSub)
+		if werr != nil {
+			return ChargeRes{}, werr
+		}
+		tok := req.InputTokens + req.OutputTokens
+		if used5+tok > cap5 {
+			deny = "quota_exceeded_claude_5h"
+		} else if used7+tok > cap7 {
+			deny = "quota_exceeded_claude_7d"
+		}
+		p5 := float64(used5+tok) / float64(cap5) * 100
+		p7 := float64(used7+tok) / float64(cap7) * 100
+		fivePct, sevenPct = &p5, &p7
 	case "cycle_start":
 		n := req.Count
 		if n <= 0 {
@@ -190,10 +249,12 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	}
 
 	res := ChargeRes{
-		Allowed:    deny == "",
-		DenyReason: deny,
-		Limits:     limits,
-		ResetAt:    NextResetAt().Format(time.RFC3339),
+		Allowed:     deny == "",
+		DenyReason:  deny,
+		Limits:      limits,
+		ResetAt:     NextResetAt().Format(time.RFC3339),
+		FiveHourPct: fivePct,
+		SevenDayPct: sevenPct,
 	}
 	if !res.Allowed {
 		// On deny: report current state, not the would-be after-state.

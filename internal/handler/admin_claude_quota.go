@@ -568,6 +568,85 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	fail(c, http.StatusServiceUnavailable, 1503, "no pooled account with available quota")
 }
 
+// AdminClaudeUserUsage lists per-user pool consumption over the rolling
+// 5h/7d windows — the per-PAT/user counterpart of the account quota table.
+//
+// GET /api/v1/admin/claude-user-usage  (RequireAdmin)
+func AdminClaudeUserUsage(c *gin.Context) {
+	now := time.Now().UTC()
+	rows := []struct {
+		UserSub string
+		Email   string
+		Win     string
+		Tokens  int
+		Reqs    int
+		LastTs  time.Time
+	}{}
+	err := common.DB.Raw(`
+		SELECT ue.user_sub                                        AS user_sub,
+		       COALESCE(u.email, ue.user_sub)                     AS email,
+		       CASE WHEN ue.ts >= ? THEN '5h' ELSE '7d' END       AS win,
+		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens,
+		       COUNT(*)                                           AS reqs,
+		       MAX(ue.ts)                                         AS last_ts
+		FROM   usage_events ue
+		LEFT JOIN users u ON u.id = ue.user_sub
+		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
+		GROUP  BY ue.user_sub, u.email, win`,
+		now.Add(-5*time.Hour), now.Add(-7*24*time.Hour)).Scan(&rows).Error
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "query usage: "+err.Error())
+		return
+	}
+
+	cap5, cap7 := common.ClaudePoolLimits()
+	type userUsage struct {
+		Email       string    `json:"email"`
+		FiveHour    int       `json:"five_hour_tokens"`
+		SevenDay    int       `json:"seven_day_tokens"`
+		FiveHourPct float64   `json:"five_hour_pct"`
+		SevenDayPct float64   `json:"seven_day_pct"`
+		Requests    int       `json:"requests_7d"`
+		LastTs      time.Time `json:"last_ts"`
+	}
+	byUser := map[string]*userUsage{}
+	for _, r := range rows {
+		u, ok := byUser[r.UserSub]
+		if !ok {
+			u = &userUsage{Email: r.Email}
+			byUser[r.UserSub] = u
+		}
+		if r.Win == "5h" {
+			u.FiveHour += r.Tokens
+		}
+		u.SevenDay += r.Tokens // 5h bucket is inside the 7d window
+		u.Requests += r.Reqs
+		if r.LastTs.After(u.LastTs) {
+			u.LastTs = r.LastTs
+		}
+	}
+	users := make([]userUsage, 0, len(byUser))
+	for _, u := range byUser {
+		u.FiveHourPct = float64(u.FiveHour) / float64(cap5) * 100
+		u.SevenDayPct = float64(u.SevenDay) / float64(cap7) * 100
+		users = append(users, *u)
+	}
+	// Highest 5h pressure first.
+	for i := 1; i < len(users); i++ {
+		for j := i; j > 0 && users[j].FiveHourPct > users[j-1].FiveHourPct; j-- {
+			users[j], users[j-1] = users[j-1], users[j]
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"users":            users,
+			"five_hour_tokens": cap5,
+			"seven_day_tokens": cap7,
+		},
+	})
+}
+
 // reportBody is the wire shape for the legacy bridge path.
 type claudeQuotaReportBody struct {
 	Email         string  `json:"email"          binding:"required"`

@@ -23,7 +23,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -130,21 +132,37 @@ func InternalClaudeTranscript(c *gin.Context) {
 
 	turnIndex := sess.TurnCount // 0-based
 	turn := models.ClaudeSessionTurn{
-		ConvKey:       convKey,
-		TurnIndex:     turnIndex,
-		Ts:            now,
-		Model:         req.Model,
-		Endpoint:      body.Endpoint,
-		Stream:        body.Stream,
-		InputTokens:   body.InputTokens,
-		OutputTokens:  body.OutputTokens,
-		ToolUseCount:  toolCount,
-		DurationMs:    body.DurationMs,
-		RequestMetaGz: gzipBytes(metaJSON),
-		NewMessagesGz: gzipBytes(deltaJSON),
-		ResponseGz:    gzipBytes(body.Response),
-		Truncated:     body.Truncated,
+		ConvKey:      convKey,
+		TurnIndex:    turnIndex,
+		Ts:           now,
+		Model:        req.Model,
+		Endpoint:     body.Endpoint,
+		Stream:       body.Stream,
+		InputTokens:  body.InputTokens,
+		OutputTokens: body.OutputTokens,
+		ToolUseCount: toolCount,
+		DurationMs:   body.DurationMs,
+		Truncated:    body.Truncated,
 	}
+
+	// Write blobs to S3 when blobstore is configured; fall back to LONGBLOB.
+	if common.Blobs != nil {
+		bk := common.TurnBlobKey(convKey, turnIndex)
+		if err := putTurnBlobs(bk, metaJSON, deltaJSON, body.Response); err != nil {
+			// Log but degrade gracefully — store in DB instead.
+			log.Printf("blobstore: put %s failed: %v — falling back to DB", bk, err)
+			turn.RequestMetaGz = gzipBytes(metaJSON)
+			turn.NewMessagesGz = gzipBytes(deltaJSON)
+			turn.ResponseGz = gzipBytes(body.Response)
+		} else {
+			turn.BlobKey = bk
+		}
+	} else {
+		turn.RequestMetaGz = gzipBytes(metaJSON)
+		turn.NewMessagesGz = gzipBytes(deltaJSON)
+		turn.ResponseGz = gzipBytes(body.Response)
+	}
+
 	if err := common.DB.Create(&turn).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "store turn: "+err.Error())
 		return
@@ -359,13 +377,21 @@ func getSession(c *gin.Context, ownerSub, convKey string) {
 	}
 	out := make([]turnOut, len(turns))
 	for i, t := range turns {
+		var metaRaw, msgsRaw, respRaw []byte
+		if t.BlobKey != "" && common.Blobs != nil {
+			metaRaw, msgsRaw, respRaw = getTurnBlobs(t.BlobKey)
+		} else {
+			metaRaw = gunzipBytes(t.RequestMetaGz)
+			msgsRaw = gunzipBytes(t.NewMessagesGz)
+			respRaw = gunzipBytes(t.ResponseGz)
+		}
 		out[i] = turnOut{
 			TurnIndex: t.TurnIndex, Ts: t.Ts, Model: t.Model, Endpoint: t.Endpoint,
 			Stream: t.Stream, InputTokens: t.InputTokens, OutputTokens: t.OutputTokens,
 			ToolUseCount: t.ToolUseCount, DurationMs: t.DurationMs, Truncated: t.Truncated,
-			RequestMeta: rawOrNull(gunzipBytes(t.RequestMetaGz)),
-			NewMessages: rawOrNull(gunzipBytes(t.NewMessagesGz)),
-			Response:    rawOrNull(gunzipBytes(t.ResponseGz)),
+			RequestMeta: rawOrNull(metaRaw),
+			NewMessages: rawOrNull(msgsRaw),
+			Response:    rawOrNull(respRaw),
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
@@ -382,6 +408,37 @@ func rawOrNull(b []byte) json.RawMessage {
 		return json.RawMessage("null")
 	}
 	return json.RawMessage(b)
+}
+
+// putTurnBlobs writes the three gzip blobs to S3 for one turn.
+func putTurnBlobs(blobKey string, metaJSON, deltaJSON, response json.RawMessage) error {
+	for _, f := range []struct {
+		suffix string
+		data   []byte
+	}{
+		{"request_meta.gz", gzipBytes(metaJSON)},
+		{"new_messages.gz", gzipBytes(deltaJSON)},
+		{"response.gz", gzipBytes(response)},
+	} {
+		if err := common.Blobs.Put(blobKey+"/"+f.suffix, f.data); err != nil {
+			return fmt.Errorf("%s: %w", f.suffix, err)
+		}
+	}
+	return nil
+}
+
+// getTurnBlobs retrieves the three gzip blobs from S3 and returns
+// (requestMetaJSON, newMessagesJSON, responseJSON). Each may be nil on error.
+func getTurnBlobs(blobKey string) (meta, msgs, resp []byte) {
+	fetch := func(suffix string) []byte {
+		raw, err := common.Blobs.Get(blobKey + "/" + suffix)
+		if err != nil {
+			log.Printf("blobstore: get %s/%s: %v", blobKey, suffix, err)
+			return nil
+		}
+		return gunzipBytes(raw)
+	}
+	return fetch("request_meta.gz"), fetch("new_messages.gz"), fetch("response.gz")
 }
 
 // GET /api/v1/me/claude-sessions

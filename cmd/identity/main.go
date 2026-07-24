@@ -34,8 +34,10 @@ func main() {
 		log.Fatalf("load signing keys: %v", err)
 	}
 
-	// Proactively refresh Claude OAuth pool tokens every 12 hours so access
-	// tokens never silently expire between proxy requests.
+	// Session blob offloading: store LONGBLOB gzip blobs in S3 when configured.
+	common.InitBlobStore()
+
+	// Proactively refresh Claude OAuth pool tokens every 45min.
 	handler.StartTokenRefreshLoop()
 
 	if cfg.App.Mode == "release" {

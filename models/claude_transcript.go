@@ -54,7 +54,11 @@ type ClaudeSessionTurn struct {
 	// non-stream, raw SSE bytes for stream). Capped by the proxy.
 	ResponseGz    []byte `gorm:"column:response_gz;type:longblob"      json:"-"`
 	// Truncated flags a blob that hit the proxy's per-turn size cap.
-	Truncated     bool   `gorm:"column:truncated;not null;default:false" json:"truncated"`
+	Truncated bool `gorm:"column:truncated;not null;default:false" json:"truncated"`
+	// BlobKey is set when blobs are stored in S3 (not in the LONGBLOB columns).
+	// Format: "{conv_key}/{turn_index}" — derive the three field paths from it.
+	// Empty string means blobs are in the LONGBLOB columns (legacy rows).
+	BlobKey string `gorm:"column:blob_key;size:100;not null;default:''" json:"-"`
 }
 
 func (ClaudeSessionTurn) TableName() string { return "claude_session_turns" }

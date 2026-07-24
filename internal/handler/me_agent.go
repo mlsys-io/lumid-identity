@@ -781,6 +781,24 @@ var llmProviders = []llmProvider{
 		minRole:           "super_admin", // pool: fable = super_admin only
 		dailyBudgetTokens: -1,
 	},
+	{
+		// Claude Code HARNESS on our own GPU — the sandbox routes the CLI at
+		// the lumid-llm gateway ("lumid-llm/<model>" prefix) instead of the
+		// pool. Full agentic loop (Bash/Edit/Todo in the user's workspace),
+		// zero Anthropic quota, free at the margin. qwen3.6-35b is the only
+		// in-house model with workable multi-turn tool calling; gemma-class
+		// models struggle in agentic loops, so no gemma entry.
+		id:                "claude-code-qwen35",
+		displayName:       "Qwen3.6-35B (Code · Lumid GPU)",
+		endpoint:          "",
+		upstreamModel:     "lumid-llm/qwen3.6-35b-a3b",
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "user",
+		dailyBudgetTokens: -1,
+	},
 	// claude-opus and claude-haiku (direct Anthropic API) are registered only
 	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.
 	// The claude-code-* sandbox providers cover Anthropic models instead.

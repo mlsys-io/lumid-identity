@@ -60,6 +60,7 @@ func RequireAdmin() gin.HandlerFunc {
 			return
 		}
 		c.Set("admin_user_id", userID)
+		c.Set("admin_user_role", role)
 		c.Next()
 	}
 }

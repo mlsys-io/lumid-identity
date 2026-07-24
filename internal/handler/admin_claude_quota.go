@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm/clause"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -426,7 +427,13 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		}
 		row.RefreshTokenEncrypted = refEnc
 	}
-	if err := common.DB.Save(&row).Error; err != nil {
+	// Upsert: INSERT ... ON DUPLICATE KEY UPDATE only the token columns.
+	// DB.Save() with a string PK includes created_at=zero in the UPDATE clause
+	// which MySQL strict mode rejects with Error 1292. Explicit DoUpdates avoids it.
+	if err := common.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "email"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value_encrypted", "refresh_token_encrypted", "updated_at"}),
+	}).Create(&row).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
 		return
 	}

@@ -40,6 +40,9 @@ func main() {
 	// Proactively refresh Claude OAuth pool tokens every 45min.
 	handler.StartTokenRefreshLoop()
 
+	// Sweep expired auto-minted claude-sandbox PATs hourly.
+	handler.StartClaudeSandboxPATSweep()
+
 	if cfg.App.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}

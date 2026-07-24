@@ -354,6 +354,9 @@ func Register(r *gin.Engine) {
 			me.DELETE("/claude-sessions/:conv", MeClaudeSessionDelete)
 			me.GET("/claude-recording", MeClaudeRecordingGet)
 			me.POST("/claude-recording", MeClaudeRecordingSet)
+			// Self-serve pool consumption (5h/7d windows + per-model 7d) —
+			// powers the chatbox QuotaMeter for claude-code models.
+			me.GET("/claude-usage", MeClaudeUsage)
 
 			// Today summary — server-side aggregation of journal
 			// entries + drafts queue + quota state for the /app/loops

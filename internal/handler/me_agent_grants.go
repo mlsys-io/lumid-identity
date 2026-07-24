@@ -17,6 +17,7 @@ package handler
 //                           so users can only resume their own sessions.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -26,6 +27,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
+
+	"lumid_identity/internal/common"
 )
 
 var grantsMu sync.Mutex // serializes read-modify-write on both files
@@ -134,10 +138,29 @@ func MeAgentToolGrantRevoke(c *gin.Context) {
 }
 
 // ── Claude session registry ──────────────────────────────────────────────────
+//
+// Redis-backed (sorted set claude:sessions:<uid>, score = issue time) so
+// the registry is consistent across BOTH identity replicas and survives
+// pod restarts — the old per-pod .claude-sessions.json flapped by replica
+// and silently broke --resume authorization. File fallback kept for
+// Redis-less dev runs and for sessions recorded before this migration.
+
+func claudeSessionsKey(userID string) string { return "claude:sessions:" + userID }
 
 // recordClaudeSession remembers that this claude CLI session id was
 // issued to this user, authorizing later --resume with it.
 func recordClaudeSession(userID, sessionID string) {
+	if common.Redis != nil {
+		ctx := context.Background()
+		key := claudeSessionsKey(userID)
+		_ = common.Redis.ZAdd(ctx, key, &redis.Z{
+			Score:  float64(time.Now().Unix()),
+			Member: sessionID,
+		}).Err()
+		// Prune oldest beyond the cap so the set can't grow unbounded.
+		_ = common.Redis.ZRemRangeByRank(ctx, key, 0, int64(-(claudeSessionsKeep + 1))).Err()
+		return
+	}
 	grantsMu.Lock()
 	defer grantsMu.Unlock()
 	path := claudeSessionsPath(userID)
@@ -161,6 +184,17 @@ func recordClaudeSession(userID, sessionID string) {
 // userOwnsClaudeSession reports whether sessionID was previously issued
 // to this user.
 func userOwnsClaudeSession(userID, sessionID string) bool {
+	if common.Redis != nil {
+		err := common.Redis.ZScore(context.Background(), claudeSessionsKey(userID), sessionID).Err()
+		if err == nil {
+			return true
+		}
+		// redis.Nil (not a member) → fall through to the legacy file so
+		// pre-migration sessions still resume; other errors → deny.
+		if err != redis.Nil {
+			return false
+		}
+	}
 	grantsMu.Lock()
 	defer grantsMu.Unlock()
 	_, ok := loadJSONMap(claudeSessionsPath(userID))[sessionID]

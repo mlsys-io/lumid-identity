@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -240,46 +241,53 @@ func PATMintHandler(c *gin.Context) {
 		req.Name = "lm_pat " + time.Now().Format("2006-01-02 15:04")
 	}
 
-	// 32 bytes of entropy → 64 hex chars, prefixed lm_pat_live_.
-	raw, err := randHex(32)
-	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "rng")
-		return
-	}
-	cleartext := patCleartextPrefix + raw
-	argonHash, err := argon2idHash(cleartext)
-	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "hash")
-		return
-	}
-	lk := patLookupKey(cleartext)
-
 	var expAt *time.Time
 	if req.TTLDays > 0 {
 		t := time.Now().AddDate(0, 0, req.TTLDays)
 		expAt = &t
 	}
-
-	row := &models.Token{
-		ID:        uuid.NewString(),
-		UserID:    userID,
-		Prefix:    patCleartextPrefix,
-		LookupKey: lk,
-		Hash:      argonHash,
-		HashAlg:   "argon2id",
-		Name:      req.Name,
-		Scopes:    scopeStr,
-		ExpiresAt: expAt,
-		Source:    "native",
-	}
-	if err := common.DB.Create(row).Error; err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "persist: "+err.Error())
+	cleartext, row, err := mintPATForUser(userID, req.Name, req.Scopes, expAt, "native")
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, err.Error())
 		return
 	}
 	ok_(c, "minted", patMintResp{
 		ID: row.ID, Token: cleartext, Prefix: patCleartextPrefix,
 		Name: row.Name, Scopes: req.Scopes, ExpiresAt: expAt,
 	})
+}
+
+// mintPATForUser is the entropy→hash→persist core of PAT creation, shared
+// by PATMintHandler (user-facing, validated + canGrant-gated + rate-limited)
+// and claudeSandboxPAT (internal auto-mint, source="claude_sandbox").
+// Returns the cleartext (surfaced exactly once) and the stored row.
+func mintPATForUser(userID, name string, scopes []string, expiresAt *time.Time, source string) (string, *models.Token, error) {
+	// 32 bytes of entropy → 64 hex chars, prefixed lm_pat_live_.
+	raw, err := randHex(32)
+	if err != nil {
+		return "", nil, fmt.Errorf("rng")
+	}
+	cleartext := patCleartextPrefix + raw
+	argonHash, err := argon2idHash(cleartext)
+	if err != nil {
+		return "", nil, fmt.Errorf("hash")
+	}
+	row := &models.Token{
+		ID:        uuid.NewString(),
+		UserID:    userID,
+		Prefix:    patCleartextPrefix,
+		LookupKey: patLookupKey(cleartext),
+		Hash:      argonHash,
+		HashAlg:   "argon2id",
+		Name:      name,
+		Scopes:    strings.Join(scopes, " "),
+		ExpiresAt: expiresAt,
+		Source:    source,
+	}
+	if err := common.DB.Create(row).Error; err != nil {
+		return "", nil, fmt.Errorf("persist: %s", err.Error())
+	}
+	return cleartext, row, nil
 }
 
 func PATListHandler(c *gin.Context) {
@@ -305,11 +313,15 @@ func PATListHandler(c *gin.Context) {
 		}
 	}
 
+	// Auto-minted claude-sandbox PATs are internal plumbing — hidden from
+	// the user's token list (revoking one is harmless, identity re-mints,
+	// but surfacing them just confuses people).
 	var total int64
-	common.DB.Model(&models.Token{}).Where("user_id = ? AND revoked_at IS NULL", userID).Count(&total)
+	common.DB.Model(&models.Token{}).
+		Where("user_id = ? AND revoked_at IS NULL AND source != ?", userID, claudeSandboxSource).Count(&total)
 
 	var rows []models.Token
-	common.DB.Where("user_id = ? AND revoked_at IS NULL", userID).
+	common.DB.Where("user_id = ? AND revoked_at IS NULL AND source != ?", userID, claudeSandboxSource).
 		Order("created_at DESC").Limit(limit).Offset(offset).Find(&rows)
 
 	out := make([]patListItem, 0, len(rows))

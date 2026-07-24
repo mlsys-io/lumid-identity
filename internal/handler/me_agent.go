@@ -495,11 +495,10 @@ func toolBashExec(userID, role, command string, timeoutSec int) (map[string]any,
 
 	if role != "super_admin" {
 		// Non-operator: this container has no docker/sandbox runtime (uid
-		// 1000, userns disabled), so delegate to the host-side sandbox
-		// broker, which runs the command in a Docker sandbox confined to the
-		// caller's own tenant workspace — network-none, read-only rootfs,
-		// only `cwd` mounted at /work. See claude-proxy.py /sandbox/bash.
-		return bashViaSandboxBroker(ctx, cwd, command, timeoutSec)
+		// 1000, userns disabled), so delegate to the in-cluster
+		// claude-sandbox, which runs the command confined to the caller's
+		// own workspace — netpol-locked pod, prlimit-fenced process.
+		return bashViaSandboxBroker(ctx, userID, command, timeoutSec)
 	}
 
 	// super_admin (operator): run in this container's process space against
@@ -532,23 +531,24 @@ func toolBashExec(userID, role, command string, timeoutSec int) (map[string]any,
 	return map[string]any{"output": string(out), "exit_code": 0}, true
 }
 
-// bashViaSandboxBroker runs a non-super bash command on the host-side sandbox
-// broker (claude-proxy.py /sandbox/bash). The broker confines execution to
-// `workspace` (the caller's own tenant dir) in a network-none, read-only
-// Docker sandbox. Returns the same {output, exit_code} shape as the
-// in-container operator path.
-func bashViaSandboxBroker(ctx context.Context, workspace, command string, timeoutSec int) (map[string]any, bool) {
+// bashViaSandboxBroker runs a non-super bash command on the in-cluster
+// claude-sandbox (/sandbox/bash). The sandbox derives the workspace from
+// user_id itself (client paths are never trusted) and confines execution
+// there — netpol-locked pod, prlimit-fenced process. Returns the same
+// {output, exit_code} shape as the in-container operator path.
+func bashViaSandboxBroker(ctx context.Context, userID, command string, timeoutSec int) (map[string]any, bool) {
 	payload, _ := json.Marshal(map[string]any{
-		"workspace": workspace,
-		"command":   command,
-		"timeout":   timeoutSec,
+		"user_id": userID,
+		"command": command,
+		"timeout": timeoutSec,
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		claudeProxyURL()+"/sandbox/bash", bytes.NewReader(payload))
+		claudeSandboxURL()+"/sandbox/bash", bytes.NewReader(payload))
 	if err != nil {
 		return map[string]any{"error": err.Error()}, false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Bridge-Secret", os.Getenv("LUMID_IDENTITY_BRIDGE_SECRET"))
 	client := &http.Client{Timeout: time.Duration(timeoutSec+10) * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -739,37 +739,51 @@ var llmProviders = []llmProvider{
 		maxOutputTokens:     8192,   // 32K ctx — smaller output budget
 		dailyBudgetTokens:   -1,
 	},
+	// claude-code-* — real Claude Code sessions in the in-cluster
+	// claude-sandbox, model access through the POOLED account proxy with a
+	// per-user ephemeral PAT. minRole mirrors the pool's own model matrix
+	// (user→sonnet, admin→+opus, super_admin→+fable) and the pool's 5h/7d
+	// per-user quota is the SINGLE limiter — dailyBudgetTokens -1 here so
+	// identity's daily budget doesn't double-count the same tokens.
 	{
-		// claude-code-sonnet — operator's Claude Code subscription via the
-		// host proxy, Sonnet tier. Available to admin+ (cheaper/faster than
-		// Opus; admins get a frontier model without the super_admin gate).
-		id:             "claude-code-sonnet",
-		displayName:    "Claude Sonnet 4.6 (Code)",
-		endpoint:       "",       // no HTTP endpoint — subprocess via proxy
-		upstreamModel:  "sonnet", // claude CLI --model alias
-		authHeader:     "",
-		authPrefix:     "",
-		keyFn:          claudeCodeKeyFn,
-		supportsVision: false,
-		minRole:        "admin",
+		id:                "claude-code-sonnet",
+		displayName:       "Claude Sonnet (Code)",
+		endpoint:          "",       // no HTTP endpoint — subprocess via sandbox
+		upstreamModel:     "sonnet", // claude CLI --model alias
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "user", // pool allows user→sonnet; pool quota gates volume
+		dailyBudgetTokens: -1,
 	},
 	{
-		// claude-code-opus — uses the operator's Claude Code subscription
-		// via a host-side proxy (claude-proxy.py on 172.17.0.1:9201).
-		// No ANTHROPIC_API_KEY needed; auth from ~/.claude/ credentials.
-		id:             "claude-code-opus",
-		displayName:    "Claude Opus 4.8 (Code)",
-		endpoint:       "",     // no HTTP endpoint — subprocess via proxy
-		upstreamModel:  "opus", // claude CLI --model alias
-		authHeader:     "",
-		authPrefix:     "",
-		keyFn:          claudeCodeKeyFn,
-		supportsVision: false,
-		minRole:        "super_admin",
+		id:                "claude-code-opus",
+		displayName:       "Claude Opus (Code)",
+		endpoint:          "",
+		upstreamModel:     "opus", // claude CLI --model alias
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "admin", // pool: opus = admin+
+		dailyBudgetTokens: -1,
+	},
+	{
+		id:                "claude-code-fable",
+		displayName:       "Claude Fable 5 (Code)",
+		endpoint:          "",
+		upstreamModel:     "claude-fable-5", // full id — CLI has no fable alias
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "super_admin", // pool: fable = super_admin only
+		dailyBudgetTokens: -1,
 	},
 	// claude-opus and claude-haiku (direct Anthropic API) are registered only
 	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.
-	// claude-code-opus covers Opus via the operator's subscription instead.
+	// The claude-code-* sandbox providers cover Anthropic models instead.
 }
 
 // roleRank ranks the role hierarchy for provider gating.

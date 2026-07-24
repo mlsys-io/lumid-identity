@@ -145,21 +145,26 @@ func TestFirstToolCapableProvider(t *testing.T) {
 	}
 }
 
-// TestProviderAllowed sanity-checks the role gate the selection logic relies on:
-// gemma4 (minRole "user") is open to all; claude-code-sonnet (minRole "admin")
-// is admin+.
+// TestProviderAllowed sanity-checks the role gate the selection logic relies
+// on, mirroring the claude-proxy pool matrix: sonnet (minRole "user") is open
+// to all, opus (minRole "admin") is admin+, fable (minRole "super_admin") is
+// operator-only.
 func TestProviderAllowed(t *testing.T) {
-	var gemma, adminOnly llmProvider
+	var gemma, sonnet, opus, fable llmProvider
 	for _, p := range llmProviders {
 		switch p.id {
 		case "kvrun-gemma4":
 			gemma = p
 		case "claude-code-sonnet":
-			adminOnly = p
+			sonnet = p
+		case "claude-code-opus":
+			opus = p
+		case "claude-code-fable":
+			fable = p
 		}
 	}
-	if gemma.id == "" || adminOnly.id == "" {
-		t.Fatalf("expected gemma4 + claude-code-sonnet in llmProviders; got gemma=%q adminOnly=%q", gemma.id, adminOnly.id)
+	if gemma.id == "" || sonnet.id == "" || opus.id == "" || fable.id == "" {
+		t.Fatalf("expected gemma4 + claude-code-{sonnet,opus,fable} in llmProviders")
 	}
 
 	cases := []struct {
@@ -170,9 +175,15 @@ func TestProviderAllowed(t *testing.T) {
 		{"user", gemma, true},
 		{"admin", gemma, true},
 		{"super_admin", gemma, true},
-		{"user", adminOnly, false},
-		{"admin", adminOnly, true},
-		{"super_admin", adminOnly, true},
+		{"user", sonnet, true},
+		{"admin", sonnet, true},
+		{"super_admin", sonnet, true},
+		{"user", opus, false},
+		{"admin", opus, true},
+		{"super_admin", opus, true},
+		{"user", fable, false},
+		{"admin", fable, false},
+		{"super_admin", fable, true},
 	}
 	for _, c := range cases {
 		t.Run(c.role+"/"+c.p.id, func(t *testing.T) {

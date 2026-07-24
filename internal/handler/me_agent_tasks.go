@@ -187,7 +187,7 @@ func runBackgroundBash(task *bgTask, userID, role string, timeoutSec int) {
 
 	if role != "super_admin" {
 		// Sandbox broker — synchronous; output arrives at completion.
-		result, ok := bashViaSandboxBroker(ctx, ownWorkspace(userID), task.Command, timeoutSec)
+		result, ok := bashViaSandboxBroker(ctx, userID, task.Command, timeoutSec)
 		if out, _ := result["output"].(string); out != "" {
 			task.appendOutput(out)
 		}

@@ -1,24 +1,24 @@
 package handler
 
-// me_agent provider: claude-code-opus
+// me_agent providers: claude-code-* (Claude Code via the in-cluster sandbox)
 //
-// Routes chat turns to the local claude CLI binary via a host-side proxy
-// (claude-proxy.py on 172.17.0.1:9201). The proxy calls:
+// Routes chat turns to the claude-sandbox service (deploy_infra
+// k8s-lift/claude-sandbox), which spawns the real claude CLI:
 //   claude -p --output-format stream-json --include-partial-messages ...
 // and streams back NDJSON events. We parse those events and re-emit them
 // as our SSE format so the frontend receives the same shape as any other
 // provider.
 //
-// Why a proxy instead of calling claude directly from this container:
-//   lumid-identity runs on Alpine (musl libc); the claude binary is a glibc
-//   ELF. Rather than change the base image, a tiny Python shim on the host
-//   bridges the gap. The container reaches it via host.docker.internal
-//   (extra_hosts → 172.17.0.1).
+// Model access rides the POOLED account proxy (lum.id/claude): the sandbox
+// runs the CLI with ANTHROPIC_BASE_URL=claude-proxy and a per-user ephemeral
+// PAT we mint here (claudeSandboxPAT). That means per-user 5h/7d pool quota,
+// role→model tiers (user→sonnet, admin→+opus, super_admin→+fable), and
+// /claude-sessions recording all apply automatically — attributed to the
+// real end user, not a service account.
 //
-// Why Claude Code instead of direct Anthropic API:
-//   Uses the operator's Claude Code subscription — no ANTHROPIC_API_KEY
-//   needed. Opus 4.8 with full Claude Code tool set (Bash, Read, Write,
-//   WebSearch, etc.) plus /proj filesystem access for super_admin.
+// The old host-side shim (claude-proxy.py on luyaomini5:9201) is dead —
+// lost in the UKS migration. CLAUDE_SANDBOX_URL points at its in-cluster
+// replacement; the legacy CLAUDE_PROXY_URL env is honored as a fallback.
 
 import (
 	"bufio"
@@ -29,44 +29,115 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
 )
 
-// claudeProxyURL returns the host-side claude-proxy.py base URL.
-func claudeProxyURL() string {
-	if u := os.Getenv("CLAUDE_PROXY_URL"); u != "" {
+// claudeSandboxURL returns the in-cluster claude-sandbox base URL.
+func claudeSandboxURL() string {
+	if u := os.Getenv("CLAUDE_SANDBOX_URL"); u != "" {
 		return strings.TrimRight(u, "/")
 	}
-	return "http://host.docker.internal:9201"
+	if u := os.Getenv("CLAUDE_PROXY_URL"); u != "" { // legacy name
+		return strings.TrimRight(u, "/")
+	}
+	return "http://claude-sandbox:9201"
 }
 
-// claudeCodeKeyFn satisfies llmProvider.keyFn. Auth flows through
-// ~/.claude/ credentials read by the proxy on the host — no API key.
+// claudeCodeKeyFn satisfies llmProvider.keyFn. Real auth is the per-user
+// ephemeral PAT minted by claudeSandboxPAT and passed in the request body.
 func claudeCodeKeyFn() (string, error) { return "claude-code", nil }
 
-// isClaudeCodeProvider reports whether a provider routes through the local
-// claude CLI proxy (no HTTP endpoint) rather than an Anthropic-wire endpoint.
-// Covers both claude-code-opus and claude-code-sonnet.
+// isClaudeCodeProvider reports whether a provider routes through the
+// claude-sandbox runner (no HTTP endpoint) rather than an Anthropic-wire
+// endpoint. Covers claude-code-{sonnet,opus,fable}.
 func isClaudeCodeProvider(p llmProvider) bool {
 	return strings.HasPrefix(p.id, "claude-code")
 }
 
-// streamClaudeCodeViaProxy sends the conversation to the host proxy,
-// reads its streaming NDJSON, and re-emits as SSE events.
+// ── ephemeral per-user sandbox PATs ─────────────────────────────────────────
+//
+// The sandbox subprocess authenticates to the pooled claude-proxy as the
+// real end user so quota/tiering/recording attribute correctly. We mint a
+// short-lived PAT (claude:proxy scope only — useless against any other
+// endpoint) per user and cache it per pod; StartClaudeSandboxPATSweep
+// clears expired rows.
+
+const (
+	claudeSandboxPATTTL   = 6 * time.Hour
+	claudeSandboxPATFresh = 30 * time.Minute // re-mint when less than this remains
+	claudeSandboxSource   = "claude_sandbox"
+)
+
+var (
+	sandboxPATMu    sync.Mutex
+	sandboxPATCache = map[string]struct {
+		token string
+		exp   time.Time
+	}{}
+)
+
+// claudeSandboxPAT returns a live claude:proxy-scoped PAT for the user,
+// minting a fresh one when the cached token is near expiry. Deliberately
+// bypasses canGrant + the mint rate limit: policy is "every user gets the
+// sandbox", and these rows are hidden from the user's token list.
+func claudeSandboxPAT(userID string) (string, error) {
+	sandboxPATMu.Lock()
+	defer sandboxPATMu.Unlock()
+	if e, ok := sandboxPATCache[userID]; ok && time.Until(e.exp) > claudeSandboxPATFresh {
+		return e.token, nil
+	}
+	exp := time.Now().Add(claudeSandboxPATTTL)
+	cleartext, _, err := mintPATForUser(userID, "claude sandbox (auto)",
+		[]string{"claude:proxy"}, &exp, claudeSandboxSource)
+	if err != nil {
+		return "", err
+	}
+	sandboxPATCache[userID] = struct {
+		token string
+		exp   time.Time
+	}{cleartext, exp}
+	return cleartext, nil
+}
+
+// StartClaudeSandboxPATSweep deletes expired auto-minted sandbox PATs
+// hourly (they are hidden from the token list, so nothing else cleans them).
+func StartClaudeSandboxPATSweep() {
+	go func() {
+		for {
+			time.Sleep(time.Hour)
+			if common.DB == nil {
+				continue
+			}
+			common.DB.Where("source = ? AND expires_at < ?",
+				claudeSandboxSource, time.Now().Add(-24*time.Hour)).
+				Delete(&models.Token{})
+		}
+	}()
+}
+
+// ── transport ───────────────────────────────────────────────────────────────
+
+// streamClaudeCodeViaProxy sends the conversation to the claude-sandbox
+// runner, reads its streaming NDJSON, and re-emits as SSE events.
 func streamClaudeCodeViaProxy(
 	ctx context.Context,
 	_ *gin.Context,
 	userID string,
-	role string, // caller role — gates filesystem access at the proxy
+	role string, // caller role — super_admin gets the shared workspaces root
 	messages []chatMessage,
 	systemPrompt string,
-	model string, // claude CLI --model alias ("opus" | "sonnet")
+	model string, // claude CLI --model alias or full claude-* id
 	sessionID string, // optional claude session to resume (must be owned by userID)
 	emit func(map[string]any) bool,
 ) error {
 	if model == "" {
-		model = "opus"
+		model = "sonnet"
 	}
 	// Session continuity: resume the prior claude CLI session when the
 	// client passes one back. Only sessions THIS user was previously
@@ -76,44 +147,40 @@ func streamClaudeCodeViaProxy(
 	if sessionID != "" && !userOwnsClaudeSession(userID, sessionID) {
 		sessionID = ""
 	}
-	// Access policy mirrored from the in-house file tools (writeRoot):
-	// only super_admin operates the /proj deployment tree with full
-	// write + skip-permissions. Everyone else (admins included) gets a
-	// READ-ONLY claude scoped to their OWN tenant workspace — the proxy
-	// drops --allow-dangerously-skip-permissions, points --add-dir at this
-	// workspace instead of /proj, and disallows the mutating/exec tools.
-	// This keeps "admin = read-only on the deployment workspace" intact
-	// even though claude-code-sonnet is admin-selectable.
-	workspace := ""
-	if role != "super_admin" {
-		workspace = ownWorkspace(userID)
+	pat, err := claudeSandboxPAT(userID)
+	if err != nil {
+		return fmt.Errorf("sandbox credential mint failed: %w", err)
 	}
 	body, _ := json.Marshal(map[string]any{
-		"messages":   proxyMessages(messages),
-		"model":      model,
-		"system":     systemPrompt,
-		"role":       role,
-		"workspace":  workspace,
-		"session_id": sessionID,
+		"messages":        proxyMessages(messages),
+		"model":           model,
+		"system":          systemPrompt,
+		"role":            role,
+		"user_id":         userID,
+		"session_id":      sessionID,
+		"anthropic_token": pat,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		claudeProxyURL()+"/claude/stream", bytes.NewReader(body))
+		claudeSandboxURL()+"/claude/stream", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Bridge-Secret", os.Getenv("LUMID_IDENTITY_BRIDGE_SECRET"))
 
-	// No client-level timeout — the stream runs until claude finishes.
+	// No client-level timeout — the stream runs until claude finishes
+	// (the sandbox enforces its own per-session hard timeout).
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("claude proxy unreachable at %s: %w\n"+
-			"(start: nohup python3 /home/luyao/bin/claude-proxy.py >> /tmp/claude-proxy.log 2>&1 &)",
-			claudeProxyURL(), err)
+		return fmt.Errorf("claude sandbox unreachable at %s: %w", claudeSandboxURL(), err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return fmt.Errorf("Claude Code sandbox is at capacity — try again in a minute")
+	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("claude proxy returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("claude sandbox returned HTTP %d", resp.StatusCode)
 	}
 
 	// toolNameByID maps tool_use id → name for emitting tool_call events
@@ -217,6 +284,13 @@ func streamClaudeCodeViaProxy(
 			subtype, _ := event["subtype"].(string)
 			if subtype == "error" {
 				msg, _ := event["result"].(string)
+				// Pool quota exhaustion surfaces as an Anthropic
+				// rate_limit_error inside the CLI's error text — rewrite it
+				// to something actionable for the chat user.
+				low := strings.ToLower(msg)
+				if strings.Contains(low, "rate_limit") || strings.Contains(low, "quota") {
+					msg = "Pooled Claude quota reached — usage windows and reset times are at lum.id/code. " + msg
+				}
 				emit(map[string]any{"type": "error", "message": msg})
 			}
 			// "success" → text already streamed via stream_event deltas.

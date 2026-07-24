@@ -32,7 +32,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,7 +46,13 @@ import (
 
 const (
 	claudeOAuthTokenURL = "https://platform.claude.com/v1/oauth/token"
-	claudeOAuthClientID = "https://claude.ai/oauth/claude-code-client-metadata"
+	// UUID-format client_id expected by platform.claude.com/v1/oauth/token.
+	// The metadata document URL (https://claude.ai/oauth/claude-code-client-metadata)
+	// is used for initial authorization but NOT for token refresh — the endpoint
+	// validates the client_id as a UUID and rejects URLs with "Invalid request format".
+	claudeOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	// Scopes required by Claude Code — must be present in the refresh body.
+	claudeOAuthScopes = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
 
 // refreshMutexes serialises token refresh per email. Anthropic rotates the
@@ -90,17 +95,20 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 		return "", fmt.Errorf("decrypt refresh token: %w", err)
 	}
 
-	// OAuth 2.0 token endpoints require application/x-www-form-urlencoded (RFC 6749 §4.1.3).
-	formBody := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {refreshTok},
-		"client_id":     {claudeOAuthClientID},
+	// Anthropic's token endpoint accepts JSON (not form-encoded).
+	// Must include client_id (UUID, not metadata URL) and scope.
+	bodyMap := map[string]string{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshTok,
+		"client_id":     claudeOAuthClientID,
+		"scope":         claudeOAuthScopes,
 	}
-	req, err := http.NewRequest(http.MethodPost, claudeOAuthTokenURL, strings.NewReader(formBody.Encode()))
+	bodyJSON, _ := json.Marshal(bodyMap)
+	req, err := http.NewRequest(http.MethodPost, claudeOAuthTokenURL, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return "", fmt.Errorf("build refresh request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 
 	cl := &http.Client{Timeout: quotaFetchTimeout}

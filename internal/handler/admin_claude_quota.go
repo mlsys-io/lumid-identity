@@ -32,6 +32,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,16 +90,17 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 		return "", fmt.Errorf("decrypt refresh token: %w", err)
 	}
 
-	body, _ := json.Marshal(map[string]string{
-		"grant_type":    "refresh_token",
-		"refresh_token": refreshTok,
-		"client_id":     claudeOAuthClientID,
-	})
-	req, err := http.NewRequest(http.MethodPost, claudeOAuthTokenURL, bytes.NewReader(body))
+	// OAuth 2.0 token endpoints require application/x-www-form-urlencoded (RFC 6749 §4.1.3).
+	formBody := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshTok},
+		"client_id":     {claudeOAuthClientID},
+	}
+	req, err := http.NewRequest(http.MethodPost, claudeOAuthTokenURL, strings.NewReader(formBody.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("build refresh request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 
 	cl := &http.Client{Timeout: quotaFetchTimeout}
@@ -118,7 +120,7 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 		if errResp.Error != "" {
 			return "", fmt.Errorf("token refresh failed: %s — %s", errResp.Error, errResp.Desc)
 		}
-		return "", fmt.Errorf("token refresh HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("token refresh HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw[:min(len(raw), 200)])))
 	}
 
 	var tok struct {

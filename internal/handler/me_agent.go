@@ -781,6 +781,34 @@ var llmProviders = []llmProvider{
 		minRole:           "super_admin", // pool: fable = super_admin only
 		dailyBudgetTokens: -1,
 	},
+	// External models through the pool proxy's OpenAI-compat path (separate
+	// API keys — no Anthropic pool 5h/7d consumption, but metered per-user
+	// with real cost + recorded on /claude-sessions). The proxy itself gates
+	// these admin+ by the PAT's role; minRole mirrors that.
+	{
+		id:                "claude-code-kimi",
+		displayName:       "Kimi K3 (Code)",
+		endpoint:          "",
+		upstreamModel:     "kimi-k3", // Moonshot via pool proxy oaicompat
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "admin",
+		dailyBudgetTokens: -1,
+	},
+	{
+		id:                "claude-code-glm",
+		displayName:       "GLM-5.2 (Code)",
+		endpoint:          "",
+		upstreamModel:     "z-ai/glm-5.2", // OpenRouter via pool proxy oaicompat
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "admin",
+		dailyBudgetTokens: -1,
+	},
 	{
 		// Claude Code HARNESS on our own GPU — the sandbox routes the CLI at
 		// the lumid-llm gateway ("lumid-llm/<model>" prefix) instead of the

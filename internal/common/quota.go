@@ -21,6 +21,7 @@ package common
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -200,6 +201,12 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	case "claude_proxy":
 		// Rolling 5h/7d windows (not midnight-daily) — mirrors the Anthropic
 		// account quota shape the pool itself is subject to.
+		//
+		// Non-Anthropic models (kimi-k3, z-ai/glm-5.2, etc.) don't consume the
+		// Anthropic token pool — skip the cap check and just record the event.
+		if !strings.HasPrefix(req.Model, "claude") {
+			break
+		}
 		cap5, cap7 := ClaudePoolLimits()
 		used5, used7, werr := ClaudePoolWindows(db, req.UserSub)
 		if werr != nil {

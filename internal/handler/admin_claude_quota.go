@@ -594,18 +594,20 @@ func InternalClaudeTokenLease(c *gin.Context) {
 func AdminClaudeUserUsage(c *gin.Context) {
 	now := time.Now().UTC()
 	rows := []struct {
-		UserSub string
-		Email   string
-		Win     string
-		Tokens  int
-		Reqs    int
-		LastTs  time.Time
+		UserSub   string
+		Email     string
+		Win       string
+		Tokens    int
+		CostCents int
+		Reqs      int
+		LastTs    time.Time
 	}{}
 	err := common.DB.Raw(`
 		SELECT ue.user_sub                                        AS user_sub,
 		       COALESCE(u.email, ue.user_sub)                     AS email,
 		       CASE WHEN ue.ts >= ? THEN '5h' ELSE '7d' END       AS win,
 		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens,
+		       COALESCE(SUM(ue.cost_cents), 0)                    AS cost_cents,
 		       COUNT(*)                                           AS reqs,
 		       MAX(ue.ts)                                         AS last_ts
 		FROM   usage_events ue
@@ -617,6 +619,23 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "query usage: "+err.Error())
 		return
 	}
+
+	// Per-model breakdown over the 7d window.
+	modelRows := []struct {
+		UserSub   string
+		Model     string
+		Tokens    int
+		CostCents int
+	}{}
+	common.DB.Raw(`
+		SELECT ue.user_sub                                        AS user_sub,
+		       COALESCE(ue.model, '')                             AS model,
+		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens,
+		       COALESCE(SUM(ue.cost_cents), 0)                    AS cost_cents
+		FROM   usage_events ue
+		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
+		GROUP  BY ue.user_sub, ue.model`,
+		now.Add(-7*24*time.Hour)).Scan(&modelRows)
 
 	// Also find users who hold a claude:proxy (or wildcard) PAT used recently
 	// — they show even if chargeUser failed (0/0 token rows).
@@ -641,30 +660,80 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		now.Add(-7*24*time.Hour)).Scan(&patHolders)
 
 	cap5, cap7 := common.ClaudePoolLimits()
+	// Third query: oldest event per user per window — used to compute reset times.
+	// five_hour_reset = min_ts_5h + 5h  (when the oldest 5h event ages out)
+	// seven_day_reset = min_ts_7d + 7d  (when the oldest 7d event ages out)
+	oldestRows := []struct {
+		UserSub  string
+		Win      string
+		OldestTs time.Time
+	}{}
+	common.DB.Raw(`
+		SELECT ue.user_sub                                        AS user_sub,
+		       CASE WHEN ue.ts >= ? THEN '5h' ELSE '7d' END       AS win,
+		       MIN(ue.ts)                                         AS oldest_ts
+		FROM   usage_events ue
+		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
+		GROUP  BY ue.user_sub, win`,
+		now.Add(-5*time.Hour), now.Add(-7*24*time.Hour)).Scan(&oldestRows)
+
+	type modelUsage struct {
+		Tokens    int `json:"tokens_7d"`
+		CostCents int `json:"cost_cents_7d"`
+	}
 	type userUsage struct {
-		Email       string    `json:"email"`
-		FiveHour    int       `json:"five_hour_tokens"`
-		SevenDay    int       `json:"seven_day_tokens"`
-		FiveHourPct float64   `json:"five_hour_pct"`
-		SevenDayPct float64   `json:"seven_day_pct"`
-		Requests    int       `json:"requests_7d"`
-		LastTs      time.Time `json:"last_ts"`
+		Email          string                `json:"email"`
+		FiveHour       int                   `json:"five_hour_tokens"`
+		SevenDay       int                   `json:"seven_day_tokens"`
+		FiveHourPct    float64               `json:"five_hour_pct"`
+		SevenDayPct    float64               `json:"seven_day_pct"`
+		CostCents7d    int                   `json:"cost_cents_7d"`
+		Requests       int                   `json:"requests_7d"`
+		LastTs         time.Time             `json:"last_ts"`
+		FiveHourReset  time.Time             `json:"five_hour_reset"`
+		SevenDayReset  time.Time             `json:"seven_day_reset"`
+		Models         map[string]modelUsage `json:"models"`
 	}
 	byUser := map[string]*userUsage{}
 	for _, r := range rows {
 		u, ok := byUser[r.UserSub]
 		if !ok {
-			u = &userUsage{Email: r.Email}
+			u = &userUsage{Email: r.Email, Models: map[string]modelUsage{}}
 			byUser[r.UserSub] = u
 		}
 		if r.Win == "5h" {
 			u.FiveHour += r.Tokens
 		}
-		u.SevenDay += r.Tokens // 5h bucket is inside the 7d window
+		u.SevenDay += r.Tokens    // 5h bucket is inside the 7d window
+		u.CostCents7d += r.CostCents // accumulate cost from both buckets (7d total)
 		u.Requests += r.Reqs
 		if r.LastTs.After(u.LastTs) {
 			u.LastTs = r.LastTs
 		}
+	}
+	// Attach per-user reset times from oldest-event query.
+	for _, or_ := range oldestRows {
+		u, ok := byUser[or_.UserSub]
+		if !ok {
+			continue
+		}
+		switch or_.Win {
+		case "5h":
+			u.FiveHourReset = or_.OldestTs.Add(5 * time.Hour)
+		case "7d":
+			u.SevenDayReset = or_.OldestTs.Add(7 * 24 * time.Hour)
+		}
+	}
+	// Attach per-model breakdown.
+	for _, mr := range modelRows {
+		u, ok := byUser[mr.UserSub]
+		if !ok {
+			continue
+		}
+		m := u.Models[mr.Model]
+		m.Tokens += mr.Tokens
+		m.CostCents += mr.CostCents
+		u.Models[mr.Model] = m
 	}
 	// Merge PAT holders who haven't charged tokens yet.
 	for _, ph := range patHolders {
@@ -672,6 +741,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 			byUser[ph.UserSub] = &userUsage{
 				Email:  ph.Email,
 				LastTs: ph.LastUsedAt,
+				Models: map[string]modelUsage{},
 			}
 		}
 	}

@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -717,4 +718,48 @@ func InternalClaudeQuotaReport(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
+}
+
+// ── proactive token refresh loop ───────────────────────────────────────────
+//
+// Claude OAuth access tokens expire in ~1 hour. StartTokenRefreshLoop starts
+// a background goroutine that wakes every 12 hours and proactively exchanges
+// every stored refresh token for a fresh access+refresh token pair, keeping
+// the pool perpetually valid without any manual intervention.
+//
+// Only rows with a stored RefreshTokenEncrypted are processed; rows with only
+// an access token are left alone (they must be re-added manually when they
+// expire). Requests are staggered by 2 s to avoid simultaneous Anthropic hits.
+
+func StartTokenRefreshLoop() {
+	go func() {
+		// Small initial delay so the DB is ready and startup noise settles.
+		time.Sleep(3 * time.Minute)
+		for {
+			proactiveRefreshAll()
+			time.Sleep(12 * time.Hour)
+		}
+	}()
+}
+
+func proactiveRefreshAll() {
+	var rows []models.ClaudeQuotaToken
+	if err := common.DB.
+		Where("refresh_token_encrypted != ''").
+		Find(&rows).Error; err != nil {
+		log.Printf("token-refresh-loop: db query failed: %v", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	log.Printf("token-refresh-loop: proactively refreshing %d token(s)", len(rows))
+	for _, row := range rows {
+		if _, err := tryRefreshToken(&row); err != nil {
+			log.Printf("token-refresh-loop: %s: FAILED: %v", row.Email, err)
+		} else {
+			log.Printf("token-refresh-loop: %s: ok", row.Email)
+		}
+		time.Sleep(2 * time.Second)
+	}
 }

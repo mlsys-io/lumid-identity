@@ -34,6 +34,10 @@ func main() {
 		log.Fatalf("load signing keys: %v", err)
 	}
 
+	// Proactively refresh Claude OAuth pool tokens every 12 hours so access
+	// tokens never silently expire between proxy requests.
+	handler.StartTokenRefreshLoop()
+
 	if cfg.App.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}

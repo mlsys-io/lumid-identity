@@ -25,6 +25,7 @@ package handler
 // Legacy bridge path — kept for any external push reporter.
 
 import (
+	base64Stdlib "encoding/base64"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -731,15 +732,58 @@ func InternalClaudeQuotaReport(c *gin.Context) {
 // an access token are left alone (they must be re-added manually when they
 // expire). Requests are staggered by 2 s to avoid simultaneous Anthropic hits.
 
+// tokenRefreshInterval is how often the proactive loop sweeps all accounts.
+// Claude OAuth access tokens expire in roughly 1 hour; 45 minutes ensures they
+// are refreshed before expiry even if the proxy hasn't been used recently.
+const tokenRefreshInterval = 45 * time.Minute
+
 func StartTokenRefreshLoop() {
 	go func() {
 		// Small initial delay so the DB is ready and startup noise settles.
 		time.Sleep(3 * time.Minute)
 		for {
 			proactiveRefreshAll()
-			time.Sleep(12 * time.Hour)
+			time.Sleep(tokenRefreshInterval)
 		}
 	}()
+}
+
+// jwtExpiry extracts the exp claim from a JWT without verifying the signature.
+// Returns zero time on any parse error.
+func jwtExpiry(rawToken string) time.Time {
+	// sk-ant-oat01-<header>.<payload>.<sig> — strip vendor prefix.
+	tok := rawToken
+	if idx := strings.Index(rawToken, "eyJ"); idx != -1 {
+		tok = rawToken[idx:]
+	}
+	parts := strings.SplitN(tok, ".", 3)
+	if len(parts) < 2 {
+		return time.Time{}
+	}
+	payload, err := base64DecodeJWT(parts[1])
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.Exp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(claims.Exp, 0)
+}
+
+func base64DecodeJWT(s string) ([]byte, error) {
+	// JWT uses base64url without padding; add padding back.
+	switch len(s) % 4 {
+	case 2:
+		s += "=="
+	case 3:
+		s += "="
+	}
+	// Replace url-safe chars.
+	s = strings.NewReplacer("-", "+", "_", "/").Replace(s)
+	return base64Stdlib.StdEncoding.DecodeString(s)
 }
 
 func proactiveRefreshAll() {
@@ -753,8 +797,18 @@ func proactiveRefreshAll() {
 	if len(rows) == 0 {
 		return
 	}
-	log.Printf("token-refresh-loop: proactively refreshing %d token(s)", len(rows))
 	for _, row := range rows {
+		tok, err := common.DecryptGrant(row.ValueEncrypted)
+		if err != nil {
+			log.Printf("token-refresh-loop: %s: decrypt err: %v — skipping", row.Email, err)
+			continue
+		}
+		// Only refresh if the token expires within 2 × the sweep interval
+		// (i.e. within ~90 min). Tokens still valid for longer are left alone.
+		if exp := jwtExpiry(tok); !exp.IsZero() && time.Until(exp) > 2*tokenRefreshInterval {
+			log.Printf("token-refresh-loop: %s: exp in %v — skipping", row.Email, time.Until(exp).Round(time.Minute))
+			continue
+		}
 		if _, err := tryRefreshToken(&row); err != nil {
 			log.Printf("token-refresh-loop: %s: FAILED: %v", row.Email, err)
 		} else {

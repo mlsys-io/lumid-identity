@@ -51,10 +51,16 @@ func InitBlobStore() {
 
 	region := os.Getenv("S3_SESSIONS_REGION")
 	if region == "" {
-		// Derive from UpCloud hostname pattern: objectstorage.<region>.upcloudobjects.com
-		parts := strings.SplitN(host, ".", 4)
-		if len(parts) >= 3 {
-			region = parts[1]
+		// Extract region from UpCloud hostnames:
+		//   objectstorage.{region}.upcloudobjects.com → last segment before ".upcloudobjects.com"
+		//   {region}.upcloudobjects.com              → the lone prefix
+		if strings.HasSuffix(host, ".upcloudobjects.com") {
+			core := strings.TrimSuffix(host, ".upcloudobjects.com")
+			if idx := strings.LastIndex(core, "."); idx >= 0 {
+				region = core[idx+1:]
+			} else {
+				region = core
+			}
 		} else {
 			region = "auto"
 		}

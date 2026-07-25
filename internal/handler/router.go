@@ -309,6 +309,10 @@ func Register(r *gin.Engine) {
 			me.POST("/agent/chat/stream", MeAgentChatStream)
 			// Tool approval — unblocks a destructive tool pending user consent.
 			me.POST("/agent/chat/tool-approve", MeAgentToolApprove)
+			// Cooperative stop for a live Claude Code turn (see
+			// me_agent_claude_code.go) — beats aborting the fetch, which
+			// SIGKILLed the CLI and discarded partial work.
+			me.POST("/agent/chat/interrupt", MeAgentChatInterrupt)
 			// Persistent "always allow" grants for destructive tools —
 			// written by tool-approve with always=true; listed/revoked here.
 			me.GET("/agent/tool-grants", MeAgentToolGrants)

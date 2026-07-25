@@ -374,3 +374,80 @@ func TestBlockIndicesAreScopedByParent(t *testing.T) {
 		t.Errorf("parent args attributed to %q, want toolu_parent", ids[1])
 	}
 }
+
+// A user-requested stop must NOT read as a failure. The CLI reports an
+// interrupted turn as error_during_execution and the sandbox then synthesizes a
+// non-zero-exit result — both would otherwise surface as "internal error".
+func TestInterruptedTurnReportsStoppedNotError(t *testing.T) {
+	for _, ev := range []map[string]any{
+		{"type": "result", "subtype": "error_during_execution", "is_error": true},
+		{"type": "result", "subtype": "error", "result": "claude exited: exit status 1"},
+	} {
+		var got []map[string]any
+		tr := newClaudeTranslator("u", func(m map[string]any) bool {
+			got = append(got, m)
+			return true
+		})
+		tr.stopped = func() bool { return true }
+		tr.handle(ev)
+
+		if len(got) != 1 {
+			t.Fatalf("want 1 event, got %v", got)
+		}
+		if got[0]["type"] != "stopped" {
+			t.Errorf("subtype %v produced %v, want type=stopped", ev["subtype"], got[0])
+		}
+	}
+}
+
+// The same events with no stop requested must still surface as errors — the
+// stopped predicate must not swallow real failures.
+func TestUninterruptedFailureStillErrors(t *testing.T) {
+	var got []map[string]any
+	tr := newClaudeTranslator("u", func(m map[string]any) bool {
+		got = append(got, m)
+		return true
+	})
+	tr.stopped = func() bool { return false }
+	tr.handle(map[string]any{"type": "result", "subtype": "error_during_execution", "is_error": true})
+
+	if len(got) != 1 || got[0]["type"] != "error" {
+		t.Fatalf("want a single error event, got %v", got)
+	}
+}
+
+// The CLI ships its own reasoning-token count; the client had been inferring it
+// from text length at ~4 chars/token.
+func TestThinkingTokensForwarded(t *testing.T) {
+	var got []map[string]any
+	tr := newClaudeTranslator("u", func(m map[string]any) bool {
+		got = append(got, m)
+		return true
+	})
+	tr.handle(map[string]any{
+		"type": "system", "subtype": "thinking_tokens",
+		"estimated_tokens": float64(69), "estimated_tokens_delta": float64(19),
+	})
+	if len(got) != 1 || got[0]["type"] != "thinking_tokens" {
+		t.Fatalf("want thinking_tokens, got %v", got)
+	}
+	if got[0]["tokens"] != float64(69) || got[0]["delta"] != float64(19) {
+		t.Errorf("tokens/delta not forwarded: %v", got[0])
+	}
+}
+
+// Turn ownership: one user must never be able to stop another's run.
+func TestInterruptOwnershipEnforced(t *testing.T) {
+	registerClaudeTurn("t-own", "alice")
+	defer unregisterClaudeTurn("t-own")
+
+	if markClaudeTurnInterrupted("t-own", "bob") {
+		t.Error("bob was allowed to interrupt alice's turn")
+	}
+	if !markClaudeTurnInterrupted("t-own", "alice") {
+		t.Error("alice could not interrupt her own turn")
+	}
+	if markClaudeTurnInterrupted("t-missing", "alice") {
+		t.Error("an unknown turn should report not-found, not success")
+	}
+}

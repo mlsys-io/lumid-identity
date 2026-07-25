@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -122,6 +123,87 @@ func StartClaudeSandboxPATSweep() {
 	}()
 }
 
+// ── live turn registry (cooperative interrupt) ──────────────────────────────
+//
+// The sandbox returns an X-Turn-Id for each streaming run and accepts
+// POST /claude/control to steer it. We keep a per-pod map of live turns so
+// POST /me/agent/chat/interrupt (a SEPARATE request from the stream) can find
+// the right run, and so the stream goroutine knows the stop was requested —
+// otherwise a user-initiated stop surfaces as the CLI's
+// `error_during_execution` and reads as an internal failure.
+
+type claudeTurn struct {
+	userID      string
+	interrupted bool
+}
+
+var (
+	claudeTurnsMu sync.Mutex
+	claudeTurns   = map[string]*claudeTurn{}
+)
+
+func registerClaudeTurn(turnID, userID string) *claudeTurn {
+	t := &claudeTurn{userID: userID}
+	claudeTurnsMu.Lock()
+	claudeTurns[turnID] = t
+	claudeTurnsMu.Unlock()
+	return t
+}
+
+func unregisterClaudeTurn(turnID string) {
+	claudeTurnsMu.Lock()
+	delete(claudeTurns, turnID)
+	claudeTurnsMu.Unlock()
+}
+
+// markClaudeTurnInterrupted flags the turn and reports whether it exists AND
+// belongs to this user — a caller must not be able to stop someone else's run.
+func markClaudeTurnInterrupted(turnID, userID string) bool {
+	claudeTurnsMu.Lock()
+	defer claudeTurnsMu.Unlock()
+	t := claudeTurns[turnID]
+	if t == nil || t.userID != userID {
+		return false
+	}
+	t.interrupted = true
+	return true
+}
+
+func claudeTurnInterrupted(t *claudeTurn) bool {
+	if t == nil {
+		return false
+	}
+	claudeTurnsMu.Lock()
+	defer claudeTurnsMu.Unlock()
+	return t.interrupted
+}
+
+// InterruptClaudeTurn asks the sandbox to stop a live turn cooperatively.
+func InterruptClaudeTurn(ctx context.Context, turnID, userID string) error {
+	if !markClaudeTurnInterrupted(turnID, userID) {
+		// Already finished, or not this user's. Either way there is nothing to
+		// stop; report success so the UI's Stop button is never a dead end.
+		return nil
+	}
+	body, _ := json.Marshal(map[string]any{"turn_id": turnID, "action": "interrupt"})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		claudeSandboxURL()+"/claude/control", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Bridge-Secret", os.Getenv("LUMID_IDENTITY_BRIDGE_SECRET"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("claude sandbox unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("sandbox control returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // ── transport ───────────────────────────────────────────────────────────────
 
 // streamClaudeCodeViaProxy sends the conversation to the claude-sandbox
@@ -152,6 +234,13 @@ func streamClaudeCodeViaProxy(
 	if err != nil {
 		return fmt.Errorf("sandbox credential mint failed: %w", err)
 	}
+	// Pre-assign the session UUID on a fresh run so the id is known BEFORE the
+	// stream starts, instead of being scraped out of system/init.
+	newSessionID := ""
+	if sessionID == "" {
+		newSessionID = uuid.NewString()
+		recordClaudeSession(userID, newSessionID)
+	}
 	body, _ := json.Marshal(map[string]any{
 		"messages":        proxyMessages(messages),
 		"model":           model,
@@ -159,6 +248,7 @@ func streamClaudeCodeViaProxy(
 		"role":            role,
 		"user_id":         userID,
 		"session_id":      sessionID,
+		"new_session_id":  newSessionID,
 		"anthropic_token": pat,
 	})
 
@@ -184,7 +274,19 @@ func streamClaudeCodeViaProxy(
 		return fmt.Errorf("claude sandbox returned HTTP %d", resp.StatusCode)
 	}
 
+	// The sandbox names this run; POST /me/agent/chat/interrupt targets it.
+	turnID := resp.Header.Get("X-Turn-Id")
+	var turn *claudeTurn
+	if turnID != "" {
+		turn = registerClaudeTurn(turnID, userID)
+		defer unregisterClaudeTurn(turnID)
+		if !emit(map[string]any{"type": "turn_id", "turn_id": turnID}) {
+			return nil
+		}
+	}
+
 	tr := newClaudeTranslator(userID, emit)
+	tr.stopped = func() bool { return claudeTurnInterrupted(turn) }
 
 	// Read lines on a goroutine so the main loop can also fire heartbeats.
 	// All emit() calls stay on THIS goroutine — the SSE writer is not
@@ -265,6 +367,10 @@ func streamClaudeCodeViaProxy(
 type claudeTranslator struct {
 	userID string
 	emit   func(map[string]any) bool
+	// stopped reports whether the user asked to stop this turn. An interrupted
+	// run ends as `error_during_execution`, which must NOT be shown as an
+	// internal failure when the user pressed Stop.
+	stopped func() bool
 
 	toolNameByID map[string]string // tool_use id → name, for the later tool_result
 	blockKind    map[string]string // scoped block index → "text"|"thinking"|"tool_use"
@@ -415,6 +521,15 @@ func (t *claudeTranslator) handleSystem(event map[string]any) bool {
 	case "status":
 		// Upstream request state ("requesting"), for a liveness indicator.
 		return t.emit(map[string]any{"type": "status", "status": event["status"]})
+
+	case "thinking_tokens":
+		// The CLI's OWN running estimate of reasoning tokens. The client had
+		// been inferring this from text length at ~4 chars/token.
+		return t.emit(map[string]any{
+			"type":   "thinking_tokens",
+			"tokens": event["estimated_tokens"],
+			"delta":  event["estimated_tokens_delta"],
+		})
 
 	case "compact_boundary":
 		// The CLI compacted its context mid-session.
@@ -571,6 +686,13 @@ func (t *claudeTranslator) handleResult(event map[string]any) bool {
 		})
 	}
 
+	// A user-requested stop also lands here (the CLI reports an interrupted
+	// turn as error_during_execution, and the sandbox then synthesizes a
+	// non-zero-exit result). Report it as what it was, not as a failure.
+	if t.stopped != nil && t.stopped() {
+		return t.emit(map[string]any{"type": "stopped"})
+	}
+
 	// Every non-success terminal state. Previously only the literal
 	// subtype "error" was handled — which the sandbox synthesizes on a
 	// non-zero exit — so the CLI's OWN failure subtypes fell through and
@@ -610,4 +732,36 @@ func proxyMessages(msgs []chatMessage) []map[string]any {
 		})
 	}
 	return out
+}
+
+// ── POST /me/agent/chat/interrupt ───────────────────────────────────────────
+
+// MeAgentChatInterrupt stops a live Claude Code turn cooperatively.
+//
+// The Stop button used to only abort the browser's fetch, which cancelled the
+// request context and SIGKILLed the CLI process group — tearing the stream and
+// discarding whatever the turn had done so far. Going through the sandbox's
+// control channel instead lets the CLI finish its current tool, flush a real
+// `result`, and persist session state, so the turn stays resumable.
+func MeAgentChatInterrupt(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok || userID == "" {
+		c.JSON(401, gin.H{"code": 401, "message": "unauthorized"})
+		return
+	}
+	var body struct {
+		TurnID string `json:"turn_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.TurnID == "" {
+		c.JSON(400, gin.H{"code": 400, "message": "turn_id required"})
+		return
+	}
+	// Ownership is enforced inside markClaudeTurnInterrupted — a caller cannot
+	// stop another user's run, and an unknown turn is a no-op rather than an
+	// error so the button is never a dead end.
+	if err := InterruptClaudeTurn(c.Request.Context(), body.TurnID, userID); err != nil {
+		c.JSON(502, gin.H{"code": 502, "message": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"code": 0, "message": "ok", "data": gin.H{"ok": true}})
 }

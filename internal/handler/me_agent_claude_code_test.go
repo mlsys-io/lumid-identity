@@ -379,6 +379,21 @@ func TestBlockIndicesAreScopedByParent(t *testing.T) {
 // interrupted turn as error_during_execution and the sandbox then synthesizes a
 // non-zero-exit result — both would otherwise surface as "internal error".
 func TestInterruptedTurnReportsStoppedNotError(t *testing.T) {
+	// Emitted exactly ONCE across both terminal shapes — a stopped turn
+	// produces the CLI's error_during_execution AND the sandbox's synthesized
+	// non-zero-exit result, and two "Stopped" notices read as a glitch.
+	var all []map[string]any
+	trOnce := newClaudeTranslator("u", func(m map[string]any) bool {
+		all = append(all, m)
+		return true
+	})
+	trOnce.stopped = func() bool { return true }
+	trOnce.handle(map[string]any{"type": "result", "subtype": "error_during_execution", "is_error": true})
+	trOnce.handle(map[string]any{"type": "result", "subtype": "error", "result": "claude exited: exit status 1"})
+	if len(all) != 1 {
+		t.Errorf("want exactly 1 stopped event across both terminal shapes, got %d: %v", len(all), all)
+	}
+
 	for _, ev := range []map[string]any{
 		{"type": "result", "subtype": "error_during_execution", "is_error": true},
 		{"type": "result", "subtype": "error", "result": "claude exited: exit status 1"},

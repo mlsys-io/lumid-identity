@@ -371,6 +371,10 @@ type claudeTranslator struct {
 	// run ends as `error_during_execution`, which must NOT be shown as an
 	// internal failure when the user pressed Stop.
 	stopped func() bool
+	// A stopped turn produces TWO terminal events (the CLI's
+	// error_during_execution, then the sandbox's synthesized non-zero exit), so
+	// the notice has to be emitted once.
+	sentStopped bool
 
 	toolNameByID map[string]string // tool_use id → name, for the later tool_result
 	blockKind    map[string]string // scoped block index → "text"|"thinking"|"tool_use"
@@ -719,6 +723,10 @@ func (t *claudeTranslator) handleResult(event map[string]any) bool {
 	// turn as error_during_execution, and the sandbox then synthesizes a
 	// non-zero-exit result). Report it as what it was, not as a failure.
 	if t.stopped != nil && t.stopped() {
+		if t.sentStopped {
+			return true
+		}
+		t.sentStopped = true
 		return t.emit(map[string]any{"type": "stopped"})
 	}
 

@@ -156,36 +156,63 @@ func unregisterClaudeTurn(turnID string) {
 	claudeTurnsMu.Unlock()
 }
 
-// markClaudeTurnInterrupted flags the turn and reports whether it exists AND
-// belongs to this user — a caller must not be able to stop someone else's run.
-func markClaudeTurnInterrupted(turnID, userID string) bool {
+// claudeStoppedKey marks a turn as user-stopped ACROSS PODS.
+//
+// identity runs multiple replicas with no session affinity, so the interrupt
+// request routinely lands on a different pod than the one holding the stream —
+// measured 2 of 3 in a live test. An in-memory flag therefore cannot tell the
+// streaming goroutine that the user pressed Stop, and the turn's terminal
+// event would render as "stopped with an internal error". Redis is the shared
+// signal; the local map stays as a same-pod fast path and as the fallback when
+// Redis is unavailable.
+func claudeStoppedKey(turnID string) string { return "claude:stopped:" + turnID }
+
+const claudeStoppedTTL = 30 * time.Minute
+
+// markClaudeTurnInterrupted records the stop locally (best effort) and
+// cross-pod via Redis. Authorization is NOT done here — see
+// InterruptClaudeTurn.
+func markClaudeTurnInterrupted(turnID, userID string) {
 	claudeTurnsMu.Lock()
-	defer claudeTurnsMu.Unlock()
-	t := claudeTurns[turnID]
-	if t == nil || t.userID != userID {
-		return false
+	if t := claudeTurns[turnID]; t != nil && t.userID == userID {
+		t.interrupted = true
 	}
-	t.interrupted = true
-	return true
+	claudeTurnsMu.Unlock()
+
+	if common.Redis != nil {
+		_ = common.Redis.Set(context.Background(), claudeStoppedKey(turnID), userID, claudeStoppedTTL).Err()
+	}
 }
 
-func claudeTurnInterrupted(t *claudeTurn) bool {
-	if t == nil {
+// claudeTurnInterrupted reports whether the user asked to stop this turn,
+// checking the same-pod flag first and then the cross-pod Redis marker.
+func claudeTurnInterrupted(turnID string, t *claudeTurn) bool {
+	if t != nil {
+		claudeTurnsMu.Lock()
+		local := t.interrupted
+		claudeTurnsMu.Unlock()
+		if local {
+			return true
+		}
+	}
+	if turnID == "" || common.Redis == nil {
 		return false
 	}
-	claudeTurnsMu.Lock()
-	defer claudeTurnsMu.Unlock()
-	return t.interrupted
+	n, err := common.Redis.Exists(context.Background(), claudeStoppedKey(turnID)).Result()
+	return err == nil && n > 0
 }
 
 // InterruptClaudeTurn asks the sandbox to stop a live turn cooperatively.
 func InterruptClaudeTurn(ctx context.Context, turnID, userID string) error {
-	if !markClaudeTurnInterrupted(turnID, userID) {
-		// Already finished, or not this user's. Either way there is nothing to
-		// stop; report success so the UI's Stop button is never a dead end.
-		return nil
-	}
-	body, _ := json.Marshal(map[string]any{"turn_id": turnID, "action": "interrupt"})
+	markClaudeTurnInterrupted(turnID, userID)
+	// ALWAYS forward. This used to early-return when the turn wasn't in this
+	// pod's map, which made the Stop button a silent no-op whenever the request
+	// landed on the pod that wasn't streaming (2 of 3 attempts, measured).
+	// Ownership is enforced by the sandbox, which is single-replica and holds
+	// the only consistent turn→owner mapping; it answers 403 on a mismatch.
+	body, _ := json.Marshal(map[string]any{
+		"turn_id": turnID, "action": "interrupt", "user_id": userID,
+	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		claudeSandboxURL()+"/claude/control", bytes.NewReader(body))
 	if err != nil {
@@ -198,6 +225,9 @@ func InterruptClaudeTurn(ctx context.Context, turnID, userID string) error {
 		return fmt.Errorf("claude sandbox unreachable: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("that turn belongs to another user")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("sandbox control returned HTTP %d", resp.StatusCode)
 	}
@@ -286,7 +316,7 @@ func streamClaudeCodeViaProxy(
 	}
 
 	tr := newClaudeTranslator(userID, emit)
-	tr.stopped = func() bool { return claudeTurnInterrupted(turn) }
+	tr.stopped = func() bool { return claudeTurnInterrupted(turnID, turn) }
 
 	// Read lines on a goroutine so the main loop can also fire heartbeats.
 	// All emit() calls stay on THIS goroutine — the SSE writer is not

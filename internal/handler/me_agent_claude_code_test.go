@@ -451,19 +451,30 @@ func TestThinkingTokensForwarded(t *testing.T) {
 	}
 }
 
-// Turn ownership: one user must never be able to stop another's run.
-func TestInterruptOwnershipEnforced(t *testing.T) {
-	registerClaudeTurn("t-own", "alice")
+// The same-pod stop flag: only the owner's stop flips it.
+//
+// Ownership is ENFORCED by the sandbox (single-replica, authoritative), not
+// here — identity runs multiple replicas with no session affinity, so an
+// in-memory map is not a consistent view. This only checks the local fast path.
+func TestLocalStopFlagRespectsOwner(t *testing.T) {
+	turn := registerClaudeTurn("t-own", "alice")
 	defer unregisterClaudeTurn("t-own")
 
-	if markClaudeTurnInterrupted("t-own", "bob") {
-		t.Error("bob was allowed to interrupt alice's turn")
+	markClaudeTurnInterrupted("t-own", "bob")
+	if claudeTurnInterrupted("", turn) {
+		t.Error("bob's stop flipped alice's turn flag")
 	}
-	if !markClaudeTurnInterrupted("t-own", "alice") {
-		t.Error("alice could not interrupt her own turn")
+	markClaudeTurnInterrupted("t-own", "alice")
+	if !claudeTurnInterrupted("", turn) {
+		t.Error("alice's own stop did not flip the flag")
 	}
-	if markClaudeTurnInterrupted("t-missing", "alice") {
-		t.Error("an unknown turn should report not-found, not success")
+}
+
+// A nil turn (no X-Turn-Id, or a stream on another pod) must not panic and must
+// not claim a stop happened when there is no Redis marker either.
+func TestStopFlagNilTurnIsFalse(t *testing.T) {
+	if claudeTurnInterrupted("t-nowhere", nil) {
+		t.Error("unknown turn reported as stopped")
 	}
 }
 

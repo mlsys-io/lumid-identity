@@ -25,8 +25,8 @@ package handler
 // Legacy bridge path — kept for any external push reporter.
 
 import (
-	base64Stdlib "encoding/base64"
 	"bytes"
+	base64Stdlib "encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -251,11 +251,11 @@ func fetchClaudeUsage(token string) (*models.ClaudeQuotaSnapshot, error) {
 	raw, _ := json.Marshal(map[string]interface{}{
 		"limits": limits,
 		"meta": map[string]string{
-			"five_hour_status":         fiveStatus,
-			"seven_day_status":         sevenStatus,
-			"representative_claim":     get("anthropic-ratelimit-unified-representative-claim"),
-			"fallback_percentage":      get("anthropic-ratelimit-unified-fallback-percentage"),
-			"source":                   "anthropic_api_headers",
+			"five_hour_status":     fiveStatus,
+			"seven_day_status":     sevenStatus,
+			"representative_claim": get("anthropic-ratelimit-unified-representative-claim"),
+			"fallback_percentage":  get("anthropic-ratelimit-unified-fallback-percentage"),
+			"source":               "anthropic_api_headers",
 		},
 	})
 	snap.Raw = string(raw)
@@ -682,17 +682,17 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		CostCents int `json:"cost_cents_7d"`
 	}
 	type userUsage struct {
-		Email          string                `json:"email"`
-		FiveHour       int                   `json:"five_hour_tokens"`
-		SevenDay       int                   `json:"seven_day_tokens"`
-		FiveHourPct    float64               `json:"five_hour_pct"`
-		SevenDayPct    float64               `json:"seven_day_pct"`
-		CostCents7d    int                   `json:"cost_cents_7d"`
-		Requests       int                   `json:"requests_7d"`
-		LastTs         time.Time             `json:"last_ts"`
-		FiveHourReset  time.Time             `json:"five_hour_reset"`
-		SevenDayReset  time.Time             `json:"seven_day_reset"`
-		Models         map[string]modelUsage `json:"models"`
+		Email         string                `json:"email"`
+		FiveHour      int                   `json:"five_hour_tokens"`
+		SevenDay      int                   `json:"seven_day_tokens"`
+		FiveHourPct   float64               `json:"five_hour_pct"`
+		SevenDayPct   float64               `json:"seven_day_pct"`
+		CostCents7d   int                   `json:"cost_cents_7d"`
+		Requests      int                   `json:"requests_7d"`
+		LastTs        time.Time             `json:"last_ts"`
+		FiveHourReset time.Time             `json:"five_hour_reset"`
+		SevenDayReset time.Time             `json:"seven_day_reset"`
+		Models        map[string]modelUsage `json:"models"`
 	}
 	byUser := map[string]*userUsage{}
 	for _, r := range rows {
@@ -704,7 +704,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		if r.Win == "5h" {
 			u.FiveHour += r.Tokens
 		}
-		u.SevenDay += r.Tokens    // 5h bucket is inside the 7d window
+		u.SevenDay += r.Tokens       // 5h bucket is inside the 7d window
 		u.CostCents7d += r.CostCents // accumulate cost from both buckets (7d total)
 		u.Requests += r.Reqs
 		if r.LastTs.After(u.LastTs) {

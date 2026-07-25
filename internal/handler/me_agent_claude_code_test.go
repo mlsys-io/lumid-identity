@@ -73,19 +73,19 @@ func TestTranslatorEmitsPreviouslyDroppedEvents(t *testing.T) {
 	n := countByType(got)
 
 	for _, want := range []string{
-		"claude_session",      // was the ONLY thing system/init produced
-		"capabilities",        // tools/agents/model/cwd — all dropped
-		"status",              // upstream request state
-		"block_start",         // content-block boundaries
-		"block_stop",          //   "
-		"tool_args_delta",     // streaming tool arguments
-		"subagent_start",      // Task lifecycle
-		"subagent_progress",   //   "
-		"subagent_done",       //   "
-		"turn_stats",          // cost/duration/turns/cache
-		"tool_start",          // (already worked)
-		"tool_call",           // (already worked)
-		"text",                // (already worked)
+		"claude_session",    // was the ONLY thing system/init produced
+		"capabilities",      // tools/agents/model/cwd — all dropped
+		"status",            // upstream request state
+		"block_start",       // content-block boundaries
+		"block_stop",        //   "
+		"tool_args_delta",   // streaming tool arguments
+		"subagent_start",    // Task lifecycle
+		"subagent_progress", //   "
+		"subagent_done",     //   "
+		"turn_stats",        // cost/duration/turns/cache
+		"tool_start",        // (already worked)
+		"tool_call",         // (already worked)
+		"text",              // (already worked)
 	} {
 		if n[want] == 0 {
 			t.Errorf("no %q event emitted; got %v", want, n)

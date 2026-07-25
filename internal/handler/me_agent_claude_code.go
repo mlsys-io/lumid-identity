@@ -407,6 +407,10 @@ type claudeTranslator struct {
 	sentStopped bool
 
 	toolNameByID map[string]string // tool_use id → name, for the later tool_result
+	// tool_use id → arguments. The tool_result message carries none, so without
+	// this a resumed/reordered stream reaches the client with no command or
+	// path and every renderer falls back to a bare label.
+	toolArgsByID map[string]map[string]any
 	blockKind    map[string]string // scoped block index → "text"|"thinking"|"tool_use"
 	blockToolID  map[string]string // scoped block index → tool_use id
 	// system/task_* covers BOTH sub-agents (task_type local_agent) AND
@@ -421,6 +425,7 @@ func newClaudeTranslator(userID string, emit func(map[string]any) bool) *claudeT
 		userID:       userID,
 		emit:         emit,
 		toolNameByID: map[string]string{},
+		toolArgsByID: map[string]map[string]any{},
 		blockKind:    map[string]string{},
 		blockToolID:  map[string]string{},
 		agentTasks:   map[string]bool{},
@@ -478,6 +483,9 @@ func (t *claudeTranslator) handle(event map[string]any) bool {
 			name, _ := b["name"].(string)
 			input, _ := b["input"].(map[string]any)
 			t.toolNameByID[id] = name
+			if input != nil {
+				t.toolArgsByID[id] = input
+			}
 			if !t.send(map[string]any{
 				"type": "tool_start",
 				"id":   id,
@@ -509,6 +517,12 @@ func (t *claudeTranslator) handle(event map[string]any) bool {
 				"name":   name,
 				"result": b["content"],
 				"ok":     !isError,
+			}
+			// Echo the arguments back. tool_result has none, and the client
+			// needs them to label the completed call.
+			if args, ok := t.toolArgsByID[id]; ok {
+				out["args"] = args
+				delete(t.toolArgsByID, id)
 			}
 			// The CLI also ships a TYPED result alongside the flattened
 			// content — Bash splits stdout/stderr and flags `interrupted`,

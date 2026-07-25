@@ -27,6 +27,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -357,8 +358,54 @@ func getSession(c *gin.Context, ownerSub, convKey string) {
 		fail(c, http.StatusNotFound, 1404, "session not found")
 		return
 	}
+	// PAGINATED, newest-first. This used to load every turn and fetch each
+	// turn's blob from object storage serially: a 517-turn session produced a
+	// 72 MB response in 48s, past the client's 30s timeout — and even served,
+	// a payload that size is not something a browser should parse or render.
+	//
+	// Default window is the most recent turns, because that is what you open a
+	// transcript to look at. `before` walks backwards for older ones.
+	limit := 40
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200 // ~35 MB worst case; the real guard is the default
+	}
+	before := 0
+	hasBefore := false
+	if v := c.Query("before"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			before, hasBefore = n, true
+		}
+	}
+
+	q := common.DB.Where("conv_key = ?", convKey)
+	if hasBefore {
+		q = q.Where("turn_index < ?", before)
+	}
 	var turns []models.ClaudeSessionTurn
-	common.DB.Where("conv_key = ?", convKey).Order("turn_index ASC").Find(&turns)
+	// DESC + limit selects the NEWEST window; reversed below so the transcript
+	// still reads oldest→newest.
+	q.Order("turn_index DESC").Limit(limit).Find(&turns)
+	for i, j := 0, len(turns)-1; i < j; i, j = i+1, j-1 {
+		turns[i], turns[j] = turns[j], turns[i]
+	}
+
+	oldestReturned := 0
+	if len(turns) > 0 {
+		oldestReturned = turns[0].TurnIndex
+	}
+	var remaining int64
+	rq := common.DB.Model(&models.ClaudeSessionTurn{}).Where("conv_key = ?", convKey)
+	if len(turns) > 0 {
+		rq = rq.Where("turn_index < ?", oldestReturned)
+	} else if hasBefore {
+		rq = rq.Where("turn_index < ?", before)
+	}
+	rq.Count(&remaining)
 
 	type turnOut struct {
 		TurnIndex    int             `json:"turn_index"`
@@ -400,7 +447,15 @@ func getSession(c *gin.Context, ownerSub, convKey string) {
 			Model: sess.Model, Title: sess.Title, TurnCount: sess.TurnCount,
 			InputTokens: sess.InputTokens, OutputTokens: sess.OutputTokens,
 			ToolUseCount: sess.ToolUseCount, FirstTs: sess.FirstTs, LastTs: sess.LastTs,
-		}, "turns": out}})
+		}, "turns": out,
+			// Pagination surface. `has_more` + `oldest_turn_index` let the client
+			// walk backwards with ?before=<oldest_turn_index>.
+			"total_turns":       sess.TurnCount,
+			"returned":          len(out),
+			"oldest_turn_index": oldestReturned,
+			"has_more":          remaining > 0,
+			"remaining":         remaining,
+		}})
 }
 
 func rawOrNull(b []byte) json.RawMessage {

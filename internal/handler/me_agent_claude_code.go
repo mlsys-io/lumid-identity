@@ -29,6 +29,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -167,25 +168,37 @@ func unregisterClaudeTurn(turnID string) {
 // Redis is unavailable.
 func claudeStoppedKey(turnID string) string { return "claude:stopped:" + turnID }
 
+// claudeTurnIDRe bounds the shape of a turn id (sandbox emits "t-<token>").
+var claudeTurnIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,80}$`)
+
 const claudeStoppedTTL = 30 * time.Minute
 
-// markClaudeTurnInterrupted records the stop locally (best effort) and
-// cross-pod via Redis. Authorization is NOT done here — see
-// InterruptClaudeTurn.
-func markClaudeTurnInterrupted(turnID, userID string) {
+// markLocalStop sets the same-pod flag, ownership-gated. Harmless: it only
+// affects a turn THIS pod is streaming and only when the owner matches.
+func markLocalStop(turnID, userID string) {
 	claudeTurnsMu.Lock()
 	if t := claudeTurns[turnID]; t != nil && t.userID == userID {
 		t.interrupted = true
 	}
 	claudeTurnsMu.Unlock()
-
-	if common.Redis != nil {
-		_ = common.Redis.Set(context.Background(), claudeStoppedKey(turnID), userID, claudeStoppedTTL).Err()
-	}
 }
 
-// claudeTurnInterrupted reports whether the user asked to stop this turn,
-// checking the same-pod flag first and then the cross-pod Redis marker.
+// recordCrossPodStop writes the cross-pod marker, storing the OWNER so the
+// reader can verify it. Called only AFTER the sandbox has confirmed ownership
+// (200) — never for a turn the caller doesn't own. Previously this was set
+// unconditionally BEFORE the sandbox 403, and the reader checked existence
+// only, so any user could spray guessable turn ids (base36 timestamps) and
+// make a victim's turn render "stopped". Now: set-after-authz + value compare.
+func recordCrossPodStop(turnID, userID string) {
+	if common.Redis == nil || turnID == "" {
+		return
+	}
+	_ = common.Redis.Set(context.Background(), claudeStoppedKey(turnID), userID, claudeStoppedTTL).Err()
+}
+
+// claudeTurnInterrupted reports whether the OWNER asked to stop this turn. The
+// cross-pod marker's stored value must equal the streaming turn's owner —
+// existence alone is not enough (a spoofed marker carries a different sub).
 func claudeTurnInterrupted(turnID string, t *claudeTurn) bool {
 	if t != nil {
 		claudeTurnsMu.Lock()
@@ -198,18 +211,23 @@ func claudeTurnInterrupted(turnID string, t *claudeTurn) bool {
 	if turnID == "" || common.Redis == nil {
 		return false
 	}
-	n, err := common.Redis.Exists(context.Background(), claudeStoppedKey(turnID)).Result()
-	return err == nil && n > 0
+	owner, err := common.Redis.Get(context.Background(), claudeStoppedKey(turnID)).Result()
+	if err != nil {
+		return false
+	}
+	// The streaming pod holds the turn locally, so compare to its true owner.
+	// If we somehow lack the local turn, refuse rather than trust the marker.
+	return t != nil && owner == t.userID
 }
 
 // InterruptClaudeTurn asks the sandbox to stop a live turn cooperatively.
 func InterruptClaudeTurn(ctx context.Context, turnID, userID string) error {
-	markClaudeTurnInterrupted(turnID, userID)
-	// ALWAYS forward. This used to early-return when the turn wasn't in this
-	// pod's map, which made the Stop button a silent no-op whenever the request
-	// landed on the pod that wasn't streaming (2 of 3 attempts, measured).
-	// Ownership is enforced by the sandbox, which is single-replica and holds
-	// the only consistent turn→owner mapping; it answers 403 on a mismatch.
+	// Local flag first (ownership-gated, same-pod fast path). The CROSS-POD
+	// Redis marker is deliberately NOT set here — only after the sandbox
+	// confirms this caller owns the turn (200), so a spoof attempt that the
+	// sandbox 403s leaves no marker behind.
+	markLocalStop(turnID, userID)
+
 	body, _ := json.Marshal(map[string]any{
 		"turn_id": turnID, "action": "interrupt", "user_id": userID,
 	})
@@ -231,6 +249,9 @@ func InterruptClaudeTurn(ctx context.Context, turnID, userID string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("sandbox control returned HTTP %d", resp.StatusCode)
 	}
+	// Ownership confirmed by the sandbox — now it's safe to broadcast the stop
+	// to the (possibly different) pod that's streaming this turn.
+	recordCrossPodStop(turnID, userID)
 	return nil
 }
 
@@ -334,17 +355,28 @@ func streamClaudeCodeViaProxy(
 	readerDone := make(chan struct{})
 	defer close(readerDone)
 	go func() {
-		rd := bufio.NewReader(resp.Body)
-		for {
-			s, err := rd.ReadString('\n')
+		// bufio.Scanner with a FINITE 16 MiB per-line cap. The prior
+		// bufio.Reader.ReadString had no ceiling, so one newline-less multi-GB
+		// line from a buggy/compromised sandbox could OOM identity (the auth
+		// authority) — memory scaled with the largest single event × concurrent
+		// turns. 16 MiB is comfortably above a base64 image in a tool_result yet
+		// bounded; an over-long line surfaces as ErrTooLong and ends the turn.
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+		for sc.Scan() {
 			select {
-			case lines <- lineRead{s, err}:
+			case lines <- lineRead{sc.Text(), nil}:
 			case <-readerDone:
 				return
 			}
-			if err != nil {
-				return
-			}
+		}
+		err := sc.Err()
+		if err == nil {
+			err = io.EOF
+		}
+		select {
+		case lines <- lineRead{"", err}:
+		case <-readerDone:
 		}
 	}()
 
@@ -837,9 +869,16 @@ func MeAgentChatInterrupt(c *gin.Context) {
 		c.JSON(400, gin.H{"code": 400, "message": "turn_id required"})
 		return
 	}
-	// Ownership is enforced inside markClaudeTurnInterrupted — a caller cannot
-	// stop another user's run, and an unknown turn is a no-op rather than an
-	// error so the button is never a dead end.
+	// Shape/length guard: turn ids are `t-<token>` from the sandbox. Bounding
+	// this keeps a hostile client from using it as an arbitrarily long Redis
+	// key (claude:stopped:<turn_id>).
+	if len(body.TurnID) > 80 || !claudeTurnIDRe.MatchString(body.TurnID) {
+		c.JSON(400, gin.H{"code": 400, "message": "invalid turn_id"})
+		return
+	}
+	// Ownership is enforced by the sandbox (403 on mismatch) and by the
+	// owner-compared cross-pod marker; an unknown/finished turn is a no-op so
+	// the Stop button is never a dead end.
 	if err := InterruptClaudeTurn(c.Request.Context(), body.TurnID, userID); err != nil {
 		c.JSON(502, gin.H{"code": 502, "message": err.Error()})
 		return

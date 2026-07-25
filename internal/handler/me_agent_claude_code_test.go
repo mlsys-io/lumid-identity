@@ -460,11 +460,11 @@ func TestLocalStopFlagRespectsOwner(t *testing.T) {
 	turn := registerClaudeTurn("t-own", "alice")
 	defer unregisterClaudeTurn("t-own")
 
-	markClaudeTurnInterrupted("t-own", "bob")
+	markLocalStop("t-own", "bob")
 	if claudeTurnInterrupted("", turn) {
 		t.Error("bob's stop flipped alice's turn flag")
 	}
-	markClaudeTurnInterrupted("t-own", "alice")
+	markLocalStop("t-own", "alice")
 	if !claudeTurnInterrupted("", turn) {
 		t.Error("alice's own stop did not flip the flag")
 	}

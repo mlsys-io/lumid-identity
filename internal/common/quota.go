@@ -160,7 +160,12 @@ type ChargeRes struct {
 // model and zero tokens) — it must be gated. Treating "" as non-Anthropic is
 // what silently disabled quota enforcement entirely; see quota_gate_test.go.
 func poolCapApplies(model string) bool {
-	return model == "" || strings.HasPrefix(model, "claude")
+	// Case-INSENSITIVE to match claude-proxy's isAnthropicNativeModel
+	// (which lowercases). A capital-C "Claude-…" routed to the pool but, when
+	// this was case-sensitive, skipped the per-request cap — a one-request
+	// overshoot. Kept hyphen-free so it stays a SUPERSET of what routes to the
+	// pool (gate at least everything the proxy treats as Anthropic).
+	return model == "" || strings.HasPrefix(strings.ToLower(model), "claude")
 }
 
 // ClaudePoolLimits reads the env-tunable per-user pool caps.

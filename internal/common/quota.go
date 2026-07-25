@@ -37,8 +37,8 @@ const (
 
 	// Claude account-pool per-user caps — rolling windows mirroring
 	// Anthropic's own 5h/7d shape (uncached input + output tokens).
-	DefaultClaude5hTokens = 2_000_000
-	DefaultClaude7dTokens = 20_000_000
+	DefaultClaude5hTokens = 4_000_000
+	DefaultClaude7dTokens = 40_000_000
 )
 
 // Limits captures the headline numbers the UI surfaces alongside today's totals.
@@ -153,6 +153,16 @@ type ChargeRes struct {
 	SevenDayPct *float64 `json:"seven_day_pct,omitempty"`
 }
 
+// poolCapApplies reports whether a model's usage counts against the Anthropic
+// account-pool caps.
+//
+// An EMPTY model means claude-proxy's pre-request gate (a dry-run carrying no
+// model and zero tokens) — it must be gated. Treating "" as non-Anthropic is
+// what silently disabled quota enforcement entirely; see quota_gate_test.go.
+func poolCapApplies(model string) bool {
+	return model == "" || strings.HasPrefix(model, "claude")
+}
+
 // ClaudePoolLimits reads the env-tunable per-user pool caps.
 func ClaudePoolLimits() (fiveH, sevenD int) {
 	return envIntPos("LUMID_QUOTA_CLAUDE_5H_TOKENS", DefaultClaude5hTokens),
@@ -204,7 +214,15 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		//
 		// Non-Anthropic models (kimi-k3, z-ai/glm-5.2, etc.) don't consume the
 		// Anthropic token pool — skip the cap check and just record the event.
-		if !strings.HasPrefix(req.Model, "claude") {
+		//
+		// `req.Model != ""` is load-bearing. claude-proxy's PRE-REQUEST gate is a
+		// dry-run with no model and zero tokens (gateUser →
+		// chargeUser(sub,"","",0,0,true)), and an empty string is not
+		// "claude"-prefixed — so this bypass silently swallowed the gate and
+		// EVERY user was served regardless of quota. The cap was effectively
+		// unenforced from the commit that introduced the bypass until this fix;
+		// only a named non-Anthropic model may skip.
+		if !poolCapApplies(req.Model) {
 			break
 		}
 		cap5, cap7 := ClaudePoolLimits()

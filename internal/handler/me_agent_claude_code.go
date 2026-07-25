@@ -375,6 +375,11 @@ type claudeTranslator struct {
 	toolNameByID map[string]string // tool_use id → name, for the later tool_result
 	blockKind    map[string]string // scoped block index → "text"|"thinking"|"tool_use"
 	blockToolID  map[string]string // scoped block index → tool_use id
+	// system/task_* covers BOTH sub-agents (task_type local_agent) AND
+	// backgrounded Bash commands (local_bash) — and only task_started carries
+	// task_type, so the agent ids have to be remembered. Without this a
+	// backgrounded `sleep` renders as a sub-agent panel.
+	agentTasks map[string]bool
 }
 
 func newClaudeTranslator(userID string, emit func(map[string]any) bool) *claudeTranslator {
@@ -384,6 +389,7 @@ func newClaudeTranslator(userID string, emit func(map[string]any) bool) *claudeT
 		toolNameByID: map[string]string{},
 		blockKind:    map[string]string{},
 		blockToolID:  map[string]string{},
+		agentTasks:   map[string]bool{},
 	}
 }
 
@@ -546,6 +552,20 @@ func (t *claudeTranslator) handleSystem(event map[string]any) bool {
 	// not ordered relative to each other.
 
 	case "task_started":
+		taskID, _ := event["task_id"].(string)
+		if tt, _ := event["task_type"].(string); tt != "local_agent" {
+			// A backgrounded shell command, not a sub-agent. Forwarded under its
+			// own name so the client can surface it later without mistaking it
+			// for agent activity.
+			return t.emit(map[string]any{
+				"type":        "background_task",
+				"task_id":     taskID,
+				"tool_use_id": event["tool_use_id"],
+				"description": event["description"],
+				"task_type":   event["task_type"],
+			})
+		}
+		t.agentTasks[taskID] = true
 		return t.emit(map[string]any{
 			"type":          "subagent_start",
 			"task_id":       event["task_id"],
@@ -556,6 +576,9 @@ func (t *claudeTranslator) handleSystem(event map[string]any) bool {
 		})
 
 	case "task_progress":
+		if id, _ := event["task_id"].(string); !t.agentTasks[id] {
+			return true // background shell task — see task_started
+		}
 		return t.emit(map[string]any{
 			"type":           "subagent_progress",
 			"task_id":        event["task_id"],
@@ -566,6 +589,9 @@ func (t *claudeTranslator) handleSystem(event map[string]any) bool {
 		})
 
 	case "task_updated":
+		if id, _ := event["task_id"].(string); !t.agentTasks[id] {
+			return true // background shell task — see task_started
+		}
 		patch, _ := event["patch"].(map[string]any)
 		return t.emit(map[string]any{
 			"type":     "subagent_progress",
@@ -575,6 +601,9 @@ func (t *claudeTranslator) handleSystem(event map[string]any) bool {
 		})
 
 	case "task_notification":
+		if id, _ := event["task_id"].(string); !t.agentTasks[id] {
+			return true // background shell task — see task_started
+		}
 		return t.emit(map[string]any{
 			"type":        "subagent_done",
 			"task_id":     event["task_id"],

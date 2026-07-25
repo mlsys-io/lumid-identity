@@ -451,3 +451,49 @@ func TestInterruptOwnershipEnforced(t *testing.T) {
 		t.Error("an unknown turn should report not-found, not success")
 	}
 }
+
+// system/task_* covers BOTH sub-agents (task_type local_agent) and
+// backgrounded Bash commands (local_bash). Only task_started carries
+// task_type, so the agent ids must be remembered — otherwise a backgrounded
+// `sleep` renders as a sub-agent panel (observed live before this fix).
+func TestBackgroundBashIsNotASubagent(t *testing.T) {
+	var got []map[string]any
+	tr := newClaudeTranslator("u", func(m map[string]any) bool {
+		got = append(got, m)
+		return true
+	})
+
+	// A backgrounded shell command.
+	tr.handle(map[string]any{"type": "system", "subtype": "task_started",
+		"task_id": "bg1", "task_type": "local_bash", "description": "Sleep for 120 seconds"})
+	tr.handle(map[string]any{"type": "system", "subtype": "task_progress", "task_id": "bg1"})
+	tr.handle(map[string]any{"type": "system", "subtype": "task_notification",
+		"task_id": "bg1", "status": "completed"})
+
+	for _, e := range got {
+		if s, _ := e["type"].(string); strings.HasPrefix(s, "subagent") {
+			t.Errorf("background bash leaked as %s: %v", s, e)
+		}
+	}
+	if len(got) != 1 || got[0]["type"] != "background_task" {
+		t.Fatalf("want a single background_task event, got %v", got)
+	}
+
+	// A real sub-agent, same follow-up shapes, must still come through.
+	got = nil
+	tr.handle(map[string]any{"type": "system", "subtype": "task_started",
+		"task_id": "ag1", "task_type": "local_agent", "subagent_type": "general-purpose"})
+	tr.handle(map[string]any{"type": "system", "subtype": "task_progress",
+		"task_id": "ag1", "last_tool_name": "Bash"})
+	tr.handle(map[string]any{"type": "system", "subtype": "task_notification",
+		"task_id": "ag1", "status": "completed"})
+
+	var kinds []string
+	for _, e := range got {
+		kinds = append(kinds, e["type"].(string))
+	}
+	want := []string{"subagent_start", "subagent_progress", "subagent_done"}
+	if len(kinds) != 3 || kinds[0] != want[0] || kinds[1] != want[1] || kinds[2] != want[2] {
+		t.Errorf("sub-agent lifecycle = %v, want %v", kinds, want)
+	}
+}

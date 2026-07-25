@@ -313,6 +313,10 @@ func Register(r *gin.Engine) {
 			// me_agent_claude_code.go) — beats aborting the fetch, which
 			// SIGKILLed the CLI and discarded partial work.
 			me.POST("/agent/chat/interrupt", MeAgentChatInterrupt)
+			// super_admin-only tenant inspection — read-only view of another
+			// tenant's checkpointed Claude Code state via the sandbox gateway.
+			// Replaces the retired super_admin shared-workspaces-root affordance.
+			me.GET("/agent/admin/tenant", MeAgentAdminTenant)
 			// Persistent "always allow" grants for destructive tools —
 			// written by tool-approve with always=true; listed/revoked here.
 			me.GET("/agent/tool-grants", MeAgentToolGrants)

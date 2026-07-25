@@ -27,7 +27,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -884,4 +886,54 @@ func MeAgentChatInterrupt(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"code": 0, "message": "ok", "data": gin.H{"ok": true}})
+}
+
+// MeAgentAdminTenant — GET /me/agent/admin/tenant?user_id=<u>&path=<p>
+//
+// super_admin-only, read-only inspection of another tenant's checkpointed
+// Claude Code state (~/.claude + workspace), served by the sandbox gateway's
+// /admin/tenant endpoint. This REPLACES the retired super_admin
+// shared-workspaces-root affordance (which was itself the cross-tenant read
+// hole per-tenant isolation closes): inspection now goes through an audited
+// endpoint over the checkpoint store, never a live shared-root pod.
+//
+// No path → JSON file listing; ?path=<name> → that file's content (capped).
+// Audited on both sides (identity logs the admin sub; the gateway logs the read).
+func MeAgentAdminTenant(c *gin.Context) {
+	adminID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "auth required")
+		return
+	}
+	if currentUserRole(c) != "super_admin" {
+		fail(c, http.StatusForbidden, 1005, "super_admin required")
+		return
+	}
+	target := c.Query("user_id")
+	if target == "" {
+		fail(c, http.StatusBadRequest, 1400, "user_id required")
+		return
+	}
+	path := c.Query("path")
+	u := claudeSandboxURL() + "/admin/tenant?user_id=" + url.QueryEscape(target)
+	if path != "" {
+		u += "&path=" + url.QueryEscape(path)
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, u, nil)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "request build failed")
+		return
+	}
+	req.Header.Set("X-Bridge-Secret", os.Getenv("LUMID_IDENTITY_BRIDGE_SECRET"))
+	req.Header.Set("X-Admin-Inspect", adminID) // audit: who inspected
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fail(c, http.StatusBadGateway, 1502, "sandbox unreachable")
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("me_agent: super_admin %s inspected tenant %s path=%q", adminID, target, path)
+	c.Header("Content-Type", resp.Header.Get("Content-Type"))
+	c.Status(resp.StatusCode)
+	io.Copy(c.Writer, resp.Body)
 }

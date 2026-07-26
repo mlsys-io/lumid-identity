@@ -12,6 +12,13 @@ type ClaudeQuotaToken struct {
 	RefreshTokenEncrypted string    `gorm:"type:text"                          json:"-"`
 	CreatedAt             time.Time `gorm:"autoCreateTime"                     json:"created_at"`
 	UpdatedAt             time.Time `gorm:"autoUpdateTime"                     json:"updated_at"`
+	// Quarantine state: set when Anthropic returns invalid_grant (the token
+	// family was revoked — typically rotation-reuse detection after the
+	// account owner's own Claude Code refreshed a shared credential copy).
+	// While set, every refresh path skips this row instead of re-presenting
+	// a revoked token; a re-add via AdminClaudeTokenAdd clears it.
+	RevokedAt    *time.Time `gorm:"column:revoked_at"                    json:"revoked_at,omitempty"`
+	RevokeReason string     `gorm:"column:revoke_reason;size:512"        json:"revoke_reason,omitempty"`
 }
 
 func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }

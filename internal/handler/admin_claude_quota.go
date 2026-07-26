@@ -26,6 +26,7 @@ package handler
 
 import (
 	"bytes"
+	"crypto/sha256"
 	base64Stdlib "encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"lumid_identity/internal/common"
@@ -66,19 +68,54 @@ func refreshMutex(email string) *sync.Mutex {
 	return m.(*sync.Mutex)
 }
 
+// withEmailLock runs fn while holding a MySQL named lock scoped to the email.
+// The in-process refreshMutex only serialises within ONE pod; identity runs
+// 2 replicas, and two pods exchanging the same (single-use, rotated-on-every-
+// exchange) refresh token concurrently trips Anthropic's rotation-reuse
+// detection, which revokes the whole token family. GET_LOCK is session-scoped,
+// so acquire/callback/release are pinned to one pooled connection.
+func withEmailLock(email string, fn func() error) error {
+	sum := sha256.Sum256([]byte(strings.ToLower(email)))
+	name := "cqr:" + fmt.Sprintf("%x", sum)[:32] // MySQL lock names cap at 64 chars
+	return common.DB.Connection(func(tx *gorm.DB) error {
+		var got int
+		if err := tx.Raw("SELECT GET_LOCK(?, 20)", name).Scan(&got).Error; err != nil {
+			return fmt.Errorf("acquire refresh lock: %w", err)
+		}
+		if got != 1 {
+			return fmt.Errorf("refresh lock busy for %s", email)
+		}
+		defer tx.Exec("DO RELEASE_LOCK(?)", name)
+		return fn()
+	})
+}
+
 // tryRefreshToken attempts to exchange a stored refresh token for a new access
 // token. On success it updates the DB row and returns the new access token.
-// Serialised per email; if another goroutine refreshed within the last 30s the
-// already-rotated access token is returned without a second exchange.
+// Serialised per email in-process AND across replicas (withEmailLock); if
+// another refresher rotated within the last 30s the already-rotated access
+// token is returned without a second exchange. Rows quarantined by a prior
+// invalid_grant are never re-presented to Anthropic — re-add clears them.
 func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 	mu := refreshMutex(row.Email)
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Re-read: another goroutine may have refreshed while we waited on the lock.
+	var tok string
+	err := withEmailLock(row.Email, func() error {
+		var innerErr error
+		tok, innerErr = refreshTokenLocked(row)
+		return innerErr
+	})
+	return tok, err
+}
+
+func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
+	// Re-read: another refresher (this pod or the other replica) may have
+	// rotated while we waited on the locks.
 	var fresh models.ClaudeQuotaToken
 	if err := common.DB.Where("email = ?", row.Email).First(&fresh).Error; err == nil {
-		if time.Since(fresh.UpdatedAt) < 30*time.Second && fresh.ValueEncrypted != row.ValueEncrypted {
+		if time.Since(fresh.UpdatedAt) < 30*time.Second && fresh.ValueEncrypted != row.ValueEncrypted && fresh.RevokedAt == nil {
 			if tok, err := common.DecryptGrant(fresh.ValueEncrypted); err == nil {
 				*row = fresh
 				return tok, nil
@@ -87,6 +124,9 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 		*row = fresh
 	}
 
+	if row.RevokedAt != nil {
+		return "", fmt.Errorf("token family revoked (%s) — re-add the account with a fresh `claude auth login`", row.RevokeReason)
+	}
 	if row.RefreshTokenEncrypted == "" {
 		return "", fmt.Errorf("no refresh token stored")
 	}
@@ -125,6 +165,21 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 			Desc  string `json:"error_description"`
 		}
 		_ = json.Unmarshal(raw, &errResp)
+		if errResp.Error == "invalid_grant" {
+			// The family is gone (typically rotation-reuse detection after the
+			// owner's own Claude Code refreshed a shared credential copy).
+			// Quarantine the row so no path re-presents the revoked token.
+			reason := strings.TrimSpace(errResp.Error + " — " + errResp.Desc)
+			now := time.Now()
+			common.DB.Model(row).Updates(map[string]interface{}{
+				"revoked_at":    now,
+				"revoke_reason": reason,
+			})
+			row.RevokedAt = &now
+			row.RevokeReason = reason
+			log.Printf("claude-refresh: %s: QUARANTINED (%s) — re-add with a fresh `claude auth login` required", row.Email, reason)
+			return "", fmt.Errorf("token refresh failed: %s (account quarantined — re-add required)", reason)
+		}
 		if errResp.Error != "" {
 			return "", fmt.Errorf("token refresh failed: %s — %s", errResp.Error, errResp.Desc)
 		}
@@ -144,7 +199,13 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 	if err != nil {
 		return tok.AccessToken, fmt.Errorf("encrypt new token: %w", err)
 	}
-	updates := map[string]interface{}{"value_encrypted": newEnc}
+	updates := map[string]interface{}{
+		"value_encrypted": newEnc,
+		// A successful exchange proves the family is alive — clear any stale
+		// quarantine (e.g. a row re-added out-of-band).
+		"revoked_at":    nil,
+		"revoke_reason": "",
+	}
 	if tok.RefreshToken != "" && tok.RefreshToken != refreshTok {
 		newRefEnc, _ := common.EncryptGrant(tok.RefreshToken)
 		if newRefEnc != "" {
@@ -313,6 +374,10 @@ type quotaResult struct {
 	Stale         bool            `json:"stale"`
 	Error         string          `json:"error,omitempty"`
 	Limits        json.RawMessage `json:"limits,omitempty"`
+	// Quarantine state — the token family was revoked (invalid_grant);
+	// the account needs a re-add with a fresh `claude auth login`.
+	Revoked      bool   `json:"revoked,omitempty"`
+	RevokeReason string `json:"revoke_reason,omitempty"`
 }
 
 func fillFromSnap(res *quotaResult, snap *models.ClaudeQuotaSnapshot) {
@@ -351,6 +416,21 @@ func AdminClaudeQuota(c *gin.Context) {
 				Where("email = ?", row.Email).
 				Order("ts DESC").
 				First(&snap).Error
+
+			// Quarantined family: don't probe (the access token died with the
+			// refresh token) — report the state and the fix explicitly.
+			if row.RevokedAt != nil {
+				res.Revoked = true
+				res.RevokeReason = row.RevokeReason
+				res.Stale = true
+				res.Error = "token family revoked — re-add with a fresh `claude auth login`"
+				if snapErr == nil {
+					fillFromSnap(&res, &snap)
+				}
+				results[i] = res
+				return
+			}
+
 			cacheHit := snapErr == nil && time.Since(snap.Ts) < quotaCacheTTL
 
 			if cacheHit {
@@ -440,9 +520,10 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	// Upsert: INSERT ... ON DUPLICATE KEY UPDATE only the token columns.
 	// DB.Save() with a string PK includes created_at=zero in the UPDATE clause
 	// which MySQL strict mode rejects with Error 1292. Explicit DoUpdates avoids it.
+	// A re-add is the recovery path for a revoked family — clear the quarantine.
 	if err := common.DB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
-		DoUpdates: clause.AssignmentColumns([]string{"value_encrypted", "refresh_token_encrypted", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"value_encrypted", "refresh_token_encrypted", "updated_at", "revoked_at", "revoke_reason"}),
 	}).Create(&row).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
 		return
@@ -510,6 +591,11 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	var cands []cand
 	for _, row := range rows {
 		if excluded[row.Email] {
+			continue
+		}
+		// Quarantined family — its access token dies with the refresh token,
+		// so it can't serve proxy traffic. Skip until re-added.
+		if row.RevokedAt != nil {
 			continue
 		}
 		var snap models.ClaudeQuotaSnapshot
@@ -874,17 +960,46 @@ func base64DecodeJWT(s string) ([]byte, error) {
 }
 
 func proactiveRefreshAll() {
+	// Single-sweeper election across replicas: GET_LOCK with 0 timeout —
+	// if the other pod is mid-sweep, skip this tick entirely. Every sweep
+	// rotates every refresh token, so duplicate sweeps double the rotation
+	// rate and widen the crash window where a rotated-but-unpersisted token
+	// loses the family.
+	_ = common.DB.Connection(func(tx *gorm.DB) error {
+		var got int
+		if err := tx.Raw("SELECT GET_LOCK('cqr:sweep', 0)").Scan(&got).Error; err != nil || got != 1 {
+			log.Printf("token-refresh-loop: another replica is sweeping — skipping this tick")
+			return nil
+		}
+		defer tx.Exec("DO RELEASE_LOCK('cqr:sweep')")
+		sweepAllTokens()
+		return nil
+	})
+}
+
+func sweepAllTokens() {
 	var rows []models.ClaudeQuotaToken
 	if err := common.DB.
-		Where("refresh_token_encrypted != ''").
+		Where("refresh_token_encrypted != '' AND revoked_at IS NULL").
 		Find(&rows).Error; err != nil {
 		log.Printf("token-refresh-loop: db query failed: %v", err)
 		return
+	}
+	var quarantined int64
+	common.DB.Model(&models.ClaudeQuotaToken{}).Where("revoked_at IS NOT NULL").Count(&quarantined)
+	if quarantined > 0 {
+		log.Printf("token-refresh-loop: %d quarantined account(s) awaiting re-add", quarantined)
 	}
 	if len(rows) == 0 {
 		return
 	}
 	for _, row := range rows {
+		// Damping: if any refresher (a lease, a dashboard probe, the other
+		// replica's earlier sweep) rotated this row recently, leave it alone —
+		// each rotation is a fresh chance to lose the family.
+		if time.Since(row.UpdatedAt) < tokenRefreshInterval/2 {
+			continue
+		}
 		tok, err := common.DecryptGrant(row.ValueEncrypted)
 		if err != nil {
 			log.Printf("token-refresh-loop: %s: decrypt err: %v — skipping", row.Email, err)

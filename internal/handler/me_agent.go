@@ -946,7 +946,7 @@ func containsImageAttachment(msgs []chatMessage) bool {
 // where autoRouted is true when we overrode. Used to surface the
 // override in the usage event so the UI can show "answered by
 // Claude (auto)" instead of pretending the user's selection ran.
-func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx map[string]any) (llmProvider, bool) {
+func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx map[string]any, mode string) (llmProvider, bool) {
 	if containsImageAttachment(req) && !providerSupportsVision(picked) {
 		// Route to the first vision-capable provider the caller's role
 		// allows. gemma4 is first + allowed to everyone + multimodal, so
@@ -969,7 +969,12 @@ func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx ma
 	// executes — on a tool-capable model, surfaced via the `route` event. (We
 	// only steal clearly-platform turns; generic "run the tests / install numpy"
 	// stay in claude-code, where its Bash/file tools are the right runtime.)
-	if isClaudeCodeProvider(picked) && (groundedDrillIn(ctx) || controlIntent(req)) {
+	//   • an explicit Search / Deep-research toggle (mode) — those are served
+	//     by the Tavily-backed me_agent tools, and the sandbox's NetworkPolicy
+	//     blocks the CLI's own WebSearch/WebFetch anyway, so staying in
+	//     claude-code made the toggle a silent no-op.
+	if isClaudeCodeProvider(picked) &&
+		(groundedDrillIn(ctx) || controlIntent(req) || mode == "search" || mode == "deep_research") {
 		if p, ok := firstToolCapableProvider(role); ok {
 			return p, true
 		}
@@ -1318,7 +1323,7 @@ func MeAgentChat(c *gin.Context) {
 
 	role := currentUserRole(c)
 	provider := resolveProvider(body.Model, role)
-	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context)
+	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context, body.Mode)
 	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
 	apiKey, err := provider.keyFn()
 	if err != nil {

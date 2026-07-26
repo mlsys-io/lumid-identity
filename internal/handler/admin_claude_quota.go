@@ -431,7 +431,17 @@ func AdminClaudeQuota(c *gin.Context) {
 				return
 			}
 
-			cacheHit := snapErr == nil && time.Since(snap.Ts) < quotaCacheTTL
+			// A snapshot whose 5h/7d reset moment has already passed reports a
+			// PRE-reset utilization that Anthropic has since rolled toward 0.
+			// Serving it is what produced the "100% ↺now" that looked stuck:
+			// the reset clock says "now" while the cached % is still the old
+			// high value. Treat a passed-reset snapshot as a miss so we re-probe
+			// the true post-reset number (the fresh snapshot gets a future
+			// reset and caches normally again).
+			now := time.Now()
+			resetPassed := (!snap.FiveHourReset.IsZero() && now.After(snap.FiveHourReset)) ||
+				(!snap.SevenDayReset.IsZero() && now.After(snap.SevenDayReset))
+			cacheHit := snapErr == nil && time.Since(snap.Ts) < quotaCacheTTL && !resetPassed
 
 			if cacheHit {
 				fillFromSnap(&res, &snap)

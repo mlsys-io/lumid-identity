@@ -2,8 +2,10 @@ package handler
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -17,7 +19,137 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/gin-gonic/gin"
+
+	"lumid_identity/internal/common"
 )
+
+// Redis key + freshness for the scheduler-published loops feed. The
+// lumid-scheduler daemon runs on its OWN pod with the real ~/.xp fs; it
+// POSTs its loop/app state to /internal/loops-summary each discovery pass
+// (~60s). Identity's own container fs is empty, so without this the tile
+// always reported scheduler_daemon="not_installed". Freshness > 5× the
+// publish cadence ⇒ the feed is stale (daemon down / not reporting).
+const (
+	loopsSummaryKey    = "admin:loops:summary"
+	loopsSummaryTTL    = 7 * 24 * time.Hour
+	loopsSummaryFresh  = 5 * time.Minute
+	loopsSummaryMaxLen = 4 << 20 // 4 MiB cap on the published doc
+)
+
+// loopsSummaryDoc is the scheduler's payload AND the cached shape. loopRow /
+// appGitStatus json tags are reused verbatim so the scheduler's field names
+// line up; Status is intentionally NOT trusted from the wire — identity
+// recomputes it at read time so the >48h "stale" verdict stays live even for
+// a cached doc.
+type loopsSummaryDoc struct {
+	GeneratedAt  time.Time      `json:"generated_at"`
+	OperatorHome string         `json:"operator_home"`
+	Loops        []loopRow      `json:"loops"`
+	Apps         []appGitStatus `json:"apps"`
+}
+
+// loopStatusFor is the single source of the per-loop status verdict, shared by
+// the Redis-fed and filesystem paths.
+func loopStatusFor(schedule string, lastRunTS float64, consecutiveFailures int, now int64) string {
+	switch {
+	case schedule == "" || schedule == "@trigger" || schedule == "manual":
+		return "manual"
+	case lastRunTS == 0:
+		return "never"
+	case consecutiveFailures > 0:
+		return "failing"
+	case now-int64(lastRunTS) > 60*60*48: // >48h since last run
+		return "stale"
+	default:
+		return "ok"
+	}
+}
+
+// InternalLoopsSummary caches the scheduler's published loop/app state.
+// Bridge-authed (RequireBridge); no user session.
+func InternalLoopsSummary(c *gin.Context) {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, loopsSummaryMaxLen+1))
+	if err != nil || len(body) == 0 {
+		fail(c, http.StatusBadRequest, 1400, "empty or unreadable body")
+		return
+	}
+	if len(body) > loopsSummaryMaxLen {
+		fail(c, http.StatusRequestEntityTooLarge, 1413, "loops summary too large")
+		return
+	}
+	// Validate it parses into our shape before caching a poison doc.
+	var doc loopsSummaryDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid loops summary: "+err.Error())
+		return
+	}
+	if common.Redis == nil {
+		fail(c, http.StatusServiceUnavailable, 1503, "no cache backend")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 500*time.Millisecond)
+	defer cancel()
+	if err := common.Redis.Set(ctx, loopsSummaryKey, body, loopsSummaryTTL).Err(); err != nil {
+		fail(c, http.StatusServiceUnavailable, 1503, "cache write failed")
+		return
+	}
+	ok(c, "ok", gin.H{"loops": len(doc.Loops), "apps": len(doc.Apps)})
+}
+
+// adminLoopsFromCache renders the tile from the scheduler-published Redis doc.
+// Returns false when no usable cached doc exists (caller falls back to the
+// local filesystem walk).
+func adminLoopsFromCache(c *gin.Context) bool {
+	if common.Redis == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 500*time.Millisecond)
+	defer cancel()
+	raw, err := common.Redis.Get(ctx, loopsSummaryKey).Result()
+	if err != nil || raw == "" {
+		return false
+	}
+	var doc loopsSummaryDoc
+	if json.Unmarshal([]byte(raw), &doc) != nil {
+		return false
+	}
+
+	now := time.Now().Unix()
+	rows := doc.Loops
+	for i := range rows {
+		rows[i].Status = loopStatusFor(rows[i].Schedule, rows[i].LastRunTS, rows[i].ConsecutiveFailures, now)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].App != rows[j].App {
+			return rows[i].App < rows[j].App
+		}
+		return rows[i].Loop < rows[j].Loop
+	})
+	summary := map[string]int{"ok": 0, "never": 0, "failing": 0, "stale": 0, "manual": 0}
+	for _, r := range rows {
+		summary[r.Status]++
+	}
+	apps := doc.Apps
+	sort.Slice(apps, func(i, j int) bool { return apps[i].App < apps[j].App })
+
+	// The daemon is "running" only if its last publish is recent; a stale doc
+	// means the scheduler stopped reporting (crash / network) — surface that
+	// rather than lying "running" off a week-old cache.
+	scheduler := "running"
+	if time.Since(doc.GeneratedAt) > loopsSummaryFresh {
+		scheduler = "stale"
+	}
+	ok(c, "ok", gin.H{
+		"loops":            rows,
+		"apps":             apps,
+		"summary":          summary,
+		"scheduler_daemon": scheduler,
+		"operator_home":    doc.OperatorHome,
+		"generated_at":     doc.GeneratedAt,
+		"source":           "scheduler",
+	})
+	return true
+}
 
 // GET /admin/loops — super-admin dashboard tile.
 //
@@ -1107,6 +1239,14 @@ func xpcloudBaseURL() string {
 }
 
 func AdminLoops(c *gin.Context) {
+	// Preferred source: the scheduler-published Redis doc (the daemon runs on
+	// its own pod with the real ~/.xp fs). Falls through to identity's local
+	// filesystem walk when no cached doc exists — keeps single-host/dev
+	// deployments working unchanged.
+	if adminLoopsFromCache(c) {
+		return
+	}
+
 	home := operatorHome()
 	state := readSchedulerState(home)
 	apps := discoverManifestLoops(home)
@@ -1175,18 +1315,7 @@ func AdminLoops(c *gin.Context) {
 					row.LastErrors, row.LastJournal = loadLastErrors(latestPath, appDir)
 				}
 			}
-			switch {
-			case L.Schedule == "" || L.Schedule == "@trigger" || L.Schedule == "manual":
-				row.Status = "manual"
-			case s.LastRunTS == 0:
-				row.Status = "never"
-			case s.ConsecutiveFailures > 0:
-				row.Status = "failing"
-			case now-int64(s.LastRunTS) > 60*60*48: // >48h since last run
-				row.Status = "stale"
-			default:
-				row.Status = "ok"
-			}
+			row.Status = loopStatusFor(L.Schedule, s.LastRunTS, s.ConsecutiveFailures, now)
 			rows = append(rows, row)
 		}
 	}

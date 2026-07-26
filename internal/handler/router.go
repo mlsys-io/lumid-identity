@@ -504,6 +504,10 @@ func Register(r *gin.Engine) {
 			// Claude session recording — claude-proxy posts each turn's full
 			// request+response; stored delta-compacted (respects opt-out).
 			internal.POST("/claude-transcript", InternalClaudeTranscript)
+			// Loops dashboard feed — the lumid-scheduler daemon POSTs its live
+			// loop/app state here every discovery pass; cached in Redis so
+			// /admin/loops reflects the SCHEDULER's fs, not identity's empty one.
+			internal.POST("/loops-summary", InternalLoopsSummary)
 		}
 
 		// Inbound webhook for Power Automate's Outlook bridge. The

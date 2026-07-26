@@ -1,20 +1,25 @@
 package handler
 
-// Persistent per-user state for the chat agent, stored as small JSON
-// files in the caller's tenant dir (same pattern as .chats/):
+// Persistent per-user state for the chat agent, stored in Redis so
+// BOTH identity replicas agree (the old per-pod JSON files flapped by
+// replica and were wiped on every image roll). Legacy files are still
+// read as a fallback for the transition window and for Redis-less dev:
 //
-//   .tool-grants.json     — "always allow" grants for destructive tools.
-//                           tool name → RFC3339 grant time. Checked by
-//                           the stream handler before raising an
-//                           approval gate; written by MeAgentToolApprove
-//                           (always=true); managed via
-//                           GET/DELETE /api/v1/me/agent/tool-grants.
+//   claude:tool-grants:<uid>  — hash of "always allow" grants for
+//                               destructive tools. field = tool name,
+//                               value = RFC3339 grant time. Checked by
+//                               the stream handler before raising an
+//                               approval gate; written by MeAgentToolApprove
+//                               (always=true); managed via
+//                               GET/DELETE /api/v1/me/agent/tool-grants.
+//                               (legacy file: .tool-grants.json)
 //
-//   .claude-sessions.json — claude CLI session ids previously issued to
-//                           this user by the claude-code provider.
-//                           Authorizes --resume: a session id from the
-//                           client is honored only if it appears here,
-//                           so users can only resume their own sessions.
+//   claude:sessions:<uid>     — claude CLI session ids previously issued
+//                               to this user by the claude-code provider.
+//                               Authorizes --resume: a session id from the
+//                               client is honored only if it appears here,
+//                               so users can only resume their own sessions.
+//                               (legacy file: .claude-sessions.json)
 
 import (
 	"context"
@@ -32,7 +37,7 @@ import (
 	"lumid_identity/internal/common"
 )
 
-var grantsMu sync.Mutex // serializes read-modify-write on both files
+var grantsMu sync.Mutex // serializes read-modify-write on the legacy fallback files
 
 const claudeSessionsKeep = 100 // oldest pruned beyond this
 
@@ -73,10 +78,29 @@ func saveJSONMap(path string, m map[string]string) error {
 }
 
 // ── Tool grants ──────────────────────────────────────────────────────────────
+//
+// Redis-backed (hash claude:tool-grants:<uid>, field = tool, value =
+// RFC3339 grant time, no TTL) so grants are consistent across BOTH
+// identity replicas and survive pod restarts — the old per-pod
+// .tool-grants.json flapped by replica, so an "always allow" recorded
+// on one pod silently re-prompted on the other. The legacy file is
+// still read as a fallback (grants recorded before this migration, and
+// Redis-less dev runs, which also keep writing it).
+
+func toolGrantsKey(userID string) string { return "claude:tool-grants:" + userID }
 
 // hasToolGrant reports whether the user has a persistent "always allow"
 // grant for the named tool.
 func hasToolGrant(userID, tool string) bool {
+	if common.Redis != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if ok, err := common.Redis.HExists(ctx, toolGrantsKey(userID), tool).Result(); err == nil && ok {
+			return true
+		}
+		// Miss (or Redis error) → fall through to the legacy file so
+		// pre-migration grants still hold.
+	}
 	grantsMu.Lock()
 	defer grantsMu.Unlock()
 	_, ok := loadJSONMap(toolGrantsPath(userID))[tool]
@@ -85,10 +109,16 @@ func hasToolGrant(userID, tool string) bool {
 
 // grantTool records a persistent allow for the named tool.
 func grantTool(userID, tool string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	if common.Redis != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		return common.Redis.HSet(ctx, toolGrantsKey(userID), tool, now).Err()
+	}
 	grantsMu.Lock()
 	defer grantsMu.Unlock()
 	m := loadJSONMap(toolGrantsPath(userID))
-	m[tool] = time.Now().UTC().Format(time.RFC3339)
+	m[tool] = now
 	return saveJSONMap(toolGrantsPath(userID), m)
 }
 
@@ -99,9 +129,20 @@ func MeAgentToolGrants(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
+	// Merge the legacy file with Redis for the transition window;
+	// Redis wins on conflicting tools.
 	grantsMu.Lock()
 	m := loadJSONMap(toolGrantsPath(userID))
 	grantsMu.Unlock()
+	if common.Redis != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if h, err := common.Redis.HGetAll(ctx, toolGrantsKey(userID)).Result(); err == nil {
+			for k, v := range h {
+				m[k] = v
+			}
+		}
+	}
 	type row struct {
 		Tool      string `json:"tool"`
 		GrantedAt string `json:"granted_at"`
@@ -122,16 +163,29 @@ func MeAgentToolGrantRevoke(c *gin.Context) {
 		return
 	}
 	name := c.Param("name")
+	removed := false
+	if common.Redis != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if n, err := common.Redis.HDel(ctx, toolGrantsKey(userID), name).Result(); err == nil && n > 0 {
+			removed = true
+		}
+	}
+	// Also drop any legacy-file copy so a revoked grant can't resurface
+	// via the transition-window merge.
 	grantsMu.Lock()
 	defer grantsMu.Unlock()
 	m := loadJSONMap(toolGrantsPath(userID))
-	if _, ok := m[name]; !ok {
-		fail(c, http.StatusNotFound, 1404, "no grant for "+name)
-		return
+	if _, ok := m[name]; ok {
+		delete(m, name)
+		if err := saveJSONMap(toolGrantsPath(userID), m); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
+			return
+		}
+		removed = true
 	}
-	delete(m, name)
-	if err := saveJSONMap(toolGrantsPath(userID), m); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
+	if !removed {
+		fail(c, http.StatusNotFound, 1404, "no grant for "+name)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"tool": name}})

@@ -32,6 +32,7 @@ var AllTables = []interface{}{
 	&ClaudeSession{},
 	&ClaudeSessionTurn{},
 	&ClaudeRecordingPref{},
+	&MePref{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

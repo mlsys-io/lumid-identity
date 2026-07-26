@@ -1,13 +1,17 @@
 package handler
 
 // me_agent tool: remember_about_me — long-term memory writes.
-// Appends a row to ~/.tenants/<userID>/.xp/kg/agents/me-prefs/bank.jsonl,
-// the dedicated "what the agent has learned about the user" bank.
+// Inserts a row into the me_prefs table (models.MePref), the dedicated
+// "what the agent has learned about the user" bank. DB-backed so BOTH
+// identity replicas see the same memories — the old per-pod bank.jsonl
+// under ~/.tenants/<userID>/.xp/kg/agents/me-prefs/ flapped by replica
+// and was wiped on every image roll. The legacy file is still read as
+// a one-shot fallback when the table is empty (transition window) and
+// written only in DB-less dev runs.
 //
-// Reads use the existing query_my_knowledge tool (which scans the
-// same path). Recent entries are also injected into buildSystemPrompt
-// so the agent always has the user's preferences in context without
-// needing an explicit recall step.
+// Recent entries are injected into buildSystemPrompt so the agent
+// always has the user's preferences in context without needing an
+// explicit recall step.
 
 import (
 	"crypto/rand"
@@ -20,13 +24,16 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
 )
 
 // prefsBankAgent — the dedicated agent name used by the personal
 // memory layer. Kept as a constant so the inject + write paths agree.
 const prefsBankAgent = "me-prefs"
 
-// toolRememberAboutMe appends one memory row to the user's me-prefs
+// toolRememberAboutMe records one memory row in the user's me-prefs
 // bank. Note is required; tags is an optional comma-or-array hint that
 // helps future retrieval (e.g. "preference,style" or "fact,context").
 func toolRememberAboutMe(userID, note string, tags any) (map[string]any, bool) {
@@ -39,33 +46,48 @@ func toolRememberAboutMe(userID, note string, tags any) (map[string]any, bool) {
 	}
 
 	tagStr := normalizeTags(tags)
-	bankPath := prefsBankPath(userID)
-	if err := os.MkdirAll(filepath.Dir(bankPath), 0o755); err != nil {
-		return map[string]any{"error": "mkdir: " + err.Error()}, false
-	}
+	memID := newMemoryID()
+	createdAt := time.Now().UTC()
 
-	row := map[string]any{
-		"id":         newMemoryID(),
-		"kind":       "preference",
-		"source":     "chat",
-		"content":    note,
-		"confidence": 1.0,
-		"created_at": time.Now().UTC().Format(time.RFC3339),
-		"recurrence": 1,
-	}
-	if tagStr != "" {
-		row["tags"] = tagStr
-	}
-
-	if err := appendBankRow(bankPath, row); err != nil {
-		return map[string]any{"error": "append: " + err.Error()}, false
+	if common.DB != nil {
+		row := &models.MePref{
+			UserID:    userID,
+			MemID:     memID,
+			Content:   note,
+			Tags:      tagStr,
+			CreatedAt: createdAt,
+		}
+		if err := common.DB.Create(row).Error; err != nil {
+			return map[string]any{"error": "insert: " + err.Error()}, false
+		}
+	} else {
+		// DB-less dev fallback: append to the legacy per-pod bank.jsonl.
+		bankPath := prefsBankPath(userID)
+		if err := os.MkdirAll(filepath.Dir(bankPath), 0o755); err != nil {
+			return map[string]any{"error": "mkdir: " + err.Error()}, false
+		}
+		row := map[string]any{
+			"id":         memID,
+			"kind":       "preference",
+			"source":     "chat",
+			"content":    note,
+			"confidence": 1.0,
+			"created_at": createdAt.Format(time.RFC3339),
+			"recurrence": 1,
+		}
+		if tagStr != "" {
+			row["tags"] = tagStr
+		}
+		if err := appendBankRow(bankPath, row); err != nil {
+			return map[string]any{"error": "append: " + err.Error()}, false
+		}
 	}
 
 	return map[string]any{
 		"ok":         true,
 		"agent":      prefsBankAgent,
-		"id":         row["id"],
-		"created_at": row["created_at"],
+		"id":         memID,
+		"created_at": createdAt.Format(time.RFC3339),
 		"note":       truncStr(note, 120),
 	}, true
 }
@@ -134,6 +156,37 @@ func loadRecentPrefs(userID string, limit int) []map[string]any {
 	if limit <= 0 || limit > 50 {
 		limit = 12
 	}
+	if common.DB != nil {
+		var prefRows []models.MePref
+		err := common.DB.Where("user_id = ?", userID).
+			Order("created_at DESC").Limit(limit).Find(&prefRows).Error
+		if err == nil && len(prefRows) > 0 {
+			rows := make([]map[string]any, 0, len(prefRows))
+			for _, p := range prefRows {
+				row := map[string]any{
+					"id":         p.MemID,
+					"kind":       "preference",
+					"source":     "chat",
+					"content":    p.Content,
+					"created_at": p.CreatedAt.UTC().Format(time.RFC3339),
+				}
+				if p.Tags != "" {
+					row["tags"] = p.Tags
+				}
+				rows = append(rows, row)
+			}
+			return rows
+		}
+		// Empty table (or query error) → fall through to the legacy
+		// bank.jsonl so pre-migration memories keep surfacing during
+		// the transition window.
+	}
+	return loadLegacyPrefs(userID, limit)
+}
+
+// loadLegacyPrefs reads the pre-migration per-pod bank.jsonl. Kept as
+// a transition-window (and DB-less dev) fallback for loadRecentPrefs.
+func loadLegacyPrefs(userID string, limit int) []map[string]any {
 	path := prefsBankPath(userID)
 	b, err := os.ReadFile(path)
 	if err != nil {

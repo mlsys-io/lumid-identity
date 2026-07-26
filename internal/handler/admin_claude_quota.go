@@ -621,21 +621,47 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		cands = append(cands, cand{row, sp})
 	}
 
-	// Order: prefer_email first, then by remaining headroom — the binding
-	// constraint is whichever window is fuller, so sort by max(5h, 7d)
-	// ascending (an account at 5h=0/7d=99 is nearly spent, not idle).
-	// Accounts without a snapshot sort last — they cost a probe.
+	// Order (ascending key, lowest picked first): "use it or lose it".
+	//   1. prefer_email — explicit stickiness (the proxy also caches leases
+	//      per-user for prompt-cache locality; honor a real match).
+	//   2. Among accounts that still HAVE 5h headroom, prefer the one whose 5h
+	//      window resets SOONEST. Its remaining allocation is wiped at the reset
+	//      regardless, so draining near-due accounts first maximizes total pool
+	//      throughput; accounts with distant resets are "savings" left for later.
+	//   3. Near-exhausted accounts (5h or 7d ≥ ceiling) go to the back — they'd
+	//      429 almost immediately and just churn the retry loop.
+	//   4. No snapshot → probe last.
+	// The key packs these into disjoint numeric bands so the ordering is total.
+	const nearExhaustCeiling = 92.0
 	sortKey := func(cd cand) float64 {
 		if cd.row.Email == prefer {
 			return -1
 		}
 		if cd.snap == nil {
-			return 200
+			return 4e9 // probe cost — behind everything with a snapshot
 		}
-		if cd.snap.SevenDayPct > cd.snap.FiveHourPct {
-			return cd.snap.SevenDayPct
+		s := cd.snap
+		// Band 3: near-exhausted on either window — last resort, ordered by how
+		// spent they are (least-spent first) so we still pick the best of a bad lot.
+		if s.FiveHourPct >= nearExhaustCeiling || s.SevenDayPct >= nearExhaustCeiling {
+			worst := s.FiveHourPct
+			if s.SevenDayPct > worst {
+				worst = s.SevenDayPct
+			}
+			return 3e9 + worst
 		}
-		return cd.snap.FiveHourPct
+		// Band 2 (primary): has 5h headroom → prefer soonest 5h reset. Key =
+		// seconds until the 5h window resets (due-now → 0 → highest priority).
+		if !s.FiveHourReset.IsZero() {
+			secs := time.Until(s.FiveHourReset).Seconds()
+			if secs < 0 {
+				secs = 0
+			}
+			return secs // 0 .. ~18000 (5h) — all below the 3e9 band
+		}
+		// Band ~2.5: healthy but no reset timestamp — fall back to most-headroom-
+		// first, kept ahead of near-exhausted (band 3) but behind timed accounts.
+		return 2e9 + s.FiveHourPct
 	}
 	for i := 1; i < len(cands); i++ {
 		for j := i; j > 0 && sortKey(cands[j]) < sortKey(cands[j-1]); j-- {

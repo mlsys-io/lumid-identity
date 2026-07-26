@@ -32,11 +32,52 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// Input ceilings for the streaming chat endpoint. Messages + base64
+// attachments ride in one JSON document, so the body cap bounds both;
+// the content caps stop a hostile turn from pushing megabytes of "text"
+// into every downstream prompt build even when the body fits.
+const (
+	chatStreamMaxBodyBytes   = 1536 * 1024 // 1.5 MiB request body
+	chatMaxMessageBytes      = 256 * 1024  // per-message typed content
+	chatMaxTotalContentBytes = 1024 * 1024 // content summed across all turns
+)
+
+// Per-user live-stream ceiling. Per-pod counter — identity runs 2 replicas
+// with no session affinity, so the effective cap is up to 2×; acceptable
+// for an abuse backstop, not an exact quota.
+const maxConcurrentChatStreams = 3
+
+var (
+	chatStreamsMu sync.Mutex
+	chatStreams   = map[string]int{}
+)
+
+func acquireChatStream(userID string) bool {
+	chatStreamsMu.Lock()
+	defer chatStreamsMu.Unlock()
+	if chatStreams[userID] >= maxConcurrentChatStreams {
+		return false
+	}
+	chatStreams[userID]++
+	return true
+}
+
+func releaseChatStream(userID string) {
+	chatStreamsMu.Lock()
+	if chatStreams[userID] > 1 {
+		chatStreams[userID]--
+	} else {
+		delete(chatStreams, userID)
+	}
+	chatStreamsMu.Unlock()
+}
 
 // MeAgentChatStream is the streaming sibling of MeAgentChat. Same
 // auth, body shape, tool-use loop, and budget enforcement — different
@@ -47,6 +88,9 @@ func MeAgentChatStream(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
+	// Cap the body BEFORE decode — an unbounded JSON document is an OOM
+	// lever on the auth authority.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, chatStreamMaxBodyBytes)
 	var body meAgentChatBody
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -55,6 +99,20 @@ func MeAgentChatStream(c *gin.Context) {
 	stashViewingApp(c, body.Context)
 	if len(body.Messages) == 0 || len(body.Messages) > 50 {
 		fail(c, http.StatusBadRequest, 1400, "messages required, ≤50 turns")
+		return
+	}
+	totalContent := 0
+	for _, m := range body.Messages {
+		if len(m.Content) > chatMaxMessageBytes {
+			fail(c, http.StatusBadRequest, 1400,
+				fmt.Sprintf("message content too large (max %d KiB per message)", chatMaxMessageBytes/1024))
+			return
+		}
+		totalContent += len(m.Content)
+	}
+	if totalContent > chatMaxTotalContentBytes {
+		fail(c, http.StatusBadRequest, 1400,
+			fmt.Sprintf("conversation content too large (max %d KiB total)", chatMaxTotalContentBytes/1024))
 		return
 	}
 
@@ -88,7 +146,14 @@ func MeAgentChatStream(c *gin.Context) {
 	c.Writer.WriteHeader(http.StatusOK)
 	c.Writer.Flush()
 
+	// Serialized: the pre-headers pinger (claude-code path) and the
+	// direct-path heartbeat goroutine both write through this closure
+	// alongside the main loop, and the SSE writer is not safe for
+	// concurrent use.
+	var emitMu sync.Mutex
 	emit := func(payload map[string]any) bool {
+		emitMu.Lock()
+		defer emitMu.Unlock()
 		b, _ := json.Marshal(payload)
 		if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", b); err != nil {
 			return false
@@ -97,20 +162,15 @@ func MeAgentChatStream(c *gin.Context) {
 		return true
 	}
 
-	// Promote frontend's flat content (+ attachments) into Anthropic's
-	// message shape — images become image blocks, text files become
-	// fenced inline blocks, PDFs become document blocks on Claude or
-	// pdftotext-extracted fenced text on non-Claude, the user's typed
-	// text closes each turn.
-	anthMsgs := make([]map[string]any, 0, len(body.Messages))
-	for _, m := range body.Messages {
-		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
+	if !acquireChatStream(userID) {
+		emit(map[string]any{
+			"type": "error", "code": "concurrent_streams",
+			"message": fmt.Sprintf("too many simultaneous chats (max %d) — close one and retry", maxConcurrentChatStreams),
+		})
+		emit(map[string]any{"type": "done"})
+		return
 	}
-
-	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body)
-	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
-	totalInputTokens := 0
-	totalOutputTokens := 0
+	defer releaseChatStream(userID)
 
 	// 30 min — deep agentic loops (50 iterations), long claude-code Opus
 	// runs, and pause-for-approval all need headroom; SSE keeps the
@@ -129,15 +189,62 @@ func MeAgentChatStream(c *gin.Context) {
 
 	// claude-code-* delegates to the local claude CLI via the host proxy.
 	// Claude's own built-in tools (Bash, Read, Write, WebSearch) replace the
-	// me_agent tool list; the system prompt is passed as context only.
+	// me_agent tool list, and the CLI reads files through its own tools —
+	// so neither the tool catalog nor the Anthropic message promotion
+	// (which forks pdftotext/pandoc per document attachment) is built on
+	// this path. The system prompt IS used (passed as context).
 	if isClaudeCodeProvider(provider) {
-		_ = tools // not used for this provider
+		basePrompt, _, _ := resolvePromptAndTools(userID, role, body, false)
+		systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
+		// Liveness before the first upstream byte: the PAT mint (argon2id)
+		// + a sandbox cold-start precede any NDJSON.
+		if !emit(map[string]any{"type": "status", "status": "starting"}) {
+			return
+		}
 		if err := streamClaudeCodeViaProxy(ctx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, emit); err != nil {
 			emit(map[string]any{"type": "error", "message": err.Error()})
 		}
 		emit(map[string]any{"type": "done"})
 		return
 	}
+
+	// Promote frontend's flat content (+ attachments) into Anthropic's
+	// message shape — images become image blocks, text files become
+	// fenced inline blocks, PDFs become document blocks on Claude or
+	// pdftotext-extracted fenced text on non-Claude, the user's typed
+	// text closes each turn.
+	anthMsgs := make([]map[string]any, 0, len(body.Messages))
+	for _, m := range body.Messages {
+		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
+	}
+
+	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body, true)
+	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
+	totalInputTokens := 0
+	totalOutputTokens := 0
+
+	// The approval wait (up to 10 min) and long tool dispatches write zero
+	// bytes; nginx's proxy_read_timeout (300s) would cut the stream first.
+	// emit is mutex-serialized, so a background pinger covers the whole
+	// direct-path loop.
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-pingDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if !emit(map[string]any{"type": "ping"}) {
+					return
+				}
+			}
+		}
+	}()
 
 	for i := 0; i < maxToolLoopIterations; i++ {
 		// Stop the moment the client is gone — otherwise the loop keeps making
@@ -346,8 +453,10 @@ func streamOneAnthropicTurn(
 	inputTokens := 0
 	outputTokens := 0
 
+	// 16 MiB per-line cap — same ceiling as the claude-code path: one big
+	// base64 image in a tool_result must not fail Scan() and kill the turn.
 	sc := bufio.NewScanner(r.Body)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	var eventType string
 	for sc.Scan() {
 		line := sc.Text()

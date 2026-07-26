@@ -1353,7 +1353,7 @@ func MeAgentChat(c *gin.Context) {
 		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
-	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body)
+	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body, true)
 	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
 	toolCalls := []toolCallResult{}
 	totalInputTokens := 0
@@ -1765,8 +1765,15 @@ func min(a, b int) int {
 // Returns (systemPrompt, tools, preferredModel). preferredModel is
 // honored only when the request didn't set Model explicitly (handler-
 // level concern, not done here).
-func resolvePromptAndTools(userID, role string, body meAgentChatBody) (string, []map[string]any, string) {
-	tools := buildToolDefsForRole(role)
+//
+// wantTools=false skips the tool-catalog build (and the persona tool
+// filter) entirely — the claude-code path replaces our tools with the
+// CLI's own, so constructing the full catalog there is dead work.
+func resolvePromptAndTools(userID, role string, body meAgentChatBody, wantTools bool) (string, []map[string]any, string) {
+	var tools []map[string]any
+	if wantTools {
+		tools = buildToolDefsForRole(role)
+	}
 	// Viewing context rides on every prompt variant (persona included) —
 	// it's per-request situational awareness, not persona flavor. Both
 	// the streaming and non-streaming endpoints, and the claude-code
@@ -1783,7 +1790,7 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody) (string, [
 	if body.PersonaID != "" {
 		p, _ := loadPersona(userID, body.PersonaID)
 		if p != nil {
-			if len(p.AllowedTools) > 0 {
+			if wantTools && len(p.AllowedTools) > 0 {
 				allow := map[string]bool{}
 				for _, t := range p.AllowedTools {
 					allow[t] = true

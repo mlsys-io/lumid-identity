@@ -224,6 +224,11 @@ func AdminUsersPatch(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "persist: "+err.Error())
 		return
 	}
+	// A suspended user's cached claude-sandbox PAT must not survive the
+	// suspension (per-pod best effort — other replicas age out on re-mint).
+	if s, ok := updates["status"].(string); ok && s == "suspended" {
+		invalidateSandboxPATCache(id)
+	}
 
 	var after models.User
 	common.DB.Where("id = ?", id).First(&after)

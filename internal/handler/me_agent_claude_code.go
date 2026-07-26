@@ -80,11 +80,16 @@ const (
 )
 
 var (
+	// sandboxPATMu guards the cache map and the per-user lock map only —
+	// never the mint itself. argon2id (64 MiB, 4 threads) + the DB insert
+	// run under the PER-USER lock, so concurrent turns from the same user
+	// still mint once, but users never serialize behind each other's KDF.
 	sandboxPATMu    sync.Mutex
 	sandboxPATCache = map[string]struct {
 		token string
 		exp   time.Time
 	}{}
+	sandboxPATMintMu = map[string]*sync.Mutex{}
 )
 
 // claudeSandboxPAT returns a live claude:proxy-scoped PAT for the user,
@@ -93,21 +98,53 @@ var (
 // sandbox", and these rows are hidden from the user's token list.
 func claudeSandboxPAT(userID string) (string, error) {
 	sandboxPATMu.Lock()
-	defer sandboxPATMu.Unlock()
 	if e, ok := sandboxPATCache[userID]; ok && time.Until(e.exp) > claudeSandboxPATFresh {
+		sandboxPATMu.Unlock()
 		return e.token, nil
 	}
+	mu := sandboxPATMintMu[userID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		sandboxPATMintMu[userID] = mu
+	}
+	sandboxPATMu.Unlock()
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Re-check under the user lock — a concurrent turn may have minted
+	// while we waited.
+	sandboxPATMu.Lock()
+	if e, ok := sandboxPATCache[userID]; ok && time.Until(e.exp) > claudeSandboxPATFresh {
+		sandboxPATMu.Unlock()
+		return e.token, nil
+	}
+	sandboxPATMu.Unlock()
+
 	exp := time.Now().Add(claudeSandboxPATTTL)
 	cleartext, _, err := mintPATForUser(userID, "claude sandbox (auto)",
 		[]string{"claude:proxy"}, &exp, claudeSandboxSource)
 	if err != nil {
 		return "", err
 	}
+	sandboxPATMu.Lock()
 	sandboxPATCache[userID] = struct {
 		token string
 		exp   time.Time
 	}{cleartext, exp}
+	sandboxPATMu.Unlock()
 	return cleartext, nil
+}
+
+// invalidateSandboxPATCache drops the cached sandbox PAT for a user, so a
+// revoked token or a suspended account stops being handed to new turns
+// immediately instead of riding the freshness window out. Per-pod best
+// effort: other replicas keep their entry until the next re-mint (≤6h) —
+// acceptable because the pooled proxy re-validates the PAT against the DB
+// on every upstream call anyway.
+func invalidateSandboxPATCache(userID string) {
+	sandboxPATMu.Lock()
+	delete(sandboxPATCache, userID)
+	sandboxPATMu.Unlock()
 }
 
 // StartClaudeSandboxPATSweep deletes expired auto-minted sandbox PATs
@@ -195,7 +232,10 @@ func recordCrossPodStop(turnID, userID string) {
 	if common.Redis == nil || turnID == "" {
 		return
 	}
-	_ = common.Redis.Set(context.Background(), claudeStoppedKey(turnID), userID, claudeStoppedTTL).Err()
+	// Bounded: a wedged Redis must not hang the interrupt request.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_ = common.Redis.Set(ctx, claudeStoppedKey(turnID), userID, claudeStoppedTTL).Err()
 }
 
 // claudeTurnInterrupted reports whether the OWNER asked to stop this turn. The
@@ -213,7 +253,11 @@ func claudeTurnInterrupted(turnID string, t *claudeTurn) bool {
 	if turnID == "" || common.Redis == nil {
 		return false
 	}
-	owner, err := common.Redis.Get(context.Background(), claudeStoppedKey(turnID)).Result()
+	// Bounded: this runs on the streaming hot path per terminal event — a
+	// wedged Redis must not stall the turn.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	owner, err := common.Redis.Get(ctx, claudeStoppedKey(turnID)).Result()
 	if err != nil {
 		return false
 	}
@@ -313,15 +357,48 @@ func streamClaudeCodeViaProxy(
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Bridge-Secret", os.Getenv("LUMID_IDENTITY_BRIDGE_SECRET"))
 
+	// The 15s heartbeat below only starts once the sandbox's response
+	// headers arrive — but a cold start (pod scale-up, checkpoint restore)
+	// can hold headers past an intermediary's idle timeout, killing the
+	// turn before its first byte. Ping while Do() waits; joined before the
+	// main loop resumes so emits stay serialized either way.
+	headersDone := make(chan struct{})
+	pingerDone := make(chan struct{})
+	go func() {
+		defer close(pingerDone)
+		t := time.NewTicker(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-headersDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if !emit(map[string]any{"type": "ping"}) {
+					return
+				}
+			}
+		}
+	}()
+
 	// No client-level timeout — the stream runs until claude finishes
 	// (the sandbox enforces its own per-session hard timeout).
 	resp, err := http.DefaultClient.Do(req)
+	close(headersDone)
+	<-pingerDone
 	if err != nil {
 		return fmt.Errorf("claude sandbox unreachable at %s: %w", claudeSandboxURL(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		return fmt.Errorf("Claude Code sandbox is at capacity — try again in a minute")
+		// Typed so the client can back off and auto-retry instead of
+		// rendering a failure card.
+		emit(map[string]any{
+			"type": "error", "code": "busy", "retry_after_s": 15,
+			"message": "Claude Code sandbox is at capacity — try again in a minute",
+		})
+		return nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("claude sandbox returned HTTP %d", resp.StatusCode)
@@ -435,10 +512,11 @@ type claudeTranslator struct {
 	// run ends as `error_during_execution`, which must NOT be shown as an
 	// internal failure when the user pressed Stop.
 	stopped func() bool
-	// A stopped turn produces TWO terminal events (the CLI's
-	// error_during_execution, then the sandbox's synthesized non-zero exit), so
-	// the notice has to be emitted once.
-	sentStopped bool
+	// A failed turn produces TWO terminal events (the CLI's
+	// error_during_execution, then the sandbox's synthesized non-zero exit) —
+	// whether it reads as "stopped" or as an error, only the first terminal
+	// notice may reach the client.
+	sentTerminal bool
 
 	toolNameByID map[string]string // tool_use id → name, for the later tool_result
 	// tool_use id → arguments. The tool_result message carries none, so without
@@ -801,12 +879,18 @@ func (t *claudeTranslator) handleResult(event map[string]any) bool {
 	// turn as error_during_execution, and the sandbox then synthesizes a
 	// non-zero-exit result). Report it as what it was, not as a failure.
 	if t.stopped != nil && t.stopped() {
-		if t.sentStopped {
+		if t.sentTerminal {
 			return true
 		}
-		t.sentStopped = true
+		t.sentTerminal = true
 		return t.emit(map[string]any{"type": "stopped"})
 	}
+	// Same double-terminal shape on a real failure: the second event is the
+	// sandbox restating the first, not new information.
+	if t.sentTerminal {
+		return true
+	}
+	t.sentTerminal = true
 
 	// Every non-success terminal state. Previously only the literal
 	// subtype "error" was handled — which the sandbox synthesizes on a

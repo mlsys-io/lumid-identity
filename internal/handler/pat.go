@@ -370,6 +370,9 @@ func PATRevokeHandler(c *gin.Context) {
 		return
 	}
 	common.DB.Model(&existing).Update("revoked_at", gorm.Expr("NOW()"))
+	// The revoked row may be this user's cached claude-sandbox PAT — drop
+	// the cache entry so new turns re-mint instead of shipping a dead token.
+	invalidateSandboxPATCache(userID)
 	ok_(c, "revoked", nil)
 }
 
@@ -444,6 +447,8 @@ func PATRotateHandler(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1002, "token not found or already revoked")
 		return
 	}
+	// Rotate revokes the old row — same cache concern as PATRevokeHandler.
+	invalidateSandboxPATCache(userID)
 	scopes := strings.Fields(newRow.Scopes)
 	ok_(c, "rotated", patMintResp{
 		ID: newRow.ID, Token: newToken, Prefix: patCleartextPrefix,

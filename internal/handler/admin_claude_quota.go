@@ -621,15 +621,19 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		cands = append(cands, cand{row, sp})
 	}
 
-	// Order (ascending key, lowest picked first): "use it or lose it".
+	// Order (ascending key, lowest picked first): "use it or lose it", driven by
+	// the SCARCE window — the 7d weekly budget.
 	//   1. prefer_email — explicit stickiness (the proxy also caches leases
 	//      per-user for prompt-cache locality; honor a real match).
-	//   2. Among accounts that still HAVE 5h headroom, prefer the one whose 5h
-	//      window resets SOONEST. Its remaining allocation is wiped at the reset
-	//      regardless, so draining near-due accounts first maximizes total pool
-	//      throughput; accounts with distant resets are "savings" left for later.
-	//   3. Near-exhausted accounts (5h or 7d ≥ ceiling) go to the back — they'd
-	//      429 almost immediately and just churn the retry loop.
+	//   2. Among usable accounts (both windows below the ceiling), prefer the one
+	//      whose 7d window resets SOONEST: its unused weekly allocation is wiped
+	//      at that reset and can never be reclaimed, so drain the nearest-due
+	//      weekly budget first. The 5h window refreshes every few hours, so its
+	//      tail-waste is negligible next to a week's budget — it's only a
+	//      tiebreaker when two accounts share a 7d reset.
+	//   3. Near-exhausted on EITHER window (≥ ceiling) → back: 7d-spent means no
+	//      weekly budget left; 5h-spent means it 429s immediately this window
+	//      (it re-enters when its 5h resets). Ordered least-spent-first.
 	//   4. No snapshot → probe last.
 	// The key packs these into disjoint numeric bands so the ordering is total.
 	const nearExhaustCeiling = 92.0
@@ -638,30 +642,36 @@ func InternalClaudeTokenLease(c *gin.Context) {
 			return -1
 		}
 		if cd.snap == nil {
-			return 4e9 // probe cost — behind everything with a snapshot
+			return 2e9 // probe cost — behind everything with a snapshot
 		}
 		s := cd.snap
-		// Band 3: near-exhausted on either window — last resort, ordered by how
-		// spent they are (least-spent first) so we still pick the best of a bad lot.
+		// Band 3: near-exhausted on either window — last resort, least-spent first.
 		if s.FiveHourPct >= nearExhaustCeiling || s.SevenDayPct >= nearExhaustCeiling {
 			worst := s.FiveHourPct
 			if s.SevenDayPct > worst {
 				worst = s.SevenDayPct
 			}
-			return 3e9 + worst
+			return 1e9 + worst
 		}
-		// Band 2 (primary): has 5h headroom → prefer soonest 5h reset. Key =
-		// seconds until the 5h window resets (due-now → 0 → highest priority).
-		if !s.FiveHourReset.IsZero() {
-			secs := time.Until(s.FiveHourReset).Seconds()
-			if secs < 0 {
-				secs = 0
+		// Band 2 (primary): usable → soonest 7d reset first. Key = seconds until
+		// the 7d window resets (due-now → 0 → highest priority), with the 5h
+		// reset as a sub-second tiebreaker that can never override the 7d order.
+		if !s.SevenDayReset.IsZero() {
+			r7 := time.Until(s.SevenDayReset).Seconds()
+			if r7 < 0 {
+				r7 = 0
 			}
-			return secs // 0 .. ~18000 (5h) — all below the 3e9 band
+			r5 := 0.0
+			if !s.FiveHourReset.IsZero() {
+				if v := time.Until(s.FiveHourReset).Seconds(); v > 0 {
+					r5 = v
+				}
+			}
+			return r7 + r5/1e6 // r7 ∈ [0, ~604800]; r5/1e6 ≤ 0.018 → tiebreak only
 		}
-		// Band ~2.5: healthy but no reset timestamp — fall back to most-headroom-
-		// first, kept ahead of near-exhausted (band 3) but behind timed accounts.
-		return 2e9 + s.FiveHourPct
+		// Usable but no 7d reset timestamp — behind timed accounts, ahead of
+		// near-exhausted; most-7d-headroom first.
+		return 9e8 + s.SevenDayPct
 	}
 	for i := 1; i < len(cands); i++ {
 		for j := i; j > 0 && sortKey(cands[j]) < sortKey(cands[j-1]); j-- {

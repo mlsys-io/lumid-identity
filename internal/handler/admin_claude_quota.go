@@ -613,9 +613,14 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil {
 			sp = &snap
 		}
-		// Skip accounts that are known-exceeded on a fresh snapshot; a stale
-		// critical snapshot falls through to a re-probe below.
-		if sp != nil && sp.Severity == "critical" && time.Since(sp.Ts) < quotaCacheTTL {
+		// Skip accounts that are unusable on a fresh snapshot: severity=critical
+		// OR genuinely exhausted on either window (≥98%). The window check is
+		// load-bearing — an account can sit at 7d=100% with severity only
+		// "warning", and leasing it wastes a request that Anthropic 429s (no
+		// weekly budget), which then cascades the whole retry loop. A stale
+		// snapshot falls through to the re-probe below.
+		if sp != nil && time.Since(sp.Ts) < quotaCacheTTL &&
+			(sp.Severity == "critical" || sp.FiveHourPct >= 98 || sp.SevenDayPct >= 98) {
 			continue
 		}
 		cands = append(cands, cand{row, sp})
@@ -692,7 +697,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 				continue // dead token with no working refresh — skip
 			}
 			snap = fresh
-			if snap.Severity == "critical" {
+			if snap.Severity == "critical" || snap.FiveHourPct >= 98 || snap.SevenDayPct >= 98 {
 				continue
 			}
 			// refreshSnapshot may have rotated the access token — re-read.

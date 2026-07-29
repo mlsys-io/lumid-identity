@@ -314,6 +314,7 @@ func streamClaudeCodeViaProxy(
 	systemPrompt string,
 	model string, // claude CLI --model alias or full claude-* id
 	sessionID string, // optional claude session to resume (must be owned by userID)
+	scope struct{ XpioRepo, ClusterID, DataApp string }, // working-context selection
 	emit func(map[string]any) bool,
 ) error {
 	if model == "" {
@@ -347,6 +348,9 @@ func streamClaudeCodeViaProxy(
 		"session_id":      sessionID,
 		"new_session_id":  newSessionID,
 		"anthropic_token": pat,
+		"xpio_repo":       scope.XpioRepo,
+		"cluster_id":      scope.ClusterID,
+		"data_app":        scope.DataApp,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -920,14 +924,48 @@ func (t *claudeTranslator) handleResult(event map[string]any) bool {
 }
 
 // proxyMessages converts chatMessage slice to plain {role, content} maps.
-// Attachments are dropped — the claude CLI handles vision via its own
-// file-read tools, and binary data doesn't travel well over a text prompt.
+// The sandbox claude-CLI path only carries plain text, so attachments must be
+// PROMOTED INTO the prompt here — otherwise uploaded PDFs/docs are silently
+// dropped and the model answers "I don't see a file". Documents are run through
+// the same extractDocumentText (pdftotext/pandoc/openpyxl) the direct-Anthropic
+// non-Claude branch uses; text files are inlined as fenced blocks. Images can't
+// travel as text on this path — we leave a breadcrumb telling the user to switch
+// to a direct Claude model for vision (only the latest user turn carries
+// attachments; history messages arrive attachment-free, so no re-extraction).
 func proxyMessages(msgs []chatMessage) []map[string]any {
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
+		content := m.Content
+		for _, a := range m.Attachments {
+			switch a.Kind {
+			case "document":
+				name := a.Name
+				if name == "" {
+					name = "document"
+				}
+				text, extractor, err := extractDocumentText(a.Mime, a.DataB64)
+				if err != nil {
+					content += "\n\n[Attached document `" + name + "` (" + a.Mime + ") — extraction failed: " + err.Error() + "]"
+					continue
+				}
+				content += "\n\nAttached document `" + name + "` (extracted via " + extractor + "):\n```\n" + text + "\n```"
+			case "text":
+				name := a.Name
+				if name == "" {
+					name = "attachment"
+				}
+				content += "\n\nAttached file `" + name + "`:\n```\n" + a.Text + "\n```"
+			case "image":
+				name := a.Name
+				if name == "" {
+					name = "image"
+				}
+				content += "\n\n[Attached image `" + name + "` — image analysis isn't available on Claude Code models; switch to a direct Claude model (e.g. Sonnet) for vision.]"
+			}
+		}
 		out = append(out, map[string]any{
 			"role":    m.Role,
-			"content": m.Content,
+			"content": content,
 		})
 	}
 	return out

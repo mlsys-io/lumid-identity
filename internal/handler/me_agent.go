@@ -1176,6 +1176,12 @@ type meAgentChatBody struct {
 	// session via `claude --resume` instead of replaying flattened
 	// history, preserving the CLI's own tool-result context across turns.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
+	// Optional working-context scope (like picking a git repo) — which xpio repo
+	// / FlowMesh cluster / lumid-data app the LumidOS MCP tools default to. Threaded
+	// to the sandbox → .mcp.json env (claude-code provider only). All optional.
+	XpioRepo  string `json:"xpio_repo,omitempty"`
+	ClusterID string `json:"cluster_id,omitempty"`
+	DataApp   string `json:"data_app,omitempty"`
 	// Optional structured "what the user is looking at" payload from the
 	// Studio shell (ViewingContext in StudioContext.ts). Rendered into a
 	// per-request system block + tool grounding hints so "this run" /
@@ -1274,6 +1280,29 @@ func chatMessageToAnthropic(m chatMessage, provider llmProvider) map[string]any 
 	}
 	if m.Content != "" {
 		blocks = append(blocks, map[string]any{"type": "text", "text": m.Content})
+	}
+	// If every block is plain text (extracted documents / inlined text files,
+	// no image or document-source block), collapse to a single STRING content.
+	// The lumid-llm `/v1/messages` shim (and OpenAI-compat upstreams generally)
+	// IGNORE block-ARRAY content and return an empty 0-token completion — so a
+	// document attachment silently produced no output. Flattening keeps the
+	// extracted text visible to every provider; the structured array is kept
+	// only when a real image/document block needs it (Anthropic vision).
+	allText := true
+	for _, b := range blocks {
+		if t, _ := b["type"].(string); t != "text" {
+			allText = false
+			break
+		}
+	}
+	if allText {
+		parts := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			if s, ok := b["text"].(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		return map[string]any{"role": m.Role, "content": strings.Join(parts, "\n\n")}
 	}
 	return map[string]any{"role": m.Role, "content": blocks}
 }
@@ -1416,7 +1445,7 @@ func MeAgentChat(c *gin.Context) {
 			}
 			return true
 		}
-		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, emit); err != nil {
+		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, struct{ XpioRepo, ClusterID, DataApp string }{body.XpioRepo, body.ClusterID, body.DataApp}, emit); err != nil {
 			fail(c, http.StatusBadGateway, 1502, "llm call: "+err.Error())
 			return
 		}

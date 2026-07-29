@@ -501,6 +501,10 @@ func Register(r *gin.Engine) {
 			// Claude account-pool lease — claude-proxy (lum.id/claude) asks
 			// for the healthiest pooled account's access token.
 			internal.POST("/claude-token/lease", InternalClaudeTokenLease)
+			// Per-user "act as <sub>" bridge credential — claude-proxy mints one
+			// to forward LumidOS tool calls to a backend as the resolved user,
+			// without the client ever holding a broad backend PAT.
+			internal.POST("/mint-user-token", InternalMintUserToken)
 			// Claude session recording — claude-proxy posts each turn's full
 			// request+response; stored delta-compacted (respects opt-out).
 			internal.POST("/claude-transcript", InternalClaudeTranscript)

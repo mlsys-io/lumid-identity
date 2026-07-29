@@ -201,7 +201,7 @@ func MeAgentChatStream(c *gin.Context) {
 		if !emit(map[string]any{"type": "status", "status": "starting"}) {
 			return
 		}
-		if err := streamClaudeCodeViaProxy(ctx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, emit); err != nil {
+		if err := streamClaudeCodeViaProxy(ctx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, struct{ XpioRepo, ClusterID, DataApp string }{body.XpioRepo, body.ClusterID, body.DataApp}, emit); err != nil {
 			emit(map[string]any{"type": "error", "message": err.Error()})
 		}
 		emit(map[string]any{"type": "done"})

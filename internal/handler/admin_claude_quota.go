@@ -1028,6 +1028,75 @@ func proactiveRefreshAll() {
 	})
 }
 
+// snapshotRefreshInterval is how often the background sweeper looks for stale
+// account quota snapshots. Kept well under quotaCacheTTL so the lease path
+// (InternalClaudeTokenLease) always finds a warm snapshot and never has to pay
+// a ~1-2s live re-probe inline. Inline re-probes serialize a fan-out burst and
+// widen the window where healthy accounts look saturated, which surfaced as
+// spurious "no pooled account with available quota" 503s on the burst tail.
+const snapshotRefreshInterval = 2 * time.Minute
+
+// StartSnapshotRefreshLoop keeps every non-revoked account's quota snapshot warm
+// in the background so leases stay on the fast (~10ms) cache path. Single-sweeper
+// across replicas via the shared 'cqr:sweep' lock — which also serializes with
+// the token sweep, since a snapshot probe can rotate the access token on a 401
+// and concurrent rotations can lose the refresh-token family.
+func StartSnapshotRefreshLoop() {
+	go func() {
+		time.Sleep(90 * time.Second) // let startup settle (token loop waits 3m)
+		for {
+			refreshAllSnapshots()
+			time.Sleep(snapshotRefreshInterval)
+		}
+	}()
+}
+
+func refreshAllSnapshots() {
+	_ = common.DB.Connection(func(tx *gorm.DB) error {
+		var got int
+		if err := tx.Raw("SELECT GET_LOCK('cqr:sweep', 0)").Scan(&got).Error; err != nil || got != 1 {
+			// Another sweep (token or snapshot) holds it — try again next tick.
+			return nil
+		}
+		defer tx.Exec("DO RELEASE_LOCK('cqr:sweep')")
+		sweepStaleSnapshots()
+		return nil
+	})
+}
+
+// sweepStaleSnapshots refreshes any non-revoked account whose latest snapshot is
+// missing, older than (quotaCacheTTL - snapshotRefreshInterval), or past a
+// window reset — i.e. anything that would otherwise force the lease path to
+// re-probe live. Probes are staggered to avoid a shared-egress IP burst.
+func sweepStaleSnapshots() {
+	var rows []models.ClaudeQuotaToken
+	if err := common.DB.Where("revoked_at IS NULL").Find(&rows).Error; err != nil {
+		log.Printf("snapshot-refresh-loop: db query failed: %v", err)
+		return
+	}
+	staleAfter := quotaCacheTTL - snapshotRefreshInterval // 3m at defaults
+	now := time.Now()
+	for _, row := range rows {
+		var snap models.ClaudeQuotaSnapshot
+		if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil {
+			resetPassed := (!snap.FiveHourReset.IsZero() && now.After(snap.FiveHourReset)) ||
+				(!snap.SevenDayReset.IsZero() && now.After(snap.SevenDayReset))
+			if time.Since(snap.Ts) < staleAfter && !resetPassed {
+				continue // still warm — leave it (also spares a rotation)
+			}
+		}
+		token, err := common.DecryptGrant(row.ValueEncrypted)
+		if err != nil {
+			log.Printf("snapshot-refresh-loop: %s: decrypt err: %v — skipping", row.Email, err)
+			continue
+		}
+		if _, err := refreshSnapshot(&row, token); err != nil {
+			log.Printf("snapshot-refresh-loop: %s: probe failed: %v", row.Email, err)
+		}
+		time.Sleep(2 * time.Second) // stagger — avoid a shared-egress IP-burst 429
+	}
+}
+
 func sweepAllTokens() {
 	var rows []models.ClaudeQuotaToken
 	if err := common.DB.

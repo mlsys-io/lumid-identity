@@ -176,6 +176,14 @@ func ClaudePoolLimits() (fiveH, sevenD int) {
 
 // ClaudePoolWindows returns one user's claude_proxy token usage over the
 // rolling 5h and 7d windows.
+//
+// The model filter MIRRORS poolCapApplies: only usage that actually consumes the
+// Anthropic account pool counts toward the windows. Without it, external-API
+// models (kimi-k3, glm, …) — which bill to our own provider keys and are exempt
+// from the cap check — still inflated the window and burned the user's Claude
+// quota. They have no prompt caching, so a single agentic turn re-sends the whole
+// context (observed 75k–296k uncached input tokens per request), which exhausted
+// a 1.5M/5h cap in a handful of calls.
 func ClaudePoolWindows(db *gorm.DB, userSub string) (fiveH, sevenD int, err error) {
 	now := time.Now().UTC()
 	rows := []struct {
@@ -187,6 +195,7 @@ func ClaudePoolWindows(db *gorm.DB, userSub string) (fiveH, sevenD int, err erro
 		       COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens
 		FROM   usage_events
 		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?
+		       AND (model IS NULL OR model = '' OR LOWER(model) LIKE 'claude%')
 		GROUP  BY win`, now.Add(-5*time.Hour), userSub, now.Add(-7*24*time.Hour)).Scan(&rows).Error
 	if err != nil {
 		return 0, 0, err

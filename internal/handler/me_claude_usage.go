@@ -52,27 +52,7 @@ func MeClaudeUsage(c *gin.Context) {
 		reqs7d += r.Reqs
 	}
 
-	// Reset times: when the oldest event in each window ages out.
-	oldest := []struct {
-		Win      string
-		OldestTs time.Time
-	}{}
-	common.DB.Raw(`
-		SELECT CASE WHEN ue.ts >= ? THEN '5h' ELSE '7d' END AS win,
-		       MIN(ue.ts)                                   AS oldest_ts
-		FROM   usage_events ue
-		WHERE  ue.kind = 'claude_proxy' AND ue.user_sub = ? AND ue.ts >= ?
-		GROUP  BY win`,
-		now.Add(-5*time.Hour), userID, now.Add(-7*24*time.Hour)).Scan(&oldest)
-	var reset5, reset7 time.Time
-	for _, o := range oldest {
-		switch o.Win {
-		case "5h":
-			reset5 = o.OldestTs.Add(5 * time.Hour)
-		case "7d":
-			reset7 = o.OldestTs.Add(7 * 24 * time.Hour)
-		}
-	}
+	reset5, reset7 := ClaudeWindowResets(userID, now)
 
 	// Per-model breakdown over the 7d window.
 	modelRows := []struct {
@@ -114,4 +94,38 @@ func MeClaudeUsage(c *gin.Context) {
 			"cap_7d":           cap7,
 		},
 	})
+}
+
+// ClaudeWindowResets returns when each rolling pool window frees up: the
+// moment the OLDEST event still inside the window ages out of it. Zero times
+// mean the window holds no usage, so there is nothing to reset.
+//
+// Shared by MeClaudeUsage (the /quota + statusline surfaces) and
+// InternalUsageCharge (which feeds claude-proxy's anthropic-ratelimit-unified-*
+// header rewrite) so both report the same instant — a user comparing the
+// dashboard against their CLI must not see two different numbers.
+func ClaudeWindowResets(userSub string, now time.Time) (reset5, reset7 time.Time) {
+	oldest := []struct {
+		Win      string
+		OldestTs time.Time
+	}{}
+	// GROUP BY puts each row in exactly one bucket, so the '7d' group holds the
+	// oldest row that is NOT also within 5h — which is the true 7d-window edge,
+	// since anything in the 5h bucket is strictly newer.
+	common.DB.Raw(`
+		SELECT CASE WHEN ue.ts >= ? THEN '5h' ELSE '7d' END AS win,
+		       MIN(ue.ts)                                   AS oldest_ts
+		FROM   usage_events ue
+		WHERE  ue.kind = 'claude_proxy' AND ue.user_sub = ? AND ue.ts >= ?
+		GROUP  BY win`,
+		now.Add(-5*time.Hour), userSub, now.Add(-7*24*time.Hour)).Scan(&oldest)
+	for _, o := range oldest {
+		switch o.Win {
+		case "5h":
+			reset5 = o.OldestTs.Add(5 * time.Hour)
+		case "7d":
+			reset7 = o.OldestTs.Add(7 * 24 * time.Hour)
+		}
+	}
+	return reset5, reset7
 }

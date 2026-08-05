@@ -12,6 +12,7 @@ package handler
 import (
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -116,12 +117,27 @@ func InternalUsageCharge(c *gin.Context) {
 	// For the claude pool, piggyback the user's recording preference so the
 	// proxy can skip shipping a transcript blob when the user opted out.
 	if body.Kind == "claude_proxy" {
+		// Window resets ride along so claude-proxy can rewrite the
+		// anthropic-ratelimit-unified-* response headers with the CALLER's pool
+		// budget. Without these the proxy would have to forward the pooled
+		// ACCOUNT's reset, which belongs to a shared credential and tells the
+		// user nothing about their own ceiling. Note `reset_at` above is the
+		// daily counter roll, NOT these rolling windows — different clocks.
+		reset5, reset7 := ClaudeWindowResets(body.UserSub, time.Now().UTC())
+		fiveReset, sevenReset := "", ""
+		if !reset5.IsZero() {
+			fiveReset = reset5.UTC().Format(time.RFC3339)
+		}
+		if !reset7.IsZero() {
+			sevenReset = reset7.UTC().Format(time.RFC3339)
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
 			"data": gin.H{
 				"allowed": res.Allowed, "deny_reason": res.DenyReason,
 				"today": res.Today, "limits": res.Limits, "reset_at": res.ResetAt,
 				"five_hour_pct": res.FiveHourPct, "seven_day_pct": res.SevenDayPct,
+				"five_hour_reset": fiveReset, "seven_day_reset": sevenReset,
 				"recording": recordingEnabled(body.UserSub),
 			},
 		})

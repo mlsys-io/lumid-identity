@@ -19,6 +19,15 @@ type ClaudeQuotaToken struct {
 	// a revoked token; a re-add via AdminClaudeTokenAdd clears it.
 	RevokedAt    *time.Time `gorm:"column:revoked_at"                    json:"revoked_at,omitempty"`
 	RevokeReason string     `gorm:"column:revoke_reason;size:512"        json:"revoke_reason,omitempty"`
+	// Label — optional free-form tag (e.g. "dublin") marking this account as
+	// belonging to a field box. When set AND a relay is configured for it in
+	// LUMID_CLAUDE_FIELD_RELAYS, both claude-proxy's Messages API dispatch and
+	// this service's own OAuth refresh call for this account are routed
+	// through that box's relay instead of the default direct path, so every
+	// Anthropic-facing call this account makes originates from its one home
+	// network. Unset accounts (the default, and every account that predates
+	// this field) are completely unaffected.
+	Label string `gorm:"column:label;size:64" json:"label,omitempty"`
 }
 
 func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }

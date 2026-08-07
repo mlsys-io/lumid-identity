@@ -33,6 +33,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +58,44 @@ const (
 	// Scopes required by Claude Code — must be present in the refresh body.
 	claudeOAuthScopes = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
+
+// fieldRelays maps an account Label (e.g. "dublin") to its field-box relay's
+// base URL. When a labeled account's refresh token is exchanged, the request
+// is sent through this relay — with X-Field-Relay-Upstream naming the real
+// target host — instead of dialing platform.claude.com directly, so the
+// refresh call originates from that box's own network, matching claude-proxy's
+// Messages API dispatch for the same account. Accounts with no Label (every
+// account today) are completely unaffected. Mirrors claude-proxy's own
+// LUMID_CLAUDE_FIELD_RELAYS parsing — same env var, same "label=url,label=url"
+// shape, kept in sync deliberately so one env value configures both sides.
+var fieldRelays = parseFieldRelays(os.Getenv("LUMID_CLAUDE_FIELD_RELAYS"))
+
+// fieldRelayBridgeSecret authenticates this service to a field relay — a
+// distinct secret from any bridge secret gating inbound requests to identity.
+var fieldRelayBridgeSecret = os.Getenv("LUMID_CLAUDE_FIELD_RELAY_BRIDGE_SECRET")
+
+func parseFieldRelays(spec string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(spec, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		label, base := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+		if label == "" || base == "" {
+			continue
+		}
+		if _, err := url.Parse(base); err != nil {
+			continue
+		}
+		out[label] = base
+	}
+	return out
+}
 
 // refreshMutexes serialises token refresh per email. Anthropic rotates the
 // refresh token on every exchange, so two concurrent refreshes with the same
@@ -144,16 +184,40 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 		"scope":         claudeOAuthScopes,
 	}
 	bodyJSON, _ := json.Marshal(bodyMap)
-	req, err := http.NewRequest(http.MethodPost, claudeOAuthTokenURL, bytes.NewReader(bodyJSON))
+
+	// Field-box accounts route this exchange through their home relay so it
+	// originates from the same network as their Messages API traffic (see
+	// claude-proxy's matching dispatch in main.go) — every line below this
+	// point (response parsing, quarantine, persistence, rotation) is
+	// unchanged either way; only the destination of this one request differs.
+	refreshURL := claudeOAuthTokenURL
+	viaRelay := ""
+	if row.Label != "" {
+		if base, ok := fieldRelays[row.Label]; ok {
+			refreshURL = base
+			viaRelay = row.Label
+		}
+	}
+
+	req, err := http.NewRequest(http.MethodPost, refreshURL, bytes.NewReader(bodyJSON))
 	if err != nil {
 		return "", fmt.Errorf("build refresh request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	if viaRelay != "" {
+		req.Header.Set("X-Field-Relay-Upstream", "platform.claude.com")
+		if fieldRelayBridgeSecret != "" {
+			req.Header.Set("X-Bridge-Secret", fieldRelayBridgeSecret)
+		}
+	}
 
 	cl := &http.Client{Timeout: quotaFetchTimeout}
 	resp, err := cl.Do(req)
 	if err != nil {
+		if viaRelay != "" {
+			return "", fmt.Errorf("token refresh network error (via %s relay): %w", viaRelay, err)
+		}
 		return "", fmt.Errorf("token refresh network error: %w", err)
 	}
 	defer resp.Body.Close()
@@ -364,7 +428,11 @@ func refreshSnapshot(row *models.ClaudeQuotaToken, token string) (*models.Claude
 }
 
 type quotaResult struct {
-	Email         string          `json:"email"`
+	Email string `json:"email"`
+	// Label — set when this account belongs to a field box (e.g. "dublin"),
+	// so /code can display and monitor it as such. Empty for every ordinary
+	// pooled account.
+	Label         string          `json:"label,omitempty"`
 	Ts            time.Time       `json:"ts"`
 	FiveHourPct   float64         `json:"five_hour_pct"`
 	SevenDayPct   float64         `json:"seven_day_pct"`
@@ -409,7 +477,7 @@ func AdminClaudeQuota(c *gin.Context) {
 		wg.Add(1)
 		go func(i int, row models.ClaudeQuotaToken) {
 			defer wg.Done()
-			res := quotaResult{Email: row.Email}
+			res := quotaResult{Email: row.Email, Label: row.Label}
 
 			var snap models.ClaudeQuotaSnapshot
 			snapErr := common.DB.
@@ -490,6 +558,11 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		Email        string `json:"email"         binding:"required"`
 		Token        string `json:"token"         binding:"required"`
 		RefreshToken string `json:"refresh_token"` // optional; enables auto-refresh on 401
+		// Label — optional field-box tag (e.g. "dublin"). Set only when this
+		// account should route its Messages API + refresh traffic through
+		// that box's relay (LUMID_CLAUDE_FIELD_RELAYS). Omit for a normal
+		// pooled account.
+		Label string `json:"label"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -498,6 +571,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	token := strings.TrimSpace(body.Token)
 	email := strings.TrimSpace(strings.ToLower(body.Email))
 	refreshTok := strings.TrimSpace(body.RefreshToken)
+	label := strings.TrimSpace(body.Label)
 
 	// Verify against Anthropic before storing.
 	valid, status, reason := verifyAnthropic(token)
@@ -518,7 +592,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "encrypt: "+err.Error())
 		return
 	}
-	row := models.ClaudeQuotaToken{Email: email, ValueEncrypted: enc}
+	row := models.ClaudeQuotaToken{Email: email, ValueEncrypted: enc, Label: label}
 	if refreshTok != "" {
 		refEnc, err := common.EncryptGrant(refreshTok)
 		if err != nil {
@@ -531,9 +605,16 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	// DB.Save() with a string PK includes created_at=zero in the UPDATE clause
 	// which MySQL strict mode rejects with Error 1292. Explicit DoUpdates avoids it.
 	// A re-add is the recovery path for a revoked family — clear the quarantine.
+	// "label" is only included in the update set when this request actually
+	// supplied one — an unrelated re-add (e.g. refresh-token rotation) with no
+	// label field must not silently wipe an existing field-box tag.
+	updateCols := []string{"value_encrypted", "refresh_token_encrypted", "updated_at", "revoked_at", "revoke_reason"}
+	if label != "" {
+		updateCols = append(updateCols, "label")
+	}
 	if err := common.DB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
-		DoUpdates: clause.AssignmentColumns([]string{"value_encrypted", "refresh_token_encrypted", "updated_at", "revoked_at", "revoke_reason"}),
+		DoUpdates: clause.AssignmentColumns(updateCols),
 	}).Create(&row).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
 		return
@@ -544,6 +625,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 			"email": email, "valid": true, "stored": true,
 			"has_refresh_token": refreshTok != "",
 			"upstream_status":   status, "reason": reason,
+			"label": label,
 		},
 	})
 }
@@ -716,6 +798,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 				"five_hour_pct": snap.FiveHourPct,
 				"seven_day_pct": snap.SevenDayPct,
 				"severity":      snap.Severity,
+				"label":         row.Label,
 			},
 		})
 		return

@@ -72,19 +72,19 @@ func recordingEnabled(userSub string) bool {
 }
 
 type transcriptBody struct {
-	UserSub      string          `json:"user_sub" binding:"required"`
-	Account      string          `json:"account"`
-	Endpoint     string          `json:"endpoint"`
-	Stream       bool            `json:"stream"`
-	InputTokens  int             `json:"input_tokens"`
-	OutputTokens int             `json:"output_tokens"`
-	DurationMs   int             `json:"duration_ms"`
-	Truncated    bool            `json:"truncated"`
+	UserSub      string `json:"user_sub" binding:"required"`
+	Account      string `json:"account"`
+	Endpoint     string `json:"endpoint"`
+	Stream       bool   `json:"stream"`
+	InputTokens  int    `json:"input_tokens"`
+	OutputTokens int    `json:"output_tokens"`
+	DurationMs   int    `json:"duration_ms"`
+	Truncated    bool   `json:"truncated"`
 	// FieldBox: account Label of the field-box relay that carried this turn
 	// ("dublin", "chicago", …). Empty means it went direct from the cluster.
-	FieldBox     string          `json:"field_box"`
-	Request      json.RawMessage `json:"request"`  // full request JSON
-	Response     json.RawMessage `json:"response"` // full response (assembled JSON or raw SSE)
+	FieldBox string          `json:"field_box"`
+	Request  json.RawMessage `json:"request"`  // full request JSON
+	Response json.RawMessage `json:"response"` // full response (assembled JSON or raw SSE)
 }
 
 // InternalClaudeTranscript stores one turn. Bridge-gated.
@@ -287,10 +287,10 @@ func countToolUse(response json.RawMessage) int {
 // ── read paths ──────────────────────────────────────────────────────────────
 
 type sessionCard struct {
-	ConvKey      string    `json:"conv_key"`
-	UserSub      string    `json:"user_sub,omitempty"`
-	UserEmail    string    `json:"user_email,omitempty"`
-	Account      string    `json:"account"`
+	ConvKey   string `json:"conv_key"`
+	UserSub   string `json:"user_sub,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	Account   string `json:"account"`
 	// FieldBox = which field-box relay served this session's latest turn
 	// ("dublin", "chicago", …); "" = dispatched direct from the cluster.
 	FieldBox     string    `json:"field_box"`

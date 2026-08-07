@@ -16,9 +16,14 @@ import "time"
 // ClaudeSession is one conversation (grouped by ConvKey = hash of model +
 // first user message). Summary row; turns hang off it.
 type ClaudeSession struct {
-	ConvKey      string    `gorm:"column:conv_key;size:32;primaryKey"                         json:"conv_key"`
-	UserSub      string    `gorm:"column:user_sub;size:36;index:idx_csess_user_last,priority:1;not null" json:"user_sub"`
-	Account      string    `gorm:"column:account;size:255"                                    json:"account"`
+	ConvKey string `gorm:"column:conv_key;size:32;primaryKey"                         json:"conv_key"`
+	UserSub string `gorm:"column:user_sub;size:36;index:idx_csess_user_last,priority:1;not null" json:"user_sub"`
+	Account string `gorm:"column:account;size:255"                                    json:"account"`
+	// FieldBox is the account Label of the field-box relay the MOST RECENT
+	// turn egressed through ("dublin", "chicago", …); empty = dispatched
+	// directly to Anthropic from the cluster. Session-level value is
+	// last-writer-wins; per-turn truth lives on ClaudeSessionTurn.FieldBox.
+	FieldBox     string    `gorm:"column:field_box;size:64"                                   json:"field_box"`
 	Model        string    `gorm:"column:model;size:64"                                       json:"model"`
 	Title        string    `gorm:"column:title;size:255"                                      json:"title"`
 	TurnCount    int       `gorm:"column:turn_count;not null;default:0"                       json:"turn_count"`
@@ -34,17 +39,22 @@ func (ClaudeSession) TableName() string { return "claude_sessions" }
 
 // ClaudeSessionTurn is one request/response exchange within a session.
 type ClaudeSessionTurn struct {
-	ID           uint64    `gorm:"primaryKey;autoIncrement"                                   json:"id"`
-	ConvKey      string    `gorm:"column:conv_key;size:32;index:idx_cturn_conv,priority:1;not null" json:"conv_key"`
-	TurnIndex    int       `gorm:"column:turn_index;index:idx_cturn_conv,priority:2;not null" json:"turn_index"`
-	Ts           time.Time `gorm:"column:ts;autoCreateTime"                                   json:"ts"`
-	Model        string    `gorm:"column:model;size:64"                                       json:"model"`
-	Endpoint     string    `gorm:"column:endpoint;size:128"                                   json:"endpoint"`
-	Stream       bool      `gorm:"column:stream;not null;default:false"                       json:"stream"`
-	InputTokens  int       `gorm:"column:input_tokens;not null;default:0"                     json:"input_tokens"`
-	OutputTokens int       `gorm:"column:output_tokens;not null;default:0"                    json:"output_tokens"`
-	ToolUseCount int       `gorm:"column:tool_use_count;not null;default:0"                   json:"tool_use_count"`
-	DurationMs   int       `gorm:"column:duration_ms;not null;default:0"                      json:"duration_ms"`
+	ID        uint64    `gorm:"primaryKey;autoIncrement"                                   json:"id"`
+	ConvKey   string    `gorm:"column:conv_key;size:32;index:idx_cturn_conv,priority:1;not null" json:"conv_key"`
+	TurnIndex int       `gorm:"column:turn_index;index:idx_cturn_conv,priority:2;not null" json:"turn_index"`
+	Ts        time.Time `gorm:"column:ts;autoCreateTime"                                   json:"ts"`
+	Model     string    `gorm:"column:model;size:64"                                       json:"model"`
+	Endpoint  string    `gorm:"column:endpoint;size:128"                                   json:"endpoint"`
+	// FieldBox: which field-box relay carried THIS turn (account Label);
+	// empty = direct from the cluster. Per-turn because routing can change
+	// mid-conversation (account re-labeled, or lease rotated to another
+	// account on a different box).
+	FieldBox     string `gorm:"column:field_box;size:64"                                   json:"field_box"`
+	Stream       bool   `gorm:"column:stream;not null;default:false"                       json:"stream"`
+	InputTokens  int    `gorm:"column:input_tokens;not null;default:0"                     json:"input_tokens"`
+	OutputTokens int    `gorm:"column:output_tokens;not null;default:0"                    json:"output_tokens"`
+	ToolUseCount int    `gorm:"column:tool_use_count;not null;default:0"                   json:"tool_use_count"`
+	DurationMs   int    `gorm:"column:duration_ms;not null;default:0"                      json:"duration_ms"`
 	// gzip(JSON). RequestMetaGz = {system, tools, max_tokens, temperature,
 	// top_p, stop_sequences, metadata, model, stream} minus messages[].
 	RequestMetaGz []byte `gorm:"column:request_meta_gz;type:longblob"  json:"-"`

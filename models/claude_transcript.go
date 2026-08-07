@@ -23,7 +23,11 @@ type ClaudeSession struct {
 	// turn egressed through ("dublin", "chicago", …); empty = dispatched
 	// directly to Anthropic from the cluster. Session-level value is
 	// last-writer-wins; per-turn truth lives on ClaudeSessionTurn.FieldBox.
-	FieldBox     string    `gorm:"column:field_box;size:64"                                   json:"field_box"`
+	FieldBox string `gorm:"column:field_box;size:64"                                   json:"field_box"`
+	// ViaRelay: did the MOST RECENT turn actually egress through that box?
+	// FieldBox is intent (the lease Label); this is delivery. Labeled but
+	// ViaRelay=false = the relay hop silently degraded to direct dispatch.
+	ViaRelay     bool      `gorm:"column:via_relay;not null;default:false"                    json:"via_relay"`
 	Model        string    `gorm:"column:model;size:64"                                       json:"model"`
 	Title        string    `gorm:"column:title;size:255"                                      json:"title"`
 	TurnCount    int       `gorm:"column:turn_count;not null;default:0"                       json:"turn_count"`
@@ -49,12 +53,15 @@ type ClaudeSessionTurn struct {
 	// empty = direct from the cluster. Per-turn because routing can change
 	// mid-conversation (account re-labeled, or lease rotated to another
 	// account on a different box).
-	FieldBox     string `gorm:"column:field_box;size:64"                                   json:"field_box"`
-	Stream       bool   `gorm:"column:stream;not null;default:false"                       json:"stream"`
-	InputTokens  int    `gorm:"column:input_tokens;not null;default:0"                     json:"input_tokens"`
-	OutputTokens int    `gorm:"column:output_tokens;not null;default:0"                    json:"output_tokens"`
-	ToolUseCount int    `gorm:"column:tool_use_count;not null;default:0"                   json:"tool_use_count"`
-	DurationMs   int    `gorm:"column:duration_ms;not null;default:0"                      json:"duration_ms"`
+	FieldBox string `gorm:"column:field_box;size:64"                                   json:"field_box"`
+	// ViaRelay: whether THIS turn actually took the relay hop (delivery),
+	// vs FieldBox which is only where it was meant to go (intent).
+	ViaRelay     bool `gorm:"column:via_relay;not null;default:false"                     json:"via_relay"`
+	Stream       bool `gorm:"column:stream;not null;default:false"                       json:"stream"`
+	InputTokens  int  `gorm:"column:input_tokens;not null;default:0"                     json:"input_tokens"`
+	OutputTokens int  `gorm:"column:output_tokens;not null;default:0"                    json:"output_tokens"`
+	ToolUseCount int  `gorm:"column:tool_use_count;not null;default:0"                   json:"tool_use_count"`
+	DurationMs   int  `gorm:"column:duration_ms;not null;default:0"                      json:"duration_ms"`
 	// gzip(JSON). RequestMetaGz = {system, tools, max_tokens, temperature,
 	// top_p, stop_sequences, metadata, model, stream} minus messages[].
 	RequestMetaGz []byte `gorm:"column:request_meta_gz;type:longblob"  json:"-"`

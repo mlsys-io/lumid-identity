@@ -80,6 +80,9 @@ type transcriptBody struct {
 	OutputTokens int             `json:"output_tokens"`
 	DurationMs   int             `json:"duration_ms"`
 	Truncated    bool            `json:"truncated"`
+	// FieldBox: account Label of the field-box relay that carried this turn
+	// ("dublin", "chicago", …). Empty means it went direct from the cluster.
+	FieldBox     string          `json:"field_box"`
 	Request      json.RawMessage `json:"request"`  // full request JSON
 	Response     json.RawMessage `json:"response"` // full response (assembled JSON or raw SSE)
 }
@@ -144,6 +147,7 @@ func InternalClaudeTranscript(c *gin.Context) {
 		ToolUseCount: toolCount,
 		DurationMs:   body.DurationMs,
 		Truncated:    body.Truncated,
+		FieldBox:     body.FieldBox,
 	}
 
 	// Write blobs to S3 when blobstore is configured; fall back to LONGBLOB.
@@ -177,6 +181,7 @@ func InternalClaudeTranscript(c *gin.Context) {
 		}
 	}
 	sess.Account = body.Account
+	sess.FieldBox = body.FieldBox
 	sess.Model = req.Model
 	sess.TurnCount = turnIndex + 1
 	sess.CumMessages = m
@@ -286,6 +291,9 @@ type sessionCard struct {
 	UserSub      string    `json:"user_sub,omitempty"`
 	UserEmail    string    `json:"user_email,omitempty"`
 	Account      string    `json:"account"`
+	// FieldBox = which field-box relay served this session's latest turn
+	// ("dublin", "chicago", …); "" = dispatched direct from the cluster.
+	FieldBox     string    `json:"field_box"`
 	Model        string    `json:"model"`
 	Title        string    `json:"title"`
 	TurnCount    int       `json:"turn_count"`
@@ -337,7 +345,7 @@ func listSessions(c *gin.Context, userSub string) {
 	for i, s := range rows {
 		cards[i] = sessionCard{
 			ConvKey: s.ConvKey, UserSub: s.UserSub, UserEmail: subToEmail(s.UserSub),
-			Account: s.Account, Model: s.Model,
+			Account: s.Account, FieldBox: s.FieldBox, Model: s.Model,
 			Title: s.Title, TurnCount: s.TurnCount, InputTokens: s.InputTokens,
 			OutputTokens: s.OutputTokens, ToolUseCount: s.ToolUseCount,
 			FirstTs: s.FirstTs, LastTs: s.LastTs,
@@ -412,6 +420,7 @@ func getSession(c *gin.Context, ownerSub, convKey string) {
 		Ts           time.Time       `json:"ts"`
 		Model        string          `json:"model"`
 		Endpoint     string          `json:"endpoint"`
+		FieldBox     string          `json:"field_box"`
 		Stream       bool            `json:"stream"`
 		InputTokens  int             `json:"input_tokens"`
 		OutputTokens int             `json:"output_tokens"`
@@ -434,7 +443,7 @@ func getSession(c *gin.Context, ownerSub, convKey string) {
 		}
 		out[i] = turnOut{
 			TurnIndex: t.TurnIndex, Ts: t.Ts, Model: t.Model, Endpoint: t.Endpoint,
-			Stream: t.Stream, InputTokens: t.InputTokens, OutputTokens: t.OutputTokens,
+			FieldBox: t.FieldBox, Stream: t.Stream, InputTokens: t.InputTokens, OutputTokens: t.OutputTokens,
 			ToolUseCount: t.ToolUseCount, DurationMs: t.DurationMs, Truncated: t.Truncated,
 			RequestMeta: rawOrNull(metaRaw),
 			NewMessages: rawOrNull(msgsRaw),
@@ -444,7 +453,7 @@ func getSession(c *gin.Context, ownerSub, convKey string) {
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
 		"data": gin.H{"session": sessionCard{
 			ConvKey: sess.ConvKey, UserSub: sess.UserSub, Account: sess.Account,
-			Model: sess.Model, Title: sess.Title, TurnCount: sess.TurnCount,
+			FieldBox: sess.FieldBox, Model: sess.Model, Title: sess.Title, TurnCount: sess.TurnCount,
 			InputTokens: sess.InputTokens, OutputTokens: sess.OutputTokens,
 			ToolUseCount: sess.ToolUseCount, FirstTs: sess.FirstTs, LastTs: sess.LastTs,
 		}, "turns": out,
@@ -539,7 +548,7 @@ func listSessionsForAdmin(c *gin.Context, callerSub string) {
 	for i, s := range rows {
 		cards[i] = sessionCard{
 			ConvKey: s.ConvKey, UserSub: s.UserSub, UserEmail: subToEmail(s.UserSub),
-			Account: s.Account, Model: s.Model,
+			Account: s.Account, FieldBox: s.FieldBox, Model: s.Model,
 			Title: s.Title, TurnCount: s.TurnCount, InputTokens: s.InputTokens,
 			OutputTokens: s.OutputTokens, ToolUseCount: s.ToolUseCount,
 			FirstTs: s.FirstTs, LastTs: s.LastTs,

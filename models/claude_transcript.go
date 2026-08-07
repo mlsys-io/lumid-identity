@@ -19,6 +19,11 @@ type ClaudeSession struct {
 	ConvKey      string    `gorm:"column:conv_key;size:32;primaryKey"                         json:"conv_key"`
 	UserSub      string    `gorm:"column:user_sub;size:36;index:idx_csess_user_last,priority:1;not null" json:"user_sub"`
 	Account      string    `gorm:"column:account;size:255"                                    json:"account"`
+	// FieldBox is the account Label of the field-box relay the MOST RECENT
+	// turn egressed through ("dublin", "chicago", …); empty = dispatched
+	// directly to Anthropic from the cluster. Session-level value is
+	// last-writer-wins; per-turn truth lives on ClaudeSessionTurn.FieldBox.
+	FieldBox     string    `gorm:"column:field_box;size:64"                                   json:"field_box"`
 	Model        string    `gorm:"column:model;size:64"                                       json:"model"`
 	Title        string    `gorm:"column:title;size:255"                                      json:"title"`
 	TurnCount    int       `gorm:"column:turn_count;not null;default:0"                       json:"turn_count"`
@@ -40,6 +45,11 @@ type ClaudeSessionTurn struct {
 	Ts           time.Time `gorm:"column:ts;autoCreateTime"                                   json:"ts"`
 	Model        string    `gorm:"column:model;size:64"                                       json:"model"`
 	Endpoint     string    `gorm:"column:endpoint;size:128"                                   json:"endpoint"`
+	// FieldBox: which field-box relay carried THIS turn (account Label);
+	// empty = direct from the cluster. Per-turn because routing can change
+	// mid-conversation (account re-labeled, or lease rotated to another
+	// account on a different box).
+	FieldBox     string    `gorm:"column:field_box;size:64"                                   json:"field_box"`
 	Stream       bool      `gorm:"column:stream;not null;default:false"                       json:"stream"`
 	InputTokens  int       `gorm:"column:input_tokens;not null;default:0"                     json:"input_tokens"`
 	OutputTokens int       `gorm:"column:output_tokens;not null;default:0"                    json:"output_tokens"`

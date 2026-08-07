@@ -28,6 +28,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	base64Stdlib "encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -657,9 +658,27 @@ func AdminClaudeTokenDelete(c *gin.Context) {
 // whose latest snapshot isn't critical (5h exceeded). Accounts with a stale
 // (>5 min) or missing snapshot are probed via refreshSnapshot — which also
 // auto-refreshes an expired access token. Unusable accounts are skipped.
+// hrwScore is the rendezvous-hashing (HRW) weight for a (user, account) pair,
+// uniformly distributed in [0,1) and stable for the life of both identifiers.
+//
+// Rendezvous rather than `index % len(accounts)` on purpose: modulo reshuffles
+// EVERY user the moment an account is added or removed, which would move the
+// whole org's traffic to new IPs at once — the exact "many identities changing
+// origin together" signal the field-box work exists to avoid. HRW moves only
+// ~1/N of users when the pool changes.
+//
+// It is also stateless, so claude-proxy's two replicas agree without sharing a
+// round-robin counter.
+func hrwScore(userSub, email string) float64 {
+	h := sha256.Sum256([]byte(userSub + "\x00" + strings.ToLower(email)))
+	// Top 53 bits → exactly representable as float64 in [0,1).
+	return float64(binary.BigEndian.Uint64(h[:8])>>11) / float64(uint64(1)<<53)
+}
+
 func InternalClaudeTokenLease(c *gin.Context) {
 	var body struct {
 		PreferEmail string   `json:"prefer_email"`
+		UserSub     string   `json:"user_sub"`
 		Exclude     []string `json:"exclude"`
 	}
 	_ = c.ShouldBindJSON(&body) // empty body is fine
@@ -723,7 +742,18 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	//      (it re-enters when its 5h resets). Ordered least-spent-first.
 	//   4. No snapshot → probe last.
 	// The key packs these into disjoint numeric bands so the ordering is total.
+	// nearExhaustCeiling is the EXHAUSTION VALVE for per-user routing: an
+	// account at/above it on either window drops to the last-resort band, so a
+	// heavy user pinned to one account degrades to a sibling instead of hard
+	// -failing while other accounts sit idle. Availability beats pinning.
 	const nearExhaustCeiling = 92.0
+	// Reset-bias tuning. Only accounts below resetBiasMaxPct on the 7d window
+	// are worth pulling extra users onto (above it there is little to reclaim,
+	// and it would race the exhaustion valve).
+	const (
+		resetBiasWindowHrs = 12.0
+		resetBiasMaxPct    = 70.0
+	)
 	sortKey := func(cd cand) float64 {
 		if cd.row.Email == prefer {
 			return -1
@@ -740,9 +770,47 @@ func InternalClaudeTokenLease(c *gin.Context) {
 			}
 			return 1e9 + worst
 		}
-		// Band 2 (primary): usable → soonest 7d reset first. Key = seconds until
-		// the 7d window resets (due-now → 0 → highest priority), with the 5h
-		// reset as a sub-second tiebreaker that can never override the 7d order.
+		// ── Band 2 (primary): per-user HRW assignment ────────────────────────
+		//
+		// Each user has a stable "home" account, so one subscription is used by
+		// a small, stable set of people from one field-box IP. The 2026-08-04
+		// suspensions came from the opposite shape: 8 accounts each serving 4-6
+		// distinct users, fully interleaved (see claude-proxy's incident doc).
+		// Field boxes fixed the IP dimension; this fixes the identity fan-out.
+		//
+		// Requires user_sub. Without it (older claude-proxy that doesn't send
+		// it yet) every user would hash identically and land on one account, so
+		// fall through to the legacy soonest-7d-reset ordering instead — that
+		// keeps behaviour correct during a staged rollout.
+		if body.UserSub != "" {
+			hrw := hrwScore(body.UserSub, cd.row.Email)
+
+			// Reset bias: a 7d window that resets with budget unspent wipes
+			// that budget for good. As an account nears its reset while still
+			// underused, pull a GROWING DETERMINISTIC FRACTION of users onto
+			// it — never all of them at once, which would itself be a mass
+			// origin change. `hrw < pull` selects a pull-sized stable subset,
+			// and because hrw is fixed per (user, account) the same users move
+			// first every time rather than the assignment churning.
+			if !s.SevenDayReset.IsZero() && s.SevenDayPct < resetBiasMaxPct {
+				hrsLeft := time.Until(s.SevenDayReset).Hours()
+				if hrsLeft < 0 {
+					hrsLeft = 0
+				}
+				if hrsLeft < resetBiasWindowHrs {
+					urgency := 1 - hrsLeft/resetBiasWindowHrs // →1 at reset
+					unused := (resetBiasMaxPct - s.SevenDayPct) / resetBiasMaxPct
+					if pull := urgency * unused; hrw < pull {
+						return 0 + (1 - hrw) // urgent band, ahead of home
+					}
+				}
+			}
+			return 100 + (1 - hrw) // home band: best HRW weight wins
+		}
+
+		// Legacy ordering (no user_sub): soonest 7d reset first. Key = seconds
+		// until the 7d window resets (due-now → 0 → highest priority), with the
+		// 5h reset as a sub-second tiebreaker that can never override it.
 		if !s.SevenDayReset.IsZero() {
 			r7 := time.Until(s.SevenDayReset).Seconds()
 			if r7 < 0 {

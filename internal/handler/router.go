@@ -540,6 +540,9 @@ func Register(r *gin.Engine) {
 			adminQuota.GET("/claude-user-usage", AdminClaudeUserUsage)
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
+			// Label-only update — move an account between field boxes without
+			// re-adding it (which would mean re-running `claude auth login`).
+			adminQuota.PATCH("/claude-token/:email", AdminClaudeTokenLabel)
 			// Pool session transcripts — admin can view all users' sessions.
 			// Per-field-box traffic + via_relay health.
 			adminQuota.GET("/claude-field-boxes", AdminClaudeFieldBoxes)

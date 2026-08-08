@@ -758,18 +758,41 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 		return
 	}
 
+	// via_relay only exists from the proxy build that started reporting it;
+	// every turn before that defaults to FALSE in the column. Counting those as
+	// degraded would report "we never measured this" as "this failed" — on the
+	// live data that was 1622 phantom failures, enough to make the signal
+	// useless. Derive the cutoff from the data itself (the first turn ever
+	// observed relayed) rather than hardcoding a date, so it stays correct
+	// across redeploys and backfills.
+	var signalStart *time.Time
+	var firstRelayed models.ClaudeSessionTurn
+	if err := common.DB.Where("via_relay = ?", true).Order("ts ASC").First(&firstRelayed).Error; err == nil {
+		signalStart = &firstRelayed.Ts
+	}
+
 	var totalReq, totalResp, totalTurns, totalDegraded int64
 	for _, r := range rows {
 		totalReq += r.RequestBytes
 		totalResp += r.ResponseBytes
 		totalTurns += r.Turns
-		if r.FieldBox != "" {
-			totalDegraded += r.NotViaRelay
+	}
+	// Degraded is counted with its own query so the per-row NotViaRelay stays a
+	// raw fact while the ALERTABLE total is restricted to turns the signal
+	// actually covers.
+	if signalStart != nil {
+		cut := *signalStart
+		if cut.Before(since) {
+			cut = since
 		}
+		common.DB.Model(&models.ClaudeSessionTurn{}).
+			Where("ts >= ? AND field_box <> ? AND via_relay = ?", cut, "", false).
+			Count(&totalDegraded)
 	}
 	ok(c, "ok", gin.H{
 		"window_hours": hours,
 		"boxes":        rows,
+		"signal_since": signalStart,
 		"totals": gin.H{
 			"turns":          totalTurns,
 			"request_bytes":  totalReq,

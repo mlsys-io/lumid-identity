@@ -541,6 +541,8 @@ func Register(r *gin.Engine) {
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
 			// Pool session transcripts — admin can view all users' sessions.
+			// Per-field-box traffic + via_relay health.
+			adminQuota.GET("/claude-field-boxes", AdminClaudeFieldBoxes)
 			adminQuota.GET("/claude-sessions", AdminClaudeSessions)
 			adminQuota.GET("/claude-sessions/:conv", AdminClaudeSessionDetail)
 			adminQuota.DELETE("/claude-sessions/:conv", AdminClaudeSessionDelete)

@@ -60,20 +60,16 @@ const (
 	claudeOAuthScopes = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 )
 
-// fieldRelays maps an account Label (e.g. "dublin") to its field-box relay's
-// base URL. When a labeled account's refresh token is exchanged, the request
-// is sent through this relay — with X-Field-Relay-Upstream naming the real
-// target host — instead of dialing platform.claude.com directly, so the
-// refresh call originates from that box's own network, matching claude-proxy's
-// Messages API dispatch for the same account. Accounts with no Label (every
-// account today) are completely unaffected. Mirrors claude-proxy's own
-// LUMID_CLAUDE_FIELD_RELAYS parsing — same env var, same "label=url,label=url"
-// shape, kept in sync deliberately so one env value configures both sides.
+// fieldRelays maps an account Label (e.g. "denmark") to its field-box relay's
+// base URL. Identity NO LONGER ROUTES ANY TRAFFIC through these — the OAuth
+// refresh went direct as of 2026-08-08 (see refreshTokenLocked for why: a lost
+// response on a rotating credential is destructive). The map is retained purely
+// as the source of truth for whether a Label actually routes, reported by
+// AdminClaudeTokenLabel's relay_configured field, so an operator learns
+// immediately that a label is unwired instead of discovering it later from
+// via_relay. Same env var and "label=url,label=url" shape as claude-proxy, which
+// does still route Messages API traffic through them.
 var fieldRelays = parseFieldRelays(os.Getenv("LUMID_CLAUDE_FIELD_RELAYS"))
-
-// fieldRelayBridgeSecret authenticates this service to a field relay — a
-// distinct secret from any bridge secret gating inbound requests to identity.
-var fieldRelayBridgeSecret = os.Getenv("LUMID_CLAUDE_FIELD_RELAY_BRIDGE_SECRET")
 
 func parseFieldRelays(spec string) map[string]string {
 	out := map[string]string{}
@@ -191,25 +187,35 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	// claude-proxy's matching dispatch in main.go) — every line below this
 	// point (response parsing, quarantine, persistence, rotation) is
 	// unchanged either way; only the destination of this one request differs.
+	// The OAuth refresh ALWAYS goes DIRECT to platform.claude.com — never through
+	// a field-box relay, even for a labelled account.
+	//
+	// This is a deliberate reversal of the original field-box design, which
+	// routed both hops (Messages API + refresh) through the box so every
+	// Anthropic-facing call for an account shared one origin. That reasoning
+	// holds for the Messages API. It does NOT hold here, because a refresh is not
+	// an idempotent read — Anthropic ROTATES the token family on receipt, and the
+	// new refresh token exists only in the response body:
+	//
+	//   request lands -> family rotated -> response LOST (relay hang / timeout)
+	//   -> we persist nothing -> next attempt presents the dead token
+	//   -> invalid_grant -> family revoked -> manual `claude auth login` required
+	//
+	// So a lossy hop in front of a rotating credential converts transient box
+	// flakiness into permanent credential loss. Observed twice on 2026-08-08:
+	// yao@yao.lu (denmark) was revoked twice within hours while its box was
+	// saturated and its relay timing out, whereas chicago/nyc — same code, healthy
+	// relays — were never revoked.
+	//
+	// The trade is lopsided: refresh is a handful of calls per account per day
+	// against thousands of relayed Messages API turns from the same box IP, so
+	// origin consistency barely moves, while the downside is losing the account.
+	// Health-gating the relay would NOT fix it — a relay healthy at check time can
+	// still hang mid-request, and the window cannot be closed, only narrowed.
+	//
+	// fieldRelays is still consulted elsewhere (AdminClaudeTokenLabel's
+	// relay_configured check); it is only the refresh ROUTING that is reverted.
 	refreshURL := claudeOAuthTokenURL
-	viaRelay := ""
-	if row.Label != "" {
-		if base, ok := fieldRelays[row.Label]; ok {
-			// The relay preserves the request PATH and only swaps host/scheme,
-			// so the base URL must be joined with the OAuth token path. Simply
-			// assigning `base` posted to the relay root, which forwarded to
-			// https://platform.claude.com/ — the marketing page, which answers
-			// 200 with 576KB of HTML. The 200 skipped the error branch below and
-			// json.Unmarshal on HTML produced the useless "invalid response
-			// body", so every labeled account's refresh failed the first time it
-			// was actually needed. Derived from claudeOAuthTokenURL rather than
-			// hardcoded so the two can't drift.
-			if u, err := url.Parse(claudeOAuthTokenURL); err == nil && u.EscapedPath() != "" {
-				refreshURL = strings.TrimRight(base, "/") + u.EscapedPath()
-				viaRelay = row.Label
-			}
-		}
-	}
 
 	req, err := http.NewRequest(http.MethodPost, refreshURL, bytes.NewReader(bodyJSON))
 	if err != nil {
@@ -217,19 +223,10 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
-	if viaRelay != "" {
-		req.Header.Set("X-Field-Relay-Upstream", "platform.claude.com")
-		if fieldRelayBridgeSecret != "" {
-			req.Header.Set("X-Bridge-Secret", fieldRelayBridgeSecret)
-		}
-	}
 
 	cl := &http.Client{Timeout: quotaFetchTimeout}
 	resp, err := cl.Do(req)
 	if err != nil {
-		if viaRelay != "" {
-			return "", fmt.Errorf("token refresh network error (via %s relay): %w", viaRelay, err)
-		}
 		return "", fmt.Errorf("token refresh network error: %w", err)
 	}
 	defer resp.Body.Close()
@@ -273,10 +270,6 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 		// makes a wrong-URL or throttled-upstream answer obvious on sight.
 		ct := resp.Header.Get("Content-Type")
 		snippet := strings.TrimSpace(string(raw[:min(len(raw), 160)]))
-		if viaRelay != "" {
-			return "", fmt.Errorf("token refresh: HTTP 200 but unparseable body (via %s relay, url=%s, content-type=%q): %s",
-				viaRelay, refreshURL, ct, snippet)
-		}
 		return "", fmt.Errorf("token refresh: HTTP 200 but unparseable body (url=%s, content-type=%q): %s",
 			refreshURL, ct, snippet)
 	}

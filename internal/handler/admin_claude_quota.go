@@ -195,8 +195,19 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	viaRelay := ""
 	if row.Label != "" {
 		if base, ok := fieldRelays[row.Label]; ok {
-			refreshURL = base
-			viaRelay = row.Label
+			// The relay preserves the request PATH and only swaps host/scheme,
+			// so the base URL must be joined with the OAuth token path. Simply
+			// assigning `base` posted to the relay root, which forwarded to
+			// https://platform.claude.com/ — the marketing page, which answers
+			// 200 with 576KB of HTML. The 200 skipped the error branch below and
+			// json.Unmarshal on HTML produced the useless "invalid response
+			// body", so every labeled account's refresh failed the first time it
+			// was actually needed. Derived from claudeOAuthTokenURL rather than
+			// hardcoded so the two can't drift.
+			if u, err := url.Parse(claudeOAuthTokenURL); err == nil && u.EscapedPath() != "" {
+				refreshURL = strings.TrimRight(base, "/") + u.EscapedPath()
+				viaRelay = row.Label
+			}
 		}
 	}
 
@@ -256,7 +267,18 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 		RefreshToken string `json:"refresh_token"`
 	}
 	if err := json.Unmarshal(raw, &tok); err != nil || tok.AccessToken == "" {
-		return "", fmt.Errorf("token refresh: invalid response body")
+		// Include what actually came back. The bare "invalid response body" sent
+		// an operator hunting a parser bug and then the relay, when the body said
+		// plainly it was HTML from the wrong endpoint. Content-Type + a snippet
+		// makes a wrong-URL or throttled-upstream answer obvious on sight.
+		ct := resp.Header.Get("Content-Type")
+		snippet := strings.TrimSpace(string(raw[:min(len(raw), 160)]))
+		if viaRelay != "" {
+			return "", fmt.Errorf("token refresh: HTTP 200 but unparseable body (via %s relay, url=%s, content-type=%q): %s",
+				viaRelay, refreshURL, ct, snippet)
+		}
+		return "", fmt.Errorf("token refresh: HTTP 200 but unparseable body (url=%s, content-type=%q): %s",
+			refreshURL, ct, snippet)
 	}
 
 	// Persist updated access token (and new refresh token if rotated).

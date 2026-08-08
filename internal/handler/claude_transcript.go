@@ -771,6 +771,24 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 		signalStart = &firstRelayed.Ts
 	}
 
+	// Emit a ZERO row for every CONFIGURED field box the aggregation didn't
+	// return. Without this the table lists only boxes that happened to carry
+	// traffic in the window, so an idle box vanishes entirely — and a vanished
+	// box is indistinguishable from a dead one. That is exactly backwards for a
+	// health surface, and it bites hardest on short windows (the panel defaults
+	// to 1h). Sourced from fieldRelays, the same map that actually does the
+	// routing, so the roster can't drift from reality the way a hardcoded UI
+	// list would.
+	seen := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		seen[r.FieldBox] = true
+	}
+	for label := range fieldRelays {
+		if !seen[label] {
+			rows = append(rows, fieldBoxRow{FieldBox: label})
+		}
+	}
+
 	var totalReq, totalResp, totalTurns, totalDegraded int64
 	for _, r := range rows {
 		totalReq += r.RequestBytes

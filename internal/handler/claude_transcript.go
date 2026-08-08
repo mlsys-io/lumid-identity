@@ -28,6 +28,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,9 +86,13 @@ type transcriptBody struct {
 	FieldBox string `json:"field_box"`
 	// ViaRelay: delivery, vs FieldBox's intent. Labeled + via_relay=false is
 	// the silent-degradation case worth alerting on.
-	ViaRelay bool            `json:"via_relay"`
-	Request  json.RawMessage `json:"request"`  // full request JSON
-	Response json.RawMessage `json:"response"` // full response (assembled JSON or raw SSE)
+	ViaRelay bool `json:"via_relay"`
+	// TRUE wire sizes from the proxy (response counted per-chunk, so unaffected
+	// by the transcript cap).
+	RequestBytes  int64           `json:"request_bytes"`
+	ResponseBytes int64           `json:"response_bytes"`
+	Request       json.RawMessage `json:"request"`  // full request JSON
+	Response      json.RawMessage `json:"response"` // full response (assembled JSON or raw SSE)
 }
 
 // InternalClaudeTranscript stores one turn. Bridge-gated.
@@ -139,19 +144,21 @@ func InternalClaudeTranscript(c *gin.Context) {
 
 	turnIndex := sess.TurnCount // 0-based
 	turn := models.ClaudeSessionTurn{
-		ConvKey:      convKey,
-		TurnIndex:    turnIndex,
-		Ts:           now,
-		Model:        req.Model,
-		Endpoint:     body.Endpoint,
-		Stream:       body.Stream,
-		InputTokens:  body.InputTokens,
-		OutputTokens: body.OutputTokens,
-		ToolUseCount: toolCount,
-		DurationMs:   body.DurationMs,
-		Truncated:    body.Truncated,
-		FieldBox:     body.FieldBox,
-		ViaRelay:     body.ViaRelay,
+		ConvKey:       convKey,
+		TurnIndex:     turnIndex,
+		Ts:            now,
+		Model:         req.Model,
+		Endpoint:      body.Endpoint,
+		Stream:        body.Stream,
+		InputTokens:   body.InputTokens,
+		OutputTokens:  body.OutputTokens,
+		ToolUseCount:  toolCount,
+		DurationMs:    body.DurationMs,
+		Truncated:     body.Truncated,
+		FieldBox:      body.FieldBox,
+		ViaRelay:      body.ViaRelay,
+		RequestBytes:  body.RequestBytes,
+		ResponseBytes: body.ResponseBytes,
 	}
 
 	// Write blobs to S3 when blobstore is configured; fall back to LONGBLOB.
@@ -187,6 +194,8 @@ func InternalClaudeTranscript(c *gin.Context) {
 	sess.Account = body.Account
 	sess.FieldBox = body.FieldBox
 	sess.ViaRelay = body.ViaRelay
+	sess.RequestBytes += body.RequestBytes
+	sess.ResponseBytes += body.ResponseBytes
 	sess.Model = req.Model
 	sess.TurnCount = turnIndex + 1
 	sess.CumMessages = m
@@ -691,4 +700,84 @@ func MeClaudeRecordingSet(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"enabled": *body.Enabled}})
+}
+
+// ── per-field-box traffic breakdown ─────────────────────────────────────────
+
+// fieldBoxRow is one row of the /code field-box panel.
+type fieldBoxRow struct {
+	// FieldBox "" means the turn was dispatched DIRECT from the cluster
+	// (unlabelled account) — rendered as "(direct)".
+	FieldBox      string    `json:"field_box"`
+	Turns         int64     `json:"turns"`
+	ViaRelay      int64     `json:"via_relay"`
+	NotViaRelay   int64     `json:"not_via_relay"`
+	RequestBytes  int64     `json:"request_bytes"`
+	ResponseBytes int64     `json:"response_bytes"`
+	InputTokens   int64     `json:"input_tokens"`
+	OutputTokens  int64     `json:"output_tokens"`
+	LastTs        time.Time `json:"last_ts"`
+}
+
+// AdminClaudeFieldBoxes — GET /api/v1/admin/claude-field-boxes?hours=24
+//
+// Aggregates recorded turns by field box: traffic volume in TRUE wire bytes,
+// plus the via_relay split. The split is the operational signal, not decoration:
+// a box showing turns with not_via_relay > 0 means labelled accounts are being
+// dispatched DIRECT from the cluster — the field-box path silently degraded and
+// the egress IP is wrong. Nothing else surfaces that.
+//
+// Byte columns only cover turns recorded after the proxy started reporting them;
+// older rows read 0 rather than being back-filled with a guess.
+func AdminClaudeFieldBoxes(c *gin.Context) {
+	hours := 24
+	if v := strings.TrimSpace(c.Query("hours")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 24*30 {
+			hours = n
+		}
+	}
+	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+
+	var rows []fieldBoxRow
+	err := common.DB.Model(&models.ClaudeSessionTurn{}).
+		Select(`field_box,
+		        COUNT(*)                                   AS turns,
+		        SUM(CASE WHEN via_relay THEN 1 ELSE 0 END) AS via_relay,
+		        SUM(CASE WHEN via_relay THEN 0 ELSE 1 END) AS not_via_relay,
+		        COALESCE(SUM(request_bytes),0)             AS request_bytes,
+		        COALESCE(SUM(response_bytes),0)            AS response_bytes,
+		        COALESCE(SUM(input_tokens),0)              AS input_tokens,
+		        COALESCE(SUM(output_tokens),0)             AS output_tokens,
+		        MAX(ts)                                    AS last_ts`).
+		Where("ts >= ?", since).
+		Group("field_box").
+		Order("response_bytes DESC").
+		Scan(&rows).Error
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "aggregate field boxes: "+err.Error())
+		return
+	}
+
+	var totalReq, totalResp, totalTurns, totalDegraded int64
+	for _, r := range rows {
+		totalReq += r.RequestBytes
+		totalResp += r.ResponseBytes
+		totalTurns += r.Turns
+		if r.FieldBox != "" {
+			totalDegraded += r.NotViaRelay
+		}
+	}
+	ok(c, "ok", gin.H{
+		"window_hours": hours,
+		"boxes":        rows,
+		"totals": gin.H{
+			"turns":          totalTurns,
+			"request_bytes":  totalReq,
+			"response_bytes": totalResp,
+			// Labelled turns that did NOT take the relay hop, across all boxes.
+			// Non-zero = silent degradation somewhere; investigate before trusting
+			// any egress claim.
+			"degraded_turns": totalDegraded,
+		},
+	})
 }

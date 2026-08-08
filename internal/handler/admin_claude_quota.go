@@ -670,6 +670,59 @@ func AdminClaudeTokenDelete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
 }
 
+// AdminClaudeTokenLabel updates ONLY a pooled account's field-box Label.
+//
+// PATCH /api/v1/admin/claude-token/:email  {"label": "denmark"}  (RequireSuperAdmin)
+//
+// Moving an account between field boxes previously meant re-adding it through
+// /code, which means re-running `claude auth login` and pasting OAuth tokens —
+// an absurd cost for changing one string, and one that risks rotating a
+// perfectly good credential. The label is pure routing metadata; nothing about
+// the token changes.
+//
+// An empty label is allowed and means "unlabelled": dispatch direct from the
+// cluster. Callers should be aware that pointing a label at a box with no
+// matching LUMID_CLAUDE_FIELD_RELAYS entry is NOT an error — claude-proxy falls
+// through to direct dispatch — so the account keeps working while silently
+// leaving from the wrong network. Check via_relay after any change.
+func AdminClaudeTokenLabel(c *gin.Context) {
+	email := strings.TrimSpace(strings.ToLower(c.Param("email")))
+	if email == "" {
+		fail(c, http.StatusBadRequest, 1400, "email required")
+		return
+	}
+	var body struct {
+		Label *string `json:"label"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Label == nil {
+		fail(c, http.StatusBadRequest, 1400, `body must be {"label": "<box>"} ("" to unlabel)`)
+		return
+	}
+	label := strings.TrimSpace(*body.Label)
+	if len(label) > 64 {
+		fail(c, http.StatusBadRequest, 1400, "label too long (max 64)")
+		return
+	}
+	var row models.ClaudeQuotaToken
+	if err := common.DB.Where("email = ?", email).First(&row).Error; err != nil {
+		fail(c, http.StatusNotFound, 1404, "account not found: "+email)
+		return
+	}
+	prev := row.Label
+	if err := common.DB.Model(&row).Update("label", label).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "update label: "+err.Error())
+		return
+	}
+	_, known := fieldRelays[label]
+	log.Printf("claude-token label: %s %q -> %q (relay configured: %v)", email, prev, label, known || label == "")
+	ok(c, "ok", gin.H{
+		"email": email, "label": label, "previous": prev,
+		// Surfaced so a caller can see immediately whether this label actually
+		// routes, rather than discovering it later from via_relay.
+		"relay_configured": known || label == "",
+	})
+}
+
 // InternalClaudeTokenLease hands the claude-proxy service the healthiest
 // pooled account's decrypted access token.
 //

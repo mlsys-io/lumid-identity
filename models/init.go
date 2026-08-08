@@ -17,6 +17,7 @@ var AllTables = []interface{}{
 	&PasswordReset{},
 	&SSHKey{},
 	&UserAccessGrant{},
+	&ClaudeUserAssignment{},
 	&GoogleGrant{},
 	&AppSecret{},
 	&UsageEvent{},

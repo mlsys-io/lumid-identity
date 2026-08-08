@@ -182,11 +182,6 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	}
 	bodyJSON, _ := json.Marshal(bodyMap)
 
-	// Field-box accounts route this exchange through their home relay so it
-	// originates from the same network as their Messages API traffic (see
-	// claude-proxy's matching dispatch in main.go) — every line below this
-	// point (response parsing, quarantine, persistence, rotation) is
-	// unchanged either way; only the destination of this one request differs.
 	// The OAuth refresh ALWAYS goes DIRECT to platform.claude.com — never through
 	// a field-box relay, even for a labelled account.
 	//
@@ -757,6 +752,13 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	}
 	prefer := strings.ToLower(strings.TrimSpace(body.PreferEmail))
 
+	// Keep placements current: no-op unless the table is stale (assignmentTTL)
+	// AND the pool is genuinely skewed. Errors are non-fatal — a stale
+	// assignment still routes correctly, it is just less well balanced.
+	if err := EnsureAssignments(false); err != nil {
+		log.Printf("claude assignment refresh: %v", err)
+	}
+
 	var rows []models.ClaudeQuotaToken
 	if err := common.DB.Find(&rows).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query tokens: "+err.Error())
@@ -851,6 +853,20 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// fall through to the legacy soonest-7d-reset ordering instead — that
 		// keeps behaviour correct during a staged rollout.
 		if body.UserSub != "" {
+			// BALANCED ASSIGNMENT (supersedes rendezvous hashing). The user's
+			// account is a persisted, load-balanced placement — see
+			// claude_balance.go. HRW is kept only as the fallback for a user with
+			// no row yet, so a brand-new caller still gets a deterministic,
+			// spread-out home instead of piling onto whoever sorts first.
+			if want := assignedAccount(body.UserSub); want != "" {
+				if cd.row.Email == want {
+					return 50 // assigned home — ahead of everything but prefer_email
+				}
+				// Not home: still a valid fallback if home is excluded/benched,
+				// but ranked behind it. HRW orders the fallbacks so the choice is
+				// deterministic across replicas.
+				return 200 + (1 - hrwScore(body.UserSub, cd.row.Email))
+			}
 			hrw := hrwScore(body.UserSub, cd.row.Email)
 
 			// Reset bias: a 7d window that resets with budget unspent wipes

@@ -44,19 +44,46 @@ const (
 
 var lastAssignmentRun time.Time
 
-// userLoad is one user's 7d token volume — the quantity being balanced.
+// userLoad is one user's 7d QUOTA DRAW, expressed in sonnet-equivalent tokens —
+// the quantity being balanced. Not raw tokens: see loadByUser.
 type userLoad struct {
 	UserSub string
 	Tokens  int64
 }
 
-// loadByUser reads 7d per-user token volume from usage_events, the same source
-// the /code per-user panel uses.
+// loadByUser reads each user's 7d draw on the Claude subscription pool.
+//
+// Two corrections over raw token volume, both measured live 2026-08-09:
+//
+//  1. MODEL WEIGHT. A subscription's 7-day allowance is model-weighted — Opus
+//     costs roughly 5× Sonnet per token. Balancing raw tokens therefore
+//     equalises the wrong quantity. Observed: the three accounts were balanced
+//     to within 0.33% on raw tokens (21.43M / 21.45M / 21.38M), yet `ytb` was
+//     tracking to ~95% of its weekly quota while `i` tracked to ~45%, because
+//     ytb's users run Opus (8,037 Opus turns vs 5,477 Sonnet) and i's run
+//     Sonnet (19,286 vs 830). Perfectly balanced tokens, badly imbalanced quota.
+//
+//  2. NON-CLAUDE MODELS DRAW NOTHING. kimi-k3, glm and other OpenAI-compat
+//     models are served by lumid-llm/OpenRouter and never touch the pooled
+//     subscription, so they must not influence placement. They also skew badly
+//     when counted — kimi averages ~57k tokens/turn, an order of magnitude above
+//     Claude traffic.
+//
+// Weights are relative, so only their ratio matters; the result stays in
+// sonnet-equivalent tokens to keep load_7d human-readable on the /code panel.
 func loadByUser() ([]userLoad, error) {
 	var rows []userLoad
 	err := common.DB.Raw(`
-		SELECT ue.user_sub                                          AS user_sub,
-		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens
+		SELECT ue.user_sub AS user_sub,
+		       CAST(COALESCE(SUM(
+		           (ue.input_tokens + ue.output_tokens) *
+		           CASE
+		               WHEN ue.model LIKE 'claude-opus%'  THEN 5.0
+		               WHEN ue.model LIKE 'claude-haiku%' THEN 0.2
+		               WHEN ue.model LIKE 'claude-%'      THEN 1.0
+		               ELSE 0.0
+		           END
+		       ), 0) AS SIGNED) AS tokens
 		FROM   usage_events ue
 		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
 		GROUP  BY ue.user_sub`, time.Now().UTC().Add(-7*24*time.Hour)).Scan(&rows).Error

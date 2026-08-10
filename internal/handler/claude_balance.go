@@ -39,6 +39,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -188,13 +189,44 @@ func assignableAccounts() ([]string, error) {
 		return nil, err
 	}
 	out := make([]string, 0, len(rows))
+	labels := make(map[string]string, len(rows))
 	for _, r := range rows {
 		if r.RevokedAt == nil {
 			out = append(out, r.Email)
+			labels[r.Email] = r.Label
 		}
 	}
 	sort.Strings(out) // deterministic across replicas
+	setAccountLabels(labels)
 	return out, nil
+}
+
+// accountLabels caches account -> field-box Label purely so the placement log
+// can print it. Without it, "account ytb has 5 users" and "field box chicago
+// has no traffic" are two facts with no way to connect them — you cannot tell
+// a silent box whose account is idle from a box no account is labelled for.
+var (
+	accountLabelMu sync.RWMutex
+	accountLabels  = map[string]string{}
+)
+
+func setAccountLabels(m map[string]string) {
+	accountLabelMu.Lock()
+	accountLabels = m
+	accountLabelMu.Unlock()
+}
+
+// accountWithLabel renders "ytb(chicago)", or bare "ytb" when unlabelled —
+// and an unlabelled account is itself worth seeing, since its users egress
+// through an adopted sibling box rather than one of their own.
+func accountWithLabel(email string) string {
+	accountLabelMu.RLock()
+	l := accountLabels[email]
+	accountLabelMu.RUnlock()
+	if l == "" {
+		return email
+	}
+	return email + "(" + l + ")"
 }
 
 // effectiveUserCap resolves the configured per-account user ceiling against what
@@ -245,7 +277,7 @@ func logPlacement(loads []userLoad, accounts []string, ideal map[string]string, 
 	}
 	parts := make([]string, 0, len(accounts))
 	for _, a := range accounts { // accounts is already sorted, so this is stable
-		parts = append(parts, fmt.Sprintf("%s=%d", a, per[a]))
+		parts = append(parts, fmt.Sprintf("%s=%d", accountWithLabel(a), per[a]))
 	}
 	unplaced := len(loads) - len(ideal)
 	msg := fmt.Sprintf("claude-pool: placed %d/%d users across %d accounts (cap %d/account): %s",

@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -219,6 +220,46 @@ func effectiveUserCap(nUsers, nAccounts, configured int) int {
 	// leaves the surplus unhomed (computeAssignment skips them) and they fall
 	// back to HRW at lease time, so nobody loses access.
 	return configured
+}
+
+// logPlacement reports the outcome of one placement pass: how many users
+// landed where, and how many did not land at all.
+//
+// This replaces the old "cannot meet the N-user/account target" line, which
+// became unreachable the moment the cap stopped widening (effectiveUserCap
+// now returns `configured`, so maxPer > configured is never true). Losing it
+// meant an undersized pool was completely silent: surplus users fell through
+// to HRW with nothing written down, and "why is field box X getting no
+// traffic?" had no answer in the logs. The per-account breakdown is the point
+// — an account with 0 users is exactly why its field relay goes quiet.
+func logPlacement(loads []userLoad, accounts []string, ideal map[string]string, configured int) {
+	if len(loads) == 0 {
+		return
+	}
+	per := make(map[string]int, len(accounts))
+	for _, a := range accounts {
+		per[a] = 0 // account with no users must still appear — that's the signal
+	}
+	for _, acct := range ideal {
+		per[acct]++
+	}
+	parts := make([]string, 0, len(accounts))
+	for _, a := range accounts { // accounts is already sorted, so this is stable
+		parts = append(parts, fmt.Sprintf("%s=%d", a, per[a]))
+	}
+	unplaced := len(loads) - len(ideal)
+	msg := fmt.Sprintf("claude-pool: placed %d/%d users across %d accounts (cap %d/account): %s",
+		len(ideal), len(loads), len(accounts), configured, strings.Join(parts, " "))
+	if unplaced > 0 {
+		// The remediation is more accounts, not more rebalancing — say so.
+		need := len(loads)
+		if configured > 0 {
+			need = (len(loads) + configured - 1) / configured
+		}
+		msg += fmt.Sprintf("; %d unplaced -> HRW fallback (no stable egress box). %d accounts would home everyone.",
+			unplaced, need)
+	}
+	log.Print(msg)
 }
 
 // computeAssignment runs greedy LPT over the given loads and accounts, refusing
@@ -466,18 +507,9 @@ func EnsureAssignments(force bool) error {
 
 		configured := common.ClaudeMaxUsersPerAccount()
 		maxPer := effectiveUserCap(len(loads), len(accounts), configured)
-		if configured > 0 && maxPer > configured {
-			// The pool cannot honour the target. Say so with the number of
-			// accounts it would take, because that is the actual remediation —
-			// the cap is a proxy for "one subscription per human", and no
-			// amount of rebalancing substitutes for having enough accounts.
-			need := (len(loads) + configured - 1) / configured
-			log.Printf("claude-pool: %d users across %d accounts cannot meet the %d-user/account target; "+
-				"spreading %d per account instead. %d accounts would be needed.",
-				len(loads), len(accounts), configured, maxPer, need)
-		}
 
 		ideal := computeAssignment(loads, accounts, maxPer)
+		logPlacement(loads, accounts, ideal, configured)
 		curSkew := skew(loads, accounts, cur)
 		sharingTooWide := overCap(cur, valid, maxPer)
 		rebalance := curSkew > rebalanceSkewFactor || sharingTooWide

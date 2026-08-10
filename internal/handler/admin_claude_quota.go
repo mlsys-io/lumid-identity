@@ -27,6 +27,7 @@ package handler
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	base64Stdlib "encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -1136,21 +1137,27 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		now.Add(-7*24*time.Hour)).Scan(&patHolders)
 
 	cap5, cap7 := common.ClaudePoolLimits()
-	// Third query: oldest event per user per window — used to compute reset times.
-	// five_hour_reset = min_ts_5h + 5h  (when the oldest 5h event ages out)
-	// seven_day_reset = min_ts_7d + 7d  (when the oldest 7d event ages out)
+	// Third query: oldest event per user, per window — used to compute reset times.
+	// five_hour_reset = oldest event WITHIN the last 5h, +5h (when that event ages out).
+	// seven_day_reset = oldest event across the FULL 7d window, +7d — NOT the oldest
+	// event older than 5h. A prior version bucketed "7d" as strictly-older-than-5h,
+	// so any user whose entire 7-day history fell inside the trailing 5h (a light or
+	// new user, or anyone right after a burst) got NO row for that bucket at all —
+	// SevenDayReset stayed the Go zero-value while SevenDayPct was still correctly
+	// non-zero (it always includes the 5h bucket, see the accumulation loop below),
+	// so the dashboard showed a usage bar with a blank/missing countdown next to it.
 	oldestRows := []struct {
 		UserSub  string
-		Win      string
-		OldestTs time.Time
+		Oldest5h sql.NullTime
+		Oldest7d time.Time
 	}{}
 	common.DB.Raw(`
 		SELECT ue.user_sub                                        AS user_sub,
-		       CASE WHEN ue.ts >= ? THEN '5h' ELSE '7d' END       AS win,
-		       MIN(ue.ts)                                         AS oldest_ts
+		       MIN(CASE WHEN ue.ts >= ? THEN ue.ts END)           AS oldest5h,
+		       MIN(ue.ts)                                         AS oldest7d
 		FROM   usage_events ue
 		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
-		GROUP  BY ue.user_sub, win`,
+		GROUP  BY ue.user_sub`,
 		now.Add(-5*time.Hour), now.Add(-7*24*time.Hour)).Scan(&oldestRows)
 
 	type modelUsage struct {
@@ -1193,12 +1200,10 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		if !ok {
 			continue
 		}
-		switch or_.Win {
-		case "5h":
-			u.FiveHourReset = or_.OldestTs.Add(5 * time.Hour)
-		case "7d":
-			u.SevenDayReset = or_.OldestTs.Add(7 * 24 * time.Hour)
+		if or_.Oldest5h.Valid {
+			u.FiveHourReset = or_.Oldest5h.Time.Add(5 * time.Hour)
 		}
+		u.SevenDayReset = or_.Oldest7d.Add(7 * 24 * time.Hour)
 	}
 	// Attach per-model breakdown.
 	for _, mr := range modelRows {

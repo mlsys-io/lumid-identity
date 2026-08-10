@@ -64,12 +64,17 @@ const (
 	// the user cap was a soft target (it just widened); under a hard gate a
 	// dormant user directly blocks an active one from being homed.
 	//
-	// 1h is deliberately aggressive: with more users than slots, a slot should
+	// 30m is deliberately aggressive: with more users than slots, a slot should
 	// belong to whoever is actually working, not to whoever claimed it first.
 	// The cost is egress-IP churn — the assignment IS the user's public egress
 	// box — so a user returning after a break may come back on a different box.
 	// That is an accepted trade here, not an oversight. 0 disables.
-	DefaultClaudeAssignmentIdle = time.Hour
+	//
+	// It is also shorter than a typical Claude Code session's think/read gaps
+	// are long, which is fine: reclamation only frees the slot, and the next
+	// request re-homes the user immediately. The window bounds how long a
+	// walked-away user holds a slot, not how long a working one keeps it.
+	DefaultClaudeAssignmentIdle = 30 * time.Minute
 )
 
 // Limits captures the headline numbers the UI surfaces alongside today's totals.

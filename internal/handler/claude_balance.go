@@ -13,14 +13,27 @@ package handler
 // here and lands within 4/3 of optimal, which is far more than good enough for
 // single-digit accounts.
 //
+// A USER-COUNT CAP bounds the other axis. Load balancing alone equalises the
+// wrong quantity for this risk: it will happily home seven unrelated people on
+// one consumer subscription so long as their combined draw matches the others,
+// and that concentration — not volume — is what got accounts suspended on
+// 2026-08-04 and again on 2026-08-09. computeAssignment therefore refuses to
+// exceed effectiveUserCap users per account, with load still the primary
+// objective among accounts that have room. The cap is a target: when the pool is
+// too small it degrades to an even spread rather than leaving anyone unplaced.
+//
 // HYSTERESIS is the important part. The assignment IS a user's public egress
 // IP, so churning it would defeat the field boxes. An existing placement is
 // therefore KEPT unless the pool is clearly skewed — only when the busiest
 // account carries more than rebalanceSkewFactor x the least does anyone move.
 // Quiet drift is tolerated on purpose; only genuine imbalance is corrected.
+// An over-cap distribution is the one other thing that forces a move, since it
+// can sit within the skew threshold indefinitely and would otherwise be frozen
+// in place by that same hysteresis.
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
@@ -109,8 +122,37 @@ func assignableAccounts() ([]string, error) {
 	return out, nil
 }
 
-// computeAssignment runs greedy LPT over the given loads and accounts.
-func computeAssignment(loads []userLoad, accounts []string) map[string]string {
+// effectiveUserCap resolves the configured per-account user ceiling against what
+// the pool can physically hold.
+//
+// The cap is a TARGET, not a limit. If it were enforced strictly, a pool with
+// fewer than ceil(users/cap) accounts would have users it could not place at
+// all — and an unplaced user still needs Claude access, so refusing to place is
+// never the right answer. When the cap is infeasible we fall back to the
+// tightest ceiling that IS feasible, ceil(users/accounts), which still bounds
+// the fan-out (it is what forces an even split instead of letting pure load
+// balancing pile 6-7 people onto one subscription) and leaves the caller to
+// report the shortfall.
+//
+// Returns 0 when the cap is disabled or there is nothing to bound.
+func effectiveUserCap(nUsers, nAccounts, configured int) int {
+	if configured <= 0 || nAccounts <= 0 || nUsers <= 0 {
+		return 0
+	}
+	if nUsers <= nAccounts*configured {
+		return configured
+	}
+	return (nUsers + nAccounts - 1) / nAccounts // ceil
+}
+
+// computeAssignment runs greedy LPT over the given loads and accounts, refusing
+// to home more than cap users on any one account (cap <= 0 disables that).
+//
+// Load remains the primary objective; the cap only removes full accounts from
+// consideration. Because callers pass a cap from effectiveUserCap, capacity is
+// guaranteed by the pigeonhole principle and the fallback below is unreachable
+// in practice — it exists so a bad cap can never leave a user unplaced.
+func computeAssignment(loads []userLoad, accounts []string, maxPer int) map[string]string {
 	out := make(map[string]string, len(loads))
 	if len(accounts) == 0 {
 		return out
@@ -123,11 +165,29 @@ func computeAssignment(loads []userLoad, accounts []string) map[string]string {
 	})
 	tot := make(map[string]int64, len(accounts))
 	cnt := make(map[string]int, len(accounts))
+	// lighter reports whether a beats the incumbent on load, then user count.
+	lighter := func(a, best string) bool {
+		return tot[a] < tot[best] || (tot[a] == tot[best] && cnt[a] < cnt[best])
+	}
 	for _, u := range loads {
-		best := accounts[0]
-		for _, a := range accounts[1:] {
-			if tot[a] < tot[best] || (tot[a] == tot[best] && cnt[a] < cnt[best]) {
+		best := ""
+		for _, a := range accounts {
+			if maxPer > 0 && cnt[a] >= maxPer {
+				continue
+			}
+			if best == "" || lighter(a, best) {
 				best = a
+			}
+		}
+		if best == "" {
+			// Every account is at the cap. Availability wins over the target:
+			// place on the least-loaded account rather than leaving the user
+			// homeless (which would drop them to the HRW fallback at lease time).
+			best = accounts[0]
+			for _, a := range accounts[1:] {
+				if lighter(a, best) {
+					best = a
+				}
 			}
 		}
 		out[u.UserSub] = best
@@ -135,6 +195,30 @@ func computeAssignment(loads []userLoad, accounts []string) map[string]string {
 		cnt[best]++
 	}
 	return out
+}
+
+// overCap reports whether any account currently hosts more than cap users.
+//
+// Load skew alone is not enough to trigger a rebalance here: an over-shared
+// account can sit perfectly within the skew threshold (that is exactly what
+// balancing on load produces), and hysteresis would then keep the cap from ever
+// taking effect on an existing pool.
+func overCap(cur map[string]string, valid map[string]bool, maxPer int) bool {
+	if maxPer <= 0 {
+		return false
+	}
+	cnt := make(map[string]int, len(valid))
+	for _, acct := range cur {
+		if valid[acct] {
+			cnt[acct]++
+		}
+	}
+	for _, n := range cnt {
+		if n > maxPer {
+			return true
+		}
+	}
+	return false
 }
 
 // skew reports busiest/least loaded across accounts under an assignment.
@@ -207,9 +291,23 @@ func EnsureAssignments(force bool) error {
 			valid[a] = true
 		}
 
-		ideal := computeAssignment(loads, accounts)
+		configured := common.ClaudeMaxUsersPerAccount()
+		maxPer := effectiveUserCap(len(loads), len(accounts), configured)
+		if configured > 0 && maxPer > configured {
+			// The pool cannot honour the target. Say so with the number of
+			// accounts it would take, because that is the actual remediation —
+			// the cap is a proxy for "one subscription per human", and no
+			// amount of rebalancing substitutes for having enough accounts.
+			need := (len(loads) + configured - 1) / configured
+			log.Printf("claude-pool: %d users across %d accounts cannot meet the %d-user/account target; "+
+				"spreading %d per account instead. %d accounts would be needed.",
+				len(loads), len(accounts), configured, maxPer, need)
+		}
+
+		ideal := computeAssignment(loads, accounts, maxPer)
 		curSkew := skew(loads, accounts, cur)
-		rebalance := curSkew > rebalanceSkewFactor
+		sharingTooWide := overCap(cur, valid, maxPer)
+		rebalance := curSkew > rebalanceSkewFactor || sharingTooWide
 
 		var writes []models.ClaudeUserAssignment
 		load := make(map[string]int64, len(loads))
@@ -225,7 +323,13 @@ func EnsureAssignments(force bool) error {
 			case !valid[have]:
 				reason = "account-gone"
 			case rebalance && have != want:
+				// Distinguish the two triggers: an operator reading the table
+				// should be able to tell a load correction from a deliberate
+				// de-sharing, since only the latter is about suspension risk.
 				reason = "rebalance"
+				if sharingTooWide && curSkew <= rebalanceSkewFactor {
+					reason = "user-cap"
+				}
 			default:
 				continue // keep the existing origin
 			}

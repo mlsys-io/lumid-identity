@@ -39,6 +39,21 @@ const (
 	// Anthropic's own 5h/7d shape (uncached input + output tokens).
 	DefaultClaude5hTokens = 4_000_000
 	DefaultClaude7dTokens = 40_000_000
+	// Target ceiling on DISTINCT end-users homed on one pooled account.
+	//
+	// The pooled accounts are individual consumer Claude subscriptions, and the
+	// shape that got them suspended — twice — was many unrelated people sharing
+	// one: 8 accounts each serving 4-6 users on 2026-08-04, and 6-7 users per
+	// account when yao@yao.lu was suspended on 2026-08-09. Balancing purely on
+	// token load equalises the wrong thing; it will happily pile seven people
+	// onto one subscription as long as their combined draw is even.
+	//
+	// 3 is a deliberate step toward 1 account <-> 1 human, which is the only
+	// shape that is actually correct. It is a TARGET, not a hard limit: when the
+	// pool is too small to honour it the balancer spreads evenly instead of
+	// refusing to place anyone (see effectiveUserCap), so availability never
+	// depends on having enough accounts.
+	DefaultClaudeMaxUsersPerAccount = 3
 )
 
 // Limits captures the headline numbers the UI surfaces alongside today's totals.
@@ -172,6 +187,25 @@ func poolCapApplies(model string) bool {
 func ClaudePoolLimits() (fiveH, sevenD int) {
 	return envIntPos("LUMID_QUOTA_CLAUDE_5H_TOKENS", DefaultClaude5hTokens),
 		envIntPos("LUMID_QUOTA_CLAUDE_7D_TOKENS", DefaultClaude7dTokens)
+}
+
+// ClaudeMaxUsersPerAccount is the env-tunable ceiling on distinct users homed on
+// one pooled account. 0 disables the cap and restores pure load balancing.
+//
+// Uses envIntNonNeg rather than envIntPos precisely so that an explicit "0" is
+// honoured as "disabled" instead of silently falling back to the default.
+func ClaudeMaxUsersPerAccount() int {
+	return envIntNonNeg("LUMID_CLAUDE_MAX_USERS_PER_ACCOUNT", DefaultClaudeMaxUsersPerAccount)
+}
+
+// envIntNonNeg is envIntPos but admits 0, for knobs where 0 means "off".
+func envIntNonNeg(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
 }
 
 // ClaudePoolWindows returns one user's claude_proxy token usage over the

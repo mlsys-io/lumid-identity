@@ -457,6 +457,14 @@ type quotaResult struct {
 	// the account needs a re-add with a fresh `claude auth login`.
 	Revoked      bool   `json:"revoked,omitempty"`
 	RevokeReason string `json:"revoke_reason,omitempty"`
+	// Pool-wide bench — claude-proxy saw Anthropic 401/403 this account and
+	// benched it across every replica. Surfaced because a benched account still
+	// reports perfectly healthy utilization headers, so without this the
+	// dashboard shows a green account that is serving nobody. BenchDead means
+	// the consecutive-failure threshold was reached and only a re-add clears it.
+	BenchedUntil *time.Time `json:"benched_until,omitempty"`
+	BenchReason  string     `json:"bench_reason,omitempty"`
+	BenchDead    bool       `json:"bench_dead,omitempty"`
 }
 
 func fillFromSnap(res *quotaResult, snap *models.ClaudeQuotaSnapshot) {
@@ -489,6 +497,13 @@ func AdminClaudeQuota(c *gin.Context) {
 		go func(i int, row models.ClaudeQuotaToken) {
 			defer wg.Done()
 			res := quotaResult{Email: row.Email, Label: row.Label}
+			// Report a standing bench alongside whatever the quota headers say —
+			// the two are independent, and a benched account looks green.
+			if row.BenchUntil != nil && time.Now().Before(*row.BenchUntil) {
+				res.BenchedUntil = row.BenchUntil
+				res.BenchReason = row.BenchReason
+				res.BenchDead = row.BenchDead
+			}
 
 			var snap models.ClaudeQuotaSnapshot
 			snapErr := common.DB.
@@ -616,10 +631,14 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	// DB.Save() with a string PK includes created_at=zero in the UPDATE clause
 	// which MySQL strict mode rejects with Error 1292. Explicit DoUpdates avoids it.
 	// A re-add is the recovery path for a revoked family — clear the quarantine.
+	// It is equally the documented recovery path for a pool-wide bench (the alert
+	// claude-proxy prints says "re-add the account to restore it"), so clear that
+	// too: `row` is freshly built, so these columns assign their zero values.
 	// "label" is only included in the update set when this request actually
 	// supplied one — an unrelated re-add (e.g. refresh-token rotation) with no
 	// label field must not silently wipe an existing field-box tag.
-	updateCols := []string{"value_encrypted", "refresh_token_encrypted", "updated_at", "revoked_at", "revoke_reason"}
+	updateCols := []string{"value_encrypted", "refresh_token_encrypted", "updated_at", "revoked_at", "revoke_reason",
+		"bench_until", "bench_reason", "bench_dead"}
 	if label != "" {
 		updateCols = append(updateCols, "label")
 	}
@@ -738,6 +757,85 @@ func hrwScore(userSub, email string) float64 {
 	return float64(binary.BigEndian.Uint64(h[:8])>>11) / float64(uint64(1)<<53)
 }
 
+// InternalClaudeAccountBench records a pool-wide cooldown for a pooled account,
+// reported by claude-proxy when Anthropic returned 401/403 for it.
+//
+// Why this lives here rather than in the proxy: the proxy's bench is an
+// in-process map, so with CLAUDE_PROXY_REPLICAS=2 only the pod that observed the
+// failure stopped using the account. The sibling kept leasing it and kept
+// presenting the same bad credential to Anthropic — the exact re-probing that
+// claude-proxy's authFailCooldown was written to prevent, and that hardens a
+// suspension rather than containing it. Identity is where every replica already
+// agrees on pool state, so the bench belongs here.
+//
+// seconds <= 0 releases the bench (the proxy sends this when a request on the
+// account succeeds, proving the credential live). A bench flagged `dead` is NOT
+// released that way: it means the proxy saw a full consecutive-failure streak,
+// and recovery is a deliberate operator re-add — same contract as the alert the
+// proxy prints. Benches are extend-only, so a short probe bench from one replica
+// can never shorten a longer one already set by the other.
+func InternalClaudeAccountBench(c *gin.Context) {
+	var body struct {
+		Email   string `json:"email"`
+		Seconds int    `json:"seconds"`
+		Dead    bool   `json:"dead"`
+		Reason  string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(body.Email))
+	if email == "" {
+		fail(c, http.StatusBadRequest, 1400, "email required")
+		return
+	}
+
+	var row models.ClaudeQuotaToken
+	if err := common.DB.Where("email = ?", email).First(&row).Error; err != nil {
+		fail(c, http.StatusNotFound, 1404, "no such pooled account")
+		return
+	}
+
+	if body.Seconds <= 0 {
+		if row.BenchDead {
+			// Deliberately not self-clearing — see the doc comment.
+			c.JSON(http.StatusOK, gin.H{"ok": true, "benched": true, "dead": true,
+				"note": "dead bench held; re-add the account to restore it"})
+			return
+		}
+		common.DB.Model(&row).Updates(map[string]interface{}{
+			"bench_until": nil, "bench_reason": "", "bench_dead": false,
+		})
+		c.JSON(http.StatusOK, gin.H{"ok": true, "benched": false})
+		return
+	}
+
+	until := time.Now().Add(time.Duration(body.Seconds) * time.Second)
+	// Extend-only: never let a 30s probe bench from one replica cut short a 6h
+	// dead bench already recorded by the other.
+	if row.BenchUntil != nil && row.BenchUntil.After(until) {
+		until = *row.BenchUntil
+	}
+	reason := strings.TrimSpace(body.Reason)
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	updates := map[string]interface{}{"bench_until": until, "bench_reason": reason}
+	if body.Dead {
+		updates["bench_dead"] = true
+	}
+	if err := common.DB.Model(&row).Updates(updates).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "persist bench: "+err.Error())
+		return
+	}
+	if body.Dead && !row.BenchDead {
+		log.Printf("claude-pool: %s BENCHED pool-wide until %s (%s) — re-add the account to restore it",
+			email, until.Format(time.RFC3339), reason)
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "benched": true, "until": until, "dead": body.Dead || row.BenchDead})
+}
+
 func InternalClaudeTokenLease(c *gin.Context) {
 	var body struct {
 		PreferEmail string   `json:"prefer_email"`
@@ -777,6 +875,12 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// Quarantined family — its access token dies with the refresh token,
 		// so it can't serve proxy traffic. Skip until re-added.
 		if row.RevokedAt != nil {
+			continue
+		}
+		// Benched pool-wide after Anthropic 401/403'd it for some proxy replica.
+		// Honouring it here is what makes the bench apply to every replica
+		// instead of only the pod that saw the failure.
+		if row.BenchUntil != nil && time.Now().Before(*row.BenchUntil) {
 			continue
 		}
 		var snap models.ClaudeQuotaSnapshot

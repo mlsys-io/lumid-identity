@@ -28,6 +28,22 @@ type ClaudeQuotaToken struct {
 	// network. Unset accounts (the default, and every account that predates
 	// this field) are completely unaffected.
 	Label string `gorm:"column:label;size:64" json:"label,omitempty"`
+	// Bench state: a POOL-WIDE cooldown reported by claude-proxy after Anthropic
+	// returned 401/403 for this account. claude-proxy benches locally too, but
+	// its state is per-process, so with >1 replica the sibling pod kept leasing
+	// a credential another pod had already proven bad — re-presenting a dead
+	// token to Anthropic indefinitely. Persisting it here makes the bench apply
+	// to every replica.
+	//
+	// Distinct from RevokedAt: that means the token FAMILY is gone (invalid_grant
+	// on refresh, unrecoverable without a re-add), whereas a bench is a timed
+	// cooldown that usually expires on its own.
+	BenchUntil  *time.Time `gorm:"column:bench_until"        json:"bench_until,omitempty"`
+	BenchReason string     `gorm:"column:bench_reason;size:512" json:"bench_reason,omitempty"`
+	// BenchDead marks a bench that reached claude-proxy's consecutive-failure
+	// threshold. It is not self-clearing on a stray success — recovery is a
+	// deliberate operator re-add, matching the alert text the proxy emits.
+	BenchDead bool `gorm:"column:bench_dead;not null;default:false" json:"bench_dead,omitempty"`
 }
 
 func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }

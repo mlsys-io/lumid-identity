@@ -501,6 +501,10 @@ func Register(r *gin.Engine) {
 			// Claude account-pool lease — claude-proxy (lum.id/claude) asks
 			// for the healthiest pooled account's access token.
 			internal.POST("/claude-token/lease", InternalClaudeTokenLease)
+			// Pool-wide account bench — claude-proxy reports a 401/403 here so
+			// the cooldown applies across every proxy replica, not just the pod
+			// that saw the failure.
+			internal.POST("/claude-account/bench", InternalClaudeAccountBench)
 			// Per-user "act as <sub>" bridge credential — claude-proxy mints one
 			// to forward LumidOS tool calls to a backend as the resolved user,
 			// without the client ever holding a broad backend PAT.

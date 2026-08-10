@@ -293,6 +293,15 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 
 const (
 	quotaCacheTTL     = 5 * time.Minute
+	// nearExhaustCeiling is the EXHAUSTION VALVE for per-user routing: an
+	// account at/above it on either window drops to the last-resort band, so a
+	// heavy user pinned to one account degrades to a sibling instead of hard
+	// -failing while other accounts sit idle. Availability beats pinning.
+	//
+	// Package-level because PLACEMENT reads it too (claude_balance.go). The two
+	// must agree: an account the valve will never select must not be given
+	// users, or they end up homed somewhere they can never actually egress from.
+	nearExhaustCeiling = 92.0
 	quotaFetchTimeout = 20 * time.Second
 	// Minimal probe model — cheapest, fastest; we only need the response headers.
 	quotaProbeModel = "claude-haiku-4-5-20251001"
@@ -916,11 +925,10 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	//      (it re-enters when its 5h resets). Ordered least-spent-first.
 	//   4. No snapshot → probe last.
 	// The key packs these into disjoint numeric bands so the ordering is total.
-	// nearExhaustCeiling is the EXHAUSTION VALVE for per-user routing: an
-	// account at/above it on either window drops to the last-resort band, so a
-	// heavy user pinned to one account degrades to a sibling instead of hard
-	// -failing while other accounts sit idle. Availability beats pinning.
-	const nearExhaustCeiling = 92.0
+	// nearExhaustCeiling is package-level (see below) so PLACEMENT can honour
+	// the same threshold this valve enforces. When only the valve knew about
+	// it, placement kept homing users onto an account lease-time would always
+	// refuse, and those users silently egressed from someone else's box.
 	// Reset-bias tuning. Only accounts below resetBiasMaxPct on the 7d window
 	// are worth pulling extra users onto (above it there is little to reclaim,
 	// and it would race the exhaustion valve).

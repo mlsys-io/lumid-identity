@@ -201,6 +201,62 @@ func assignableAccounts() ([]string, error) {
 	return out, nil
 }
 
+// accountQuota is the placement-relevant slice of an account's quota state.
+// `known` is false when there is no snapshot or it has gone stale — in that
+// case the account is treated as SERVABLE, because lease-time will re-probe it
+// and a missing snapshot must never be read as "exhausted".
+type accountQuota struct {
+	pct5, pct7 float64
+	known      bool
+}
+
+func (q accountQuota) exhausted() bool {
+	return q.known && (q.pct5 >= nearExhaustCeiling || q.pct7 >= nearExhaustCeiling)
+}
+
+// accountQuotas reads the latest snapshot for each account.
+func accountQuotas(accounts []string) map[string]accountQuota {
+	out := make(map[string]accountQuota, len(accounts))
+	for _, a := range accounts {
+		var snap models.ClaudeQuotaSnapshot
+		if err := common.DB.Where("email = ?", a).Order("ts DESC").First(&snap).Error; err != nil {
+			out[a] = accountQuota{} // unknown -> servable
+			continue
+		}
+		if time.Since(snap.Ts) >= quotaCacheTTL {
+			out[a] = accountQuota{} // stale -> unknown -> servable
+			continue
+		}
+		out[a] = accountQuota{pct5: snap.FiveHourPct, pct7: snap.SevenDayPct, known: true}
+	}
+	return out
+}
+
+// servableAccounts drops accounts the lease-time exhaustion valve would refuse.
+//
+// Placement used to be deliberately quota-blind, on the reasoning that quota is
+// a moment-to-moment concern and placement is durable. That reasoning breaks at
+// the ceiling: an account at >=nearExhaustCeiling is not momentarily busy, it is
+// unselectable, and homing users there gives them a field box they can never
+// egress from. Observed 2026-08-10: ytb(chicago) held 5 of 8 users and served 0
+// of ~1770 requests, so all five silently spilled onto other accounts — the
+// interleaved fan-out the whole design exists to prevent.
+//
+// If NOTHING is servable the full list is returned unchanged: leaving everyone
+// unhomed would be strictly worse than an imperfect home.
+func servableAccounts(accounts []string, q map[string]accountQuota) []string {
+	out := make([]string, 0, len(accounts))
+	for _, a := range accounts {
+		if !q[a].exhausted() {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return accounts
+	}
+	return out
+}
+
 // accountLabels caches account -> field-box Label purely so the placement log
 // can print it. Without it, "account ytb has 5 users" and "field box chicago
 // has no traffic" are two facts with no way to connect them — you cannot tell
@@ -264,7 +320,7 @@ func effectiveUserCap(nUsers, nAccounts, configured int) int {
 // to HRW with nothing written down, and "why is field box X getting no
 // traffic?" had no answer in the logs. The per-account breakdown is the point
 // — an account with 0 users is exactly why its field relay goes quiet.
-func logPlacement(loads []userLoad, accounts []string, ideal map[string]string, configured int) {
+func logPlacement(loads []userLoad, accounts []string, ideal map[string]string, configured int, quotas map[string]accountQuota) {
 	if len(loads) == 0 {
 		return
 	}
@@ -277,7 +333,14 @@ func logPlacement(loads []userLoad, accounts []string, ideal map[string]string, 
 	}
 	parts := make([]string, 0, len(accounts))
 	for _, a := range accounts { // accounts is already sorted, so this is stable
-		parts = append(parts, fmt.Sprintf("%s=%d", accountWithLabel(a), per[a]))
+		// An exhausted account reads "=0 EXHAUSTED(7d=96%)" rather than a bare
+		// zero, so a silent field box explains itself instead of looking like
+		// an account nobody happened to be assigned to.
+		suffix := ""
+		if q := quotas[a]; q.exhausted() {
+			suffix = fmt.Sprintf(" EXHAUSTED(5h=%.0f%% 7d=%.0f%%)", q.pct5, q.pct7)
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d%s", accountWithLabel(a), per[a], suffix))
 	}
 	unplaced := len(loads) - len(ideal)
 	msg := fmt.Sprintf("claude-pool: placed %d/%d users across %d accounts (cap %d/account): %s",
@@ -538,13 +601,34 @@ func EnsureAssignments(force bool) error {
 		loads = placementPopulation(loads, existing)
 
 		configured := common.ClaudeMaxUsersPerAccount()
-		maxPer := effectiveUserCap(len(loads), len(accounts), configured)
 
-		ideal := computeAssignment(loads, accounts, maxPer)
-		logPlacement(loads, accounts, ideal, configured)
-		curSkew := skew(loads, accounts, cur)
+		// Place only onto accounts lease-time can actually select. `accounts`
+		// stays the full list for reporting and for skew, so an exhausted
+		// account still shows in the log — it just stops receiving people.
+		quotas := accountQuotas(accounts)
+		targets := servableAccounts(accounts, quotas)
+		maxPer := effectiveUserCap(len(loads), len(targets), configured)
+
+		ideal := computeAssignment(loads, targets, maxPer)
+		logPlacement(loads, accounts, ideal, configured, quotas)
+		curSkew := skew(loads, targets, cur)
 		sharingTooWide := overCap(cur, valid, maxPer)
-		rebalance := curSkew > rebalanceSkewFactor || sharingTooWide
+
+		// Users sitting on an exhausted account are ALREADY displaced: the valve
+		// sends every one of their requests to a sibling, so their egress IP is
+		// unstable today. Moving them is not new churn — it is placement catching
+		// up to what lease-time is doing anyway, and it restores a stable box.
+		stranded := 0
+		servable := make(map[string]bool, len(targets))
+		for _, a := range targets {
+			servable[a] = true
+		}
+		for _, acct := range cur {
+			if !servable[acct] {
+				stranded++
+			}
+		}
+		rebalance := curSkew > rebalanceSkewFactor || sharingTooWide || stranded > 0
 
 		var writes []models.ClaudeUserAssignment
 		load := make(map[string]int64, len(loads))
@@ -560,11 +644,16 @@ func EnsureAssignments(force bool) error {
 			case !valid[have]:
 				reason = "account-gone"
 			case rebalance && have != want:
-				// Distinguish the two triggers: an operator reading the table
-				// should be able to tell a load correction from a deliberate
-				// de-sharing, since only the latter is about suspension risk.
+				// Distinguish the triggers: an operator reading the table should
+				// be able to tell a load correction from a deliberate de-sharing
+				// from an evacuation, since they mean different things —
+				// only de-sharing is about suspension risk, and only evacuation
+				// says the old account had run out of quota.
 				reason = "rebalance"
-				if sharingTooWide && curSkew <= rebalanceSkewFactor {
+				switch {
+				case !servable[have]:
+					reason = "exhausted"
+				case sharingTooWide && curSkew <= rebalanceSkewFactor:
 					reason = "user-cap"
 				}
 			default:

@@ -19,8 +19,10 @@ package handler
 // and that concentration — not volume — is what got accounts suspended on
 // 2026-08-04 and again on 2026-08-09. computeAssignment therefore refuses to
 // exceed effectiveUserCap users per account, with load still the primary
-// objective among accounts that have room. The cap is a target: when the pool is
-// too small it degrades to an even spread rather than leaving anyone unplaced.
+// objective among accounts that have room. The cap is a GATE (2026-08-10): when
+// the pool is too small it does NOT widen — the surplus is left unhomed and
+// falls back to HRW at lease time, so the shortfall stays visible instead of
+// being absorbed by over-sharing a subscription.
 //
 // HYSTERESIS is the important part. The assignment IS a user's public egress
 // IP, so churning it would defeat the field boxes. An existing placement is
@@ -32,6 +34,7 @@ package handler
 // in place by that same hysteresis.
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"sort"
@@ -103,6 +106,77 @@ func loadByUser() ([]userLoad, error) {
 	return rows, err
 }
 
+// activeSubsSince returns the users who have drawn on the pool since `cutoff`.
+//
+// MEMBERSHIP and WEIGHT are different questions and must use different windows.
+// loadByUser's 7d window answers "how much does this user draw" — the right
+// horizon for a balance objective. It is the WRONG horizon for "does this user
+// still deserve a slot": using it meant pruneIdleAssignments deleted an idle
+// user and the very next placement re-homed them from the same 7d list, so the
+// reclamation was a no-op that only churned egress IPs.
+func activeSubsSince(cutoff time.Time) (map[string]bool, error) {
+	var subs []string
+	if err := common.DB.Raw(
+		`SELECT DISTINCT user_sub FROM usage_events WHERE kind = 'claude_proxy' AND ts >= ?`,
+		cutoff,
+	).Scan(&subs).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(subs))
+	for _, s := range subs {
+		out[s] = true
+	}
+	return out, nil
+}
+
+// pruneIdleAssignments releases slots held by users who have not touched the
+// pool within the idle window, and reports how many it freed.
+//
+// This is the only code path that deletes a ClaudeUserAssignment. Without it
+// the pool is monotonic: placement deliberately re-adds quiet homed users (see
+// placementPopulation) so the cap counts them, which is correct for accounting
+// but means a single turn months ago holds a subscription slot forever. That
+// was harmless while the cap was a soft target — it simply widened — but under
+// a hard gate a dormant user blocks an active one from ever being homed.
+//
+// Grace: a user placed within the window keeps their slot even with no traffic
+// yet, so a freshly-added human is never evicted before they have had a chance
+// to use the pool.
+//
+//nolint:gocyclo
+func pruneIdleAssignments(idle time.Duration) (int, error) {
+	if idle <= 0 {
+		return 0, nil // reclamation disabled
+	}
+	cutoff := time.Now().UTC().Add(-idle)
+	var rows []models.ClaudeUserAssignment
+	if err := common.DB.Find(&rows).Error; err != nil {
+		return 0, err
+	}
+	freed := 0
+	for _, r := range rows {
+		if r.AssignedAt.After(cutoff) {
+			continue // placed recently — grace period
+		}
+		var last sql.NullTime
+		if err := common.DB.Raw(
+			`SELECT MAX(ts) FROM usage_events WHERE kind = 'claude_proxy' AND user_sub = ?`,
+			r.UserSub,
+		).Scan(&last).Error; err != nil {
+			continue // a lookup failure must never evict
+		}
+		if last.Valid && last.Time.After(cutoff) {
+			continue // active within the window
+		}
+		if err := common.DB.Where("user_sub = ?", r.UserSub).
+			Delete(&models.ClaudeUserAssignment{}).Error; err == nil {
+			freed++
+			log.Printf("claude-pool: released %s's slot on %s — idle since %v", r.UserSub, r.Account, r.AssignedAt.UTC().Format(time.RFC3339))
+		}
+	}
+	return freed, nil
+}
+
 // assignableAccounts returns pooled accounts eligible to host users: present,
 // not quarantined. Quota state is deliberately NOT consulted here — that is a
 // moment-to-moment concern handled at lease time, whereas this is a durable
@@ -125,24 +199,26 @@ func assignableAccounts() ([]string, error) {
 // effectiveUserCap resolves the configured per-account user ceiling against what
 // the pool can physically hold.
 //
-// The cap is a TARGET, not a limit. If it were enforced strictly, a pool with
-// fewer than ceil(users/cap) accounts would have users it could not place at
-// all — and an unplaced user still needs Claude access, so refusing to place is
-// never the right answer. When the cap is infeasible we fall back to the
-// tightest ceiling that IS feasible, ceil(users/accounts), which still bounds
-// the fan-out (it is what forces an even split instead of letting pure load
-// balancing pile 6-7 people onto one subscription) and leaves the caller to
-// report the shortfall.
+// The cap is a GATE. It used to be a target that widened to ceil(users/accounts)
+// when the pool was undersized, which meant a subscription silently absorbed
+// more humans than policy allowed — the exact concentration that got accounts
+// suspended. It no longer widens. An unplaced user is NOT denied access:
+// assignedAccount returns "" and the lease falls through to HRW, so they are
+// served but without a stable egress box, which is the pressure that should
+// drive adding an account.
 //
 // Returns 0 when the cap is disabled or there is nothing to bound.
 func effectiveUserCap(nUsers, nAccounts, configured int) int {
 	if configured <= 0 || nAccounts <= 0 || nUsers <= 0 {
 		return 0
 	}
-	if nUsers <= nAccounts*configured {
-		return configured
-	}
-	return (nUsers + nAccounts - 1) / nAccounts // ceil
+	// The cap is a GATE (operator decision 2026-08-10). It no longer widens to
+	// ceil(nUsers/nAccounts) when the pool is undersized — widening meant an
+	// account silently absorbed more humans than the policy allowed, which is
+	// the suspension risk the cap exists to bound. An undersized pool now
+	// leaves the surplus unhomed (computeAssignment skips them) and they fall
+	// back to HRW at lease time, so nobody loses access.
+	return configured
 }
 
 // computeAssignment runs greedy LPT over the given loads and accounts, refusing
@@ -180,15 +256,12 @@ func computeAssignment(loads []userLoad, accounts []string, maxPer int) map[stri
 			}
 		}
 		if best == "" {
-			// Every account is at the cap. Availability wins over the target:
-			// place on the least-loaded account rather than leaving the user
-			// homeless (which would drop them to the HRW fallback at lease time).
-			best = accounts[0]
-			for _, a := range accounts[1:] {
-				if lighter(a, best) {
-					best = a
-				}
-			}
+			// Every account is at the cap. The cap is a GATE, so we do NOT
+			// over-home: leave this user unplaced and let the lease fall back
+			// to HRW rendezvous placement. They stay served; what they lose is
+			// a stable egress box, which is the correct pressure — the fix is
+			// another account, not a quietly over-shared subscription.
+			continue
 		}
 		out[u.UserSub] = best
 		tot[best] += u.Tokens
@@ -292,6 +365,37 @@ func skew(loads []userLoad, accounts []string, assign map[string]string) float64
 //
 // Serialised across replicas by a MySQL named lock; a replica that cannot get
 // the lock simply skips, since another is already doing the work.
+// StartAssignmentReclaimLoop drives placement on a timer.
+//
+// EnsureAssignments' only other caller is the admin claude-quota endpoint, so
+// before this loop existed reclamation ran only when a human happened to open
+// lum.id/code. That was tolerable for a 30-day window; for a 1-hour one it is
+// not — a slot freed at 02:00 would sit unusable until someone looked at a
+// dashboard. The loop is multi-replica-safe for free: EnsureAssignments takes
+// the `claude_assign` GET_LOCK and no-ops when another replica holds it.
+//
+// Cadence tracks the idle window (quarter of it, clamped) so the reclaim
+// latency stays proportional to the policy rather than being a second
+// independent number to keep in sync.
+func StartAssignmentReclaimLoop() {
+	interval := common.ClaudeAssignmentIdle() / 4
+	if interval < 5*time.Minute {
+		interval = 5 * time.Minute
+	}
+	if interval > time.Hour {
+		interval = time.Hour
+	}
+	go func() {
+		for {
+			time.Sleep(interval)
+			if err := EnsureAssignments(true); err != nil {
+				log.Printf("claude-pool: scheduled reclaim/placement failed: %v", err)
+			}
+		}
+	}()
+	log.Printf("claude-pool: assignment reclaim loop every %v (idle window %v)", interval, common.ClaudeAssignmentIdle())
+}
+
 func EnsureAssignments(force bool) error {
 	if !force && time.Since(lastAssignmentRun) < assignmentTTL {
 		return nil
@@ -308,9 +412,42 @@ func EnsureAssignments(force bool) error {
 		if err != nil || len(accounts) == 0 {
 			return err
 		}
+		// Reclaim dormant slots BEFORE reading `existing`, so freed slots are
+		// available to this same placement pass rather than a later one.
+		idle := common.ClaudeAssignmentIdle()
+		if freed, perr := pruneIdleAssignments(idle); perr != nil {
+			log.Printf("claude-pool: idle-slot reclamation failed: %v", perr)
+		} else if freed > 0 {
+			log.Printf("claude-pool: reclaimed %d idle slot(s)", freed)
+		}
 		loads, err := loadByUser()
 		if err != nil {
 			return err
+		}
+		// Placement membership must honour the SAME window the prune used.
+		// loadByUser's 7d horizon is the load WEIGHT; using it for membership
+		// would re-home the user we just reclaimed, in this very pass, making
+		// reclamation a no-op that only churns egress IPs. Keep a user if they
+		// are active within the idle window, or still homed (i.e. they survived
+		// the prune, i.e. active or inside their grace period).
+		if idle > 0 {
+			active, aerr := activeSubsSince(time.Now().UTC().Add(-idle))
+			if aerr != nil {
+				return aerr // never silently fall back to the wider population
+			}
+			var surviving []models.ClaudeUserAssignment
+			common.DB.Find(&surviving)
+			homed := make(map[string]bool, len(surviving))
+			for _, s := range surviving {
+				homed[s.UserSub] = true
+			}
+			kept := loads[:0]
+			for _, u := range loads {
+				if active[u.UserSub] || homed[u.UserSub] {
+					kept = append(kept, u)
+				}
+			}
+			loads = kept
 		}
 		var existing []models.ClaudeUserAssignment
 		common.DB.Find(&existing)

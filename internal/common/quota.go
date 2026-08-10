@@ -48,12 +48,28 @@ const (
 	// token load equalises the wrong thing; it will happily pile seven people
 	// onto one subscription as long as their combined draw is even.
 	//
-	// 3 is a deliberate step toward 1 account <-> 1 human, which is the only
-	// shape that is actually correct. It is a TARGET, not a hard limit: when the
-	// pool is too small to honour it the balancer spreads evenly instead of
-	// refusing to place anyone (see effectiveUserCap), so availability never
-	// depends on having enough accounts.
-	DefaultClaudeMaxUsersPerAccount = 3
+	// 5 is a HARD GATE, not a target: the balancer will not home a 6th user on
+	// an account, even when the pool is too small to place everyone. Overflow
+	// users are left unhomed and fall back to HRW rendezvous placement at lease
+	// time (see admin_claude_quota.go) — they are still SERVED, they just have
+	// no stable egress box. Operator decision 2026-08-10, replacing the earlier
+	// soft-target semantics where an undersized pool silently widened the cap.
+	DefaultClaudeMaxUsersPerAccount = 5
+
+	// DefaultClaudeAssignmentIdle is how long a homed user may go without using
+	// the pool before their slot is released.
+	//
+	// Nothing else ever deletes a ClaudeUserAssignment, so before this existed a
+	// single turn months ago held a subscription slot forever. Harmless while
+	// the user cap was a soft target (it just widened); under a hard gate a
+	// dormant user directly blocks an active one from being homed.
+	//
+	// 1h is deliberately aggressive: with more users than slots, a slot should
+	// belong to whoever is actually working, not to whoever claimed it first.
+	// The cost is egress-IP churn — the assignment IS the user's public egress
+	// box — so a user returning after a break may come back on a different box.
+	// That is an accepted trade here, not an oversight. 0 disables.
+	DefaultClaudeAssignmentIdle = time.Hour
 )
 
 // Limits captures the headline numbers the UI surfaces alongside today's totals.
@@ -201,6 +217,22 @@ func ClaudePoolLimits() (fiveH, sevenD int) {
 // honoured as "disabled" instead of silently falling back to the default.
 func ClaudeMaxUsersPerAccount() int {
 	return envIntNonNeg("LUMID_CLAUDE_MAX_USERS_PER_ACCOUNT", DefaultClaudeMaxUsersPerAccount)
+}
+
+// ClaudeAssignmentIdle is the env-tunable dormancy window after which a homed
+// user's slot is released. Accepts a Go duration ("90m", "24h"); "0" disables
+// reclamation entirely. An unparseable value falls back to the default rather
+// than silently disabling reclamation.
+func ClaudeAssignmentIdle() time.Duration {
+	v := strings.TrimSpace(os.Getenv("LUMID_CLAUDE_ASSIGNMENT_IDLE"))
+	if v == "" {
+		return DefaultClaudeAssignmentIdle
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return DefaultClaudeAssignmentIdle
+	}
+	return d
 }
 
 // envIntNonNeg is envIntPos but admits 0, for knobs where 0 means "off".

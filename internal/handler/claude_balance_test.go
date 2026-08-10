@@ -128,36 +128,48 @@ func TestUserCapBoundsFanOut(t *testing.T) {
 	}
 }
 
-// The live pool: 15 users, 3 accounts, target 3. That needs 5 accounts, so the
-// target is infeasible and must degrade to the tightest feasible ceiling — an
-// even 5 per account — rather than refusing to place anyone.
-func TestUserCapDegradesToEvenSpreadWhenPoolTooSmall(t *testing.T) {
+// The live pool: 15 users, 3 accounts, target 3. The cap is a GATE (2026-08-10):
+// it must NOT widen to ceil(15/3)=5 just because the pool is undersized. The
+// surplus is left unhomed and falls back to HRW at lease time.
+func TestUserCapDoesNotWidenWhenPoolTooSmall(t *testing.T) {
 	accounts := []string{"i", "sail@mlsys.io", "ytb"}
 	maxPer := effectiveUserCap(len(observed), len(accounts), 3)
-	if maxPer != 5 {
-		t.Fatalf("effectiveUserCap = %d, want 5 = ceil(15/3)", maxPer)
+	if maxPer != 3 {
+		t.Fatalf("effectiveUserCap = %d, want 3 — the cap is a gate, not a target", maxPer)
 	}
 	got := counts(computeAssignment(observed, accounts, maxPer))
-	if len(got) != len(accounts) {
-		t.Fatalf("used %d accounts, want %d", len(got), len(accounts))
-	}
 	for acct, n := range got {
-		if n != 5 {
-			t.Errorf("account %s homes %d users, want an even 5", acct, n)
+		if n > maxPer {
+			t.Errorf("account %s homes %d users, gate is %d", acct, n, maxPer)
 		}
+	}
+	total := 0
+	for _, n := range got {
+		total += n
+	}
+	if want := len(accounts) * 3; total != want {
+		t.Errorf("homed %d users, want exactly %d (3 accounts x gate 3)", total, want)
+	}
+	if total >= len(observed) {
+		t.Errorf("expected a surplus to be left unhomed, homed all %d", total)
 	}
 }
 
-// Availability outranks the target: every user must still get a home, even when
-// the cap cannot be met. An unplaced user drops to the HRW fallback at lease
-// time, which silently undoes the pinning the cap exists to enforce.
-func TestUserCapNeverLeavesAUserUnplaced(t *testing.T) {
+// The gate deliberately leaves a surplus unplaced when the pool is too small.
+// An unhomed user is NOT denied access — assignedAccount returns "" and the
+// lease falls through to HRW — but they lose a stable egress box, which is the
+// pressure that should drive adding an account.
+func TestUserCapLeavesSurplusUnplaced(t *testing.T) {
 	accounts := []string{"only"}
-	for _, maxPer := range []int{0, 1, 3, effectiveUserCap(len(observed), 1, 1)} {
+	for _, maxPer := range []int{1, 3} {
 		assign := computeAssignment(observed, accounts, maxPer)
-		if len(assign) != len(observed) {
-			t.Errorf("maxPer=%d placed %d of %d users", maxPer, len(assign), len(observed))
+		if len(assign) != maxPer {
+			t.Errorf("maxPer=%d homed %d users, want exactly %d", maxPer, len(assign), maxPer)
 		}
+	}
+	// 0 still means "cap disabled" — everyone gets a home.
+	if assign := computeAssignment(observed, accounts, 0); len(assign) != len(observed) {
+		t.Errorf("maxPer=0 (disabled) homed %d of %d", len(assign), len(observed))
 	}
 }
 

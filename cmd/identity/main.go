@@ -43,6 +43,7 @@ func main() {
 	// Keep pool account quota snapshots warm so leases stay on the fast cache
 	// path (never re-probe inline, which serialized fan-out bursts → spurious 503).
 	handler.StartSnapshotRefreshLoop()
+	handler.StartAssignmentReclaimLoop()
 
 	// Sweep expired auto-minted claude-sandbox PATs hourly.
 	handler.StartClaudeSandboxPATSweep()

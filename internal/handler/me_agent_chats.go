@@ -40,10 +40,15 @@ var chatIDRe = regexp.MustCompile(`^chat-[a-f0-9]{16}$`)
 // JSON-as-is (whatever the frontend sends) so we don't have to keep
 // the wire format in lockstep with the message type as it evolves.
 type chatRecord struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// TitleSummary marks Title as a generated summary rather than the
+	// truncated first user message. It is what stops the summary being
+	// regenerated on every save AND stops inferTitle overwriting it — see
+	// me_agent_chat_title.go.
+	TitleSummary bool   `json:"title_summary,omitempty"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
 	// Messages is a free-form array of objects matching the frontend
 	// Message type — {role, content, tools?, thinking?, ...}.
 	Messages []map[string]any `json:"messages"`
@@ -264,7 +269,11 @@ func MeChatSave(c *gin.Context) {
 	if body.App != "" {
 		rec.App = body.App
 	}
-	rec.Title = inferTitle(body.Messages)
+	// Only re-derive the truncated title while the thread has no generated
+	// summary — otherwise every save would undo the summary.
+	if !rec.TitleSummary {
+		rec.Title = inferTitle(body.Messages)
+	}
 	rec.UpdatedAt = now
 
 	if err := os.MkdirAll(chatsDir(userID), 0o755); err != nil {
@@ -280,19 +289,29 @@ func MeChatSave(c *gin.Context) {
 		fail(c, http.StatusRequestEntityTooLarge, 1413, fmt.Sprintf("chat exceeds %d bytes — split into a new thread", chatMaxBytes))
 		return
 	}
+	// Held across write+rename so an in-flight title rewrite (which does its
+	// own read-modify-write) can't interleave and drop this transcript.
+	chatFileMu.Lock()
 	tmp := chatPath(userID, rec.ID) + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write: "+err.Error())
-		return
+	werr := os.WriteFile(tmp, buf, 0o644)
+	if werr == nil {
+		if werr = os.Rename(tmp, chatPath(userID, rec.ID)); werr != nil {
+			_ = os.Remove(tmp)
+		}
 	}
-	if err := os.Rename(tmp, chatPath(userID, rec.ID)); err != nil {
-		_ = os.Remove(tmp)
-		fail(c, http.StatusInternalServerError, 1500, "rename: "+err.Error())
+	chatFileMu.Unlock()
+	if werr != nil {
+		fail(c, http.StatusInternalServerError, 1500, "write: "+werr.Error())
 		return
 	}
 
 	if isNew {
 		go pruneChats(userID, chatsKeep)
+	}
+	// Fire-and-forget: replaces the truncated title with a generated summary
+	// once the thread has a reply to summarize. No-op if it already has one.
+	if !rec.TitleSummary {
+		maybeSummarizeChatTitle(userID, rec.ID, rec.Messages)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

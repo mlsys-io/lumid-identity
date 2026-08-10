@@ -728,6 +728,10 @@ type fieldBoxRow struct {
 	InputTokens   int64     `json:"input_tokens"`
 	OutputTokens  int64     `json:"output_tokens"`
 	LastTs        time.Time `json:"last_ts"`
+	// Fingerprint is the SDK User-Agent/X-Stainless-* fingerprint claude-proxy is
+	// currently attaching to this box's egress — nil for the "" direct row and for
+	// any homed-but-unconfigured label. See claude_field_fingerprint.go.
+	Fingerprint *fieldFingerprintInfo `json:"fingerprint,omitempty"`
 }
 
 // AdminClaudeFieldBoxes — GET /api/v1/admin/claude-field-boxes?hours=24
@@ -852,6 +856,21 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 			rows = append(rows, fieldBoxRow{FieldBox: h.Label, HomedUsers: h.N})
 			idx[h.Label] = len(rows) - 1
 		}
+	}
+
+	// Fingerprint chip — only for rows backed by an actual configured relay
+	// (fieldRelays), never the "" direct row and never a homed-but-unconfigured
+	// label (claude-proxy has nothing to attach a fingerprint to there either).
+	now := time.Now()
+	for i, r := range rows {
+		if r.FieldBox == "" {
+			continue
+		}
+		if _, ok := fieldRelays[r.FieldBox]; !ok {
+			continue
+		}
+		fp := fingerprintInfoForLabel(r.FieldBox, now)
+		rows[i].Fingerprint = &fp
 	}
 
 	var totalReq, totalResp, totalTurns, totalDegraded int64

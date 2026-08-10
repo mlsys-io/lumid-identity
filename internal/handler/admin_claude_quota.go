@@ -1243,6 +1243,101 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	})
 }
 
+// AdminClaudeAccountUsers reports how many distinct users are homed on each
+// pooled account right now, straight from claude_user_assignments — the
+// ground truth the user-count cap (ClaudeMaxUsersPerAccount) enforces
+// against. Exists so the cap can be verified via API instead of a raw
+// production DB query.
+//
+// GET /api/v1/admin/claude-account-users  (RequireAdmin)
+func AdminClaudeAccountUsers(c *gin.Context) {
+	rows := []struct {
+		Account    string
+		Label      string
+		UserSub    string
+		Email      string
+		Load7d     int64
+		AssignedAt time.Time
+		Reason     string
+	}{}
+	err := common.DB.Raw(`
+		SELECT a.account                     AS account,
+		       COALESCE(t.label, '')         AS label,
+		       a.user_sub                    AS user_sub,
+		       COALESCE(u.email, a.user_sub) AS email,
+		       a.load_7d                     AS load_7d,
+		       a.assigned_at                 AS assigned_at,
+		       a.reason                      AS reason
+		FROM   claude_user_assignments a
+		LEFT JOIN users u ON u.id = a.user_sub
+		LEFT JOIN claude_quota_tokens t ON t.email = a.account
+		ORDER  BY a.account, a.assigned_at DESC`).Scan(&rows).Error
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "query assignments: "+err.Error())
+		return
+	}
+
+	type userEntry struct {
+		UserSub    string    `json:"user_sub"`
+		Email      string    `json:"email"`
+		Load7d     int64     `json:"load_7d"`
+		AssignedAt time.Time `json:"assigned_at"`
+		Reason     string    `json:"reason"`
+	}
+	type accountGroup struct {
+		Account   string      `json:"account"`
+		Label     string      `json:"label,omitempty"`
+		NUsers    int         `json:"n_users"`
+		OverCap   bool        `json:"over_cap"`
+		TotalLoad int64       `json:"total_load_7d"`
+		Users     []userEntry `json:"users"`
+	}
+	byAccount := map[string]*accountGroup{}
+	order := []string{}
+	for _, r := range rows {
+		g, ok := byAccount[r.Account]
+		if !ok {
+			g = &accountGroup{Account: r.Account, Label: r.Label}
+			byAccount[r.Account] = g
+			order = append(order, r.Account)
+		}
+		g.Users = append(g.Users, userEntry{
+			UserSub: r.UserSub, Email: r.Email, Load7d: r.Load7d,
+			AssignedAt: r.AssignedAt, Reason: r.Reason,
+		})
+		g.NUsers++
+		g.TotalLoad += r.Load7d
+	}
+
+	// Deterministic account-name order (insertion sort — small N, avoids a new import).
+	for i := 1; i < len(order); i++ {
+		for j := i; j > 0 && order[j] < order[j-1]; j-- {
+			order[j], order[j-1] = order[j-1], order[j]
+		}
+	}
+
+	userCap := common.ClaudeMaxUsersPerAccount()
+	overCapAccounts := 0
+	groups := make([]accountGroup, 0, len(order))
+	for _, acct := range order {
+		g := byAccount[acct]
+		if userCap > 0 && g.NUsers > userCap {
+			g.OverCap = true
+			overCapAccounts++
+		}
+		groups = append(groups, *g)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{
+			"accounts":          groups,
+			"configured_cap":    userCap,
+			"over_cap_accounts": overCapAccounts,
+		},
+	})
+}
+
 // reportBody is the wire shape for the legacy bridge path.
 type claudeQuotaReportBody struct {
 	Email         string  `json:"email"          binding:"required"`

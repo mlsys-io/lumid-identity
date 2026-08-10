@@ -708,7 +708,18 @@ func MeClaudeRecordingSet(c *gin.Context) {
 type fieldBoxRow struct {
 	// FieldBox "" means the turn was dispatched DIRECT from the cluster
 	// (unlabelled account) — rendered as "(direct)".
-	FieldBox      string    `json:"field_box"`
+	FieldBox string `json:"field_box"`
+	// HomedUsers is how many users are ASSIGNED to this box right now — the
+	// placement truth from claude_user_assignments (each field box holds one
+	// pooled account), and the number a rebalance actually moves. This is what
+	// "balance users, then load" is decided on.
+	HomedUsers int64 `json:"homed_users"`
+	// ActiveUsers is DISTINCT users whose turns egressed through this box in
+	// the window. It is NOT placement: a lease rotation sends one user through
+	// several boxes, so on live data this runs higher than HomedUsers and the
+	// per-box values overlap heavily. Read it as "who touched this box", and
+	// read HomedUsers for balance.
+	ActiveUsers   int64     `json:"active_users"`
 	Turns         int64     `json:"turns"`
 	ViaRelay      int64     `json:"via_relay"`
 	NotViaRelay   int64     `json:"not_via_relay"`
@@ -729,6 +740,18 @@ type fieldBoxRow struct {
 //
 // Byte columns only cover turns recorded after the proxy started reporting them;
 // older rows read 0 rather than being back-filled with a guess.
+//
+// Two user counts per box, and they answer different questions:
+//   - homed_users  — users ASSIGNED to the box's account right now. Current
+//     state, unaffected by the window. This is the balancing number.
+//   - active_users — distinct users whose turns actually took the box in the
+//     window. Traffic, not placement.
+//
+// They diverge by design: leases rotate, so one user's turns spread across
+// several boxes and the active column overlaps between rows. active_users also
+// undercounts — recording is per-user opt-out (ClaudeRecordingPref) and an
+// opted-out user's turns are never written here, so they use the box invisibly.
+// Treat active as a floor; treat homed as authoritative.
 func AdminClaudeFieldBoxes(c *gin.Context) {
 	hours := 24
 	if v := strings.TrimSpace(c.Query("hours")); v != "" {
@@ -738,19 +761,25 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 	}
 	since := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
 
+	// The user count needs the JOIN: turns carry the routing (field_box,
+	// via_relay) but not the identity — user_sub lives on the session. Join is
+	// LEFT so a turn whose session row is missing still counts toward traffic
+	// instead of vanishing from the table; it just contributes no user.
 	var rows []fieldBoxRow
-	err := common.DB.Model(&models.ClaudeSessionTurn{}).
-		Select(`field_box,
-		        COUNT(*)                                   AS turns,
-		        SUM(CASE WHEN via_relay THEN 1 ELSE 0 END) AS via_relay,
-		        SUM(CASE WHEN via_relay THEN 0 ELSE 1 END) AS not_via_relay,
-		        COALESCE(SUM(request_bytes),0)             AS request_bytes,
-		        COALESCE(SUM(response_bytes),0)            AS response_bytes,
-		        COALESCE(SUM(input_tokens),0)              AS input_tokens,
-		        COALESCE(SUM(output_tokens),0)             AS output_tokens,
-		        MAX(ts)                                    AS last_ts`).
-		Where("ts >= ?", since).
-		Group("field_box").
+	err := common.DB.Table("claude_session_turns AS t").
+		Joins("LEFT JOIN claude_sessions AS s ON s.conv_key = t.conv_key").
+		Select(`t.field_box                                    AS field_box,
+		        COUNT(DISTINCT s.user_sub)                      AS active_users,
+		        COUNT(*)                                        AS turns,
+		        SUM(CASE WHEN t.via_relay THEN 1 ELSE 0 END)    AS via_relay,
+		        SUM(CASE WHEN t.via_relay THEN 0 ELSE 1 END)    AS not_via_relay,
+		        COALESCE(SUM(t.request_bytes),0)                AS request_bytes,
+		        COALESCE(SUM(t.response_bytes),0)               AS response_bytes,
+		        COALESCE(SUM(t.input_tokens),0)                 AS input_tokens,
+		        COALESCE(SUM(t.output_tokens),0)                AS output_tokens,
+		        MAX(t.ts)                                       AS last_ts`).
+		Where("t.ts >= ?", since).
+		Group("t.field_box").
 		Order("response_bytes DESC").
 		Scan(&rows).Error
 	if err != nil {
@@ -789,11 +818,62 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 		}
 	}
 
+	// Homed users per box. Separate query on purpose: placement is CURRENT
+	// state, not a property of the time window, so it must not be filtered by
+	// `since` the way the traffic aggregate is. A box with zero turns in the
+	// last hour still has its users homed on it, and that is exactly the case
+	// where an operator is asking "who is on this box".
+	//
+	// The box label lives on the ACCOUNT (claude_quota_tokens.label), and each
+	// field box holds one account, so grouping assignments by that label is the
+	// per-box user count.
+	var homed []struct {
+		Label string
+		N     int64
+	}
+	if err := common.DB.Table("claude_user_assignments AS a").
+		Joins("LEFT JOIN claude_quota_tokens AS t ON t.email = a.account").
+		Select("COALESCE(t.label,'') AS label, COUNT(*) AS n").
+		Group("t.label").
+		Scan(&homed).Error; err == nil {
+		idx := make(map[string]int, len(rows))
+		for i, r := range rows {
+			idx[r.FieldBox] = i
+		}
+		for _, h := range homed {
+			if i, ok := idx[h.Label]; ok {
+				rows[i].HomedUsers = h.N
+				continue
+			}
+			// A box with users homed on it but no traffic in the window and no
+			// relay entry. Surface it rather than dropping it — users homed on
+			// a box that is not routing is precisely the misconfiguration this
+			// panel exists to catch.
+			rows = append(rows, fieldBoxRow{FieldBox: h.Label, HomedUsers: h.N})
+			idx[h.Label] = len(rows) - 1
+		}
+	}
+
 	var totalReq, totalResp, totalTurns, totalDegraded int64
 	for _, r := range rows {
 		totalReq += r.RequestBytes
 		totalResp += r.ResponseBytes
 		totalTurns += r.Turns
+	}
+	// Distinct across the whole window, NOT the sum of the per-box counts — one
+	// user can span several boxes (lease rotation moves them), so summing the
+	// column would over-report the population. On live data the sum runs ~2.6x
+	// the distinct total; the two disagreeing is normal, not a bug.
+	var totalActive int64
+	common.DB.Table("claude_session_turns AS t").
+		Joins("JOIN claude_sessions AS s ON s.conv_key = t.conv_key").
+		Where("t.ts >= ?", since).
+		Distinct("s.user_sub").
+		Count(&totalActive)
+	// Homed totals DO sum: an assignment pins a user to exactly one account.
+	var totalHomed int64
+	for _, r := range rows {
+		totalHomed += r.HomedUsers
 	}
 	// Degraded is counted with its own query so the per-row NotViaRelay stays a
 	// raw fact while the ALERTABLE total is restricted to turns the signal
@@ -812,6 +892,10 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 		"boxes":        rows,
 		"signal_since": signalStart,
 		"totals": gin.H{
+			// Users assigned across all boxes (sums cleanly), and distinct users
+			// seen in the window (deliberately NOT the sum of the column).
+			"homed_users":    totalHomed,
+			"active_users":   totalActive,
 			"turns":          totalTurns,
 			"request_bytes":  totalReq,
 			"response_bytes": totalResp,

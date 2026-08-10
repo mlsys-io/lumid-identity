@@ -542,6 +542,7 @@ func Register(r *gin.Engine) {
 		{
 			adminQuota.GET("/claude-quota", AdminClaudeQuota)
 			adminQuota.GET("/claude-user-usage", AdminClaudeUserUsage)
+			adminQuota.GET("/claude-account-users", AdminClaudeAccountUsers)
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
 			// Label-only update — move an account between field boxes without

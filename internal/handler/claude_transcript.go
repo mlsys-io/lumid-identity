@@ -731,7 +731,14 @@ type fieldBoxRow struct {
 	// Fingerprint is the SDK User-Agent/X-Stainless-* fingerprint claude-proxy is
 	// currently attaching to this box's egress — nil for the "" direct row and for
 	// any homed-but-unconfigured label. See claude_field_fingerprint.go.
-	Fingerprint *fieldFingerprintInfo `json:"fingerprint,omitempty"`
+	//
+	// gorm:"-" is required: fieldBoxRow is also a raw-SQL Scan target below, and
+	// without it GORM's schema parser treats this pointer-to-struct field as an
+	// association needing a foreign key, erroring the whole query ("invalid field
+	// found for struct ... Fingerprint: define a valid foreign key for relations
+	// or implement the Valuer/Scanner interface"). This field is only ever filled
+	// by the Go loop after the Scan, never by SQL.
+	Fingerprint *fieldFingerprintInfo `json:"fingerprint,omitempty" gorm:"-"`
 }
 
 // AdminClaudeFieldBoxes — GET /api/v1/admin/claude-field-boxes?hours=24

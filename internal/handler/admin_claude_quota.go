@@ -27,7 +27,6 @@ package handler
 import (
 	"bytes"
 	"crypto/sha256"
-	"database/sql"
 	base64Stdlib "encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -1064,40 +1063,59 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	fail(c, http.StatusServiceUnavailable, 1503, "no pooled account with available quota")
 }
 
-// AdminClaudeUserUsage lists per-user pool consumption over the rolling
-// 5h/7d windows — the per-PAT/user counterpart of the account quota table.
+// AdminClaudeUserUsage lists per-user pool consumption over the fixed 5h/7d
+// windows anchored in claude_pool_windows — the per-PAT/user counterpart of
+// the account quota table.
 //
 // GET /api/v1/admin/claude-user-usage  (RequireAdmin)
 func AdminClaudeUserUsage(c *gin.Context) {
 	now := time.Now().UTC()
+	far := now.AddDate(100, 0, 0)
+
+	// One row per user who has ever committed a claude_proxy charge — a
+	// claude_pool_windows row only exists once ClaudePoolCommit has run,
+	// which only happens right after a usage_events row for that user was
+	// created, so the INNER JOIN below never drops a real user.
+	//
+	// five_eff/seven_eff are each either the LIVE anchor (still within its
+	// window) or the far-future sentinel — mirrors ClaudePoolUsage's
+	// per-user logic, just computed once for the whole table instead of a
+	// query per user. Model inclusion is left broader than poolCapApplies
+	// deliberately (this admin table intentionally surfaces ALL claude_proxy
+	// spend per user, not just what counts against the pool cap).
 	rows := []struct {
-		UserSub   string
-		Email     string
-		Win       string
-		Tokens    int
-		CostCents int
-		Reqs      int
-		LastTs    time.Time
+		UserSub     string
+		Email       string
+		FiveTokens  int
+		SevenTokens int
+		CostCents   int
+		Reqs        int
+		LastTs      time.Time
 	}{}
 	err := common.DB.Raw(`
-		SELECT ue.user_sub                                        AS user_sub,
-		       COALESCE(u.email, ue.user_sub)                     AS email,
-		       CASE WHEN ue.ts >= ? THEN '5h' ELSE '7d' END       AS win,
-		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens,
-		       COALESCE(SUM(ue.cost_cents), 0)                    AS cost_cents,
-		       COUNT(*)                                           AS reqs,
-		       MAX(ue.ts)                                         AS last_ts
+		SELECT ue.user_sub                                                              AS user_sub,
+		       COALESCE(u.email, ue.user_sub)                                           AS email,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN ue.input_tokens + ue.output_tokens ELSE 0 END), 0) AS five_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.input_tokens + ue.output_tokens ELSE 0 END), 0) AS seven_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.cost_cents ELSE 0 END), 0)                      AS cost_cents,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN 1 ELSE 0 END), 0)                                  AS reqs,
+		       MAX(ue.ts)                                                               AS last_ts
 		FROM   usage_events ue
+		JOIN  (SELECT user_sub,
+		              CASE WHEN five_hour_anchor + INTERVAL 5 HOUR > ? THEN five_hour_anchor ELSE ? END AS five_eff,
+		              CASE WHEN seven_day_anchor + INTERVAL 7 DAY > ? THEN seven_day_anchor ELSE ? END AS seven_eff
+		       FROM   claude_pool_windows) w ON w.user_sub = ue.user_sub
 		LEFT JOIN users u ON u.id = ue.user_sub
-		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
-		GROUP  BY ue.user_sub, u.email, win`,
-		now.Add(-5*time.Hour), now.Add(-7*24*time.Hour)).Scan(&rows).Error
+		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= LEAST(w.five_eff, w.seven_eff)
+		GROUP  BY ue.user_sub, u.email`,
+		now, far, now, far).Scan(&rows).Error
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query usage: "+err.Error())
 		return
 	}
 
-	// Per-model breakdown over the 7d window.
+	// Per-model breakdown, anchor-bounded to the 7d window (same seven_eff
+	// shape as above, recomputed inline since this is a separate query).
 	modelRows := []struct {
 		UserSub   string
 		Model     string
@@ -1110,9 +1128,12 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens,
 		       COALESCE(SUM(ue.cost_cents), 0)                    AS cost_cents
 		FROM   usage_events ue
-		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
+		JOIN  (SELECT user_sub,
+		              CASE WHEN seven_day_anchor + INTERVAL 7 DAY > ? THEN seven_day_anchor ELSE ? END AS seven_eff
+		       FROM   claude_pool_windows) w ON w.user_sub = ue.user_sub
+		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= w.seven_eff
 		GROUP  BY ue.user_sub, ue.model`,
-		now.Add(-7*24*time.Hour)).Scan(&modelRows)
+		now, far).Scan(&modelRows)
 
 	// Also find users who hold a claude:proxy (or wildcard) PAT used recently
 	// — they show even if chargeUser failed (0/0 token rows).
@@ -1137,28 +1158,13 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		now.Add(-7*24*time.Hour)).Scan(&patHolders)
 
 	cap5, cap7 := common.ClaudePoolLimits()
-	// Third query: oldest event per user, per window — used to compute reset times.
-	// five_hour_reset = oldest event WITHIN the last 5h, +5h (when that event ages out).
-	// seven_day_reset = oldest event across the FULL 7d window, +7d — NOT the oldest
-	// event older than 5h. A prior version bucketed "7d" as strictly-older-than-5h,
-	// so any user whose entire 7-day history fell inside the trailing 5h (a light or
-	// new user, or anyone right after a burst) got NO row for that bucket at all —
-	// SevenDayReset stayed the Go zero-value while SevenDayPct was still correctly
-	// non-zero (it always includes the 5h bucket, see the accumulation loop below),
-	// so the dashboard showed a usage bar with a blank/missing countdown next to it.
-	oldestRows := []struct {
-		UserSub  string
-		Oldest5h sql.NullTime
-		Oldest7d time.Time
-	}{}
-	common.DB.Raw(`
-		SELECT ue.user_sub                                        AS user_sub,
-		       MIN(CASE WHEN ue.ts >= ? THEN ue.ts END)           AS oldest5h,
-		       MIN(ue.ts)                                         AS oldest7d
-		FROM   usage_events ue
-		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
-		GROUP  BY ue.user_sub`,
-		now.Add(-5*time.Hour), now.Add(-7*24*time.Hour)).Scan(&oldestRows)
+
+	// Anchor rows, for the reset instants — a trivial small-table read
+	// (claude_pool_windows has at most one row per user who's ever used the
+	// pool, PK-indexed) plus a Go-side ClaudeWindowLive per row, replacing
+	// the old oldest-event query entirely.
+	var anchorRows []models.ClaudePoolWindow
+	common.DB.Find(&anchorRows)
 
 	type modelUsage struct {
 		Tokens    int `json:"tokens_7d"`
@@ -1173,8 +1179,8 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		CostCents7d   int                   `json:"cost_cents_7d"`
 		Requests      int                   `json:"requests_7d"`
 		LastTs        time.Time             `json:"last_ts"`
-		FiveHourReset time.Time             `json:"five_hour_reset"`
-		SevenDayReset time.Time             `json:"seven_day_reset"`
+		FiveHourReset string                `json:"five_hour_reset,omitempty"`
+		SevenDayReset string                `json:"seven_day_reset,omitempty"`
 		Models        map[string]modelUsage `json:"models"`
 	}
 	byUser := map[string]*userUsage{}
@@ -1184,26 +1190,24 @@ func AdminClaudeUserUsage(c *gin.Context) {
 			u = &userUsage{Email: r.Email, Models: map[string]modelUsage{}}
 			byUser[r.UserSub] = u
 		}
-		if r.Win == "5h" {
-			u.FiveHour += r.Tokens
-		}
-		u.SevenDay += r.Tokens       // 5h bucket is inside the 7d window
-		u.CostCents7d += r.CostCents // accumulate cost from both buckets (7d total)
-		u.Requests += r.Reqs
-		if r.LastTs.After(u.LastTs) {
-			u.LastTs = r.LastTs
-		}
+		u.FiveHour = r.FiveTokens
+		u.SevenDay = r.SevenTokens
+		u.CostCents7d = r.CostCents
+		u.Requests = r.Reqs
+		u.LastTs = r.LastTs
 	}
-	// Attach per-user reset times from oldest-event query.
-	for _, or_ := range oldestRows {
-		u, ok := byUser[or_.UserSub]
+	// Attach per-user reset times from the anchor table.
+	for _, win := range anchorRows {
+		u, ok := byUser[win.UserSub]
 		if !ok {
 			continue
 		}
-		if or_.Oldest5h.Valid {
-			u.FiveHourReset = or_.Oldest5h.Time.Add(5 * time.Hour)
+		if live, resetAt := common.ClaudeWindowLive(win.FiveHourAnchor, 5*time.Hour, now); live {
+			u.FiveHourReset = resetAt.UTC().Format(time.RFC3339)
 		}
-		u.SevenDayReset = or_.Oldest7d.Add(7 * 24 * time.Hour)
+		if live, resetAt := common.ClaudeWindowLive(win.SevenDayAnchor, 7*24*time.Hour, now); live {
+			u.SevenDayReset = resetAt.UTC().Format(time.RFC3339)
+		}
 	}
 	// Attach per-model breakdown.
 	for _, mr := range modelRows {

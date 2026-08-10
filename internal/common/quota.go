@@ -163,9 +163,14 @@ type ChargeRes struct {
 	Limits     Limits `json:"limits"`
 	ResetAt    string `json:"reset_at"`
 	// kind=claude_proxy only: the user's pool utilization after this charge,
-	// as a percentage of the rolling 5h/7d token caps.
+	// as a percentage of the fixed-window 5h/7d token caps.
 	FiveHourPct *float64 `json:"five_hour_pct,omitempty"`
 	SevenDayPct *float64 `json:"seven_day_pct,omitempty"`
+	// kind=claude_proxy only: when each window fully resets (RFC3339), or
+	// empty when that window is idle (no anchor, or its window has expired
+	// with no charge yet to open a fresh one).
+	FiveHourReset string `json:"five_hour_reset,omitempty"`
+	SevenDayReset string `json:"seven_day_reset,omitempty"`
 }
 
 // poolCapApplies reports whether a model's usage counts against the Anthropic
@@ -208,44 +213,142 @@ func envIntNonNeg(key string, def int) int {
 	return def
 }
 
-// ClaudePoolWindows returns one user's claude_proxy token usage over the
-// rolling 5h and 7d windows.
+// ClaudeWindowLive reports whether a fixed window anchored at `anchor` with
+// length `windowLen` is still live at `now`, and the instant it resets. A
+// zero anchor (window never opened) is never live. The boundary is
+// expired-inclusive: now == anchor+windowLen is NOT live — that instant is
+// exactly when the window is fully spent and a fresh one may open.
+func ClaudeWindowLive(anchor time.Time, windowLen time.Duration, now time.Time) (live bool, resetAt time.Time) {
+	if anchor.IsZero() {
+		return false, time.Time{}
+	}
+	resetAt = anchor.Add(windowLen)
+	return now.Before(resetAt), resetAt
+}
+
+// claudePoolFarFuture is a sentinel bound used in place of a non-live
+// window's anchor, so a SQL "ts >= sentinel" branch always contributes zero
+// rows instead of risking a zero-value time.Time (year 1) hitting the MySQL
+// DATETIME range.
+func claudePoolFarFuture(now time.Time) time.Time {
+	return now.AddDate(100, 0, 0)
+}
+
+// ClaudePoolStatus is one user's claude_proxy pool usage under the
+// fixed-window (anchor-based) accounting. A zero Reset means that window is
+// idle: no anchor yet, or its window fully expired with no charge since to
+// open a fresh one — in both cases Used is 0.
+type ClaudePoolStatus struct {
+	FiveHourUsed  int
+	SevenDayUsed  int
+	FiveHourReset time.Time
+	SevenDayReset time.Time
+}
+
+// formatPoolReset renders a ClaudePoolStatus reset instant for ChargeRes —
+// RFC3339, or empty when the window is idle. Matches ResetAt's existing
+// string convention and exactly what claude-proxy's chargeRes already
+// expects on the wire.
+func formatPoolReset(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// ClaudePoolUsage returns one user's claude_proxy token usage under the
+// fixed 5h/7d windows anchored in claude_pool_windows. Read-only and
+// side-effect-free — safe to call from a dry-run gate check or a display
+// handler with no risk of starting anyone's clock; only ClaudePoolCommit
+// opens or rolls an anchor.
 //
-// The model filter MIRRORS poolCapApplies: only usage that actually consumes the
-// Anthropic account pool counts toward the windows. Without it, external-API
-// models (kimi-k3, glm, …) — which bill to our own provider keys and are exempt
-// from the cap check — still inflated the window and burned the user's Claude
-// quota. They have no prompt caching, so a single agentic turn re-sends the whole
-// context (observed 75k–296k uncached input tokens per request), which exhausted
-// a 1.5M/5h cap in a handful of calls.
-func ClaudePoolWindows(db *gorm.DB, userSub string) (fiveH, sevenD int, err error) {
-	now := time.Now().UTC()
-	rows := []struct {
-		Win    string
-		Tokens int
-	}{}
-	err = db.Raw(`
-		SELECT CASE WHEN ts >= ? THEN '5h' ELSE '7d' END AS win,
-		       COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens
+// The model filter MIRRORS poolCapApplies: only usage that actually consumes
+// the Anthropic account pool counts toward the windows. Without it,
+// external-API models (kimi-k3, glm, …) — which bill to our own provider keys
+// and are exempt from the cap check — still inflated the window and burned
+// the user's Claude quota. They have no prompt caching, so a single agentic
+// turn re-sends the whole context (observed 75k–296k uncached input tokens
+// per request), which exhausted a 1.5M/5h cap in a handful of calls.
+func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStatus, error) {
+	var status ClaudePoolStatus
+	var win models.ClaudePoolWindow
+	if err := db.Where("user_sub = ?", userSub).First(&win).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return status, nil
+		}
+		return status, err
+	}
+
+	fiveLive, fiveReset := ClaudeWindowLive(win.FiveHourAnchor, 5*time.Hour, now)
+	sevenLive, sevenReset := ClaudeWindowLive(win.SevenDayAnchor, 7*24*time.Hour, now)
+	if !fiveLive && !sevenLive {
+		return status, nil
+	}
+	if fiveLive {
+		status.FiveHourReset = fiveReset
+	}
+	if sevenLive {
+		status.SevenDayReset = sevenReset
+	}
+
+	far := claudePoolFarFuture(now)
+	fiveBound, sevenBound := far, far
+	if fiveLive {
+		fiveBound = win.FiveHourAnchor
+	}
+	if sevenLive {
+		sevenBound = win.SevenDayAnchor
+	}
+	scanBound := fiveBound
+	if sevenBound.Before(scanBound) {
+		scanBound = sevenBound
+	}
+
+	var row struct {
+		FiveTokens  int
+		SevenTokens int
+	}
+	if err := db.Raw(`
+		SELECT
+		  COALESCE(SUM(CASE WHEN ts >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS five_tokens,
+		  COALESCE(SUM(CASE WHEN ts >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS seven_tokens
 		FROM   usage_events
 		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?
-		       AND (model IS NULL OR model = '' OR LOWER(model) LIKE 'claude%')
-		GROUP  BY win`, now.Add(-5*time.Hour), userSub, now.Add(-7*24*time.Hour)).Scan(&rows).Error
-	if err != nil {
-		return 0, 0, err
+		       AND (model IS NULL OR model = '' OR LOWER(model) LIKE 'claude%')`,
+		fiveBound, sevenBound, userSub, scanBound).Scan(&row).Error; err != nil {
+		return status, err
 	}
-	for _, r := range rows {
-		if r.Win == "5h" {
-			fiveH += r.Tokens
-		}
-		sevenD += r.Tokens // 5h window is inside the 7d window
-	}
-	return fiveH, sevenD, nil
+	status.FiveHourUsed = row.FiveTokens
+	status.SevenDayUsed = row.SevenTokens
+	return status, nil
+}
+
+// ClaudePoolCommit opens or rolls forward userSub's pool window anchors as of
+// `now`. Call this ONLY when a claude_proxy charge is about to be recorded
+// (allowed && !DryRun) — never from a dry-run gate check, and never on a
+// denied charge; a rejected, unrecorded request must not be able to start or
+// roll someone's clock.
+//
+// Each anchor column is only overwritten if the STORED anchor's window has
+// already fully elapsed as of `now`; otherwise the upsert is a no-op
+// re-affirming the existing (still-open) anchor. That makes concurrent
+// commits near a boundary converge safely without row locking — whichever
+// commits first wins, the other harmlessly re-affirms the fresh anchor.
+func ClaudePoolCommit(db *gorm.DB, userSub string, now time.Time) error {
+	return db.Exec(`
+		INSERT INTO claude_pool_windows (user_sub, five_hour_anchor, seven_day_anchor, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		  five_hour_anchor = IF(five_hour_anchor + INTERVAL 5 HOUR <= VALUES(five_hour_anchor), VALUES(five_hour_anchor), five_hour_anchor),
+		  seven_day_anchor = IF(seven_day_anchor + INTERVAL 7 DAY <= VALUES(seven_day_anchor), VALUES(seven_day_anchor), seven_day_anchor),
+		  updated_at       = VALUES(updated_at)`,
+		userSub, now, now, now).Error
 }
 
 // CheckAndCharge enforces the four daily caps and (on allowed && !DryRun)
 // writes a usage_events row. Unknown kinds are recorded but ungated.
 func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
+	now := time.Now().UTC()
 	limits := DefaultLimits()
 	totals, err := FetchTodayTotals(db, req.UserSub)
 	if err != nil {
@@ -255,9 +358,10 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	after := totals
 	deny := ""
 	var fivePct, sevenPct *float64
+	var fiveReset, sevenReset time.Time
 	switch req.Kind {
 	case "claude_proxy":
-		// Rolling 5h/7d windows (not midnight-daily) — mirrors the Anthropic
+		// Fixed 5h/7d windows (not midnight-daily) — mirrors the Anthropic
 		// account quota shape the pool itself is subject to.
 		//
 		// Non-Anthropic models (kimi-k3, z-ai/glm-5.2, etc.) don't consume the
@@ -274,10 +378,12 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 			break
 		}
 		cap5, cap7 := ClaudePoolLimits()
-		used5, used7, werr := ClaudePoolWindows(db, req.UserSub)
+		status, werr := ClaudePoolUsage(db, req.UserSub, now)
 		if werr != nil {
 			return ChargeRes{}, werr
 		}
+		used5, used7 := status.FiveHourUsed, status.SevenDayUsed
+		fiveReset, sevenReset = status.FiveHourReset, status.SevenDayReset
 		tok := req.InputTokens + req.OutputTokens
 		if used5+tok > cap5 {
 			deny = "quota_exceeded_claude_5h"
@@ -322,15 +428,20 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	}
 
 	res := ChargeRes{
-		Allowed:     deny == "",
-		DenyReason:  deny,
-		Limits:      limits,
-		ResetAt:     NextResetAt().Format(time.RFC3339),
-		FiveHourPct: fivePct,
-		SevenDayPct: sevenPct,
+		Allowed:       deny == "",
+		DenyReason:    deny,
+		Limits:        limits,
+		ResetAt:       NextResetAt().Format(time.RFC3339),
+		FiveHourPct:   fivePct,
+		SevenDayPct:   sevenPct,
+		FiveHourReset: formatPoolReset(fiveReset),
+		SevenDayReset: formatPoolReset(sevenReset),
 	}
 	if !res.Allowed {
-		// On deny: report current state, not the would-be after-state.
+		// On deny: report current state, not the would-be after-state. A
+		// denied claude_proxy charge must NOT call ClaudePoolCommit below — a
+		// rejected, unrecorded request cannot be allowed to start or roll
+		// someone's clock.
 		res.Today = totals
 		return res, nil
 	}
@@ -341,7 +452,7 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	}
 	ev := models.UsageEvent{
 		UserSub:      req.UserSub,
-		Ts:           time.Now().UTC(),
+		Ts:           now,
 		Kind:         req.Kind,
 		Endpoint:     req.Endpoint,
 		Model:        req.Model,
@@ -352,6 +463,18 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	}
 	if err := db.Create(&ev).Error; err != nil {
 		return ChargeRes{}, err
+	}
+
+	if req.Kind == "claude_proxy" && poolCapApplies(req.Model) {
+		if cerr := ClaudePoolCommit(db, req.UserSub, now); cerr != nil {
+			return ChargeRes{}, cerr
+		}
+		status, serr := ClaudePoolUsage(db, req.UserSub, now)
+		if serr != nil {
+			return ChargeRes{}, serr
+		}
+		res.FiveHourReset = formatPoolReset(status.FiveHourReset)
+		res.SevenDayReset = formatPoolReset(status.SevenDayReset)
 	}
 	return res, nil
 }

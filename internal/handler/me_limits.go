@@ -12,7 +12,6 @@ package handler
 import (
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -122,22 +121,19 @@ func InternalUsageCharge(c *gin.Context) {
 		// budget. Without these the proxy would have to forward the pooled
 		// ACCOUNT's reset, which belongs to a shared credential and tells the
 		// user nothing about their own ceiling. Note `reset_at` above is the
-		// daily counter roll, NOT these rolling windows — different clocks.
-		reset5, reset7 := ClaudeWindowResets(body.UserSub, time.Now().UTC())
-		fiveReset, sevenReset := "", ""
-		if !reset5.IsZero() {
-			fiveReset = reset5.UTC().Format(time.RFC3339)
-		}
-		if !reset7.IsZero() {
-			sevenReset = reset7.UTC().Format(time.RFC3339)
-		}
+		// daily counter roll, NOT these fixed pool windows — different clocks.
+		// res.FiveHourReset/SevenDayReset already come straight out of
+		// CheckAndCharge (backed by the anchor CheckAndCharge itself just
+		// committed) — forwarding them here, rather than recomputing via a
+		// second independent query, is what guarantees the allow/pct numbers
+		// and the reset instant can never disagree.
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
 			"data": gin.H{
 				"allowed": res.Allowed, "deny_reason": res.DenyReason,
 				"today": res.Today, "limits": res.Limits, "reset_at": res.ResetAt,
 				"five_hour_pct": res.FiveHourPct, "seven_day_pct": res.SevenDayPct,
-				"five_hour_reset": fiveReset, "seven_day_reset": sevenReset,
+				"five_hour_reset": res.FiveHourReset, "seven_day_reset": res.SevenDayReset,
 				"recording": recordingEnabled(body.UserSub),
 			},
 		})

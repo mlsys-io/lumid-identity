@@ -34,7 +34,7 @@ func connectTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	if err := db.AutoMigrate(&models.UsageEvent{}); err != nil {
+	if err := db.AutoMigrate(&models.UsageEvent{}, &models.ClaudePoolWindow{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return db
@@ -43,6 +43,7 @@ func connectTestDB(t *testing.T) *gorm.DB {
 func cleanupSub(t *testing.T, db *gorm.DB, sub string) {
 	t.Helper()
 	db.Where("user_sub = ?", sub).Delete(&models.UsageEvent{})
+	db.Where("user_sub = ?", sub).Delete(&models.ClaudePoolWindow{})
 }
 
 func TestQuota_CyclesDaily(t *testing.T) {

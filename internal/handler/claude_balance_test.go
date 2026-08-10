@@ -1,6 +1,10 @@
 package handler
 
-import "testing"
+import (
+	"testing"
+
+	"lumid_identity/models"
+)
 
 // Real weighted loads measured 2026-08-09 (sonnet-equivalent tokens, millions).
 // Ordering here is deliberately NOT the raw-token ordering: eyuansu71 ran only
@@ -167,6 +171,41 @@ func TestUserCapDisabledMatchesPureLoadBalancing(t *testing.T) {
 	for _, n := range counts(a) {
 		if n == 0 {
 			t.Error("an account went unused with the cap disabled")
+		}
+	}
+}
+
+// loadByUser only sees 7 days of activity, but the cap counts everyone homed.
+// If the counted population were wider than the placeable one, overCap could
+// report a violation computeAssignment cannot fix — pinning `rebalance` true
+// forever, which disables the skew hysteresis and churns people's egress IPs.
+func TestPlacementIncludesHomedButIdleUsers(t *testing.T) {
+	loads := []userLoad{{"active1", 900}, {"active2", 100}}
+	existing := []models.ClaudeUserAssignment{
+		{UserSub: "active1", Account: "i"},     // already counted
+		{UserSub: "idle1", Account: "i"},       // quiet, still homed
+		{UserSub: "idle2", Account: "gone@ex"}, // quiet AND account removed
+	}
+	got := placementPopulation(loads, existing)
+	if len(got) != 4 {
+		t.Fatalf("population = %d, want 4 (2 active + 2 idle, no duplicate)", len(got))
+	}
+	byUser := map[string]int64{}
+	for _, u := range got {
+		if _, dup := byUser[u.UserSub]; dup {
+			t.Errorf("%s appears twice", u.UserSub)
+		}
+		byUser[u.UserSub] = u.Tokens
+	}
+	if byUser["active1"] != 900 {
+		t.Errorf("active1 load = %d, want 900 (must not be zeroed)", byUser["active1"])
+	}
+	for _, q := range []string{"idle1", "idle2"} {
+		if _, ok := byUser[q]; !ok {
+			t.Errorf("%s was not placed, so it is counted but unplaceable", q)
+		}
+		if byUser[q] != 0 {
+			t.Errorf("%s joined with load %d, want 0 so it cannot perturb balancing", q, byUser[q])
 		}
 	}
 }

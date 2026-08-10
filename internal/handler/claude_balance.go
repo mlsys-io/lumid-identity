@@ -197,6 +197,38 @@ func computeAssignment(loads []userLoad, accounts []string, maxPer int) map[stri
 	return out
 }
 
+// placementPopulation is everyone the balancer must place: users with recent
+// load, plus anyone already homed who has gone quiet.
+//
+// loadByUser only returns users active in the last 7 days, but the cap bounds
+// distinct humans HOMED on a subscription — an idle user still occupies their
+// account and still routes there the moment they come back. Two things break if
+// the counted population is wider than the placeable one:
+//
+//   - the cap under-protects, because dormant sharers are invisible to it; and
+//   - worse, overCap can then report a violation that computeAssignment is
+//     structurally unable to fix, stranding `rebalance` at true forever. That
+//     silently disables the skew hysteresis, and users' egress IPs start moving
+//     on every load fluctuation — the exact churn this file exists to prevent.
+//
+// Quiet users join with zero load, so they do not perturb the load objective;
+// they only occupy a slot. Users pinned to a removed account are included too,
+// so a dormant user whose account disappeared still gets re-placed.
+func placementPopulation(loads []userLoad, existing []models.ClaudeUserAssignment) []userLoad {
+	seen := make(map[string]bool, len(loads)+len(existing))
+	for _, u := range loads {
+		seen[u.UserSub] = true
+	}
+	out := loads
+	for _, e := range existing {
+		if !seen[e.UserSub] {
+			out = append(out, userLoad{UserSub: e.UserSub})
+			seen[e.UserSub] = true
+		}
+	}
+	return out
+}
+
 // overCap reports whether any account currently hosts more than cap users.
 //
 // Load skew alone is not enough to trigger a rebalance here: an over-shared
@@ -290,6 +322,10 @@ func EnsureAssignments(force bool) error {
 		for _, a := range accounts {
 			valid[a] = true
 		}
+
+		// Place everyone HOMED, not just everyone recently active — see
+		// placementPopulation for why the two populations must match.
+		loads = placementPopulation(loads, existing)
 
 		configured := common.ClaudeMaxUsersPerAccount()
 		maxPer := effectiveUserCap(len(loads), len(accounts), configured)

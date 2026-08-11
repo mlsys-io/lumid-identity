@@ -40,7 +40,14 @@ func resolveAppDir(userSub, app string) string {
 			return dir
 		}
 	}
-	return ""
+	// Cross-node fallback. A CLOUD-installed tenant app lives on the scheduler's
+	// PVC, which identity does not mount — so neither path above exists and every
+	// caller here (39 of them: casebook, experiment_case, the dataset/cycle/config
+	// readers) failed with "app not found" for an app /me/apps reports ready.
+	// Materialise the published bundle locally and hand it back like any other
+	// bundle dir. READ path only — see resolveOwnedAppDir below, which must keep
+	// failing loudly rather than accept writes into a copy that gets refreshed.
+	return materialiseTenantApp(userSub, app)
 }
 
 // resolveOwnedAppDir is the WRITE-path resolver: it returns ONLY the caller's

@@ -1849,6 +1849,10 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody, wantTools 
 	if body.Context != nil {
 		if app, ok := body.Context["app"].(string); ok && app != "" {
 			ctxBlock += groundedActionsHint(userID, app)
+			// Works on EVERY provider, including claude-code, which never receives
+			// identity's tool catalog — a file-capable agent can adopt the app's
+			// voice from its prompts without needing a tool at all.
+			ctxBlock += appVoiceHint(userID, app)
 		}
 	}
 	if body.PersonaID != "" {

@@ -967,6 +967,39 @@ func stashViewingApp(c *gin.Context, ctx map[string]any) {
 // groundedActionsHint appends a one-line-per-verb summary of what the AI can
 // DO on the grounded app, so it offers concrete actions unprompted. Returns ""
 // when the app declares no actions.
+// appVoiceHint tells a file-capable agent (the claude-code path) to answer AS
+// the app, by reading the app's own prompts.
+//
+// It needs no tool. toolAppAnswer is just "read analyst_system.md + the fitting
+// skill cards, then answer" — and an agent with file access can do that itself.
+// The claude-code path receives systemPrompt but NOT identity's tool catalog
+// (streamClaudeCodeViaProxy takes no tools), so on those models casebook and
+// app_answer simply do not exist and the app sat unused while the generic
+// assistant answered. This closes that without duplicating the analyst logic in
+// a second place, which is the thing actually worth avoiding.
+//
+// Emitted only when the app really ships an analyst prompt, so it stays silent
+// for apps that are not built this way.
+func appVoiceHint(userID, app string) string {
+	dir := resolveAppDir(userID, app)
+	if dir == "" {
+		return ""
+	}
+	sys := filepath.Join(dir, "prompts", "analyst_system.md")
+	if _, err := os.Stat(sys); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\nThis app (%s) defines its own expert voice. For any DOMAIN question about %s's subject matter:\n", app, app)
+	fmt.Fprintf(&b, "  1. Read %s and adopt it as your system instruction for the answer.\n", sys)
+	fmt.Fprintf(&b, "  2. Read the fitting %s/prompts/analyst_skill_*.md card(s) and apply their output shape.\n", dir)
+	if _, err := os.Stat(filepath.Join(dir, "procedure.md")); err == nil {
+		fmt.Fprintf(&b, "  3. %s/procedure.md has the full working procedure, including how to score and what must never be read.\n", dir)
+	}
+	b.WriteString("Answer in that voice, in the conversation. Do not answer domain questions as the generic assistant, and do not trigger a workflow run to answer a person — that returns nothing to the chat.\n")
+	return b.String()
+}
+
 func groundedActionsHint(userID, app string) string {
 	cat := appActionsCatalog(userID, app)
 	actions, _ := cat["actions"].([]map[string]any)

@@ -2196,6 +2196,25 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			// Without this, an app's declared tools[] are unreachable from chat:
+			// app_run returns a PROCEDURE rather than executing one, and nothing
+			// else dispatches an app's own commands. So a free-form question got
+			// answered by deep_research and the app never participated — its
+			// analyst voice, its skill cards and its grounded/ungrounded scoring
+			// all sat unused. This is the missing verb.
+			"name":        "app_answer",
+			"description": "Answer a question AS an installed app's analyst, using that app's own prompts and skill cards. Use whenever the user asks a domain question while an app is in context — including free-form questions with no case id. Returns the answer plus whether it is backed by ground truth.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":      map[string]any{"type": "string"},
+					"question": map[string]any{"type": "string", "description": "the user's question, verbatim"},
+					"case_id":  map[string]any{"type": "string", "description": "optional labelled case; omit for an open question"},
+				},
+				"required": []string{"app", "question"},
+			},
+		},
+		{
 			"name":        "app_config_get",
 			"description": "Read an installed app's xpcloud.yaml (workflows, schedules, skill imports, publish policy). Returns the YAML + a sha for optimistic-locked writes.",
 			"input_schema": map[string]any{
@@ -3414,6 +3433,12 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		app, _ := args["app"].(string)
 		loop, _ := args["loop"].(string)
 		return toolCasebook(userID, app, loop)
+
+	case "app_answer":
+		app, _ := args["app"].(string)
+		question, _ := args["question"].(string)
+		caseID, _ := args["case_id"].(string)
+		return toolAppAnswer(c.Request.Context(), userID, role, app, question, caseID)
 
 	case "app_config_get":
 		app, _ := args["app"].(string)

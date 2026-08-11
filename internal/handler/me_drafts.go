@@ -223,14 +223,14 @@ func MeDraftsList(c *gin.Context) {
 	stateFilter := c.Query("state")
 
 	tenantApps := tenantAppsDir(userID)
+	// Missing tenant tree is NOT the end of the list. A CLOUD-installed app has
+	// no directory here at all, so this errors — and returning early skipped the
+	// DB union below, which is the only place such an app's drafts can live.
+	// A correction was staged with a real draft_id and then read back as an
+	// empty list, because the read bailed out one block above the union.
 	apps, err := os.ReadDir(tenantApps)
 	if err != nil {
-		// No tenant tree yet — return empty list, not 500.
-		c.JSON(http.StatusOK, gin.H{
-			"ret_code": 0, "message": "ok",
-			"data": gin.H{"drafts": []draftCard{}},
-		})
-		return
+		apps = nil
 	}
 	all := []draftCard{}
 	for _, a := range apps {

@@ -534,6 +534,9 @@ func Register(r *gin.Engine) {
 			// bearer token belongs to a super_admin, otherwise 401/403.
 			superAdmin.GET("/super-check", SuperAdminCheck)
 			superAdmin.GET("/oauth-clients", AdminOAuthClientsList)
+			// Reset the per-user SHORT-window quota clock. super_admin, not admin:
+			// it hands capacity back to users, which is a budget decision.
+			superAdmin.POST("/claude-pool/reset-window", AdminClaudePoolResetWindow)
 		}
 
 		// admin + super_admin — Claude Code quota dashboard (/quota page) and

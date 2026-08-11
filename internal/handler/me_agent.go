@@ -2236,6 +2236,22 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			// give_feedback needs app+loop+ts because it scores a scheduled CYCLE;
+			// an interactive answer has no run to point at, so a user correcting
+			// something in chat had nowhere to send it. This is that route.
+			"name":        "app_feedback",
+			"description": "Record a correction against an installed app and stage it for human review. Use when the user says an answer was wrong or should have been different. Do NOT use give_feedback for this — that scores a scheduled cycle run and needs a loop + timestamp.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":    map[string]any{"type": "string"},
+					"note":   map[string]any{"type": "string", "description": "what was wrong, in the user's words"},
+					"rating": map[string]any{"type": "number", "description": "-1 negative, 1 positive; optional"},
+				},
+				"required": []string{"app", "note"},
+			},
+		},
+		{
 			"name":        "app_config_get",
 			"description": "Read an installed app's xpcloud.yaml (workflows, schedules, skill imports, publish policy). Returns the YAML + a sha for optimistic-locked writes.",
 			"input_schema": map[string]any{
@@ -3454,6 +3470,15 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		app, _ := args["app"].(string)
 		loop, _ := args["loop"].(string)
 		return toolCasebook(userID, app, loop)
+
+	case "app_feedback":
+		app, _ := args["app"].(string)
+		note, _ := args["note"].(string)
+		rating := 0
+		if v, ok := args["rating"].(float64); ok {
+			rating = int(v)
+		}
+		return toolAppFeedback(userID, app, note, rating)
 
 	case "app_answer":
 		app, _ := args["app"].(string)

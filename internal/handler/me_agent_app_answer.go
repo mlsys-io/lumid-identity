@@ -24,6 +24,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"lumid_identity/models"
 )
 
 const openModeCaveat = "indicative only — no ground truth for this question"
@@ -174,4 +179,64 @@ func answerWithAppVoice(ctx context.Context, role, system, user string) (string,
 		}
 	}
 	return strings.TrimSpace(sb.String()), nil
+}
+
+// toolAppFeedback records a correction against an app and STAGES it for review.
+//
+// give_feedback cannot serve this: it requires app+loop+ts because it is
+// feedback on a scheduled cycle run, and an interactive answer has no run to
+// point at. So a user correcting an answer in chat had nowhere to send it.
+//
+// Staged, never auto-applied: a claim that an answer was wrong is a claim about
+// quality, and an unreviewed one does not just sit there — it biases what the
+// app retrieves next. The human confirms before it compounds.
+func toolAppFeedback(userID, app, note string, rating int) (map[string]any, bool) {
+	if app == "" || strings.TrimSpace(note) == "" {
+		return map[string]any{"error": "app and note are required"}, false
+	}
+	if resolveAppDir(userID, app) == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	agent := "mbb-ai-analyst"
+	if xp, err := os.ReadFile(filepath.Join(resolveAppDir(userID, app), "xpcloud.yaml")); err == nil {
+		if a := firstMemoryAgent(xp); a != "" {
+			agent = a
+		}
+	}
+	d := &models.MeDraft{
+		ID:      "fb-" + contentSHA([]byte(app + note + time.Now().UTC().String()))[:24],
+		UserSub: userID, App: app, Agent: agent,
+		Subject: "Correction", Body: strings.TrimSpace(note),
+		State: "pending",
+	}
+	if rating != 0 {
+		d.Confidence = float64(rating)
+	}
+	if err := draftStoreStage(d); err != nil {
+		return map[string]any{"error": "could not stage: " + err.Error()}, false
+	}
+	return map[string]any{
+		"ok": true, "app": app, "draft_id": d.ID, "agent": agent,
+		"state": "pending",
+		"next":  "waiting in this app's Review queue; approve it and it shapes later answers",
+	}, true
+}
+
+// firstMemoryAgent reads memory_agent / memory_agents[0] from a spec so a
+// correction is attributed to the app's own agent rather than a hardcoded one.
+func firstMemoryAgent(spec []byte) string {
+	var doc struct {
+		MemoryAgent  string   `yaml:"memory_agent"`
+		MemoryAgents []string `yaml:"memory_agents"`
+	}
+	if yaml.Unmarshal(spec, &doc) != nil {
+		return ""
+	}
+	if doc.MemoryAgent != "" {
+		return doc.MemoryAgent
+	}
+	if len(doc.MemoryAgents) > 0 {
+		return doc.MemoryAgents[0]
+	}
+	return ""
 }

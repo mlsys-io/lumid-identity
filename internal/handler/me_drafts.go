@@ -254,6 +254,28 @@ func MeDraftsList(c *gin.Context) {
 		all = f
 	}
 	// Freshest cycle first; deterministic tiebreak by id.
+	// Union with DB-backed drafts. A CLOUD-installed tenant app has no directory
+	// on identity's filesystem, so the file walk above finds nothing for it and a
+	// correction recorded against such an app was invisible however it was
+	// routed. Additive on purpose: the file walk still runs first and wins on id,
+	// so nothing that shows today can disappear — this only ADDS what files
+	// cannot represent. The write path moves separately.
+	if rows, derr := draftStoreList(userID, appFilter, stateFilter); derr == nil {
+		seen := make(map[string]bool, len(all))
+		for _, d := range all {
+			seen[d.ID] = true
+		}
+		for _, r := range rows {
+			if seen[r.ID] {
+				continue
+			}
+			all = append(all, draftCard{
+				ID: r.ID, App: r.App, CycleTS: r.CycleTS,
+				To: r.To, Subject: r.Subject, Body: r.Body,
+				Confidence: r.Confidence, State: r.State, ActedAt: r.ActedAt,
+			})
+		}
+	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].CycleTS != all[j].CycleTS {
 			return all[i].CycleTS > all[j].CycleTS

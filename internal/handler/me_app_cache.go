@@ -21,6 +21,7 @@ package handler
 
 import (
 	"encoding/base64"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -246,6 +247,7 @@ func materialiseDataset(userSub, repo, dst, stageRoot string) {
 	}
 	paths := repoTreeAt(userSub, repo, "")
 	if len(paths) == 0 {
+		log.Printf("[app-cache] dataset %s: tree empty or unreadable — mounting nothing", repo)
 		return
 	}
 	if len(paths) > tenantCacheMaxFiles {
@@ -255,9 +257,24 @@ func materialiseDataset(userSub, repo, dst, stageRoot string) {
 		return
 	}
 	total := 0
+	wrote := 0
+	var firstErr string
+	// Silence here is the failure mode this logging exists for: the loop below
+	// skips quietly on a bad fetch or write, so a dataset that fetches 0 of 52
+	// left an EMPTY mount dir that is indistinguishable from success. Count what
+	// actually landed and say so.
+	defer func() {
+		if wrote < len(paths) {
+			log.Printf("[app-cache] dataset %s: wrote %d/%d files into %s%s",
+				repo, wrote, len(paths), dst, firstErr)
+		}
+	}()
 	for _, p := range paths {
 		body, ok := fetchRepoBlobAt(userSub, repo, p)
 		if !ok {
+			if firstErr == "" {
+				firstErr = " (first failure: fetch " + p + ")"
+			}
 			continue
 		}
 		if b, err := base64.StdEncoding.DecodeString(string(body)); err == nil && len(b) > 0 {
@@ -269,12 +286,24 @@ func materialiseDataset(userSub, repo, dst, stageRoot string) {
 		}
 		out := filepath.Join(dst, filepath.FromSlash(p))
 		if !strings.HasPrefix(out, dst+string(os.PathSeparator)) {
+			if firstErr == "" {
+				firstErr = " (first failure: path escaped dst: " + p + ")"
+			}
 			continue
 		}
-		if os.MkdirAll(filepath.Dir(out), 0o755) != nil {
+		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+			if firstErr == "" {
+				firstErr = " (first failure: mkdir " + filepath.Dir(out) + ": " + err.Error() + ")"
+			}
 			continue
 		}
-		_ = os.WriteFile(out, body, 0o644)
+		if err := os.WriteFile(out, body, 0o644); err != nil {
+			if firstErr == "" {
+				firstErr = " (first failure: write " + out + ": " + err.Error() + ")"
+			}
+			continue
+		}
+		wrote++
 	}
 }
 

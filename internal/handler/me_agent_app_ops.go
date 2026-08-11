@@ -985,18 +985,25 @@ func appVoiceHint(userID, app string) string {
 	if dir == "" {
 		return ""
 	}
-	sys := filepath.Join(dir, "prompts", "analyst_system.md")
-	if _, err := os.Stat(sys); err != nil {
+	sys, err := os.ReadFile(filepath.Join(dir, "prompts", "analyst_system.md"))
+	if err != nil || len(sys) == 0 {
 		return ""
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "\nThis app (%s) defines its own expert voice. For any DOMAIN question about %s's subject matter:\n", app, app)
-	fmt.Fprintf(&b, "  1. Read %s and adopt it as your system instruction for the answer.\n", sys)
-	fmt.Fprintf(&b, "  2. Read the fitting %s/prompts/analyst_skill_*.md card(s) and apply their output shape.\n", dir)
-	if _, err := os.Stat(filepath.Join(dir, "procedure.md")); err == nil {
-		fmt.Fprintf(&b, "  3. %s/procedure.md has the full working procedure, including how to score and what must never be read.\n", dir)
+	// INLINE the prompt, never a path. The claude-code path runs in its own
+	// sandbox with a different filesystem — pointing it at
+	// <appdir>/prompts/analyst_system.md made it `ls` an unrelated working
+	// directory and correctly report it had no such app. Identity can read the
+	// bundle; the agent on the other end cannot, so the content has to travel.
+	const maxVoice = 12 << 10
+	body := string(sys)
+	if len(body) > maxVoice {
+		body = body[:maxVoice]
 	}
-	b.WriteString("Answer in that voice, in the conversation. Do not answer domain questions as the generic assistant, and do not trigger a workflow run to answer a person — that returns nothing to the chat.\n")
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n--- %s: answer domain questions in THIS voice ---\n", app)
+	b.WriteString(body)
+	b.WriteString("\n--- end of app voice ---\n")
+	b.WriteString("Apply the above to any question about this app's subject matter, in the conversation. Do not answer such questions as the generic assistant, and do not trigger a workflow run to answer a person — that returns nothing to the chat.\n")
 	return b.String()
 }
 

@@ -1195,6 +1195,18 @@ type meAgentChatBody struct {
 	XpioRepo  string `json:"xpio_repo,omitempty"`
 	ClusterID string `json:"cluster_id,omitempty"`
 	DataApp   string `json:"data_app,omitempty"`
+	// Optional: require a specific tool for THIS turn.
+	//
+	// Some turns are not the model's judgement call. When the user has picked a
+	// case in an app workspace, "answer it as this app's analyst" is already
+	// decided — leaving it to tool selection is how a free-form question ends up
+	// answered by the generic assistant while the app, its rubric and its
+	// grounded/ungrounded distinction sit unused. Neither gemma nor Sonnet
+	// selects app_answer unprompted, and four rounds of description-tuning did
+	// not move it, so the UI needs a way to say "use this one" rather than ask.
+	//
+	// Names an allowlisted tool the caller already has; it cannot widen access.
+	ToolChoice string `json:"tool_choice,omitempty"`
 	// Optional structured "what the user is looking at" payload from the
 	// Studio shell (ViewingContext in StudioContext.ts). Rendered into a
 	// per-request system block + tool grounding hints so "this run" /
@@ -1507,6 +1519,11 @@ func MeAgentChat(c *gin.Context) {
 			"system":     systemPrompt,
 			"messages":   anthMsgs,
 			"tools":      tools,
+		}
+		// Forced tool for this turn. Only honoured when the caller already has
+		// that tool — this narrows the model's choice, it never widens access.
+		if tc := strings.TrimSpace(body.ToolChoice); tc != "" && toolAvailable(tools, tc) {
+			req["tool_choice"] = map[string]any{"type": "tool", "name": tc}
 		}
 		if body.Think && provider.addAnthropicVersion {
 			req["thinking"] = map[string]any{
@@ -3921,4 +3938,16 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 
 	log.Printf("[me-agent] unknown tool name=%q user=%s — in prompt catalog but not wired into dispatch", name, userID)
 	return map[string]any{"error": "unknown tool: " + name}, false
+}
+
+// toolAvailable reports whether `name` is among the tool definitions already
+// built for this caller's role. Forcing a tool the caller does not have would
+// be a privilege escalation dressed up as a convenience.
+func toolAvailable(tools []map[string]any, name string) bool {
+	for _, td := range tools {
+		if n, _ := td["name"].(string); n == name {
+			return true
+		}
+	}
+	return false
 }

@@ -61,3 +61,21 @@ func TestSkillCardsAlwaysIncludeCommunication(t *testing.T) {
 		t.Fatal("communication card must always apply — it enforces top-line-first")
 	}
 }
+
+// tool_choice narrows what the model may pick; it must never grant a tool the
+// caller does not already have. That would be a privilege escalation dressed up
+// as a convenience.
+func TestToolAvailableGuardsForcedChoice(t *testing.T) {
+	tools := []map[string]any{
+		{"name": "app_answer"},
+		{"name": "casebook"},
+	}
+	if !toolAvailable(tools, "app_answer") {
+		t.Fatal("a tool the caller HAS must be forceable")
+	}
+	for _, bad := range []string{"admin_set_user_role", "", "App_Answer"} {
+		if toolAvailable(tools, bad) {
+			t.Fatalf("forced a tool the caller does not have: %q", bad)
+		}
+	}
+}

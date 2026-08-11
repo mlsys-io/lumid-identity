@@ -1,10 +1,17 @@
 package handler
 
 import (
+	"errors"
+	"os"
 	"testing"
 	"time"
 
+	mysqldriver "gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
+
 	"lumid_identity/internal/common"
+	"lumid_identity/models"
 )
 
 // The reset must expire the anchor, NOT stamp it to now. An anchor set to now
@@ -57,5 +64,65 @@ func TestResetUsesTheConfiguredWindow(t *testing.T) {
 	expired := now.Add(-common.ClaudePoolShortWindow() - time.Second)
 	if expired.Add(2 * time.Hour).After(now) {
 		t.Error("expiry did not track the reconfigured window")
+	}
+}
+
+// REGRESSION (shipped broken in v0.5.8, reported as "reset: WHERE conditions
+// required"): GORM refuses an UPDATE with no WHERE clause, so the reset-ALL
+// path failed for every caller while the single-user path worked.
+//
+// This test needs a real database and SKIPS without one. That is a genuine
+// weakness, stated rather than papered over: I first wrote a DB-free version
+// against an unreachable DSN, but the dial fails BEFORE GORM reports
+// ErrMissingWhereClause, so the guarded and unguarded statements returned an
+// identical error. It would have passed whether or not the bug was present —
+// false assurance, which is worse than no test. The DB-free variants of the
+// other properties (anchor expiry, window tracking) are above.
+func TestResetAllExecutesAgainstARealDB(t *testing.T) {
+	dsn := os.Getenv("TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_DSN not set — cannot verify the global UPDATE actually executes")
+	}
+	db, err := gorm.Open(mysqldriver.Open(dsn), &gorm.Config{Logger: gormlogger.Discard})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.AutoMigrate(&models.ClaudePoolWindow{}); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	sub := "reset-test-" + time.Now().UTC().Format("150405.000000")
+	live := time.Now().UTC()
+	if err := db.Create(&models.ClaudePoolWindow{
+		UserSub: sub, FiveHourAnchor: live, SevenDayAnchor: live,
+	}).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	defer db.Where("user_sub = ?", sub).Delete(&models.ClaudePoolWindow{})
+
+	expired := time.Now().UTC().Add(-common.ClaudePoolShortWindow() - time.Second)
+
+	// The exact chain the handler uses for reset-ALL.
+	res := db.Model(&models.ClaudePoolWindow{}).
+		Session(&gorm.Session{AllowGlobalUpdate: true}).
+		Update("five_hour_anchor", expired)
+	if errors.Is(res.Error, gorm.ErrMissingWhereClause) {
+		t.Fatal("reset-all trips ErrMissingWhereClause — the global update is not opted in")
+	}
+	if res.Error != nil {
+		t.Fatalf("reset-all failed: %v", res.Error)
+	}
+
+	var got models.ClaudePoolWindow
+	if err := db.Where("user_sub = ?", sub).First(&got).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.FiveHourAnchor.After(expired.Add(time.Minute)) {
+		t.Errorf("short anchor not expired: %v", got.FiveHourAnchor)
+	}
+	// The 7d anchor must be untouched — that is the whole reason this expires
+	// a column instead of deleting the row.
+	if got.SevenDayAnchor.Before(live.Add(-time.Minute)) {
+		t.Errorf("7d anchor was modified: %v (seeded %v)", got.SevenDayAnchor, live)
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -61,6 +62,13 @@ func AdminClaudePoolResetWindow(c *gin.Context) {
 	q := common.DB.Model(&models.ClaudePoolWindow{})
 	if sub != "" {
 		q = q.Where("user_sub = ?", sub)
+	} else {
+		// GORM refuses an UPDATE with no WHERE clause (ErrMissingWhereClause,
+		// surfaced as "WHERE conditions required") — a guard against the
+		// accidental global write. Resetting everyone is the whole point of the
+		// no-argument form, so opt in EXPLICITLY rather than faking a predicate
+		// like "1 = 1": the intent stays visible at the call site.
+		q = q.Session(&gorm.Session{AllowGlobalUpdate: true})
 	}
 	res := q.Update("five_hour_anchor", expired)
 	if res.Error != nil {

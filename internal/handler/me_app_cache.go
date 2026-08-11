@@ -408,3 +408,30 @@ func commonTopDir(paths []string) string {
 	}
 	return top
 }
+
+// repoIsRunnable reports whether a published repo declares loops[] or tools[] —
+// i.e. it is something you INSTALL and run, not a knowledge bank you subscribe
+// to. Used to tell a migrated app (kind rewritten to `agent` by app_push) from a
+// genuine knowledge agent, which the `kind` label alone cannot do.
+//
+// Fails OPEN like the gate it serves: if the spec cannot be fetched we return
+// false and the caller keeps its existing behaviour, rather than guessing.
+func repoIsRunnable(userSub, slug string) bool {
+	if !strings.Contains(slug, "/") {
+		return false
+	}
+	spec, ok := fetchRepoBlobAt(userSub, slug, ".xpcloud.yaml")
+	if !ok {
+		if spec, ok = fetchRepoBlobAt(userSub, slug, "xpcloud.yaml"); !ok {
+			return false
+		}
+	}
+	var doc struct {
+		Loops []map[string]any `yaml:"loops"`
+		Tools []map[string]any `yaml:"tools"`
+	}
+	if yaml.Unmarshal(spec, &doc) != nil {
+		return false
+	}
+	return len(doc.Loops) > 0 || len(doc.Tools) > 0
+}

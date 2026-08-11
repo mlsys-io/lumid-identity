@@ -96,8 +96,21 @@ func MeAppsInstall(c *gin.Context) {
 	// can't be resolved (bare slugs, drafts, xpcloud down) — the Python
 	// installer re-checks authoritatively and returns the same pointers.
 	if kind := marketplaceRepoKind(c, body.Slug); kind != "" && kind != "app" && kind != "autoresearch" {
-		fail(c, http.StatusUnprocessableEntity, 1422, kindInstallPointer(kind, body.Slug))
-		return
+		// `agent` needs a second look. app_push MIGRATES kind app -> agent on
+		// publish (it reports "migrated": {"kind": "app -> agent"}), so an app
+		// authored and validated as kind=app arrives here labelled agent and gets
+		// told to subscribe — which is the wrong verb entirely: subscribing gives
+		// you a knowledge bank, not the workspace, surfaces or tools. Every app
+		// published through the normal path was uninstallable from the
+		// marketplace because of this.
+		//
+		// The label cannot distinguish them, so ask whether the repo is RUNNABLE:
+		// declares loops[] or tools[]. A knowledge agent is a memory bank and has
+		// neither, so it still gets the subscribe pointer.
+		if kind != "agent" || !repoIsRunnable(userID, body.Slug) {
+			fail(c, http.StatusUnprocessableEntity, 1422, kindInstallPointer(kind, body.Slug))
+			return
+		}
 	}
 
 	id := writeIntent(c, "install", userID, map[string]any{

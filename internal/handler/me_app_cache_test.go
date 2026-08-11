@@ -129,3 +129,26 @@ datasets:
 		t.Fatal("unparseable spec must yield no mounts")
 	}
 }
+
+// A dataset repo must keep records under a directory (the publisher drops
+// root-level .json), so mounting its tree verbatim buries them one level below
+// where consumers glob. Stripping the shared top dir is what makes
+// "mount this dataset at data/seed" mean what an app author expects.
+func TestCommonTopDir(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []string
+		want string
+	}{
+		{"all under one dir", []string{"data/a.json", "data/b.json"}, "data"},
+		{"marker at root is ignored", []string{".xpcloud.yaml", "data/a.json"}, "data"},
+		{"a record at root -> no strip", []string{"a.json", "data/b.json"}, ""},
+		{"two top dirs -> no strip", []string{"data/a.json", "other/b.json"}, ""},
+		{"nested deeper still strips one", []string{"data/x/a.json", "data/y/b.json"}, "data"},
+		{"empty", nil, ""},
+	} {
+		if got := commonTopDir(tc.in); got != tc.want {
+			t.Fatalf("%s: commonTopDir(%v) = %q want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}

@@ -253,6 +253,16 @@ func materialiseDataset(userSub, repo, dst, stageRoot string) {
 	if len(paths) > tenantCacheMaxFiles {
 		paths = paths[:tenantCacheMaxFiles]
 	}
+	// Graft the dataset's CONTENT at mount_at, not the repo's own layout.
+	//
+	// The publisher drops root-level .json (it reads them as marker files), so a
+	// dataset repo has to keep its records under a directory — conventionally
+	// data/. Mounting the tree verbatim then lands them at
+	// <mount_at>/data/*.json while every consumer globs <mount_at>/*.json:
+	// casebook reported `cases: 0` while the files were present one level down.
+	// When every record shares one top-level directory, strip it — that is what
+	// "mount this dataset at data/seed" means to the app.
+	strip := commonTopDir(paths)
 	if os.MkdirAll(dst, 0o755) != nil {
 		return
 	}
@@ -284,7 +294,11 @@ func materialiseDataset(userSub, repo, dst, stageRoot string) {
 		if total > tenantCacheMaxBytes {
 			return
 		}
-		out := filepath.Join(dst, filepath.FromSlash(p))
+		rel := p
+		if strip != "" {
+			rel = strings.TrimPrefix(rel, strip+"/")
+		}
+		out := filepath.Join(dst, filepath.FromSlash(rel))
 		if !strings.HasPrefix(out, dst+string(os.PathSeparator)) {
 			if firstErr == "" {
 				firstErr = " (first failure: path escaped dst: " + p + ")"
@@ -369,4 +383,28 @@ func fetchRepoBlobAt(userSub, repo, path string) ([]byte, bool) {
 		return dec, true
 	}
 	return []byte(content), true
+}
+
+// commonTopDir returns the single top-level directory shared by every path, or
+// "" when they do not all share one (or when some sit at the root already).
+// Platform files the publisher adds (.xpcloud.yaml, .manifest.json) are ignored
+// so one marker at the root does not defeat the check.
+func commonTopDir(paths []string) string {
+	top := ""
+	for _, p := range paths {
+		if strings.HasPrefix(p, ".") {
+			continue // publisher marker at the root
+		}
+		i := strings.Index(p, "/")
+		if i <= 0 {
+			return "" // a record sits at the root — nothing to strip
+		}
+		d := p[:i]
+		if top == "" {
+			top = d
+		} else if top != d {
+			return "" // more than one top-level dir — keep the layout as-is
+		}
+	}
+	return top
 }

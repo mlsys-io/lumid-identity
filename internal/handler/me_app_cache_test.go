@@ -95,3 +95,37 @@ func TestResolveAppDirRejectsTraversal(t *testing.T) {
 		}
 	}
 }
+
+// The mount target and repo slug are both interpolated into filesystem paths
+// under the staging dir, and both come from a spec the app author controls.
+func TestParseMountedDatasets(t *testing.T) {
+	spec := []byte(`
+datasets:
+  - id: cases_v1
+    repo: 70f192ce-owner/mbb-ai-cases
+    mount_at: data/seed
+  - id: local_only
+    local_path: data/seed
+  - id: traversal
+    repo: owner/x
+    mount_at: ../../etc
+  - id: absolute
+    repo: owner/x
+    mount_at: /etc
+  - id: bad_repo
+    repo: too/many/segments
+    mount_at: data/x
+  - id: no_mount
+    repo: owner/x
+`)
+	got := parseMountedDatasets(spec)
+	if len(got) != 1 {
+		t.Fatalf("want exactly the one valid mount, got %d: %+v", len(got), got)
+	}
+	if got[0].repo != "70f192ce-owner/mbb-ai-cases" || got[0].mountAt != "data/seed" {
+		t.Fatalf("unexpected mount: %+v", got[0])
+	}
+	if len(parseMountedDatasets([]byte("\t\tnot: [yaml"))) != 0 {
+		t.Fatal("unparseable spec must yield no mounts")
+	}
+}

@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // How long a materialised copy is trusted before refetching. A single chat turn
@@ -170,8 +172,19 @@ func materialiseTenantApp(userSub, app string) string {
 	}
 	// The publisher stores the spec dot-prefixed; readAppUI/ResolveSpecPath look
 	// for the bare name too, so provide both rather than teach every reader.
-	if b, err := os.ReadFile(filepath.Join(stage, ".xpcloud.yaml")); err == nil {
-		_ = os.WriteFile(filepath.Join(stage, "xpcloud.yaml"), b, 0o644)
+	spec, specErr := os.ReadFile(filepath.Join(stage, ".xpcloud.yaml"))
+	if specErr == nil {
+		_ = os.WriteFile(filepath.Join(stage, "xpcloud.yaml"), spec, 0o644)
+	}
+	// Mounted datasets. A well-formed app declares `datasets: [{repo, mount_at}]`
+	// and does NOT ship the data in its bundle — shipping it blows the upload cap
+	// and forks the ground truth away from the source repo. So the bundle alone
+	// gives a materialised app zero records: casebook resolved but answered
+	// `cases: []`. Pull each mounted repo in beside the code.
+	if specErr == nil {
+		for _, ds := range parseMountedDatasets(spec) {
+			materialiseDataset(userSub, ds.repo, filepath.Join(stage, filepath.FromSlash(ds.mountAt)), stage)
+		}
 	}
 	_ = os.WriteFile(filepath.Join(stage, tenantCacheMarker), []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
 
@@ -184,4 +197,147 @@ func materialiseTenantApp(userSub, app string) string {
 		return ""
 	}
 	return dir
+}
+
+// ─── mounted datasets ────────────────────────────────────────────────────
+
+type mountedDataset struct{ repo, mountAt string }
+
+// parseMountedDatasets pulls {repo, mount_at} pairs out of an app spec. Only
+// entries with BOTH are mountable; a `local_path` dataset ships in the bundle
+// and is already on disk.
+func parseMountedDatasets(spec []byte) []mountedDataset {
+	var doc struct {
+		Datasets []struct {
+			Repo    string `yaml:"repo"`
+			MountAt string `yaml:"mount_at"`
+		} `yaml:"datasets"`
+	}
+	if yaml.Unmarshal(spec, &doc) != nil {
+		return nil
+	}
+	var out []mountedDataset
+	for _, d := range doc.Datasets {
+		if d.Repo == "" || d.MountAt == "" {
+			continue
+		}
+		// mount_at is interpolated into a path under the staging dir.
+		if strings.Contains(d.MountAt, "..") || strings.HasPrefix(d.MountAt, "/") {
+			continue
+		}
+		// repo is "<owner-sub>/<name>" — exactly two segments, no traversal.
+		parts := strings.Split(d.Repo, "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(d.Repo, "..") {
+			continue
+		}
+		out = append(out, mountedDataset{repo: d.Repo, mountAt: d.MountAt})
+	}
+	return out
+}
+
+// materialiseDataset copies one mounted repo's blobs into `dst`.
+//
+// Best-effort: a dataset the caller cannot read (or that has moved) must leave
+// the app itself usable rather than fail the whole materialisation — the app's
+// code and surfaces are still worth serving without its data.
+func materialiseDataset(userSub, repo, dst, stageRoot string) {
+	if !strings.HasPrefix(dst, stageRoot+string(os.PathSeparator)) {
+		return
+	}
+	paths := repoTreeAt(userSub, repo, "")
+	if len(paths) == 0 {
+		return
+	}
+	if len(paths) > tenantCacheMaxFiles {
+		paths = paths[:tenantCacheMaxFiles]
+	}
+	if os.MkdirAll(dst, 0o755) != nil {
+		return
+	}
+	total := 0
+	for _, p := range paths {
+		body, ok := fetchRepoBlobAt(userSub, repo, p)
+		if !ok {
+			continue
+		}
+		if b, err := base64.StdEncoding.DecodeString(string(body)); err == nil && len(b) > 0 {
+			body = b
+		}
+		total += len(body)
+		if total > tenantCacheMaxBytes {
+			return
+		}
+		out := filepath.Join(dst, filepath.FromSlash(p))
+		if !strings.HasPrefix(out, dst+string(os.PathSeparator)) {
+			continue
+		}
+		if os.MkdirAll(filepath.Dir(out), 0o755) != nil {
+			continue
+		}
+		_ = os.WriteFile(out, body, 0o644)
+	}
+}
+
+// repoTreeAt / fetchRepoBlobAt are the cross-owner forms: a mounted dataset
+// lives in ANOTHER account's repo, so the path is "<owner>/<name>" rather than
+// "<caller>/<app>". The caller's JWT still authorises the read.
+func repoTreeAt(userSub, repo, sub string) []string {
+	bearer, err := xpcloudUserJWT(userSub)
+	if err != nil {
+		return nil
+	}
+	url := xpcloudBaseURL() + "/api/v1/repos/" + repo + "/tree/main"
+	if sub != "" {
+		url += "/" + sub
+	}
+	code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
+	if err != nil || code >= 300 || resp == nil {
+		return nil
+	}
+	entries, _ := resp["entries"].([]any)
+	var out []string
+	for _, e := range entries {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		kind, _ := m["type"].(string)
+		if name == "" || strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
+			continue
+		}
+		path := name
+		if sub != "" {
+			path = sub + "/" + name
+		}
+		if kind == "tree" {
+			out = append(out, repoTreeAt(userSub, repo, path)...)
+			continue
+		}
+		out = append(out, path)
+	}
+	return out
+}
+
+func fetchRepoBlobAt(userSub, repo, path string) ([]byte, bool) {
+	if path == "" || strings.Contains(path, "..") || strings.HasPrefix(path, "/") {
+		return nil, false
+	}
+	bearer, err := xpcloudUserJWT(userSub)
+	if err != nil {
+		return nil, false
+	}
+	url := xpcloudBaseURL() + "/api/v1/repos/" + repo + "/blob/main/" + path
+	code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
+	if err != nil || code >= 300 || resp == nil {
+		return nil, false
+	}
+	content, _ := resp["content"].(string)
+	if content == "" {
+		return nil, false
+	}
+	if dec, derr := base64.StdEncoding.DecodeString(content); derr == nil && len(dec) > 0 {
+		return dec, true
+	}
+	return []byte(content), true
 }

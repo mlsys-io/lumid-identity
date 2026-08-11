@@ -162,34 +162,6 @@ func MeAgentChatStream(c *gin.Context) {
 		return true
 	}
 
-	// Forced tool — run it, don't ask.
-	//
-	// tool_choice is passed to the provider, but the lumid-llm gateway (which
-	// serves the default kvrun-gemma4) does not honour it: the parameter is
-	// accepted and silently dropped, so a forced tool never fires. Measured —
-	// tool_choice=app_answer returns a normal reply with tool_calls empty. That
-	// makes model-side forcing unreliable by provider, which is exactly what a
-	// UI control cannot depend on.
-	//
-	// So execute it here instead. The args these app tools need are already
-	// known without the model: the app comes from the viewing context the client
-	// sent, and the question/note is the user's own last message. Deterministic,
-	// provider-independent, and one fewer round trip.
-	if forced := strings.TrimSpace(body.ToolChoice); forced != "" {
-		if res, handled := runForcedAppTool(c, userID, role, forced, body); handled {
-			emit(map[string]any{"type": "tool_call", "name": forced, "result": res})
-			if txt, _ := res["answer"].(string); txt != "" {
-				emit(map[string]any{"type": "text", "text": txt})
-			} else if nxt, _ := res["next"].(string); nxt != "" {
-				emit(map[string]any{"type": "text", "text": nxt})
-			} else if e, _ := res["error"].(string); e != "" {
-				emit(map[string]any{"type": "text", "text": "That didn't work: " + e})
-			}
-			emit(map[string]any{"type": "done"})
-			return
-		}
-	}
-
 	if !acquireChatStream(userID) {
 		emit(map[string]any{
 			"type": "error", "code": "concurrent_streams",

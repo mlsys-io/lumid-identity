@@ -26,7 +26,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 
 	"lumid_identity/models"
@@ -240,44 +239,4 @@ func firstMemoryAgent(spec []byte) string {
 		return doc.MemoryAgents[0]
 	}
 	return ""
-}
-
-// runForcedAppTool executes a client-forced app tool without a model turn.
-//
-// Only the app tools are eligible, and only their own arguments are synthesised
-// — from the viewing context the client already sent and the user's last
-// message. It cannot reach anything else, so "force a tool" can never become
-// "call an arbitrary handler with attacker-chosen args".
-func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentChatBody) (map[string]any, bool) {
-	app := ""
-	if body.Context != nil {
-		app, _ = body.Context["app"].(string)
-	}
-	if app == "" {
-		return nil, false // nothing to ground on; fall through to the model
-	}
-	last := ""
-	for i := len(body.Messages) - 1; i >= 0; i-- {
-		if body.Messages[i].Role == "user" {
-			last = strings.TrimSpace(body.Messages[i].Content)
-			break
-		}
-	}
-	if last == "" {
-		return nil, false
-	}
-	switch tool {
-	case "app_answer":
-		res, _ := toolAppAnswer(c.Request.Context(), userID, role, app, last, "")
-		return res, true
-	case "app_feedback":
-		// The composer prefixes the correction; the note is what follows.
-		note := last
-		if i := strings.Index(note, ":"); i > 0 && i < 60 {
-			note = strings.TrimSpace(note[i+1:])
-		}
-		res, _ := toolAppFeedback(userID, app, note, -1)
-		return res, true
-	}
-	return nil, false // any other tool stays the model's business
 }

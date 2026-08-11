@@ -292,7 +292,7 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 }
 
 const (
-	quotaCacheTTL     = 5 * time.Minute
+	quotaCacheTTL = 5 * time.Minute
 	// nearExhaustCeiling is the EXHAUSTION VALVE for per-user routing: an
 	// account at/above it on either window drops to the last-resort band, so a
 	// heavy user pinned to one account degrades to a sibling instead of hard
@@ -302,7 +302,7 @@ const (
 	// must agree: an account the valve will never select must not be given
 	// users, or they end up homed somewhere they can never actually egress from.
 	nearExhaustCeiling = 92.0
-	quotaFetchTimeout = 20 * time.Second
+	quotaFetchTimeout  = 20 * time.Second
 	// Minimal probe model — cheapest, fastest; we only need the response headers.
 	quotaProbeModel = "claude-haiku-4-5-20251001"
 )

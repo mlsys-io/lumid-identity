@@ -118,6 +118,12 @@ func readAppConfig(appDir string) map[string]any {
 	if err != nil {
 		return nil
 	}
+	return parseAppConfigBytes(b)
+}
+
+// parseAppConfigBytes is readAppConfig's body, split out so the cross-node
+// fallback can reuse it on a spec fetched over HTTP instead of read from disk.
+func parseAppConfigBytes(b []byte) map[string]any {
 	var doc struct {
 		Config map[string]any `yaml:"config"`
 	}
@@ -213,17 +219,34 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 	if name == "" {
 		name = "home"
 	}
+	// Cross-node fallback, mirroring MeAppConfig. identity runs on the service
+	// tier and does not mount the scheduler's xpio-state PVC, so a CLOUD-installed
+	// tenant app has no files here at all. Without this the handler 404s
+	// ("app not found") for every such app — including ones that are installed,
+	// healthy, and listed by /me/apps — which reads as "the app has no UI" when
+	// really it is "identity cannot see the disk". The published bundle carries
+	// the same bytes, so serve from there when the local dir is absent.
 	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
-		return
+	remote := appDir == ""
+
+	var ui *appUI
+	var appCfg map[string]any
+	if remote {
+		spec, ok := fetchRepoSpecYAML(userID, app)
+		if !ok {
+			fail(c, http.StatusNotFound, 1404, "app not found")
+			return
+		}
+		ui = parseAppUI(spec)
+		appCfg = parseAppConfigBytes(spec)
+	} else {
+		ui = readAppUI(appDir)
+		appCfg = readAppConfig(appDir)
 	}
-	ui := readAppUI(appDir)
 	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
 		fail(c, http.StatusNotFound, 1404, "app declares no ui surface")
 		return
 	}
-	appCfg := readAppConfig(appDir)
 
 	// Resolve the requested surface name → (markdown path | native key | page spec).
 	var mdPath, native, pagePath string
@@ -250,15 +273,24 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 			fail(c, http.StatusBadRequest, 1400, "invalid page path")
 			return
 		}
-		abs := filepath.Clean(filepath.Join(appDir, pagePath))
-		if abs != appDir && !strings.HasPrefix(abs, appDir+string(filepath.Separator)) {
-			fail(c, http.StatusBadRequest, 1400, "page path escapes app")
-			return
-		}
-		pb, rerr := os.ReadFile(abs)
-		if rerr != nil {
-			fail(c, http.StatusNotFound, 1404, "page spec not found: "+pagePath)
-			return
+		var pb []byte
+		if remote {
+			var ok bool
+			if pb, ok = fetchRepoBlob(userID, app, pagePath); !ok {
+				fail(c, http.StatusNotFound, 1404, "page spec not found: "+pagePath)
+				return
+			}
+		} else {
+			abs := filepath.Clean(filepath.Join(appDir, pagePath))
+			if abs != appDir && !strings.HasPrefix(abs, appDir+string(filepath.Separator)) {
+				fail(c, http.StatusBadRequest, 1400, "page path escapes app")
+				return
+			}
+			var rerr error
+			if pb, rerr = os.ReadFile(abs); rerr != nil {
+				fail(c, http.StatusNotFound, 1404, "page spec not found: "+pagePath)
+				return
+			}
 		}
 		md, cerr := compilePageSpec(pb)
 		if cerr != nil {
@@ -300,6 +332,40 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 	// The resolved path is reported back as-is so the client can show
 	// "inherits from template" in the editor UI.
 	resolvedPath := mdPath
+	// Remote (cloud-installed) apps: the .md body comes from the published
+	// bundle. The @fork_of / @shared indirections below are filesystem-only
+	// (they resolve against a parent app dir / the operator templates dir), so
+	// a remote app declaring one is served as "not found" rather than silently
+	// falling through to a path guard that would reject it anyway.
+	if remote {
+		if strings.HasPrefix(mdPath, "@") {
+			fail(c, http.StatusNotFound, 1404, "template surfaces need a local install ("+mdPath+")")
+			return
+		}
+		if strings.ToLower(filepath.Ext(mdPath)) != ".md" {
+			fail(c, http.StatusBadRequest, 1400, "surface must be a .md file")
+			return
+		}
+		body, ok := fetchRepoBlob(userID, app, mdPath)
+		if !ok {
+			fail(c, http.StatusNotFound, 1404, "surface file not found")
+			return
+		}
+		const maxRemote = 256 * 1024
+		truncated := false
+		if len(body) > maxRemote {
+			body, truncated = body[:maxRemote], true
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"app": app, "surface": name, "path": mdPath,
+				"markdown": string(body), "bytes": len(body), "truncated": truncated,
+				"nav": ui.Nav, "config": appCfg, "sha": contentSHA(body),
+			},
+		})
+		return
+	}
 	if strings.HasPrefix(mdPath, "@") {
 		var resolvedDir string
 		resolvedPath, resolvedDir = resolveSpecialMdPath(mdPath, appDir, userID)

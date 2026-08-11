@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
@@ -35,12 +36,33 @@ import (
 // surfaces (config_schema, loops, etc.) work without a shared filesystem.
 // Best-effort; ("", false) on any miss. Owner is assumed to be the caller (the
 // common case: a user manages their own installed app).
-func fetchRepoSpecYAML(userID, app string) ([]byte, bool) {
+// fetchRepoBlob reads ONE file from the caller's xp.io repo. This is the
+// cross-node escape hatch: identity runs on the service tier and does not mount
+// the scheduler's xpio-state PVC, so a tenant app's files simply are not on its
+// filesystem. The published bundle is the same content, reachable over HTTP.
+//
+// `paths` are tried in order and the first hit wins — the publisher stores the
+// spec dot-prefixed (`.xpcloud.yaml`) while the working tree uses the bare name,
+// so both spellings have to be probed.
+func fetchRepoBlob(userID, app string, paths ...string) ([]byte, bool) {
+	// Validate FIRST. The repo API is path-addressed, so a traversal here would
+	// read another repo's blob — refuse rather than normalize. Screening before
+	// minting the JWT also means a bad path costs no DB lookup and no request.
+	safe := paths[:0:0]
+	for _, p := range paths {
+		if p == "" || strings.Contains(p, "..") || strings.HasPrefix(p, "/") || strings.ContainsAny(p, "\x00") {
+			continue
+		}
+		safe = append(safe, p)
+	}
+	if len(safe) == 0 {
+		return nil, false
+	}
 	bearer, err := xpcloudUserJWT(userID)
 	if err != nil {
 		return nil, false
 	}
-	for _, p := range []string{".xpcloud.yaml", "xpcloud.yaml"} {
+	for _, p := range safe {
 		url := xpcloudBaseURL() + "/api/v1/repos/" + userID + "/" + app + "/blob/main/" + p
 		code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
 		if err != nil || code >= 300 || resp == nil {
@@ -56,6 +78,10 @@ func fetchRepoSpecYAML(userID, app string) ([]byte, bool) {
 		return []byte(content), true
 	}
 	return nil, false
+}
+
+func fetchRepoSpecYAML(userID, app string) ([]byte, bool) {
+	return fetchRepoBlob(userID, app, ".xpcloud.yaml", "xpcloud.yaml")
 }
 
 func contentSHA(b []byte) string {

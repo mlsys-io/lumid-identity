@@ -12,6 +12,15 @@ type ClaudeQuotaToken struct {
 	RefreshTokenEncrypted string    `gorm:"type:text"                          json:"-"`
 	CreatedAt             time.Time `gorm:"autoCreateTime"                     json:"created_at"`
 	UpdatedAt             time.Time `gorm:"autoUpdateTime"                     json:"updated_at"`
+	// RotatedAt is when the OAuth token family was last exchanged — the only
+	// honest "last rotation" clock. UpdatedAt cannot serve that role: it is
+	// bumped by ANY write to the row, and under load the most frequent writer
+	// is claude-proxy's bench reporter, not a rotation. Damping the refresh
+	// sweep on UpdatedAt therefore made heavy usage SUPPRESS proactive refresh
+	// (every bench pushed the next eligible sweep out by another 22.5 min),
+	// letting access tokens drift to expiry until the pool discovered it the
+	// expensive way — a burst of 401s and a reactive refresh stampede.
+	RotatedAt *time.Time `gorm:"column:rotated_at" json:"rotated_at,omitempty"`
 	// Quarantine state: set when Anthropic returns invalid_grant (the token
 	// family was revoked — typically rotation-reuse detection after the
 	// account owner's own Claude Code refreshed a shared credential copy).

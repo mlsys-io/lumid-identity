@@ -94,15 +94,46 @@ func parseFieldRelays(spec string) map[string]string {
 	return out
 }
 
-// refreshMutexes serialises token refresh per email. Anthropic rotates the
+// refreshFlights coalesces concurrent refreshes per email. Anthropic rotates the
 // refresh token on every exchange, so two concurrent refreshes with the same
 // refresh token (e.g. a dashboard probe racing a pool lease) would invalidate
 // one side's rotated credentials.
-var refreshMutexes sync.Map // email -> *sync.Mutex
+//
+// This REPLACES a plain per-email mutex, which serialised callers but did not
+// coalesce them: N queued callers each performed their own full exchange, so a
+// burst of 401s produced N rotations instead of one. That is the rate coupling
+// behind the 2026-08-11 quarantines. A rotation invalidates every access token
+// issued before it, so redundant rotations don't just waste an exchange — they
+// invalidate the leases still being handed out, which produces more 401s, which
+// queue more refreshes. Each extra rotation is also an extra draw at the
+// lost-response window (see refreshTokenLocked) that permanently kills the
+// family. One 401 storm could therefore rotate an account a dozen times in a
+// minute and quarantine it on any one of them.
+//
+// With singleflight, N concurrent 401s on an account produce exactly ONE
+// exchange and all N callers receive its result.
+type refreshFlight struct {
+	done  chan struct{}
+	token string
+	err   error
+}
 
-func refreshMutex(email string) *sync.Mutex {
-	m, _ := refreshMutexes.LoadOrStore(email, &sync.Mutex{})
-	return m.(*sync.Mutex)
+var refreshFlights sync.Map // email -> *refreshFlight
+
+// beginRefresh returns the in-flight refresh for this email, or claims the slot.
+// leader is true for the caller that must actually perform the exchange.
+func beginRefresh(email string) (f *refreshFlight, leader bool) {
+	mine := &refreshFlight{done: make(chan struct{})}
+	if existing, loaded := refreshFlights.LoadOrStore(email, mine); loaded {
+		return existing.(*refreshFlight), false
+	}
+	return mine, true
+}
+
+func (f *refreshFlight) finish(email, token string, err error) {
+	f.token, f.err = token, err
+	refreshFlights.Delete(email)
+	close(f.done)
 }
 
 // withEmailLock runs fn while holding a MySQL named lock scoped to the email.
@@ -134,9 +165,27 @@ func withEmailLock(email string, fn func() error) error {
 // token is returned without a second exchange. Rows quarantined by a prior
 // invalid_grant are never re-presented to Anthropic — re-add clears them.
 func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
-	mu := refreshMutex(row.Email)
-	mu.Lock()
-	defer mu.Unlock()
+	f, leader := beginRefresh(row.Email)
+	if !leader {
+		// A refresh for this account is already in flight. Wait for it and take
+		// its result rather than starting a second, redundant rotation.
+		select {
+		case <-f.done:
+			if f.err != nil {
+				return "", f.err
+			}
+			// Adopt the row the leader persisted, so callers that go on to use
+			// *row (the lease path re-reads, the sweep does not) see the rotated
+			// credential rather than their stale copy.
+			var fresh models.ClaudeQuotaToken
+			if common.DB.Where("email = ?", row.Email).First(&fresh).Error == nil {
+				*row = fresh
+			}
+			return f.token, nil
+		case <-time.After(refreshExchangeTimeout + 10*time.Second):
+			return "", fmt.Errorf("refresh already in flight for %s — timed out waiting", row.Email)
+		}
+	}
 
 	var tok string
 	err := withEmailLock(row.Email, func() error {
@@ -144,16 +193,28 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 		tok, innerErr = refreshTokenLocked(row)
 		return innerErr
 	})
+	f.finish(row.Email, tok, err)
 	return tok, err
 }
 
 func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	// Re-read: another refresher (this pod or the other replica) may have
-	// rotated while we waited on the locks.
+	// rotated while we waited on the locks. singleflight collapses concurrent
+	// callers within one pod; this is the cross-replica arm of the same idea.
+	//
+	// The test is "did the stored access token CHANGE since the copy I set out
+	// to replace", not "was the row written recently". A wall-clock window (this
+	// was 30s) silently stops collapsing exactly when collapsing matters most:
+	// under a burst, callers queue behind a lock whose exchange can take up to
+	// refreshExchangeTimeout, so anyone past the first couple of places in line
+	// arrives after the window has closed and rotates redundantly — the deeper
+	// the queue, the more redundant rotations, which is backwards. A changed
+	// value is proof someone rotated for us regardless of how long we waited;
+	// all we owe it is a check that what we'd hand back is actually usable.
 	var fresh models.ClaudeQuotaToken
 	if err := common.DB.Where("email = ?", row.Email).First(&fresh).Error; err == nil {
-		if time.Since(fresh.UpdatedAt) < 30*time.Second && fresh.ValueEncrypted != row.ValueEncrypted && fresh.RevokedAt == nil {
-			if tok, err := common.DecryptGrant(fresh.ValueEncrypted); err == nil {
+		if fresh.ValueEncrypted != row.ValueEncrypted && fresh.RevokedAt == nil {
+			if tok, err := common.DecryptGrant(fresh.ValueEncrypted); err == nil && !tokenExpiringSoon(tok) {
 				*row = fresh
 				return tok, nil
 			}
@@ -219,7 +280,7 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 
-	cl := &http.Client{Timeout: quotaFetchTimeout}
+	cl := &http.Client{Timeout: refreshExchangeTimeout}
 	resp, err := cl.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("token refresh network error: %w", err)
@@ -274,13 +335,17 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	if err != nil {
 		return tok.AccessToken, fmt.Errorf("encrypt new token: %w", err)
 	}
+	now := time.Now()
 	updates := map[string]interface{}{
 		"value_encrypted": newEnc,
 		// A successful exchange proves the family is alive — clear any stale
 		// quarantine (e.g. a row re-added out-of-band).
 		"revoked_at":    nil,
 		"revoke_reason": "",
+		// The true rotation clock the sweep damps on. See ClaudeQuotaToken.
+		"rotated_at": now,
 	}
+	row.RotatedAt = &now
 	if tok.RefreshToken != "" && tok.RefreshToken != refreshTok {
 		newRefEnc, _ := common.EncryptGrant(tok.RefreshToken)
 		if newRefEnc != "" {
@@ -303,6 +368,16 @@ const (
 	// users, or they end up homed somewhere they can never actually egress from.
 	nearExhaustCeiling = 92.0
 	quotaFetchTimeout  = 20 * time.Second
+	// refreshExchangeTimeout bounds the OAuth refresh POST specifically, and is
+	// deliberately far more patient than quotaFetchTimeout. The two calls fail
+	// asymmetrically: abandoning a quota PROBE costs one stale snapshot, while
+	// abandoning a refresh mid-flight can cost the ACCOUNT — Anthropic rotates
+	// the family on receipt, so a response we hang up on is a rotation we can
+	// never persist, and the next attempt presents a dead token (invalid_grant
+	// → quarantine → manual `claude auth login`). Waiting a slow upstream out is
+	// always cheaper than that, so this is sized to outlast a slow response
+	// rather than to keep the caller snappy.
+	refreshExchangeTimeout = 60 * time.Second
 	// Minimal probe model — cheapest, fastest; we only need the response headers.
 	quotaProbeModel = "claude-haiku-4-5-20251001"
 )
@@ -1036,6 +1111,20 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		if err != nil {
 			continue
 		}
+		// Never lease a credential that is about to expire. claude-proxy now caps
+		// its lease cache at the token's own expiry, so handing out a nearly-dead
+		// token would give it a lease that is stale on arrival and send it back
+		// here on the very next request — a lease storm in place of the 401 storm
+		// this pairing exists to remove. Rotate first (coalesced, so a burst of
+		// callers still produces one exchange) and lease the result.
+		if tokenExpiringSoon(token) {
+			newTok, err := tryRefreshToken(&row)
+			if err != nil {
+				log.Printf("claude-lease: %s: token near expiry and refresh failed: %v — skipping", row.Email, err)
+				continue
+			}
+			token = newTok
+		}
 		snap := cd.snap
 		if snap == nil || time.Since(snap.Ts) >= quotaCacheTTL {
 			fresh, err := refreshSnapshot(&row, token)
@@ -1054,15 +1143,27 @@ func InternalClaudeTokenLease(c *gin.Context) {
 				}
 			}
 		}
+		// access_token_exp lets claude-proxy bound its lease cache by the life of
+		// the credential inside it rather than by a fixed TTL. Without it a cached
+		// lease kept presenting a token this service had since rotated — every
+		// rotation invalidates the previous access token immediately — so each
+		// rotation produced a burst of "OAuth access token has been revoked" 401s
+		// from whichever leases were still holding the old one. Zero when the
+		// token carries no parseable exp; the proxy falls back to its fixed TTL.
+		var tokenExp int64
+		if exp := jwtExpiry(token); !exp.IsZero() {
+			tokenExp = exp.Unix()
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
 			"data": gin.H{
-				"email":         row.Email,
-				"access_token":  token,
-				"five_hour_pct": snap.FiveHourPct,
-				"seven_day_pct": snap.SevenDayPct,
-				"severity":      snap.Severity,
-				"label":         row.Label,
+				"email":            row.Email,
+				"access_token":     token,
+				"access_token_exp": tokenExp,
+				"five_hour_pct":    snap.FiveHourPct,
+				"seven_day_pct":    snap.SevenDayPct,
+				"severity":         snap.Severity,
+				"label":            row.Label,
 			},
 		})
 		return
@@ -1210,7 +1311,15 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		if !ok {
 			continue
 		}
-		if live, resetAt := common.ClaudeWindowLive(win.FiveHourAnchor, 5*time.Hour, now); live {
+		// MUST be the configured short window, not a literal. This read is the
+		// third of the three sites ClaudePoolShortWindow warns must never
+		// disagree, and it was the one still hardcoded at 5h after the window
+		// moved to 4h — so the admin usage table reported resets up to an hour
+		// beyond the window that actually governs the budget (a user 23 min into
+		// their window was shown "resets in 4h37m", which a 4h window can never
+		// produce). Only the displayed reset was wrong; enforcement and the anchor
+		// roll already used the configured length.
+		if live, resetAt := common.ClaudeWindowLive(win.FiveHourAnchor, common.ClaudePoolShortWindow(), now); live {
 			u.FiveHourReset = resetAt.UTC().Format(time.RFC3339)
 		}
 		if live, resetAt := common.ClaudeWindowLive(win.SevenDayAnchor, 7*24*time.Hour, now); live {
@@ -1432,6 +1541,11 @@ func InternalClaudeQuotaReport(c *gin.Context) {
 // are refreshed before expiry even if the proxy hasn't been used recently.
 const tokenRefreshInterval = 45 * time.Minute
 
+// minHealthyPoolAccounts is the floor below which the sweep warns. Two is not a
+// comfort level, it is the point at which losing one more account leaves the
+// pool with a single credential serving every user.
+const minHealthyPoolAccounts = 2
+
 func StartTokenRefreshLoop() {
 	go func() {
 		// Small initial delay so the DB is ready and startup noise settles.
@@ -1467,6 +1581,20 @@ func jwtExpiry(rawToken string) time.Time {
 	}
 	return time.Unix(claims.Exp, 0)
 }
+
+// tokenExpiringSoon reports whether an access token is too close to expiry to be
+// worth handing back in place of a rotation. An opaque token (no parseable exp)
+// is treated as usable — the collapse guard's other arm already proved it was
+// freshly written by another refresher.
+func tokenExpiringSoon(rawToken string) bool {
+	exp := jwtExpiry(rawToken)
+	return !exp.IsZero() && time.Until(exp) < accessTokenMinLife
+}
+
+// accessTokenMinLife is the headroom a leased access token must still have. It
+// bounds both the collapse guard above and the lease TTL claude-proxy derives
+// from `access_token_exp`, so a lease can never outlive the credential inside it.
+const accessTokenMinLife = 5 * time.Minute
 
 func base64DecodeJWT(s string) ([]byte, error) {
 	// JWT uses base64url without padding; add padding back.
@@ -1576,11 +1704,28 @@ func sweepAllTokens() {
 		log.Printf("token-refresh-loop: db query failed: %v", err)
 		return
 	}
-	var quarantined int64
-	common.DB.Model(&models.ClaudeQuotaToken{}).Where("revoked_at IS NOT NULL").Count(&quarantined)
-	if quarantined > 0 {
-		log.Printf("token-refresh-loop: %d quarantined account(s) awaiting re-add", quarantined)
+	// Name them. A bare count told an operator that something was wrong but not
+	// which account, so diagnosing a thin pool meant inferring identities from
+	// traffic going quiet in the proxy logs.
+	var quarantinedRows []models.ClaudeQuotaToken
+	common.DB.Where("revoked_at IS NOT NULL").Find(&quarantinedRows)
+	if len(quarantinedRows) > 0 {
+		parts := make([]string, 0, len(quarantinedRows))
+		for _, q := range quarantinedRows {
+			parts = append(parts, fmt.Sprintf("%s (%s)", q.Email, q.RevokeReason))
+		}
+		log.Printf("token-refresh-loop: %d quarantined account(s) awaiting re-add: %s",
+			len(quarantinedRows), strings.Join(parts, "; "))
 	}
+
+	// A pool this thin is one bad credential away from a total outage, and the
+	// symptom (every user pinned to one account) is invisible from any single
+	// request. Warn on the sweep so it lands before the outage does.
+	if healthy := len(rows); healthy < minHealthyPoolAccounts {
+		log.Printf("token-refresh-loop: WARNING pool is down to %d refreshable account(s) "+
+			"(want >= %d) — re-add quarantined accounts", healthy, minHealthyPoolAccounts)
+	}
+
 	if len(rows) == 0 {
 		return
 	}
@@ -1588,7 +1733,14 @@ func sweepAllTokens() {
 		// Damping: if any refresher (a lease, a dashboard probe, the other
 		// replica's earlier sweep) rotated this row recently, leave it alone —
 		// each rotation is a fresh chance to lose the family.
-		if time.Since(row.UpdatedAt) < tokenRefreshInterval/2 {
+		//
+		// Damps on RotatedAt, never UpdatedAt: UpdatedAt is bumped by every write
+		// to the row, and the busiest writer is claude-proxy's bench reporter. On
+		// UpdatedAt this check inverted under load — the accounts being benched
+		// most were the ones whose proactive refresh got deferred longest, so
+		// their tokens drifted to expiry and the pool rediscovered it as a 401
+		// burst. A row that has never rotated (nil) is always eligible.
+		if row.RotatedAt != nil && time.Since(*row.RotatedAt) < tokenRefreshInterval/2 {
 			continue
 		}
 		tok, err := common.DecryptGrant(row.ValueEncrypted)

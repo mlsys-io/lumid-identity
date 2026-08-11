@@ -25,7 +25,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log"
 	"os"
@@ -167,31 +166,16 @@ func setChatTitle(userID, chatID, title string) error {
 	chatFileMu.Lock()
 	defer chatFileMu.Unlock()
 
-	path := chatPath(userID, chatID)
-	b, err := os.ReadFile(path)
+	rec, err := chatStoreGet(userID, chatID)
 	if err != nil {
 		return err // deleted mid-flight is a normal outcome, not an error to fix
-	}
-	var rec chatRecord
-	if err := json.Unmarshal(b, &rec); err != nil {
-		return err
 	}
 	if rec.TitleSummary {
 		return nil
 	}
 	rec.Title = title
 	rec.TitleSummary = true
-
-	buf, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := chatStoreSave(userID, rec); err != nil {
 		return err
 	}
 	return nil

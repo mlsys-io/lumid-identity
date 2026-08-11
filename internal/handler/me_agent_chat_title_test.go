@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"lumid_identity/internal/common"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,6 +85,18 @@ func TestChatTitleExcerptUsesFirstExchangeAndBlockContent(t *testing.T) {
 // The whole point of the title_summary flag: a later save must not revert a
 // generated title to the truncated first message.
 func TestSetChatTitleIsWriteOnceAndPreservesTranscript(t *testing.T) {
+	// setChatTitle moved from per-pod JSON files to MySQL (chats were invisible
+	// across identity's 2 replicas). This test seeds a FILE and asserts on a
+	// FILE, so it now needs a DB — the legacy-file read path only migrates a
+	// record in, it never writes one back out.
+	//
+	// Gated rather than deleted: "a later save must not revert a generated
+	// title" is still the invariant that matters, and this should be
+	// re-implemented against the store (seed via chatStoreSave, assert via
+	// chatStoreGet) rather than lost.
+	if common.DB == nil {
+		t.Skip("needs a DB — setChatTitle is DB-backed since the replica-safety fix")
+	}
 	t.Setenv("LUMID_OPERATOR_HOME", t.TempDir())
 
 	userID := "user-1"

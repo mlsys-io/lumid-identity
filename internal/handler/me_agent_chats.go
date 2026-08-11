@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -26,6 +25,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const (
@@ -115,14 +115,9 @@ func MeChatsList(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
-	dir := chatsDir(userID)
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"chats": []any{}}})
-		return
-	}
+	recs, err := chatStoreList(userID)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "readdir: "+err.Error())
+		fail(c, http.StatusInternalServerError, 1500, "list chats: "+err.Error())
 		return
 	}
 	type listRow struct {
@@ -135,32 +130,15 @@ func MeChatsList(c *gin.Context) {
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
 	}
-	rows := make([]listRow, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		b, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var r chatRecord
-		if err := json.Unmarshal(b, &r); err != nil {
-			continue
-		}
+	rows := make([]listRow, 0, len(recs))
+	for _, r := range recs {
 		rows = append(rows, listRow{
-			ID:        r.ID,
-			Title:     r.Title,
-			Model:     r.Model,
-			Mode:      r.Mode,
-			App:       r.App,
-			MsgCount:  len(r.Messages),
-			CreatedAt: r.CreatedAt,
-			UpdatedAt: r.UpdatedAt,
+			ID: r.ID, Title: r.Title, Model: r.Model, Mode: r.Mode, App: r.App,
+			MsgCount: len(r.Messages), CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}
-	// Newest-updated first.
+	// Newest-updated first. chatStoreList already orders by updated_at, but any
+	// legacy files merged in on this pod land at the end, so re-sort.
 	sort.Slice(rows, func(i, j int) bool { return rows[i].UpdatedAt > rows[j].UpdatedAt })
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"chats": rows}})
 }
@@ -177,14 +155,8 @@ func MeChatGet(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid chat id")
 		return
 	}
-	path := chatPath(userID, id)
-	abs, _ := filepath.Abs(path)
-	if !strings.HasPrefix(abs, chatsDir(userID)+string(os.PathSeparator)) {
-		fail(c, http.StatusBadRequest, 1400, "invalid path")
-		return
-	}
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	rec, err := chatStoreGet(userID, id)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		fail(c, http.StatusNotFound, 1404, "not found")
 		return
 	}
@@ -192,12 +164,7 @@ func MeChatGet(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "read: "+err.Error())
 		return
 	}
-	var r chatRecord
-	if err := json.Unmarshal(b, &r); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "parse: "+err.Error())
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": r})
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": rec})
 }
 
 // MeChatSave — POST /api/v1/me/chats — upsert.
@@ -243,9 +210,8 @@ func MeChatSave(c *gin.Context) {
 			return
 		}
 		// Load existing to preserve CreatedAt.
-		path := chatPath(userID, body.ID)
-		b, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
+		existing, err := chatStoreGet(userID, body.ID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			fail(c, http.StatusNotFound, 1404, "chat not found — omit id to create a new one")
 			return
 		}
@@ -253,9 +219,7 @@ func MeChatSave(c *gin.Context) {
 			fail(c, http.StatusInternalServerError, 1500, "read: "+err.Error())
 			return
 		}
-		if err := json.Unmarshal(b, &rec); err != nil {
-			rec = chatRecord{ID: body.ID, CreatedAt: now}
-		}
+		rec = *existing
 	}
 
 	rec.Messages = body.Messages
@@ -276,10 +240,6 @@ func MeChatSave(c *gin.Context) {
 	}
 	rec.UpdatedAt = now
 
-	if err := os.MkdirAll(chatsDir(userID), 0o755); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "mkdir: "+err.Error())
-		return
-	}
 	buf, err := json.Marshal(rec)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "marshal: "+err.Error())
@@ -289,16 +249,13 @@ func MeChatSave(c *gin.Context) {
 		fail(c, http.StatusRequestEntityTooLarge, 1413, fmt.Sprintf("chat exceeds %d bytes — split into a new thread", chatMaxBytes))
 		return
 	}
-	// Held across write+rename so an in-flight title rewrite (which does its
-	// own read-modify-write) can't interleave and drop this transcript.
+	// Still held: an in-flight title rewrite does its own read-modify-write, and
+	// the lock is what stops it interleaving and dropping this transcript. It is
+	// per-pod, which was fine when storage was per-pod too — the DB upsert is
+	// atomic, so the remaining window is only the read-modify-write in the title
+	// path, and that races on one pod exactly as before.
 	chatFileMu.Lock()
-	tmp := chatPath(userID, rec.ID) + ".tmp"
-	werr := os.WriteFile(tmp, buf, 0o644)
-	if werr == nil {
-		if werr = os.Rename(tmp, chatPath(userID, rec.ID)); werr != nil {
-			_ = os.Remove(tmp)
-		}
-	}
+	werr := chatStoreSave(userID, &rec)
 	chatFileMu.Unlock()
 	if werr != nil {
 		fail(c, http.StatusInternalServerError, 1500, "write: "+werr.Error())
@@ -306,7 +263,7 @@ func MeChatSave(c *gin.Context) {
 	}
 
 	if isNew {
-		go pruneChats(userID, chatsKeep)
+		go chatStorePrune(userID, chatsKeep)
 	}
 	// Fire-and-forget: replaces the truncated title with a generated summary
 	// once the thread has a reply to summarize. No-op if it already has one.
@@ -338,45 +295,10 @@ func MeChatDelete(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid chat id")
 		return
 	}
-	err := os.Remove(chatPath(userID, id))
-	if errors.Is(err, os.ErrNotExist) {
-		fail(c, http.StatusNotFound, 1404, "not found")
-		return
-	}
+	err := chatStoreDelete(userID, id)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "remove: "+err.Error())
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"id": id}})
-}
-
-// pruneChats deletes the oldest files when the user has more than
-// `keep`. Best-effort. Mirrors the artifact-pruning pattern.
-func pruneChats(userID string, keep int) {
-	entries, err := os.ReadDir(chatsDir(userID))
-	if err != nil {
-		return
-	}
-	type item struct {
-		name string
-		mod  time.Time
-	}
-	rows := make([]item, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		rows = append(rows, item{e.Name(), info.ModTime()})
-	}
-	if len(rows) <= keep {
-		return
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].mod.Before(rows[j].mod) })
-	for _, r := range rows[:len(rows)-keep] {
-		_ = os.Remove(filepath.Join(chatsDir(userID), r.name))
-	}
 }

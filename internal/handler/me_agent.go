@@ -2203,7 +2203,11 @@ func buildToolDefs() []map[string]any {
 			// analyst voice, its skill cards and its grounded/ungrounded scoring
 			// all sat unused. This is the missing verb.
 			"name":        "app_answer",
-			"description": "Answer a question AS an installed app's analyst, using that app's own prompts and skill cards. Use whenever the user asks a domain question while an app is in context — including free-form questions with no case id. Returns the answer plus whether it is backed by ground truth.",
+			// Imperative on purpose. With a permissive description a small model
+			// answers domain questions from its own knowledge and the app never
+			// participates — which is the exact failure this tool exists to fix,
+			// so a tool that is merely *available* is not enough.
+			"description": "REQUIRED for any domain/subject-matter question asked while an app is in context — including free-form ones with no case id. Answers AS that app's analyst using the app's own prompts and skill cards, and reports whether the answer is backed by ground truth. Do NOT answer such a question yourself and do NOT use web_search or deep_research for it: the app's voice, rubric and grounded/ungrounded distinction only exist here. Pass the user's question verbatim.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

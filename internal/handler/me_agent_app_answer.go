@@ -267,9 +267,12 @@ func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentCha
 		return nil, false
 	}
 	switch tool {
-	case "app_answer":
-		res, _ := toolAppAnswer(c.Request.Context(), userID, role, app, last, "")
-		return res, true
+	// app_answer is deliberately NOT here. "Ask the app" is a sticky toggle that
+	// is ON by default, so forcing it server-side hijacked EVERY docked turn into
+	// a one-shot answer with no case context and no conversation history —
+	// breaking multi-turn continuity and reload persistence (shipped as v0.5.17,
+	// reverted 20 minutes later). Only a tool sent by an explicit, per-turn user
+	// action belongs on this path.
 	case "app_feedback":
 		// The composer prefixes the correction; the note is what follows.
 		note := last

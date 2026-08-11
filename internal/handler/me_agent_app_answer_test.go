@@ -79,3 +79,31 @@ func TestToolAvailableGuardsForcedChoice(t *testing.T) {
 		}
 	}
 }
+
+// The regression this guards (shipped v0.5.17, reverted 20 min later):
+// "Ask the app" is a sticky toggle, ON by default, so it sends
+// tool_choice=app_answer on EVERY docked turn. Executing that server-side
+// hijacked every message into a one-shot answer with no case context and no
+// conversation history, breaking multi-turn continuity and reload persistence.
+//
+// Only a tool sent by an explicit, per-turn user action (the "Correct this"
+// button) may be executed without a model turn. If app_answer ever reappears
+// here, that regression comes back.
+func TestForcedToolPathExcludesAppAnswer(t *testing.T) {
+	src, err := os.ReadFile("me_agent_app_answer.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	i := strings.Index(body, "func runForcedAppTool")
+	if i < 0 {
+		t.Fatal("runForcedAppTool not found")
+	}
+	fn := body[i:]
+	if strings.Contains(fn, `case "app_answer":`) {
+		t.Fatal("app_answer is back on the forced path — this hijacks every docked turn (see v0.5.17)")
+	}
+	if !strings.Contains(fn, `case "app_feedback":`) {
+		t.Fatal("app_feedback should be forceable — it is only ever sent by an explicit button")
+	}
+}

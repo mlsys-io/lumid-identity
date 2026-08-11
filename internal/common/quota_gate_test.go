@@ -45,8 +45,8 @@ func TestClaudePoolLimitsSane(t *testing.T) {
 	if seven < five {
 		t.Errorf("7d cap (%d) must be >= 5h cap (%d)", seven, five)
 	}
-	if five != DefaultClaude5hTokens || seven != DefaultClaude7dTokens {
+	if five != DefaultClaudeShortTokens || seven != DefaultClaude7dTokens {
 		t.Logf("caps are env-overridden: 5h=%d 7d=%d (defaults %d/%d)",
-			five, seven, DefaultClaude5hTokens, DefaultClaude7dTokens)
+			five, seven, DefaultClaudeShortTokens, DefaultClaude7dTokens)
 	}
 }

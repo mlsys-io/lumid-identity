@@ -1110,13 +1110,13 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       MAX(ue.ts)                                                               AS last_ts
 		FROM   usage_events ue
 		JOIN  (SELECT user_sub,
-		              CASE WHEN five_hour_anchor + INTERVAL 5 HOUR > ? THEN five_hour_anchor ELSE ? END AS five_eff,
+		              CASE WHEN five_hour_anchor + INTERVAL ? SECOND > ? THEN five_hour_anchor ELSE ? END AS five_eff,
 		              CASE WHEN seven_day_anchor + INTERVAL 7 DAY > ? THEN seven_day_anchor ELSE ? END AS seven_eff
 		       FROM   claude_pool_windows) w ON w.user_sub = ue.user_sub
 		LEFT JOIN users u ON u.id = ue.user_sub
 		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= LEAST(w.five_eff, w.seven_eff)
 		GROUP  BY ue.user_sub, u.email`,
-		now, far, now, far).Scan(&rows).Error
+		int(common.ClaudePoolShortWindow().Seconds()), now, far, now, far).Scan(&rows).Error
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query usage: "+err.Error())
 		return

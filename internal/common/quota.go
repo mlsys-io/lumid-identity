@@ -35,10 +35,21 @@ const (
 	DefaultGmailSendsDaily = 200
 	DefaultSlackPostsDaily = 100
 
-	// Claude account-pool per-user caps — rolling windows mirroring
-	// Anthropic's own 5h/7d shape (uncached input + output tokens).
-	DefaultClaude5hTokens = 4_000_000
-	DefaultClaude7dTokens = 40_000_000
+	// Claude account-pool per-user caps (uncached input + output tokens).
+	//
+	// The short window was 4M/5h; it is now 2M/4h (operator decision
+	// 2026-08-11). The 5h originally mirrored Anthropic's own window so a
+	// user's lumid budget reset at the same moment their upstream one did.
+	// 4h deliberately breaks that alignment: this is a FAIRNESS cap between
+	// lumid users sharing a pooled subscription, not a mirror of Anthropic's
+	// accounting, and a shorter window bounds how much of a shared account one
+	// person can absorb before the others get a turn.
+	//
+	// Consequence worth knowing: the two windows now drift out of phase, so a
+	// user can hit their lumid cap while Anthropic still shows headroom (and
+	// vice versa). That is intended — the pool-side ceiling is the binding one.
+	DefaultClaudeShortTokens = 2_000_000
+	DefaultClaude7dTokens    = 40_000_000
 	// Target ceiling on DISTINCT end-users homed on one pooled account.
 	//
 	// The pooled accounts are individual consumer Claude subscriptions, and the
@@ -210,9 +221,39 @@ func poolCapApplies(model string) bool {
 }
 
 // ClaudePoolLimits reads the env-tunable per-user pool caps.
-func ClaudePoolLimits() (fiveH, sevenD int) {
-	return envIntPos("LUMID_QUOTA_CLAUDE_5H_TOKENS", DefaultClaude5hTokens),
+// LUMID_QUOTA_CLAUDE_5H_TOKENS keeps its name for continuity with any existing
+// deployment env; it now sets the SHORT-window budget whatever that window's
+// length is (see ClaudePoolShortWindow).
+func ClaudePoolLimits() (short, sevenD int) {
+	return envIntPos("LUMID_QUOTA_CLAUDE_5H_TOKENS", DefaultClaudeShortTokens),
 		envIntPos("LUMID_QUOTA_CLAUDE_7D_TOKENS", DefaultClaude7dTokens)
+}
+
+// DefaultClaudeShortWindow is the length of the per-user short window.
+//
+// The DB column is still `five_hour_anchor`: renaming it needs a migration for
+// no functional gain, and the column only ever meant "when the short window
+// started". Read it as shortAnchor.
+const DefaultClaudeShortWindow = 4 * time.Hour
+
+// ClaudePoolShortWindow is the env-tunable short-window length
+// (LUMID_QUOTA_CLAUDE_SHORT_WINDOW, e.g. "4h", "90m").
+//
+// It is read in THREE places that must never disagree — the usage read
+// (ClaudePoolUsage), the anchor roll (ClaudePoolCommit) and the admin usage
+// query. If they diverge, a user's window appears to reset at one length while
+// their budget is measured over another, which reads as quota vanishing or
+// never resetting.
+func ClaudePoolShortWindow() time.Duration {
+	v := strings.TrimSpace(os.Getenv("LUMID_QUOTA_CLAUDE_SHORT_WINDOW"))
+	if v == "" {
+		return DefaultClaudeShortWindow
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return DefaultClaudeShortWindow
+	}
+	return d
 }
 
 // ClaudeMaxUsersPerAccount is the env-tunable ceiling on distinct users homed on
@@ -316,7 +357,7 @@ func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStat
 		return status, err
 	}
 
-	fiveLive, fiveReset := ClaudeWindowLive(win.FiveHourAnchor, 5*time.Hour, now)
+	fiveLive, fiveReset := ClaudeWindowLive(win.FiveHourAnchor, ClaudePoolShortWindow(), now)
 	sevenLive, sevenReset := ClaudeWindowLive(win.SevenDayAnchor, 7*24*time.Hour, now)
 	if !fiveLive && !sevenLive {
 		return status, nil
@@ -376,10 +417,10 @@ func ClaudePoolCommit(db *gorm.DB, userSub string, now time.Time) error {
 		INSERT INTO claude_pool_windows (user_sub, five_hour_anchor, seven_day_anchor, updated_at)
 		VALUES (?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
-		  five_hour_anchor = IF(five_hour_anchor + INTERVAL 5 HOUR <= VALUES(five_hour_anchor), VALUES(five_hour_anchor), five_hour_anchor),
+		  five_hour_anchor = IF(five_hour_anchor + INTERVAL ? SECOND <= VALUES(five_hour_anchor), VALUES(five_hour_anchor), five_hour_anchor),
 		  seven_day_anchor = IF(seven_day_anchor + INTERVAL 7 DAY <= VALUES(seven_day_anchor), VALUES(seven_day_anchor), seven_day_anchor),
 		  updated_at       = VALUES(updated_at)`,
-		userSub, now, now, now).Error
+		userSub, now, now, now, int(ClaudePoolShortWindow().Seconds())).Error
 }
 
 // CheckAndCharge enforces the four daily caps and (on allowed && !DryRun)

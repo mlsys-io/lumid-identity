@@ -200,7 +200,17 @@ func lumidosURL() string {
 
 // dispatchLumidosTool POSTs to the schedule server's tool bridge and returns
 // the result map. The schedule server runs the actual Python ops function.
-func dispatchLumidosTool(name string, args map[string]any) (map[string]any, bool) {
+// tenantSubHeader carries the CALLER's identity to the LumidOS tool server.
+//
+// Without it LumidOS resolves app bundles against the operator's own ~/.xp and
+// finds nothing for a tenant, so every app tool answered "app not found" and
+// the agent reported "I don't see any apps installed in your tenant" — for apps
+// that were installed, healthy and listed by /me/apps. LumidOS's
+// resolve_bundle_dir already searches ~/.tenants/<sub>/.xp when LUMID_TENANT_SUB
+// is set; nothing on the wire was telling it which tenant was calling.
+const tenantSubHeader = "X-Lumid-Tenant-Sub"
+
+func dispatchLumidosTool(userID, name string, args map[string]any) (map[string]any, bool) {
 	payload, _ := json.Marshal(map[string]any{"tool": name, "args": args})
 	// 90s: ops tools walk the knowledge graph (xp_status on a large KG
 	// measures ~35s) — 30s cut those off mid-flight.
@@ -212,6 +222,9 @@ func dispatchLumidosTool(name string, args map[string]any) (map[string]any, bool
 		return map[string]any{"error": err.Error()}, false
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if userID != "" {
+		req.Header.Set(tenantSubHeader, userID)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return map[string]any{"error": "lumidos unreachable: " + err.Error()}, false
@@ -3874,7 +3887,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 	// canonical name is normalized to its legacy app_* wire name first, since
 	// the schedule server still dispatches on app_*.
 	if lumidosToolNames[name] {
-		return dispatchLumidosTool(agentToolWireName(name), args)
+		return dispatchLumidosTool(userID, agentToolWireName(name), args)
 	}
 
 	log.Printf("[me-agent] unknown tool name=%q user=%s — in prompt catalog but not wired into dispatch", name, userID)

@@ -2202,7 +2202,7 @@ func buildToolDefs() []map[string]any {
 			// answered by deep_research and the app never participated — its
 			// analyst voice, its skill cards and its grounded/ungrounded scoring
 			// all sat unused. This is the missing verb.
-			"name":        "app_answer",
+			"name": "app_answer",
 			// Imperative on purpose. With a permissive description a small model
 			// answers domain questions from its own knowledge and the app never
 			// participates — which is the exact failure this tool exists to fix,

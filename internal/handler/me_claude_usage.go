@@ -91,6 +91,9 @@ func MeClaudeUsage(c *gin.Context) {
 			"models":           models,
 			"cap_5h":           cap5,
 			"cap_7d":           cap7,
+			// Env-tunable and no longer 5h — see shortWindowLabel. Any surface
+			// showing this quota must render it instead of a hardcoded "5h".
+			"short_window_label": shortWindowLabel(),
 		},
 	})
 }

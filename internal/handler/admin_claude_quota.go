@@ -1256,8 +1256,28 @@ func AdminClaudeUserUsage(c *gin.Context) {
 			"users":            users,
 			"five_hour_tokens": cap5,
 			"seven_day_tokens": cap7,
+			// The short window is env-tunable (LUMID_QUOTA_CLAUDE_SHORT_WINDOW)
+			// and is no longer 5h, so the UI must render this rather than a
+			// hardcoded "5h" — otherwise the dashboard silently lies the next
+			// time the window moves. The JSON keys above keep their historical
+			// five_hour_* names for wire compatibility.
+			"short_window_label": shortWindowLabel(),
 		},
 	})
+}
+
+// shortWindowLabel renders the per-user short window for display ("4h", "90m").
+// Whole hours read as "4h"; anything else falls back to Go's duration string
+// with the zero-value units trimmed.
+func shortWindowLabel() string {
+	d := common.ClaudePoolShortWindow()
+	if d%time.Hour == 0 {
+		return strconv.Itoa(int(d/time.Hour)) + "h"
+	}
+	if d%time.Minute == 0 {
+		return strconv.Itoa(int(d/time.Minute)) + "m"
+	}
+	return d.String()
 }
 
 // AdminClaudeAccountUsers reports how many distinct users are homed on each

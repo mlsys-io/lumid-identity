@@ -2,6 +2,7 @@ package common
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -90,5 +91,78 @@ func TestClaudeModelWeightSQLQualifiesColumn(t *testing.T) {
 	}
 	if strings.Contains(sql, "LOWER(model)") {
 		t.Fatalf("unqualified column leaked into SQL despite a qualified argument:\n%s", sql)
+	}
+}
+
+// The quota unit folds raw token classes together by price ratio, then scales by
+// model. These pin the arithmetic and, critically, the BACKWARD-COMPATIBILITY
+// property that lets the schema change ship without a backfill.
+func TestClaudeWeightedTokens(t *testing.T) {
+	cases := []struct {
+		name                   string
+		model                  string
+		in, out, cRead, cWrite int
+		want                   int
+	}{
+		// A Claude Code turn: tiny fresh input, huge cached context. This is the
+		// shape that made raw-token counting meaningless and weighted counting
+		// necessary — 118k cache reads cost a tenth of 118k fresh tokens.
+		{"opus cached turn", "claude-opus-5", 4, 350, 118000, 0, 4 + 350 + 11800},
+		// Same turn on Sonnet costs a fifth again.
+		{"sonnet cached turn", "claude-sonnet-5", 4, 350, 118000, 0, 2431}, // (4+350+11800)*0.2 = 2430.8, rounded
+		// Cache WRITES are more expensive than fresh input, not less.
+		{"cache write premium", "claude-opus-5", 0, 0, 0, 1000, 1250},
+		{"haiku is nearly free", "claude-haiku-4-5", 0, 0, 100000, 0, 530}, // 100000*0.1*0.053
+		// Unknown model bills at the conservative default, never free.
+		{"unknown model", "some-future-model", 1000, 0, 0, 0, 200},
+	}
+	for _, c := range cases {
+		got := ClaudeWeightedTokens(c.model, c.in, c.out, c.cRead, c.cWrite)
+		if got != c.want {
+			t.Errorf("%s: ClaudeWeightedTokens = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// Rows written before the cache columns existed folded the already-weighted
+// total into input_tokens and leave both cache columns at 0. The read-time
+// formula must pass those through unchanged — otherwise shipping this schema
+// change would silently re-scale every historical row and either wipe out or
+// double-count usage that users are currently being capped on.
+func TestClaudeWeightedTokensLegacyRowsPassThrough(t *testing.T) {
+	const legacyWeightedInput = 39812 // what an old row stored for one Opus turn
+
+	// Old row: everything in input_tokens, cache columns 0.
+	old := ClaudeWeightedTokens("claude-opus-5", legacyWeightedInput, 0, 0, 0)
+	if old != legacyWeightedInput {
+		t.Fatalf("legacy Opus row changed value: %d -> %d; a schema change must not "+
+			"re-scale history", legacyWeightedInput, old)
+	}
+
+	// And the model weight still applies to legacy rows exactly as it did before
+	// the cache columns were added.
+	oldSonnet := ClaudeWeightedTokens("claude-sonnet-5", legacyWeightedInput, 0, 0, 0)
+	want := int(math.Round(float64(legacyWeightedInput) * 0.2))
+	if oldSonnet != want {
+		t.Fatalf("legacy Sonnet row = %d, want %d", oldSonnet, want)
+	}
+}
+
+// The SQL twin must reference every raw column and both cache weights, or stored
+// cached usage silently stops counting toward the cap.
+func TestClaudeWeightedTokensSQLCoversAllColumns(t *testing.T) {
+	sql := ClaudeWeightedTokensSQL("ue.")
+	for _, col := range []string{"ue.input_tokens", "ue.output_tokens", "ue.cache_read_tokens", "ue.cache_creation_tokens"} {
+		if !strings.Contains(sql, col) {
+			t.Errorf("SQL is missing %s — that usage would not count toward the cap:\n%s", col, sql)
+		}
+	}
+	for _, w := range []float64{claudeCacheReadWeight, claudeCacheWriteWeight} {
+		if !strings.Contains(sql, fmt.Sprintf("%v", w)) {
+			t.Errorf("SQL is missing cache weight %v:\n%s", w, sql)
+		}
+	}
+	if !strings.Contains(sql, "ue.model") {
+		t.Errorf("SQL does not apply the model weight:\n%s", sql)
 	}
 }

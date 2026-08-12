@@ -80,10 +80,16 @@ type internalChargeBody struct {
 	Model        string `json:"model,omitempty"`
 	InputTokens  int    `json:"input_tokens,omitempty"`
 	OutputTokens int    `json:"output_tokens,omitempty"`
-	Count        int    `json:"count,omitempty"`
-	CostCents    int    `json:"cost_cents,omitempty"`
-	DryRun       bool   `json:"dry_run,omitempty"`
-	Meta         string `json:"meta,omitempty"`
+	// RAW cached-input counts from claude-proxy, unweighted. Optional so an
+	// older proxy that doesn't send them still charges correctly (it folds the
+	// weighted total into input_tokens, which the read-time formula passes
+	// through untouched).
+	CacheReadTokens     int    `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int    `json:"cache_creation_tokens,omitempty"`
+	Count               int    `json:"count,omitempty"`
+	CostCents           int    `json:"cost_cents,omitempty"`
+	DryRun              bool   `json:"dry_run,omitempty"`
+	Meta                string `json:"meta,omitempty"`
 }
 
 // POST /api/v1/internal/usage/charge   (X-Bridge-Secret required)
@@ -97,16 +103,18 @@ func InternalUsageCharge(c *gin.Context) {
 		return
 	}
 	res, err := common.CheckAndCharge(common.DB, common.ChargeReq{
-		UserSub:      body.UserSub,
-		Kind:         body.Kind,
-		Endpoint:     body.Endpoint,
-		Model:        body.Model,
-		InputTokens:  body.InputTokens,
-		OutputTokens: body.OutputTokens,
-		Count:        body.Count,
-		CostCents:    body.CostCents,
-		DryRun:       body.DryRun,
-		Meta:         body.Meta,
+		UserSub:             body.UserSub,
+		Kind:                body.Kind,
+		Endpoint:            body.Endpoint,
+		Model:               body.Model,
+		InputTokens:         body.InputTokens,
+		OutputTokens:        body.OutputTokens,
+		CacheReadTokens:     body.CacheReadTokens,
+		CacheCreationTokens: body.CacheCreationTokens,
+		Count:               body.Count,
+		CostCents:           body.CostCents,
+		DryRun:              body.DryRun,
+		Meta:                body.Meta,
 	})
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "charge: "+err.Error())

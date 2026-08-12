@@ -183,7 +183,12 @@ type ChargeReq struct {
 	Model        string
 	InputTokens  int
 	OutputTokens int
-	Count        int // for cycle_start / external_api; defaults to 1 when 0
+	// RAW cached-input counts as Anthropic reported them. claude-proxy sends
+	// these unweighted; the quota weighting happens here so usage_events stays a
+	// faithful record that reconciles against Anthropic's own numbers.
+	CacheReadTokens     int
+	CacheCreationTokens int
+	Count               int // for cycle_start / external_api; defaults to 1 when 0
 	CostCents    int
 	DryRun       bool
 	Meta         string // optional JSON blob
@@ -247,7 +252,45 @@ const (
 	claudeWeightSonnet  = 0.2
 	claudeWeightHaiku   = 0.053
 	claudeWeightDefault = claudeWeightSonnet // conservative, matches modelCostCents' default
+
+	// Cached input is charged at a fraction of fresh input, so the quota weights
+	// it the same way it weights models — by price ratio. A cache READ is a tenth
+	// of fresh input; a 5-minute cache WRITE is 1.25x.
+	//
+	// These live here, not in claude-proxy, because the proxy now reports RAW
+	// counts and identity owns every quota weighting. Keeping the arithmetic in
+	// one service is what lets usage_events stay a faithful record: the stored
+	// numbers are what Anthropic reported, and the quota is a view over them.
+	claudeCacheReadWeight  = 0.1
+	claudeCacheWriteWeight = 1.25
 )
+
+// ClaudeWeightedTokensSQL is the full quota unit as a SQL expression: raw token
+// columns folded together by price ratio, then scaled by the model weight.
+//
+// `pfx` qualifies the columns for joined queries ("ue." or ""). This is the ONE
+// definition of the quota unit — the gate, the admin table and the /me surface
+// all interpolate it, because a dashboard that disagrees with the gate about how
+// much someone has drawn is the bug class that produced the 5h/4h window skew.
+//
+// Old rows (pre-2026-08-12) carry a pre-weighted total in input_tokens with both
+// cache columns at 0, so they pass through this expression unchanged. No backfill
+// is needed and no row is double-counted.
+func ClaudeWeightedTokensSQL(pfx string) string {
+	return fmt.Sprintf(`ROUND((%[1]sinput_tokens + %[1]soutput_tokens
+	   + %[1]scache_read_tokens * %[2]v
+	   + %[1]scache_creation_tokens * %[3]v) * (%[4]s))`,
+		pfx, claudeCacheReadWeight, claudeCacheWriteWeight, ClaudeModelWeightSQL(pfx+"model"))
+}
+
+// ClaudeWeightedTokens is the Go twin of ClaudeWeightedTokensSQL, for weighting
+// the single in-flight request the gate is deciding on. Keep the two in step.
+func ClaudeWeightedTokens(model string, in, out, cacheRead, cacheWrite int) int {
+	raw := float64(in) + float64(out) +
+		float64(cacheRead)*claudeCacheReadWeight +
+		float64(cacheWrite)*claudeCacheWriteWeight
+	return int(math.Round(raw * ClaudeModelWeight(model)))
+}
 
 // ClaudeModelWeightSQL is the weight as a SQL expression over a `model` column.
 //
@@ -447,11 +490,11 @@ func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStat
 		FiveTokens  int
 		SevenTokens int
 	}
-	w := ClaudeModelWeightSQL("model")
+	w := ClaudeWeightedTokensSQL("")
 	if err := db.Raw(fmt.Sprintf(`
 		SELECT
-		  COALESCE(SUM(CASE WHEN ts >= ? THEN ROUND((input_tokens + output_tokens) * (%[1]s)) ELSE 0 END), 0) AS five_tokens,
-		  COALESCE(SUM(CASE WHEN ts >= ? THEN ROUND((input_tokens + output_tokens) * (%[1]s)) ELSE 0 END), 0) AS seven_tokens
+		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS five_tokens,
+		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS seven_tokens
 		FROM   usage_events
 		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?
 		       AND (model IS NULL OR model = '' OR LOWER(model) LIKE 'claude%%')`, w),
@@ -524,10 +567,12 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		}
 		used5, used7 := status.FiveHourUsed, status.SevenDayUsed
 		fiveReset, sevenReset = status.FiveHourReset, status.SevenDayReset
-		// Weighted to match the stored history this is being added to. Note the
-		// pre-request gate is a dry run with model="" and zero tokens, so this is
-		// 0 there either way; it matters on the real post-response charge.
-		tok := int(math.Round(float64(req.InputTokens+req.OutputTokens) * ClaudeModelWeight(req.Model)))
+		// Weighted by the SAME formula as the stored history this is being added
+		// to. Note the pre-request gate is a dry run with model="" and zero
+		// tokens, so this is 0 there either way; it matters on the real
+		// post-response charge.
+		tok := ClaudeWeightedTokens(req.Model, req.InputTokens, req.OutputTokens,
+			req.CacheReadTokens, req.CacheCreationTokens)
 		if used5+tok > cap5 {
 			deny = "quota_exceeded_claude_5h"
 		} else if used7+tok > cap7 {
@@ -628,15 +673,17 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		return res, nil
 	}
 	ev := models.UsageEvent{
-		UserSub:      req.UserSub,
-		Ts:           now,
-		Kind:         req.Kind,
-		Endpoint:     req.Endpoint,
-		Model:        req.Model,
-		InputTokens:  req.InputTokens,
-		OutputTokens: req.OutputTokens,
-		CostCents:    req.CostCents,
-		Meta:         req.Meta,
+		UserSub:             req.UserSub,
+		Ts:                  now,
+		Kind:                req.Kind,
+		Endpoint:            req.Endpoint,
+		Model:               req.Model,
+		InputTokens:         req.InputTokens,
+		OutputTokens:        req.OutputTokens,
+		CacheReadTokens:     req.CacheReadTokens,
+		CacheCreationTokens: req.CacheCreationTokens,
+		CostCents:           req.CostCents,
+		Meta:                req.Meta,
 	}
 	if err := db.Create(&ev).Error; err != nil {
 		return ChargeRes{}, err

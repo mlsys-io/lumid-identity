@@ -1193,24 +1193,34 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	// deliberately (this admin table intentionally surfaces ALL claude_proxy
 	// spend per user, not just what counts against the pool cap).
 	rows := []struct {
-		UserSub     string
-		Email       string
-		FiveTokens  int
-		SevenTokens int
-		CostCents   int
-		Reqs        int
-		LastTs      time.Time
+		UserSub       string
+		Email         string
+		FiveTokens    int
+		SevenTokens   int
+		RawInput      int
+		RawOutput     int
+		RawCacheRead  int
+		RawCacheWrite int
+		CostCents     int
+		Reqs          int
+		LastTs        time.Time
 	}{}
 	// Model-weighted, using the SAME shared expression the gate uses. If this
 	// table and ClaudePoolUsage disagreed about how much someone has drawn, the
 	// dashboard would show a user comfortably inside their cap while the proxy
 	// 429s them — the same class of bug as the 5h/4h window skew.
-	wsql := common.ClaudeModelWeightSQL("ue.model")
+	wsql := common.ClaudeWeightedTokensSQL("ue.")
 	err := common.DB.Raw(fmt.Sprintf(`
 		SELECT ue.user_sub                                                              AS user_sub,
 		       COALESCE(u.email, ue.user_sub)                                           AS email,
-		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN ROUND((ue.input_tokens + ue.output_tokens) * (%[1]s)) ELSE 0 END), 0) AS five_tokens,
-		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ROUND((ue.input_tokens + ue.output_tokens) * (%[1]s)) ELSE 0 END), 0) AS seven_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s ELSE 0 END), 0) AS five_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s ELSE 0 END), 0) AS seven_tokens,
+		       -- RAW totals alongside the weighted ones, so the quota number can be
+		       -- reconciled against Anthropic's own record instead of taken on trust.
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.input_tokens ELSE 0 END), 0)         AS raw_input,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.output_tokens ELSE 0 END), 0)        AS raw_output,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.cache_read_tokens ELSE 0 END), 0)    AS raw_cache_read,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.cache_creation_tokens ELSE 0 END), 0) AS raw_cache_write,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.cost_cents ELSE 0 END), 0)                      AS cost_cents,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN 1 ELSE 0 END), 0)                                  AS reqs,
 		       MAX(ue.ts)                                                               AS last_ts
@@ -1296,6 +1306,16 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		FiveHourReset string                `json:"five_hour_reset,omitempty"`
 		SevenDayReset string                `json:"seven_day_reset,omitempty"`
 		Models        map[string]modelUsage `json:"models"`
+		// RAW 7d totals exactly as Anthropic reported them. five_hour_tokens and
+		// seven_day_tokens above are the WEIGHTED quota unit (cache reads at a
+		// tenth, model by price ratio), which is deliberately not a token count —
+		// these are here so the two can be reconciled against Anthropic's record
+		// rather than the quota number being taken on trust.
+		RawInput      int `json:"raw_input_tokens_7d"`
+		RawOutput     int `json:"raw_output_tokens_7d"`
+		RawCacheRead  int `json:"raw_cache_read_tokens_7d"`
+		RawCacheWrite int `json:"raw_cache_creation_tokens_7d"`
+		RawTotal      int `json:"raw_total_tokens_7d"`
 	}
 	byUser := map[string]*userUsage{}
 	for _, r := range rows {
@@ -1306,6 +1326,9 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		}
 		u.FiveHour = r.FiveTokens
 		u.SevenDay = r.SevenTokens
+		u.RawInput, u.RawOutput = r.RawInput, r.RawOutput
+		u.RawCacheRead, u.RawCacheWrite = r.RawCacheRead, r.RawCacheWrite
+		u.RawTotal = r.RawInput + r.RawOutput + r.RawCacheRead + r.RawCacheWrite
 		u.CostCents7d = r.CostCents
 		u.Requests = r.Reqs
 		u.LastTs = r.LastTs

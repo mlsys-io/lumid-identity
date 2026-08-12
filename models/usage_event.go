@@ -19,7 +19,20 @@ type UsageEvent struct {
 	Model        string    `gorm:"column:model;size:64"                json:"model"`
 	InputTokens  int       `gorm:"column:input_tokens;not null;default:0"  json:"input_tokens"`
 	OutputTokens int       `gorm:"column:output_tokens;not null;default:0" json:"output_tokens"`
-	CostCents    int       `gorm:"column:cost_cents;not null;default:0"    json:"cost_cents"`
+	// RAW cached-input counts, exactly as Anthropic reported them. Stored
+	// separately and unweighted so this table remains a faithful record that can
+	// be reconciled against Anthropic's own — the pool QUOTA weights these (a
+	// cache read costs a tenth of fresh input) but the weighting belongs at read
+	// time, not in the stored truth.
+	//
+	// Rows written before 2026-08-12 leave these 0 and fold the weighted total
+	// into InputTokens instead. That is why the read-time formula ADDS the
+	// weighted cache columns rather than replacing InputTokens: on an old row
+	// the two cache terms contribute nothing and the historical value stands, so
+	// the transition needs no backfill and cannot double-count.
+	CacheReadTokens     int `gorm:"column:cache_read_tokens;not null;default:0"     json:"cache_read_tokens"`
+	CacheCreationTokens int `gorm:"column:cache_creation_tokens;not null;default:0" json:"cache_creation_tokens"`
+	CostCents           int `gorm:"column:cost_cents;not null;default:0"    json:"cost_cents"`
 	Meta         string    `gorm:"column:meta;type:text"               json:"meta"` // optional JSON blob
 }
 

@@ -19,6 +19,8 @@ package common
 // upgrades to SERIALIZABLE transactions if it matters.
 
 import (
+	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -220,6 +222,65 @@ func poolCapApplies(model string) bool {
 	return model == "" || strings.HasPrefix(strings.ToLower(model), "claude")
 }
 
+// Model weighting for the pool quota.
+//
+// The cap counts COST, not raw tokens. Anthropic prices Opus at 5x Sonnet and
+// Sonnet at ~3.75x Haiku ($15/$75, $3/$15, $0.80/$4 per M in/out), but the gate
+// summed tokens flat — so a Sonnet token cost exactly as much quota as an Opus
+// token despite being ~4.6x cheaper in practice (measured 2026-08-12: one user's
+// Sonnet work was 31% of their tokens and 9% of their spend).
+//
+// Flat counting doesn't just misprice, it inverts the incentive: under a binding
+// cap, Sonnet costs the same quota as Opus while delivering less, so the
+// rational move is to route everything to the most expensive model. Weighting
+// removes that.
+//
+// Normalised to OPUS = 1.0 rather than to Sonnet, so the operator-set caps keep
+// the meaning they were measured against (an Opus-dominated workload) and adding
+// weights doesn't silently re-scale them.
+//
+// Applied at READ time, never at write time: usage_events keeps TRUE token
+// counts so cost reporting and the per-model breakdown stay honest, the weights
+// apply retroactively, and changing them doesn't require rewriting history.
+const (
+	claudeWeightOpus    = 1.0
+	claudeWeightSonnet  = 0.2
+	claudeWeightHaiku   = 0.053
+	claudeWeightDefault = claudeWeightSonnet // conservative, matches modelCostCents' default
+)
+
+// ClaudeModelWeightSQL is the weight as a SQL expression over a `model` column.
+//
+// It is a shared constant because the weighted sum happens in SQL in more than
+// one place (the gate's ClaudePoolUsage and the admin usage table), and those
+// MUST agree — a dashboard that disagrees with the gate about how much someone
+// has used is the same class of bug as the 5h/4h window skew. `col` lets a
+// caller qualify the column (e.g. "ue.model") for joined queries.
+func ClaudeModelWeightSQL(col string) string {
+	return fmt.Sprintf(`CASE
+	  WHEN LOWER(%[1]s) LIKE 'claude-opus%%'   THEN %[2]v
+	  WHEN LOWER(%[1]s) LIKE 'claude-sonnet%%' THEN %[3]v
+	  WHEN LOWER(%[1]s) LIKE 'claude-haiku%%'  THEN %[4]v
+	  ELSE %[5]v
+	END`, col, claudeWeightOpus, claudeWeightSonnet, claudeWeightHaiku, claudeWeightDefault)
+}
+
+// ClaudeModelWeight is the Go-side twin of ClaudeModelWeightSQL, for weighting
+// the increment a single in-flight request would add. Keep the two in step.
+func ClaudeModelWeight(model string) float64 {
+	m := strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(m, "claude-opus"):
+		return claudeWeightOpus
+	case strings.HasPrefix(m, "claude-sonnet"):
+		return claudeWeightSonnet
+	case strings.HasPrefix(m, "claude-haiku"):
+		return claudeWeightHaiku
+	default:
+		return claudeWeightDefault
+	}
+}
+
 // ClaudePoolLimits reads the env-tunable per-user pool caps.
 // LUMID_QUOTA_CLAUDE_5H_TOKENS keeps its name for continuity with any existing
 // deployment env; it now sets the SHORT-window budget whatever that window's
@@ -386,13 +447,14 @@ func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStat
 		FiveTokens  int
 		SevenTokens int
 	}
-	if err := db.Raw(`
+	w := ClaudeModelWeightSQL("model")
+	if err := db.Raw(fmt.Sprintf(`
 		SELECT
-		  COALESCE(SUM(CASE WHEN ts >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS five_tokens,
-		  COALESCE(SUM(CASE WHEN ts >= ? THEN input_tokens + output_tokens ELSE 0 END), 0) AS seven_tokens
+		  COALESCE(SUM(CASE WHEN ts >= ? THEN ROUND((input_tokens + output_tokens) * (%[1]s)) ELSE 0 END), 0) AS five_tokens,
+		  COALESCE(SUM(CASE WHEN ts >= ? THEN ROUND((input_tokens + output_tokens) * (%[1]s)) ELSE 0 END), 0) AS seven_tokens
 		FROM   usage_events
 		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?
-		       AND (model IS NULL OR model = '' OR LOWER(model) LIKE 'claude%')`,
+		       AND (model IS NULL OR model = '' OR LOWER(model) LIKE 'claude%%')`, w),
 		fiveBound, sevenBound, userSub, scanBound).Scan(&row).Error; err != nil {
 		return status, err
 	}
@@ -462,7 +524,10 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		}
 		used5, used7 := status.FiveHourUsed, status.SevenDayUsed
 		fiveReset, sevenReset = status.FiveHourReset, status.SevenDayReset
-		tok := req.InputTokens + req.OutputTokens
+		// Weighted to match the stored history this is being added to. Note the
+		// pre-request gate is a dry run with model="" and zero tokens, so this is
+		// 0 there either way; it matters on the real post-response charge.
+		tok := int(math.Round(float64(req.InputTokens+req.OutputTokens) * ClaudeModelWeight(req.Model)))
 		if used5+tok > cap5 {
 			deny = "quota_exceeded_claude_5h"
 		} else if used7+tok > cap7 {

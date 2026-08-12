@@ -1201,11 +1201,16 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		Reqs        int
 		LastTs      time.Time
 	}{}
-	err := common.DB.Raw(`
+	// Model-weighted, using the SAME shared expression the gate uses. If this
+	// table and ClaudePoolUsage disagreed about how much someone has drawn, the
+	// dashboard would show a user comfortably inside their cap while the proxy
+	// 429s them — the same class of bug as the 5h/4h window skew.
+	wsql := common.ClaudeModelWeightSQL("ue.model")
+	err := common.DB.Raw(fmt.Sprintf(`
 		SELECT ue.user_sub                                                              AS user_sub,
 		       COALESCE(u.email, ue.user_sub)                                           AS email,
-		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN ue.input_tokens + ue.output_tokens ELSE 0 END), 0) AS five_tokens,
-		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.input_tokens + ue.output_tokens ELSE 0 END), 0) AS seven_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN ROUND((ue.input_tokens + ue.output_tokens) * (%[1]s)) ELSE 0 END), 0) AS five_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ROUND((ue.input_tokens + ue.output_tokens) * (%[1]s)) ELSE 0 END), 0) AS seven_tokens,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.cost_cents ELSE 0 END), 0)                      AS cost_cents,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN 1 ELSE 0 END), 0)                                  AS reqs,
 		       MAX(ue.ts)                                                               AS last_ts
@@ -1216,7 +1221,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       FROM   claude_pool_windows) w ON w.user_sub = ue.user_sub
 		LEFT JOIN users u ON u.id = ue.user_sub
 		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= LEAST(w.five_eff, w.seven_eff)
-		GROUP  BY ue.user_sub, u.email`,
+		GROUP  BY ue.user_sub, u.email`, wsql),
 		int(common.ClaudePoolShortWindow().Seconds()), now, far, now, far).Scan(&rows).Error
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query usage: "+err.Error())

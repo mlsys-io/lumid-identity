@@ -36,20 +36,96 @@ func TestResetAnchorIsExpiredNotNow(t *testing.T) {
 // Resetting the short clock must leave the 7-day budget alone. Deleting the
 // row would have reset both, which is a far bigger giveaway than intended.
 func TestResetTouchesOnlyTheShortAnchor(t *testing.T) {
-	// The handler updates exactly one column. Guard it as a literal so a
-	// refactor to .Updates(map[...]) or .Delete() has to break this test.
-	const updatedColumn = "five_hour_anchor"
-	if updatedColumn == "seven_day_anchor" {
-		t.Fatal("reset must never touch the 7d anchor")
+	// NOTE: the previous version of this test compared two string literals to
+	// each other and asserted nothing about the handler. It passed unchanged
+	// when the handler was refactored from Update("five_hour_anchor", ...) to
+	// Updates(map[...]) with a second column — exactly the regression it
+	// claimed to guard. It now calls the real decision function.
+	now := time.Now().UTC()
+
+	cols, label, err := poolResetColumns("", now) // default
+	if err != nil {
+		t.Fatalf("default window rejected: %v", err)
 	}
-	// Sanity: the two anchors are genuinely separate columns on the model.
-	var w = struct {
-		Five  time.Time
-		Seven time.Time
-	}{}
-	w.Five = time.Now()
-	if w.Five == w.Seven {
-		t.Error("anchors are not independent")
+	if _, touched := cols["seven_day_anchor"]; touched {
+		t.Fatal("DEFAULT reset touched the 7d anchor — the weekly budget must never be given away implicitly")
+	}
+	if _, ok := cols["five_hour_anchor"]; !ok {
+		t.Fatal("default reset did not touch the short anchor")
+	}
+	if len(cols) != 1 {
+		t.Fatalf("default reset wrote %d columns, want exactly 1: %v", len(cols), cols)
+	}
+	if label != shortWindowLabel() {
+		t.Errorf("default label = %q, want %q", label, shortWindowLabel())
+	}
+}
+
+// The weekly reset is the inverse: it must move the 7d anchor and leave the
+// short window alone, so resetting the week does not also hand back a 4h budget
+// the user may have legitimately spent minutes ago.
+func TestWeeklyResetTouchesOnlyTheSevenDayAnchor(t *testing.T) {
+	now := time.Now().UTC()
+	cols, label, err := poolResetColumns("weekly", now)
+	if err != nil {
+		t.Fatalf("weekly rejected: %v", err)
+	}
+	if _, touched := cols["five_hour_anchor"]; touched {
+		t.Error("weekly reset touched the short anchor")
+	}
+	anchor, ok := cols["seven_day_anchor"].(time.Time)
+	if !ok {
+		t.Fatal("weekly reset did not set seven_day_anchor")
+	}
+	// Must read as CLOSED against a 7d window, or the reset is a no-op.
+	if anchor.Add(7 * 24 * time.Hour).After(now) {
+		t.Errorf("weekly anchor %v still live against a 7d window", anchor)
+	}
+	if label != "7d" {
+		t.Errorf("label = %q, want 7d", label)
+	}
+}
+
+func TestBothResetsEachAnchorAgainstItsOwnWindow(t *testing.T) {
+	now := time.Now().UTC()
+	cols, _, err := poolResetColumns("both", now)
+	if err != nil {
+		t.Fatalf("both rejected: %v", err)
+	}
+	if len(cols) != 2 {
+		t.Fatalf("both wrote %d columns, want 2", len(cols))
+	}
+	// Each anchor must be expired against ITS OWN window — reusing the short
+	// window for the 7d anchor would leave the weekly clock still running.
+	short := cols["five_hour_anchor"].(time.Time)
+	weekly := cols["seven_day_anchor"].(time.Time)
+	if short.Add(common.ClaudePoolShortWindow()).After(now) {
+		t.Error("short anchor still live")
+	}
+	if weekly.Add(7 * 24 * time.Hour).After(now) {
+		t.Error("weekly anchor still live — likely expired against the SHORT window")
+	}
+}
+
+func TestUnknownWindowIsRejectedNotSilentlyDefaulted(t *testing.T) {
+	// A typo like "week" must 400, not quietly reset the short window and
+	// report success while the caller believes the weekly clock moved.
+	for _, w := range []string{"week", "7d", "weekley", "all", "none"} {
+		if _, _, err := poolResetColumns(w, time.Now().UTC()); err == nil {
+			t.Errorf("window %q was accepted; want rejection", w)
+		}
+	}
+}
+
+func TestWindowParsingIsForgivingAboutCaseAndSpace(t *testing.T) {
+	for _, w := range []string{"Weekly", " weekly ", "WEEKLY"} {
+		cols, _, err := poolResetColumns(w, time.Now().UTC())
+		if err != nil {
+			t.Fatalf("window %q rejected: %v", w, err)
+		}
+		if _, ok := cols["seven_day_anchor"]; !ok {
+			t.Errorf("window %q did not resolve to weekly", w)
+		}
 	}
 }
 

@@ -221,6 +221,7 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app", MeAppsUninstall)
 			me.GET("/apps/:app/ui", MeAppUI) // app-declared Studio surface (markdown)
 			me.GET("/apps/:app/ui/:surface", MeAppUISurface)
+			me.GET("/apps/:app/data", MeAppData)   // read-only app content for declarative surfaces
 			me.PUT("/apps/:app/ui", MeUpdateAppUI) // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)
 			me.POST("/apps/:app/ui/generate", MeGenerateAppUI) // AI-generate surface from config

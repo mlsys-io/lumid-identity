@@ -204,3 +204,21 @@ func expStateFromRuns(runs []models.MeAppRun, metricName string, baseline float6
 		"criteria_met": *latest >= baseline,
 	}
 }
+
+// lastRunFromDB returns the most recent recorded run for a loop, from the
+// cross-node table. The journal file is the richer log but only exists where the
+// scheduler wrote it; identity (service tier) cannot read that PVC, so for a
+// cloud-installed app the journal is absent and this is the only evidence a
+// cycle ever happened.
+func lastRunFromDB(userSub, app, loop string) (float64, bool, bool) {
+	if common.DB == nil {
+		return 0, false, false
+	}
+	var row models.MeAppRun
+	err := common.DB.Where("user_sub = ? AND app = ? AND `loop` = ?", userSub, app, loop).
+		Order("run_ts DESC").Limit(1).First(&row).Error
+	if err != nil || row.RunTs == 0 {
+		return 0, false, false
+	}
+	return float64(row.RunTs), row.Ok, true
+}

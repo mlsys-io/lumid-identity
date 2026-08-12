@@ -585,6 +585,16 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					row.LastRunTS = jts
 					row.LastRunOK = &jok
 				}
+				// ...and the DB run record, which is the only source that
+				// crosses nodes. The journal lives on the scheduler's PVC that
+				// identity does not mount, so for a cloud-installed app it is
+				// simply absent — an interactive @trigger cycle would report
+				// "never ran" forever. Newest of the two wins, so a real
+				// scheduled run is never masked by an older interactive one.
+				if dts, dok, ok := lastRunFromDB(userID, e.Name(), L.Name); ok && dts > row.LastRunTS {
+					row.LastRunTS = dts
+					row.LastRunOK = &dok
+				}
 				row.Running = loopRunning(cyclesRoot, L.Name, row.LastRunTS)
 				row.LastRunRecovered = lastRunRecovered(journalPath, L.Name)
 				out = append(out, row)

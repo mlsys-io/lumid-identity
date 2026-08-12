@@ -100,6 +100,7 @@ func MeAgentChatStream(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	c.Set(ctxModeKey, chatMode(body.Context))
 	stashViewingApp(c, body.Context)
 	if len(body.Messages) == 0 || len(body.Messages) > 50 {
 		fail(c, http.StatusBadRequest, 1400, "messages required, ≤50 turns")

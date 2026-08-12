@@ -1362,6 +1362,12 @@ type toolCallResult struct {
 }
 
 // POST /api/v1/me/agent/chat
+// ctxModeKey carries the validated interview mode from the handler to
+// dispatchTool, which has no access to the request body. Stashed rather than
+// threaded through every tool signature — only the judge needs it, and only to
+// decide whether MISSED keypoints may be returned.
+const ctxModeKey = "lumid_interview_mode"
+
 func MeAgentChat(c *gin.Context) {
 	// Stamped BEFORE the turn runs so the recorded cycle's run_ts is when the
 	// user asked, not when the model finished — a 40s answer would otherwise
@@ -1377,6 +1383,7 @@ func MeAgentChat(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	c.Set(ctxModeKey, chatMode(body.Context))
 	stashViewingApp(c, body.Context)
 	if len(body.Messages) == 0 {
 		fail(c, http.StatusBadRequest, 1400, "messages required")
@@ -2271,6 +2278,25 @@ func buildToolDefs() []map[string]any {
 					"case_id":  map[string]any{"type": "string", "description": "optional labelled case; omit for an open question"},
 				},
 				"required": []string{"app", "question"},
+			},
+		},
+		{
+			// The scoring verb. "Score my last answer" used to be served by
+			// app_answer, which reports grounded:true because a case was LOADED —
+			// nothing checked a keypoint, yet the reply claimed the answer was
+			// evaluated against ground truth. This is the tool that actually
+			// compares, and the only one that may hold the answer key.
+			"name":        "app_judge",
+			"description": "REQUIRED whenever the user asks for a score, an evaluation, or how well an answer did while an app is in context. Compares the answer against the case's real ground-truth keypoints and returns covered/total plus per-axis scores. Do NOT use app_answer for scoring and do NOT estimate a score yourself — only this tool sees the rubric, so any other number is invented.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":      map[string]any{"type": "string"},
+					"answer":   map[string]any{"type": "string", "description": "the answer being scored, verbatim"},
+					"question": map[string]any{"type": "string", "description": "the question it answered"},
+					"case_id":  map[string]any{"type": "string", "description": "the labelled case; omit for an open answer (score will be reported as ungrounded)"},
+				},
+				"required": []string{"app", "answer"},
 			},
 		},
 		{
@@ -3523,6 +3549,15 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		question, _ := args["question"].(string)
 		caseID, _ := args["case_id"].(string)
 		return toolAppAnswer(c.Request.Context(), userID, role, app, question, caseID)
+
+	case "app_judge":
+		app, _ := args["app"].(string)
+		answer, _ := args["answer"].(string)
+		question, _ := args["question"].(string)
+		caseID, _ := args["case_id"].(string)
+		// The mode decides whether MISSED keypoints come back: the interviewer
+		// owns the case and may see them; the candidate must not.
+		return toolAppJudge(c.Request.Context(), userID, role, app, caseID, question, answer, c.GetString(ctxModeKey))
 
 	case "app_config_get":
 		app, _ := args["app"].(string)

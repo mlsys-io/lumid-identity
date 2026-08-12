@@ -612,7 +612,9 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 	// back empty even though the app runs. Backfill loops from the caller's
 	// PUBLISHED xp.io spec (same fallback MeAppConfig/MeAppsList use) for any
 	// installed tenant app not already represented. Run/next-run state is
-	// omitted (identity can't read the journal cross-node) — best-effort.
+	// Run state used to be omitted here because identity can't read the journal
+	// cross-node — which left every cloud-installed app reporting "never ran".
+	// The DB run record does cross nodes, so last-run is filled from it.
 	covered := map[string]bool{}
 	for _, r := range out {
 		if r.App != "" {
@@ -664,6 +666,13 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			}
 			if L.Engine.Experiment != "" {
 				row.ExperimentIDs = []string{L.Engine.Experiment}
+			}
+			// The only run evidence that survives the node boundary. Without
+			// it an app whose loop is @trigger — "it runs when you talk" —
+			// showed last_run_ts: null however many turns it had served.
+			if dts, dok, okRun := lastRunFromDB(userID, app, L.Name); okRun {
+				row.LastRunTS = dts
+				row.LastRunOK = &dok
 			}
 			out = append(out, row)
 		}

@@ -146,3 +146,42 @@ func TestJudgeKeypointBlockIsExplicit(t *testing.T) {
 		t.Error("no keypoints should render no block, not an empty rubric")
 	}
 }
+
+// The denominator must belong to the QUESTION. One real case declares 13, 19
+// and 8 keypoints across its questions; scoring a Q1 answer against all 40 makes
+// a good answer look terrible and makes two answers incomparable.
+func TestJudgeKeypointsForNarrowsToTheQuestion(t *testing.T) {
+	gt := `{
+	  "structure_3_case_questions": {
+	    "Q1": {"question_text": "What factors would you consider to work on this problem?"},
+	    "Q2": {"question_text": "What are Premier Oil's major expenses?"}
+	  },
+	  "structure_4_ground_truth": {
+	    "Q1_ground_truth": {"pillars": {"a": {"keypoints": ["k1","k2","k3"]}}},
+	    "Q2_ground_truth": {"pillars": {"b": {"keypoints": ["m1","m2"]}}}
+	  }}`
+
+	t.Run("matches Q1", func(t *testing.T) {
+		kps, scope := judgeKeypointsFor(gt, "What factors would you consider to work on this problem?")
+		if scope != "Q1" || len(kps) != 3 {
+			t.Errorf("got scope=%s n=%d, want Q1/3", scope, len(kps))
+		}
+	})
+	t.Run("matches Q2", func(t *testing.T) {
+		kps, scope := judgeKeypointsFor(gt, "To begin with, what are Premier Oil's major expenses?")
+		if scope != "Q2" || len(kps) != 2 {
+			t.Errorf("got scope=%s n=%d, want Q2/2", scope, len(kps))
+		}
+	})
+	t.Run("unrecognised question falls back to the whole case and SAYS so", func(t *testing.T) {
+		kps, scope := judgeKeypointsFor(gt, "How is the weather in Rotterdam today?")
+		if scope != "case" || len(kps) != 5 {
+			t.Errorf("got scope=%s n=%d, want case/5", scope, len(kps))
+		}
+	})
+	t.Run("empty question does not guess", func(t *testing.T) {
+		if _, scope := judgeKeypointsFor(gt, ""); scope != "case" {
+			t.Errorf("scope = %s, want case", scope)
+		}
+	})
+}

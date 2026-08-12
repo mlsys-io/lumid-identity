@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -49,7 +50,7 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 	// benchmark move: six runs on one question returned totals of 1, 3 and 13
 	// for a rubric whose size is fixed. The total is a property of the rubric,
 	// not a judgement — the model is asked only WHICH are covered.
-	keypoints := judgeKeypoints(gt)
+	keypoints, scope := judgeKeypointsFor(gt, question)
 	sys := judgePromptFor(appDir)
 	user := "Ground truth and case (CONFIDENTIAL — never quote it back):\n" + gt +
 		"\n\nQuestion put to the interviewee:\n" + question +
@@ -107,6 +108,7 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 	// the same on every run, which is what makes two scores comparable at all.
 	if len(keypoints) > 0 {
 		total = len(keypoints)
+		out["total_scope"] = scope
 		okCounts = okCov(parsed)
 		if covered > total {
 			covered = total
@@ -251,8 +253,17 @@ func judgeKeypoints(gt string) []string {
 					}
 				}
 			}
-			for _, nested := range x {
-				walk(nested)
+			// Sorted: map iteration order is random in Go, so an unsorted walk
+			// returned the same keypoints in a different order every call. The
+			// count was right and the list was not reproducible — which matters
+			// the moment anything quotes "the first missed keypoint".
+			keys := make([]string, 0, len(x))
+			for k := range x {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				walk(x[k])
 			}
 		case []any:
 			for _, nested := range x {
@@ -284,4 +295,98 @@ func judgeKeypointBlock(kps []string) string {
 	}
 	b.WriteString("`total` is " + strconv.Itoa(len(kps)) + ". Do not invent keypoints.\n")
 	return b.String()
+}
+
+// judgeKeypointsFor narrows the rubric to the QUESTION being scored.
+//
+// The ground truth is keyed per question (Q1_ground_truth, Q2_ground_truth, …),
+// each declaring its own total_keypoints — 13, 19, 8 for one real case. Scoring
+// an answer to Q1 against all 40 makes a good answer look terrible, and makes
+// two answers to different questions incomparable, which is the opposite of what
+// a denominator is for.
+//
+// The question is matched by word overlap against structure_3's question_text.
+// A weak match falls back to the whole case AND says so in total_scope, because
+// a number whose denominator is a guess should be labelled as one.
+func judgeKeypointsFor(gt, question string) ([]string, string) {
+	var doc map[string]any
+	if json.Unmarshal([]byte(gt), &doc) != nil {
+		return judgeKeypoints(gt), "case"
+	}
+	qid := matchQuestionID(doc, question)
+	if qid == "" {
+		return judgeKeypoints(gt), "case"
+	}
+	key, _ := doc["structure_4_ground_truth"].(map[string]any)
+	if key == nil {
+		return judgeKeypoints(gt), "case"
+	}
+	sub, _ := key[qid+"_ground_truth"].(map[string]any)
+	if sub == nil {
+		return judgeKeypoints(gt), "case"
+	}
+	wrapped, err := json.Marshal(map[string]any{"structure_4_ground_truth": sub})
+	if err != nil {
+		return judgeKeypoints(gt), "case"
+	}
+	kps := judgeKeypoints(string(wrapped))
+	if len(kps) == 0 {
+		return judgeKeypoints(gt), "case"
+	}
+	return kps, qid
+}
+
+// matchQuestionID picks the question whose text best overlaps `question`.
+// Returns "" when nothing matches convincingly — a wrong denominator is worse
+// than an honest whole-case one.
+func matchQuestionID(doc map[string]any, question string) string {
+	qs, _ := doc["structure_3_case_questions"].(map[string]any)
+	if qs == nil || strings.TrimSpace(question) == "" {
+		return ""
+	}
+	want := wordSet(question)
+	if len(want) == 0 {
+		return ""
+	}
+	best, bestScore := "", 0.0
+	for id, raw := range qs {
+		m, _ := raw.(map[string]any)
+		if m == nil {
+			continue
+		}
+		text, _ := m["question_text"].(string)
+		if text == "" {
+			continue
+		}
+		have := wordSet(text)
+		hits := 0
+		for w := range have {
+			if want[w] {
+				hits++
+			}
+		}
+		if len(have) == 0 {
+			continue
+		}
+		s := float64(hits) / float64(len(have))
+		if s > bestScore {
+			best, bestScore = id, s
+		}
+	}
+	if bestScore < 0.4 { // weak overlap — do not guess a denominator
+		return ""
+	}
+	return best
+}
+
+func wordSet(s string) map[string]bool {
+	out := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+	}) {
+		if len(w) > 3 { // skip the/what/would/… which every question shares
+			out[w] = true
+		}
+	}
+	return out
 }

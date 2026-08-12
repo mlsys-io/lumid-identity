@@ -186,44 +186,107 @@ func TestClaudePoolWindow_BackdatedRoll(t *testing.T) {
 	}
 }
 
-func TestClaudePoolWindow_DeniedNeverCommits(t *testing.T) {
+// A REFUSED request writes nothing — it never consumed anything. For
+// claude_proxy that means the DRY-RUN gate, which is the only call that can
+// actually refuse: it happens before the request is served. Other kinds are
+// pre-authorization by nature, so a plain denial covers them.
+func TestClaudePoolWindow_RefusedNeverCommits(t *testing.T) {
 	t.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "1000") // tiny cap, easy to blow through
 	t.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "10000")
 	db := connectTestDB(t)
-	sub := claudePoolTestSub("denied")
+	sub := claudePoolTestSub("refused")
 	t.Cleanup(func() { cleanupSub(t, db, sub) })
 
-	res, err := CheckAndCharge(db, ChargeReq{
+	// Seed usage so the user is already over, then let the gate refuse.
+	if _, err := CheckAndCharge(db, ChargeReq{
 		UserSub: sub, Kind: "claude_proxy", Model: "claude-sonnet-5",
-		InputTokens: 5000, OutputTokens: 0, // over the 1000 cap
+		InputTokens: 5000, OutputTokens: 0,
+	}); err != nil {
+		t.Fatalf("seed charge: %v", err)
+	}
+	var evBefore int64
+	db.Model(&models.UsageEvent{}).Where("user_sub = ?", sub).Count(&evBefore)
+
+	// The dry-run gate: zero tokens, must refuse and must write nothing.
+	res, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "", DryRun: true,
 	})
 	if err != nil {
-		t.Fatalf("oversized charge: %v", err)
+		t.Fatalf("gate: %v", err)
 	}
 	if res.Allowed {
-		t.Fatalf("oversized charge should be denied")
+		t.Fatalf("gate must refuse a user already over the cap")
 	}
-	var winCnt, evCnt int64
-	db.Model(&models.ClaudePoolWindow{}).Where("user_sub = ?", sub).Count(&winCnt)
-	db.Model(&models.UsageEvent{}).Where("user_sub = ?", sub).Count(&evCnt)
-	if winCnt != 0 {
-		t.Fatalf("denied charge must not create an anchor row, found %d", winCnt)
+	var evAfter int64
+	db.Model(&models.UsageEvent{}).Where("user_sub = ?", sub).Count(&evAfter)
+	if evAfter != evBefore {
+		t.Fatalf("refused gate wrote %d usage_events rows, want 0", evAfter-evBefore)
 	}
-	if evCnt != 0 {
-		t.Fatalf("denied charge must not write a usage_events row, found %d", evCnt)
+}
+
+// An OVERSPEND — a non-dry-run claude_proxy charge whose tokens Anthropic has
+// already served — MUST be recorded even though it breaches the cap.
+//
+// This inverts the older "denied charge never commits" rule, which conflated
+// refusal with accounting. claude-proxy gates on a dry run carrying zero tokens
+// and charges for real only after the response is served, so dropping the
+// over-cap record left the counter frozen one request short of the cap forever:
+// the gate kept seeing used+0 <= cap and kept allowing, while the user consumed
+// without limit and never received a single 429. Observed live 2026-08-12 with
+// two users pinned just under a 5M cap while still serving traffic.
+func TestClaudePoolWindow_OverspendIsRecorded(t *testing.T) {
+	t.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "1000")
+	t.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "10000")
+	db := connectTestDB(t)
+	sub := claudePoolTestSub("overspend")
+	t.Cleanup(func() { cleanupSub(t, db, sub) })
+
+	// Land just under the cap.
+	if _, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "claude-opus-5",
+		InputTokens: 900, OutputTokens: 0,
+	}); err != nil {
+		t.Fatalf("under-cap charge: %v", err)
+	}
+	before, err := ClaudePoolUsage(db, sub, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("usage before: %v", err)
 	}
 
-	// A subsequent smaller, allowed charge is what actually opens the window.
-	res2, err := CheckAndCharge(db, ChargeReq{
-		UserSub: sub, Kind: "claude_proxy", Model: "claude-sonnet-5",
+	// A real charge that crosses the cap: denied, but recorded.
+	res, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "claude-opus-5",
 		InputTokens: 500, OutputTokens: 0,
 	})
-	if err != nil || !res2.Allowed {
-		t.Fatalf("follow-up small charge: err=%v allowed=%v", err, res2.Allowed)
+	if err != nil {
+		t.Fatalf("overspend charge: %v", err)
 	}
-	db.Model(&models.ClaudePoolWindow{}).Where("user_sub = ?", sub).Count(&winCnt)
-	if winCnt != 1 {
-		t.Fatalf("allowed charge should open exactly one anchor row, found %d", winCnt)
+	if res.Allowed {
+		t.Fatalf("charge crossing the cap should report Allowed=false")
+	}
+
+	after, err := ClaudePoolUsage(db, sub, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("usage after: %v", err)
+	}
+	if after.FiveHourUsed <= before.FiveHourUsed {
+		t.Fatalf("overspend was not recorded: usage stayed at %d (the frozen-counter bug)",
+			before.FiveHourUsed)
+	}
+	if after.FiveHourUsed <= 1000 {
+		t.Fatalf("recorded usage %d must now EXCEED the 1000 cap, or the next gate still allows",
+			after.FiveHourUsed)
+	}
+
+	// The point of recording it: the next gate now refuses.
+	gate, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "", DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	if gate.Allowed {
+		t.Fatalf("gate must refuse after an overspend pushed the user over the cap")
 	}
 }
 

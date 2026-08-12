@@ -1321,7 +1321,7 @@ var caseIDRe = regexp.MustCompile(`\bCase_[A-Za-z0-9_]+`)
 // caseContext is the SAME helper the tool path uses, and it truncates at
 // structure_4_ground_truth — so the interviewee still never sees the answer
 // key. Nothing here widens what an analyst may read.
-func appDataHint(userID, app, userText string) string {
+func appDataHint(userID, app, userText, mode string) string {
 	id := caseIDRe.FindString(userText)
 	if id == "" {
 		return ""
@@ -1330,11 +1330,56 @@ func appDataHint(userID, app, userText string) string {
 	if appDir == "" {
 		return ""
 	}
-	ctx, ok := caseContext(appDir, id)
+	// The ROLE is derived here, from a mode the server validated — never taken
+	// from the caller. A candidate able to name their own role would simply ask
+	// to be the judge.
+	role := roleForMode(mode)
+	ctx, ok := caseContextForRole(appDir, id, role)
 	if !ok || ctx == "" {
 		return ""
+	}
+	if role == caseRoleInterviewer {
+		return "\n\nYou are the INTERVIEWER for case " + id + ", and the user is the " +
+			"candidate. Ask the case's questions IN ORDER, one at a time, and never " +
+			"reveal a later question before its turn. Release a fact from " +
+			"information_upon_request ONLY when the candidate's own answer touches it " +
+			"— never volunteer one. The answer key is deliberately withheld from you " +
+			"here; if you need it to score, say so rather than inventing one.\n\n" + ctx + "\n"
 	}
 	return "\n\nThe user is working case " + id + ". Its content follows — treat it as " +
 		"the case you have been given, and do NOT claim you cannot find it. The answer " +
 		"key is deliberately withheld; never ask for it.\n\n" + ctx + "\n"
+}
+
+// Interview modes. The mode says WHO sits in which seat; the role it maps to
+// decides what the model may see. An explicit mapping, rather than a role on the
+// request, so a client can choose a mode but never a privilege.
+const (
+	modeTrainAI = "train_ai" // the AI answers, the human interviews (default)
+	modeFree    = "free"     // open question: no case, no ground truth
+	modeCoach   = "coach"    // the HUMAN answers, the AI interviews
+)
+
+func roleForMode(mode string) string {
+	if mode == modeCoach {
+		return caseRoleInterviewer
+	}
+	// train_ai, free, unknown, empty → interviewee: the client brief only.
+	// Fail closed, so a typo cannot widen the projection.
+	return caseRoleInterviewee
+}
+
+// chatMode reads the mode off the request's viewing context. Unrecognised values
+// collapse to the default rather than erroring — the mode selects a experience,
+// and an unknown one should degrade to the narrowest, not break the turn.
+func chatMode(ctx map[string]any) string {
+	if ctx == nil {
+		return modeTrainAI
+	}
+	m, _ := ctx["mode"].(string)
+	switch m {
+	case modeCoach, modeFree, modeTrainAI:
+		return m
+	}
+	return modeTrainAI
 }

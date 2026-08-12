@@ -1882,7 +1882,7 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody, wantTools 
 			// Voice alone left the tool-less path in character but without the
 			// case; carry the content too, so picking a case works on every model.
 			if n := len(body.Messages); n > 0 {
-				ctxBlock += appDataHint(userID, app, body.Messages[n-1].Content)
+				ctxBlock += appDataHint(userID, app, body.Messages[n-1].Content, chatMode(body.Context))
 			}
 		}
 	}

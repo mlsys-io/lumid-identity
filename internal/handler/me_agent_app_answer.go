@@ -314,7 +314,19 @@ func toolAppAnswer(c context.Context, userID, role, app, question, caseID string
 // system prompt. Mirrors the provider/key/callLLM path the chat endpoint uses
 // (me_agent.go) rather than opening a second way to reach a model.
 func answerWithAppVoice(ctx context.Context, role, system, user string) (string, error) {
-	provider := resolveProvider("", role)
+	return answerWithAppVoiceModel(ctx, role, "", system, user)
+}
+
+// answerWithAppVoiceModel is answerWithAppVoice with an explicit provider.
+//
+// Scoring is precision work, and the default chat provider is not up to it:
+// measured across six runs on the same question and answer, the judge returned
+// totals of 1, 3 and 13 for a rubric with a fixed number of keypoints, and
+// failed to produce a parsable count half the time. A coverage figure computed
+// from a total the scorer invented is the same unearned number this tool was
+// built to replace — just with more steps.
+func answerWithAppVoiceModel(ctx context.Context, role, modelID, system, user string) (string, error) {
+	provider := resolveProvider(modelID, role)
 	apiKey, err := provider.keyFn()
 	if err != nil {
 		return "", err

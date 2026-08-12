@@ -69,7 +69,10 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 				"object ONLY — no prose, no code fence, no explanation. `covered` and " +
 				"`total` must be plain integers."
 		}
-		text, err = answerWithAppVoice(c, role, sys, u)
+		// Pinned to a stronger scorer than the chat default. resolveProvider
+		// still re-checks the caller's role, so an over-tier pin degrades to the
+		// role default rather than escalating.
+		text, err = answerWithAppVoiceModel(c, role, judgeModelID, sys, u)
 		if err != nil {
 			return map[string]any{"error": "judge call failed: " + err.Error()}, false
 		}
@@ -159,6 +162,11 @@ func judgeCount(v any) (int, bool) {
 	}
 	return 0, false
 }
+
+// judgeModelID — the scorer. Kept separate from the chat model on purpose: the
+// user picks a model for CONVERSATION, and letting that choice decide how
+// answers are scored makes a benchmark that moves with a dropdown.
+const judgeModelID = "lumid-qwen3-35b"
 
 // judgePromptFor loads the app's own judge prompt, falling back to a neutral
 // rubric instruction. Apps carry per-axis prompts (judge_score_framework.md,

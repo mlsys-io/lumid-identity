@@ -40,3 +40,32 @@ func TestJudgePromptForAlwaysReturnsARubric(t *testing.T) {
 		t.Errorf("fallback should still describe keypoint scoring, got %q", got)
 	}
 }
+
+// A model told to return an integer returned the LIST it counted. Accept both,
+// refuse anything else — a coverage figure from a shape we did not understand is
+// the invented number this tool replaces.
+func TestJudgeCount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   any
+		want int
+		ok   bool
+	}{
+		{"integer", float64(5), 5, true},
+		{"zero", float64(0), 0, true},
+		{"list is counted", []any{"a", "b", "c"}, 3, true},
+		{"empty list", []any{}, 0, true},
+		{"numeric string", "7", 7, true},
+		{"negative refused", float64(-1), 0, false},
+		{"prose refused", "about five", 0, false},
+		{"object refused", map[string]any{"n": 5}, 0, false},
+		{"nil refused", nil, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := judgeCount(tc.in)
+			if got != tc.want || ok != tc.ok {
+				t.Errorf("judgeCount(%v) = (%d, %v), want (%d, %v)", tc.in, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}

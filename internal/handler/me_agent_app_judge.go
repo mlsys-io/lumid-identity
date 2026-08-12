@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -49,8 +50,9 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		"\n\nQuestion put to the interviewee:\n" + question +
 		"\n\nInterviewee's answer:\n" + answer +
 		"\n\nScore it. Reply with STRICT JSON only, no prose:\n" +
-		`{"covered": <int>, "total": <int>, "axes": {"framework": <0-1>, "qualitative": <0-1>, "quantitative": <0-1>}, "missed": ["<short label>", ...]}` +
-		"\nUse only axes the question actually exercises; omit the others. " +
+		`{"covered": <integer count>, "total": <integer count>, "axes": {"framework": <0-1>, "qualitative": <0-1>, "quantitative": <0-1>}, "missed": ["<short label>", ...]}` +
+		"\n`covered` and `total` MUST be integers — counts of keypoints, not lists. " +
+		"Use only axes the question actually exercises; omit the others. " +
 		"`missed` holds SHORT LABELS of uncovered keypoints — never their content."
 
 	text, err := answerWithAppVoice(c, role, sys, user)
@@ -68,10 +70,23 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 			"error": "judge returned no parsable score",
 		}, false
 	}
-	for _, k := range []string{"covered", "total", "axes"} {
-		if v, present := parsed[k]; present {
-			out[k] = v
-		}
+	// Coerce before use. Told to return an integer count, the model returned
+	// `covered` as a LIST of the keypoints it matched — accepted by the parser
+	// (the key was present) and then unusable, so the turn reported a score of
+	// nothing. Count a list, take a number, refuse anything else.
+	covered, okCov := judgeCount(parsed["covered"])
+	total, okTot := judgeCount(parsed["total"])
+	if !okCov || !okTot || total <= 0 {
+		return map[string]any{
+			"app": app, "case_id": caseID, "grounded": true, "mode": "casebook",
+			"error": "judge returned no usable covered/total count",
+		}, false
+	}
+	out["covered"] = covered
+	out["total"] = total
+	out["score"] = float64(covered) / float64(total)
+	if v, present := parsed["axes"]; present {
+		out["axes"] = v
 	}
 	// The candidate must not be handed the answer key by another name.
 	if mode != modeCoach {
@@ -79,12 +94,30 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 			out["missed"] = v
 		}
 	}
-	if cov, okc := parsed["covered"].(float64); okc {
-		if tot, okt := parsed["total"].(float64); okt && tot > 0 {
-			out["score"] = cov / tot
-		}
-	}
 	return out, true
+}
+
+// judgeCount accepts the two shapes a model actually produces for a count: the
+// integer it was asked for, and the LIST of items it counted. Anything else is
+// refused rather than guessed — a coverage figure derived from a shape we did
+// not understand is exactly the invented number this tool exists to replace.
+func judgeCount(v any) (int, bool) {
+	switch x := v.(type) {
+	case float64:
+		if x < 0 {
+			return 0, false
+		}
+		return int(x), true
+	case []any:
+		return len(x), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(x))
+		if err != nil || n < 0 {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
 }
 
 // judgePromptFor loads the app's own judge prompt, falling back to a neutral

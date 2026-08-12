@@ -57,7 +57,6 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		"\n\nScore it. Reply with STRICT JSON only, no prose:\n" +
 		`{"covered": <integer count>, "total": <integer count>, "axes": {"framework": <0-1>, "qualitative": <0-1>, "quantitative": <0-1>}, "missed": ["<short label>", ...]}` +
 		"\n`covered` and `total` MUST be integers — counts of keypoints, not lists. " +
-		judgeKeypointBlock(keypoints) +
 		"Use only axes the question actually exercises; omit the others. " +
 		"`missed` holds SHORT LABELS of uncovered keypoints — never their content."
 
@@ -267,8 +266,12 @@ func judgeKeypoints(gt string) []string {
 
 // judgeKeypointBlock renders the keypoints as an explicit numbered list.
 //
-// The app's judge template expects a pre-formatted {gt_text}; handing the model
-// raw JSON and hoping left it counting a different rubric each run.
+// NOT currently injected into the prompt. Adding it took the judge from 4/4
+// parsable to 0/4: the numbered list tipped the model into answering in prose
+// about each keypoint instead of emitting JSON. Kept because the total it
+// implies is still used — judgeKeypoints supplies the denominator — and because
+// the next attempt at a filled {gt_text} template should start here rather than
+// rediscover the shape.
 func judgeKeypointBlock(kps []string) string {
 	if len(kps) == 0 {
 		return ""

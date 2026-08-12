@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +17,27 @@ import (
 var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, bool){
 	"casebook": func(userID, app string) (map[string]any, bool) {
 		return toolCasebook(userID, app, "")
+	},
+	// The app's own run history — every cycle, scheduled or interactive, with
+	// the metrics blob each one reported. This is what a results surface reads
+	// to show coverage over time, and it is deliberately the SAME record the
+	// trajectory reads, so a number on a page and a node on the tree cannot
+	// disagree about what happened.
+	"runs": func(userID, app string) (map[string]any, bool) {
+		rows := appRunsFor(userID, app, "")
+		out := make([]map[string]any, 0, len(rows))
+		for _, r := range rows {
+			m := map[string]any{}
+			if r.Metrics != "" {
+				_ = json.Unmarshal([]byte(r.Metrics), &m)
+			}
+			out = append(out, map[string]any{
+				"loop": r.Loop, "run_ts": r.RunTs, "ok": r.Ok,
+				"model": r.Model, "source": r.Source,
+				"duration_s": r.DurationS, "metrics": m,
+			})
+		}
+		return map[string]any{"app": app, "runs": out, "count": len(out)}, true
 	},
 }
 

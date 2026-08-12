@@ -189,9 +189,9 @@ type ChargeReq struct {
 	CacheReadTokens     int
 	CacheCreationTokens int
 	Count               int // for cycle_start / external_api; defaults to 1 when 0
-	CostCents    int
-	DryRun       bool
-	Meta         string // optional JSON blob
+	CostCents           int
+	DryRun              bool
+	Meta                string // optional JSON blob
 }
 
 // ChargeRes is the output. Same shape served by /internal/usage/charge.

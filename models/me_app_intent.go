@@ -30,8 +30,8 @@ type MeAppIntent struct {
 	Payload string `gorm:"column:payload;type:text"                                                  json:"-"` // JSON (slug/runtime/as/app/...) — no bearer
 	Bearer  string `gorm:"column:bearer;type:text"                                                   json:"-"` // short-lived user JWT, picker-only
 	// pending → claimed → done | failed
-	Status      string     `gorm:"column:status;size:16;not null;default:pending;index:idx_meintent_status,priority:1" json:"status"`
-	Result      string     `gorm:"column:result;type:text"                                                            json:"-"` // JSON result envelope written on completion
+	Status string `gorm:"column:status;size:16;not null;default:pending;index:idx_meintent_status,priority:1" json:"status"`
+	Result string `gorm:"column:result;type:text"                                                            json:"-"` // JSON result envelope written on completion
 	// Attempts counts how many times this intent has been CLAIMED, including
 	// re-claims after a stale-claim re-queue. It exists to bound the retry that
 	// staleClaimAfter provides: that re-queue assumes the PICKER died for reasons

@@ -1304,3 +1304,37 @@ func qaCall(c *gin.Context, method, path string, body map[string]any) (any, erro
 	}
 	return out, nil
 }
+
+// caseIDRe — a case identifier as the picker and the casebook emit it
+// (Case_019_BetaOptics_PK21, optionally with a _v<N> suffix).
+var caseIDRe = regexp.MustCompile(`\bCase_[A-Za-z0-9_]+`)
+
+// appDataHint carries an app's case CONTENT to providers that get no tools.
+//
+// appVoiceHint already gives the claude-code path the analyst's voice, but
+// voice without data is worse than neither: the agent answers confidently in
+// character while having no case, and (observed in a live session) starts
+// grepping the filesystem for a case file that only exists in the app bundle.
+// The user picked a case; the answer should not depend on which model they
+// happened to have selected.
+//
+// caseContext is the SAME helper the tool path uses, and it truncates at
+// structure_4_ground_truth — so the interviewee still never sees the answer
+// key. Nothing here widens what an analyst may read.
+func appDataHint(userID, app, userText string) string {
+	id := caseIDRe.FindString(userText)
+	if id == "" {
+		return ""
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return ""
+	}
+	ctx, ok := caseContext(appDir, id)
+	if !ok || ctx == "" {
+		return ""
+	}
+	return "\n\nThe user is working case " + id + ". Its content follows — treat it as " +
+		"the case you have been given, and do NOT claim you cannot find it. The answer " +
+		"key is deliberately withheld; never ask for it.\n\n" + ctx + "\n"
+}

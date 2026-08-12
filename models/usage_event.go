@@ -30,10 +30,10 @@ type UsageEvent struct {
 	// weighted cache columns rather than replacing InputTokens: on an old row
 	// the two cache terms contribute nothing and the historical value stands, so
 	// the transition needs no backfill and cannot double-count.
-	CacheReadTokens     int `gorm:"column:cache_read_tokens;not null;default:0"     json:"cache_read_tokens"`
-	CacheCreationTokens int `gorm:"column:cache_creation_tokens;not null;default:0" json:"cache_creation_tokens"`
-	CostCents           int `gorm:"column:cost_cents;not null;default:0"    json:"cost_cents"`
-	Meta         string    `gorm:"column:meta;type:text"               json:"meta"` // optional JSON blob
+	CacheReadTokens     int    `gorm:"column:cache_read_tokens;not null;default:0"     json:"cache_read_tokens"`
+	CacheCreationTokens int    `gorm:"column:cache_creation_tokens;not null;default:0" json:"cache_creation_tokens"`
+	CostCents           int    `gorm:"column:cost_cents;not null;default:0"    json:"cost_cents"`
+	Meta                string `gorm:"column:meta;type:text"               json:"meta"` // optional JSON blob
 }
 
 func (UsageEvent) TableName() string { return "usage_events" }

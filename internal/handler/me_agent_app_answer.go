@@ -332,8 +332,13 @@ func answerWithAppVoiceModel(ctx context.Context, role, modelID, system, user st
 		return "", err
 	}
 	resp, err := callLLM(ctx, provider, apiKey, map[string]any{
-		"model":      provider.upstreamModel,
-		"max_tokens": 2000,
+		"model": provider.upstreamModel,
+		// 2000 truncated the JUDGE. The pinned scorer is a reasoning model: it
+		// emits a thinking preamble before its answer, and a long one consumed
+		// the whole budget before the JSON appeared — which surfaced as
+		// "judge returned no parsable score" on some runs and not others, with
+		// no other difference between them.
+		"max_tokens": 6000,
 		"system":     system,
 		"messages": []map[string]any{
 			{"role": "user", "content": user},

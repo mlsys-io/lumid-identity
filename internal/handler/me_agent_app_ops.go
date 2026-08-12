@@ -1321,7 +1321,7 @@ var caseIDRe = regexp.MustCompile(`\bCase_[A-Za-z0-9_]+`)
 // caseContext is the SAME helper the tool path uses, and it truncates at
 // structure_4_ground_truth — so the interviewee still never sees the answer
 // key. Nothing here widens what an analyst may read.
-func appDataHint(userID, app, userText, mode string) string {
+func appDataHint(userID, app, userText, mode string, qIdx int) string {
 	id := caseIDRe.FindString(userText)
 	if id == "" {
 		return ""
@@ -1334,14 +1334,24 @@ func appDataHint(userID, app, userText, mode string) string {
 	// from the caller. A candidate able to name their own role would simply ask
 	// to be the judge.
 	role := roleForMode(mode)
-	ctx, ok := caseContextForRole(appDir, id, role)
+	var ctx string
+	var ok bool
+	if role == caseRoleInterviewer {
+		// ONE question at a time. Handing over the whole set is what let the
+		// opening turn reveal Q2-Q4; qIdx advances with the conversation, so the
+		// model can only ask what it currently holds.
+		ctx, ok = caseContextAtQuestion(appDir, id, qIdx)
+	} else {
+		ctx, ok = caseContextForRole(appDir, id, role)
+	}
 	if !ok || ctx == "" {
 		return ""
 	}
 	if role == caseRoleInterviewer {
 		return "\n\nYou are the INTERVIEWER for case " + id + ", and the user is the " +
-			"candidate. Ask the case's questions IN ORDER, one at a time, and never " +
-			"reveal a later question before its turn. Release a fact from " +
+			"candidate. You have been given ONLY the question you are currently on — ask " +
+			"that one, and when the candidate has answered it, say so and wait. Do not " +
+			"invent a next question. Release a fact from " +
 			"information_upon_request ONLY when the candidate's own answer touches it " +
 			"— never volunteer one. The answer key is deliberately withheld from you " +
 			"here; if you need it to score, say so rather than inventing one.\n\n" + ctx + "\n"
@@ -1382,4 +1392,25 @@ func chatMode(ctx map[string]any) string {
 		return m
 	}
 	return modeTrainAI
+}
+
+// answeredQuestions estimates how far into a case interview the conversation is,
+// from the transcript alone.
+//
+// Server-derived on purpose. The obvious alternative — let the client send the
+// question index — hands the candidate a control that unlocks later questions,
+// which is the one thing this whole projection exists to prevent.
+//
+// One assistant turn per question asked is a deliberate under-count: clarifying
+// exchanges make it lag, and lagging means the candidate stays on the CURRENT
+// question rather than being advanced past one they have not answered.
+func answeredQuestions(msgs []chatMessage) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			n++
+		}
+	}
+	// The opening turn (restate + first question) is question 1, i.e. index 0.
+	return n - 1
 }

@@ -115,15 +115,22 @@ func TestCaseContextWrapperMatchesIntervieweeRole(t *testing.T) {
 	}
 }
 
-// The interviewer gets the script, the questions and the on-request facts — and
-// still no answer key, not even the field name.
-func TestCaseContextForRoleInterviewerSeesScriptAndQuestionsNotTheKey(t *testing.T) {
+// The interviewer gets the questions and the on-request facts — no answer key,
+// and NOT the opening script.
+//
+// The script was in this set until a live coach-mode turn pasted it verbatim and
+// revealed Q2, Q3 and Q4 in the opening message. It contains every question, and
+// a model that holds the whole list does not honour "ask them one at a time".
+// Removing it is what makes caseContextAtQuestion's narrowing meaningful — the
+// model cannot reveal what it was never given.
+func TestCaseContextForRoleInterviewerSeesQuestionsButNotTheScriptOrTheKey(t *testing.T) {
 	dir := writeCaseFile(t)
 	got := mustCase(t, dir, caseRoleInterviewer)
 
 	mustContain(t, caseRoleInterviewer, got,
-		seeBriefCompany, seeScript, seeQuestionLate, "What factors would you consider", seeOnRequest,
+		seeBriefCompany, seeQuestionLate, "What factors would you consider", seeOnRequest,
 	)
+	mustNotContain(t, caseRoleInterviewer, got, seeScript)
 	mustNotContain(t, caseRoleInterviewer, got,
 		seeAnswerKey, seeAnswerKeypoint, "ground_truth", seeKeyName, seeUnlisted,
 	)
@@ -136,8 +143,11 @@ func TestCaseContextForRoleJudgeSeesTheAnswerKey(t *testing.T) {
 
 	mustContain(t, caseRoleJudge, got,
 		seeAnswerKey, seeAnswerKeypoint, seeKeyName,
-		seeBriefCompany, seeScript, seeQuestionLate, seeOnRequest,
+		seeBriefCompany, seeQuestionLate, seeOnRequest,
 	)
+	// The judge scores a finished transcript; it has no use for the interviewer's
+	// script either, and every field withheld is one that cannot leak.
+	mustNotContain(t, caseRoleJudge, got, seeScript)
 	mustNotContain(t, caseRoleJudge, got, seeUnlisted)
 }
 

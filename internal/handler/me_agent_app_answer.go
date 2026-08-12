@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,8 +85,14 @@ var caseFieldsInterviewee = []string{
 // caseFieldsInterviewerExtra is what running the case requires and being tested
 // on it forbids: the interviewer's own script, the questions to put, and the
 // facts to release only when the candidate's answer touches them.
+// NOTE: opening_prompt is deliberately ABSENT. It is the interviewer's full
+// script and contains every question, and a model handed it pastes it verbatim
+// — measured live: coach mode revealed Q2, Q3 and Q4 in its opening turn, which
+// is the same leak that made the analyst echo the script back at the user. The
+// instruction "never reveal a later question" does not survive contact with a
+// model that has the whole list in front of it. Structure beats prompt: see
+// caseContextAtQuestion, which projects ONE question.
 var caseFieldsInterviewerExtra = []string{
-	"opening_prompt",
 	"structure_3_case_questions",
 	"structure_2_information_upon_request",
 }
@@ -441,4 +448,69 @@ func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentCha
 		return res, true
 	}
 	return nil, false // any other tool stays the model's business
+}
+
+// caseContextAtQuestion is the interviewer's view for ONE question.
+//
+// caseContextForRole(interviewer) hands over every question at once, which a
+// model reliably dumps into its first turn. A candidate who can see Q4 while
+// answering Q1 is not being interviewed. So the question set is filtered to the
+// one being asked: the model cannot reveal what it was never given.
+//
+// qIdx is 0-based over the case's questions in key order (Q1, Q2, …), clamped —
+// past the end returns the last question rather than nothing, so an over-long
+// conversation degrades to "still on the final question" instead of losing the
+// case.
+func caseContextAtQuestion(appDir, caseID string, qIdx int) (string, bool) {
+	full, ok := caseContextForRole(appDir, caseID, caseRoleInterviewer)
+	if !ok {
+		return "", false
+	}
+	var doc map[string]json.RawMessage
+	if json.Unmarshal([]byte(full), &doc) != nil {
+		return "", false
+	}
+	qraw, present := doc["structure_3_case_questions"]
+	if !present {
+		return full, true // no question set to narrow — nothing to leak
+	}
+	var qs map[string]json.RawMessage
+	if json.Unmarshal(qraw, &qs) != nil {
+		return "", false
+	}
+	keys := make([]string, 0, len(qs))
+	for k := range qs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		return full, true
+	}
+	if qIdx < 0 {
+		qIdx = 0
+	}
+	if qIdx >= len(keys) {
+		qIdx = len(keys) - 1
+	}
+	only := map[string]json.RawMessage{keys[qIdx]: qs[keys[qIdx]]}
+	enc, err := json.Marshal(only)
+	if err != nil {
+		return "", false
+	}
+	doc["structure_3_case_questions"] = enc
+	// Tell the interviewer where it is, so it does not invent a "next" question
+	// it cannot see.
+	doc["_question_position"] = json.RawMessage(
+		[]byte(`"` + keys[qIdx] + ` of ` + strconv.Itoa(len(keys)) + `"`))
+	var buf bytes.Buffer
+	e := json.NewEncoder(&buf)
+	e.SetEscapeHTML(false)
+	if e.Encode(doc) != nil {
+		return "", false
+	}
+	body := strings.TrimSpace(buf.String())
+	if strings.Contains(body, "ground_truth") {
+		return "", false
+	}
+	return body, true
 }

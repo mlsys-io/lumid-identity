@@ -48,6 +48,9 @@ func main() {
 	// Sweep expired auto-minted claude-sandbox PATs hourly.
 	handler.StartClaudeSandboxPATSweep()
 
+	// Drop client-fingerprint observations too old for any window to read.
+	handler.StartClaudeFingerprintGC()
+
 	if cfg.App.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}

@@ -506,6 +506,13 @@ func Register(r *gin.Engine) {
 			// the cooldown applies across every proxy replica, not just the pod
 			// that saw the failure.
 			internal.POST("/claude-account/bench", InternalClaudeAccountBench)
+			// Field-box fingerprint adoption — each proxy replica reports the
+			// client version triples it saw, and reads back ONE aggregated
+			// pool. Central because the replicas must present an identical
+			// identity per box; adopting per-pod would split it during exactly
+			// the version transitions that matter.
+			internal.POST("/claude-fingerprint/observe", InternalClaudeFingerprintObserve)
+			internal.GET("/claude-fingerprint/pool", InternalClaudeFingerprintPool)
 			// Per-user "act as <sub>" bridge credential — claude-proxy mints one
 			// to forward LumidOS tool calls to a backend as the resolved user,
 			// without the client ever holding a broad backend PAT.

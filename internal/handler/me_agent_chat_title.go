@@ -27,7 +27,10 @@ import (
 	"context"
 	"errors"
 	"log"
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -251,4 +254,43 @@ func generateChatTitle(userID, chatID, excerpt string) error {
 		return errors.New("model returned no usable title")
 	}
 	return setChatTitle(userID, chatID, title)
+}
+
+// disambiguateChatTitle appends an ordinal when a user already has a DIFFERENT
+// thread by the same name.
+//
+// Both title stages derive from the opening exchange, and an app that starts
+// every thread from one templated prompt ("Let's work case X. Give me the
+// opening.") therefore produces identical titles by construction. In the
+// sidebar that reads as one conversation duplicated N times — the rail's whole
+// job is telling threads apart.
+//
+// Ordinal, not a timestamp: the row already shows a relative age, and two
+// facts competing for ~14 characters leaves neither legible.
+func disambiguateChatTitle(userSub, chatID, title string) string {
+	if common.DB == nil || title == "" || userSub == "" {
+		return title
+	}
+	var clash int64
+	if err := common.DB.Model(&models.MeChat{}).
+		Where("user_sub = ? AND title = ? AND id <> ?", userSub, title, chatID).
+		Count(&clash).Error; err != nil || clash == 0 {
+		return title
+	}
+	// Find the first free ordinal rather than using count+1: threads get
+	// deleted, and reusing a freed number is better than skipping to " · 7"
+	// because six were removed.
+	for n := 2; n <= 99; n++ {
+		cand := title + " · " + strconv.Itoa(n)
+		var taken int64
+		if err := common.DB.Model(&models.MeChat{}).
+			Where("user_sub = ? AND title = ? AND id <> ?", userSub, cand, chatID).
+			Count(&taken).Error; err != nil {
+			return title
+		}
+		if taken == 0 {
+			return cand
+		}
+	}
+	return title
 }

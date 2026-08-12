@@ -236,7 +236,9 @@ func MeChatSave(c *gin.Context) {
 	// Only re-derive the truncated title while the thread has no generated
 	// summary — otherwise every save would undo the summary.
 	if !rec.TitleSummary {
-		rec.Title = inferTitle(body.Messages)
+		// Disambiguated on save: an app whose threads all open with the same
+		// templated prompt otherwise fills the rail with identical rows.
+		rec.Title = disambiguateChatTitle(userID, rec.ID, inferTitle(body.Messages))
 	}
 	rec.UpdatedAt = now
 

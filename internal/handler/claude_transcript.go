@@ -868,7 +868,22 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 	// Fingerprint chip — only for rows backed by an actual configured relay
 	// (fieldRelays), never the "" direct row and never a homed-but-unconfigured
 	// label (claude-proxy has nothing to attach a fingerprint to there either).
+	//
+	// Prefer what claude-proxy REPORTS it is presenting over identity's own
+	// re-derivation. The derivation is a mirror of the proxy's rotation logic
+	// and is correct only while both copies stay byte-identical — which they
+	// did not: it rendered `Anthropic/JS <sdk>` for a day after the proxy moved
+	// to `claude-cli/<ver> (external, cli)`, and nothing caught it because each
+	// side was self-consistent against its own copy. A reported row has exactly
+	// one writer, so it can be stale but never invented.
 	now := time.Now()
+	reported := map[string]models.ClaudeFieldPresenting{}
+	var presentRows []models.ClaudeFieldPresenting
+	if err := common.DB.Find(&presentRows).Error; err == nil {
+		for _, p := range presentRows {
+			reported[p.Label] = p
+		}
+	}
 	for i, r := range rows {
 		if r.FieldBox == "" {
 			continue
@@ -876,6 +891,24 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 		if _, ok := fieldRelays[r.FieldBox]; !ok {
 			continue
 		}
+		if p, ok := reported[r.FieldBox]; ok && p.UserAgent != "" {
+			at := p.UpdatedAt
+			fp := fieldFingerprintInfo{
+				UserAgent:      p.UserAgent,
+				OS:             p.OS,
+				Arch:           p.Arch,
+				Runtime:        p.Runtime,
+				PackageVersion: p.SDK,
+				Override:       p.Source == "override",
+				Reported:       true,
+				ReportedAt:     &at,
+			}
+			rows[i].Fingerprint = &fp
+			continue
+		}
+		// No report yet (proxy not yet upgraded, or this box has been idle
+		// since the last identity restart). Fall back to the local derivation,
+		// flagged so the panel can present it as a guess, not an observation.
 		fp := fingerprintInfoForLabel(r.FieldBox, now)
 		rows[i].Fingerprint = &fp
 	}

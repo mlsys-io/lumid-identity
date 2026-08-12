@@ -41,6 +41,13 @@ type fieldFingerprintInfo struct {
 	// pointer, not a zero time.Time, because encoding/json's omitempty does NOT
 	// treat a zero-value struct as empty; only nil/zero scalars are omitted.
 	RotatesAt *time.Time `json:"rotates_at,omitempty"`
+	// Reported distinguishes an OBSERVED value (claude-proxy told us what it
+	// is sending) from this file's DERIVED guess. The guess is only right
+	// while the mirrored pool below matches the proxy's byte for byte, and it
+	// silently was not for a day — so the panel must be able to say which of
+	// the two it is showing rather than presenting both with equal confidence.
+	Reported   bool       `json:"reported"`
+	ReportedAt *time.Time `json:"reported_at,omitempty"`
 }
 
 func parseFieldRelayFingerprints(spec string) map[string]string {

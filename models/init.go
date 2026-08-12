@@ -35,6 +35,8 @@ var AllTables = []interface{}{
 	&ClaudeRecordingPref{},
 	&MePref{},
 	&ClaudePoolWindow{},
+	&ClaudeFingerprintObservation{},
+	&ClaudeFieldPresenting{},
 	&MeChat{},
 	&MeDraft{},
 }

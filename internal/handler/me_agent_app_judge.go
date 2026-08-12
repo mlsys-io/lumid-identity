@@ -55,13 +55,33 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		"Use only axes the question actually exercises; omit the others. " +
 		"`missed` holds SHORT LABELS of uncovered keypoints — never their content."
 
-	text, err := answerWithAppVoice(c, role, sys, user)
-	if err != nil {
-		return map[string]any{"error": "judge call failed: " + err.Error()}, false
+	// One retry, with the format restated bluntly. Measured: the same model
+	// returned clean counts on one call and unparsable prose on the next, so a
+	// single attempt made scoring randomly unavailable. Bounded at two — a judge
+	// that cannot produce a number twice should refuse, not be argued with.
+	var parsed map[string]any
+	var text string
+	var err error
+	for attempt := 0; attempt < 2 && parsed == nil; attempt++ {
+		u := user
+		if attempt > 0 {
+			u = user + "\n\nYour previous reply could not be parsed. Output the JSON " +
+				"object ONLY — no prose, no code fence, no explanation. `covered` and " +
+				"`total` must be plain integers."
+		}
+		text, err = answerWithAppVoice(c, role, sys, u)
+		if err != nil {
+			return map[string]any{"error": "judge call failed: " + err.Error()}, false
+		}
+		parsed = parseJudgeJSON(text)
+		if parsed != nil {
+			if _, ok := judgeCount(parsed["covered"]); !ok {
+				parsed = nil // parsed, but not into a count — retry once
+			}
+		}
 	}
 
 	out := map[string]any{"app": app, "case_id": caseID, "grounded": true, "mode": "casebook"}
-	parsed := parseJudgeJSON(text)
 	if parsed == nil {
 		// Refuse rather than pass the raw model text through: unparsed judge
 		// output reaching the user is exactly how the answer key escapes.

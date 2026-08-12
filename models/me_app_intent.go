@@ -32,6 +32,16 @@ type MeAppIntent struct {
 	// pending → claimed → done | failed
 	Status      string     `gorm:"column:status;size:16;not null;default:pending;index:idx_meintent_status,priority:1" json:"status"`
 	Result      string     `gorm:"column:result;type:text"                                                            json:"-"` // JSON result envelope written on completion
+	// Attempts counts how many times this intent has been CLAIMED, including
+	// re-claims after a stale-claim re-queue. It exists to bound the retry that
+	// staleClaimAfter provides: that re-queue assumes the PICKER died for reasons
+	// unrelated to the intent, but an intent whose own work kills the picker
+	// turns it into a perpetual motion machine — claim, crash, re-queue, claim.
+	// Observed 2026-08-12: one run_loop intent for venue-link-matcher.match_cycle
+	// (needs ~900MB against ~880MB of headroom) OOM-killed lumid-scheduler 13
+	// times over ~2h, one kill per 10-minute reclaim, taking every other loop
+	// down with it each time.
+	Attempts    int        `gorm:"column:attempts;not null;default:0"                                                 json:"attempts"`
 	CreatedAt   time.Time  `gorm:"column:created_at;autoCreateTime;index:idx_meintent_status,priority:3"               json:"created_at"`
 	ClaimedAt   *time.Time `gorm:"column:claimed_at"                                                                   json:"claimed_at,omitempty"`
 	CompletedAt *time.Time `gorm:"column:completed_at"                                                                 json:"completed_at,omitempty"`

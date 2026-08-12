@@ -180,3 +180,127 @@ func TestMeIntentResultFailure(t *testing.T) {
 		t.Fatalf("expected 1 failed card w/ error, got %+v", cards)
 	}
 }
+
+// staleClaimAfter re-queues a claimed-but-uncompleted intent on the assumption
+// that the PICKER died for reasons unrelated to the intent. When the intent's
+// own work is what kills the picker, that assumption inverts and the retry
+// becomes a poison pill. Observed 2026-08-12: one venue-link-matcher.match_cycle
+// run_loop intent OOM-killed lumid-scheduler 13 times over ~2h — one kill per
+// reclaim — taking every other in-flight loop down with it each time, until an
+// operator marked it failed by hand.
+//
+// This pins the bound: after maxClaimAttempts claims with no result, the intent
+// is abandoned rather than re-queued.
+func TestMeIntentQueuePoisonPillIsAbandoned(t *testing.T) {
+	db := setupIntentDB(t)
+	r := bridgeRouter()
+
+	claim := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/me-intents/claim", bytes.NewReader([]byte("{}")))
+		req.Header.Set("X-Bridge-Secret", "test-bridge-secret")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("claim status %d: %s", w.Code, w.Body.String())
+		}
+		var body struct {
+			Data struct {
+				Intents []claimedIntent `json:"intents"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return len(body.Data.Intents)
+	}
+
+	if err := db.Create(&models.MeAppIntent{
+		ID: "intent-poison", Action: "run_loop", UserSub: "user-A",
+		Payload: `{"app":"venue-link-matcher","loop":"match_cycle"}`,
+		Status:  "pending", CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Simulate the loop: claim, picker dies without reporting, claim goes stale.
+	for i := 1; i <= maxClaimAttempts; i++ {
+		if n := claim(); n != 1 {
+			t.Fatalf("attempt %d: claimed %d intents, want 1", i, n)
+		}
+		var row models.MeAppIntent
+		if err := db.First(&row, "id = ?", "intent-poison").Error; err != nil {
+			t.Fatalf("attempt %d: reload: %v", i, err)
+		}
+		if row.Attempts != i {
+			t.Fatalf("attempt %d: attempts=%d, want %d — the counter must advance on CLAIM, "+
+				"since a picker that dies never reports", i, row.Attempts, i)
+		}
+		// Back-date the claim so the next poll treats it as a crashed picker.
+		if err := db.Model(&models.MeAppIntent{}).Where("id = ?", "intent-poison").
+			Update("claimed_at", time.Now().Add(-staleClaimAfter-time.Minute)).Error; err != nil {
+			t.Fatalf("attempt %d: backdate: %v", i, err)
+		}
+	}
+
+	// The next poll must abandon it, not hand it out again.
+	if n := claim(); n != 0 {
+		t.Fatalf("poison pill was re-dispatched after %d attempts (claimed %d) — the loop is unbounded",
+			maxClaimAttempts, n)
+	}
+	var row models.MeAppIntent
+	if err := db.First(&row, "id = ?", "intent-poison").Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if row.Status != "failed" {
+		t.Fatalf("status=%q, want %q — an abandoned intent must be terminal, not left claimed/pending", row.Status, "failed")
+	}
+	if row.CompletedAt == nil {
+		t.Fatal("abandoned intent must carry completed_at, or it reads as still in flight")
+	}
+	if row.Result == "" {
+		t.Fatal("abandoned intent must record WHY, or the user sees a silent failure")
+	}
+}
+
+// A healthy intent must not be abandoned: attempts advance on claim, but a
+// reported result ends the lifecycle well before the bound.
+func TestMeIntentQueueHealthyIntentUnaffected(t *testing.T) {
+	db := setupIntentDB(t)
+	r := bridgeRouter()
+
+	if err := db.Create(&models.MeAppIntent{
+		ID: "intent-ok", Action: "run_loop", UserSub: "user-A",
+		Payload: `{"app":"x","loop":"y"}`, Status: "pending", CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/internal/me-intents/claim", bytes.NewReader([]byte("{}")))
+	req.Header.Set("X-Bridge-Secret", "test-bridge-secret")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("claim status %d", w.Code)
+	}
+
+	res := httptest.NewRequest(http.MethodPost, "/api/v1/internal/me-intents/intent-ok/result",
+		bytes.NewReader([]byte(`{"ok":true}`)))
+	res.Header.Set("X-Bridge-Secret", "test-bridge-secret")
+	res.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, res)
+	if w2.Code != 200 {
+		t.Fatalf("result status %d: %s", w2.Code, w2.Body.String())
+	}
+
+	var row models.MeAppIntent
+	if err := db.First(&row, "id = ?", "intent-ok").Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if row.Status != "done" {
+		t.Fatalf("status=%q, want done — the guard must not disturb the happy path", row.Status)
+	}
+	if row.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1", row.Attempts)
+	}
+}

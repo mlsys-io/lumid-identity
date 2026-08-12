@@ -11,8 +11,10 @@ package handler
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -42,6 +44,18 @@ var actionsNeedingBearer = map[string]bool{
 const (
 	claimBatchSize  = 16               // max intents claimed per picker poll
 	staleClaimAfter = 10 * time.Minute // claimed-but-not-completed → re-queue (picker crash)
+	// maxClaimAttempts bounds that re-queue. staleClaimAfter assumes the PICKER
+	// died for reasons unrelated to the intent, so retrying is free. When the
+	// intent's own work is what kills the picker, that assumption inverts and
+	// the retry becomes a poison pill: claim → crash → re-queue → claim, every
+	// staleClaimAfter, forever, taking every other in-flight loop with it each
+	// time. Observed 2026-08-12: one venue-link-matcher.match_cycle run_loop
+	// intent OOM-killed lumid-scheduler 13 times over ~2h before an operator
+	// killed it by hand.
+	//
+	// 3 is enough to ride out genuine picker crashes (pod eviction, rollout,
+	// node drain) while capping a self-inflicted loop at three blast radii.
+	maxClaimAttempts = 3
 )
 
 // insertIntent enqueues an intent and returns its id. `payload` may carry a
@@ -91,9 +105,28 @@ type claimedIntent struct {
 // intents (FOR UPDATE SKIP LOCKED), returning them with bearer merged into
 // payload for the picker.
 func InternalMeIntentsClaim(c *gin.Context) {
+	// Burn out poison pills BEFORE re-queueing, so an intent that has already
+	// had maxClaimAttempts goes to `failed` instead of round-tripping again.
+	// Ordering matters: re-queue first and the offender is pending again before
+	// anything counts it.
+	stale := time.Now().Add(-staleClaimAfter)
+	if res := common.DB.Model(&models.MeAppIntent{}).
+		Where("status = ? AND claimed_at < ? AND attempts >= ?", "claimed", stale, maxClaimAttempts).
+		Updates(map[string]any{
+			"status": "failed",
+			"result": `{"ok":false,"error":"abandoned after ` +
+				strconv.Itoa(maxClaimAttempts) +
+				` claims without a result — the picker died every time it ran this intent, ` +
+				`so it is being treated as the cause rather than a victim"}`,
+			"completed_at": time.Now(),
+		}); res.Error == nil && res.RowsAffected > 0 {
+		log.Printf("me-intents: abandoned %d poison-pill intent(s) after %d claims with no result",
+			res.RowsAffected, maxClaimAttempts)
+	}
+
 	// Re-queue crashed claims first (best effort, own statement).
 	common.DB.Model(&models.MeAppIntent{}).
-		Where("status = ? AND claimed_at < ?", "claimed", time.Now().Add(-staleClaimAfter)).
+		Where("status = ? AND claimed_at < ?", "claimed", stale).
 		Updates(map[string]any{"status": "pending", "claimed_at": nil})
 
 	var claimed []claimedIntent
@@ -114,8 +147,15 @@ func InternalMeIntentsClaim(c *gin.Context) {
 		for i := range rows {
 			ids = append(ids, rows[i].ID)
 		}
+		// attempts is incremented in the SAME statement that claims, so a picker
+		// that dies before reporting still leaves the count advanced — that is
+		// precisely the case the poison-pill guard needs to see.
 		if err := tx.Model(&models.MeAppIntent{}).Where("id IN ?", ids).
-			Updates(map[string]any{"status": "claimed", "claimed_at": time.Now()}).Error; err != nil {
+			Updates(map[string]any{
+				"status":     "claimed",
+				"claimed_at": time.Now(),
+				"attempts":   gorm.Expr("attempts + 1"),
+			}).Error; err != nil {
 			return err
 		}
 		for i := range rows {

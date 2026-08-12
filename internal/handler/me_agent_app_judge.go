@@ -45,6 +45,11 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		return map[string]any{"error": "no ground truth available for case " + caseID}, false
 	}
 
+	// Count the keypoints OURSELVES. Asking the model for `total` made the
+	// benchmark move: six runs on one question returned totals of 1, 3 and 13
+	// for a rubric whose size is fixed. The total is a property of the rubric,
+	// not a judgement — the model is asked only WHICH are covered.
+	keypoints := judgeKeypoints(gt)
 	sys := judgePromptFor(appDir)
 	user := "Ground truth and case (CONFIDENTIAL — never quote it back):\n" + gt +
 		"\n\nQuestion put to the interviewee:\n" + question +
@@ -52,6 +57,7 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		"\n\nScore it. Reply with STRICT JSON only, no prose:\n" +
 		`{"covered": <integer count>, "total": <integer count>, "axes": {"framework": <0-1>, "qualitative": <0-1>, "quantitative": <0-1>}, "missed": ["<short label>", ...]}` +
 		"\n`covered` and `total` MUST be integers — counts of keypoints, not lists. " +
+		judgeKeypointBlock(keypoints) +
 		"Use only axes the question actually exercises; omit the others. " +
 		"`missed` holds SHORT LABELS of uncovered keypoints — never their content."
 
@@ -98,6 +104,15 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 	// (the key was present) and then unusable, so the turn reported a score of
 	// nothing. Count a list, take a number, refuse anything else.
 	covered, total, okCounts := judgeTotals(parsed)
+	// Our count wins when we have one: it is derived from the rubric, so it is
+	// the same on every run, which is what makes two scores comparable at all.
+	if len(keypoints) > 0 {
+		total = len(keypoints)
+		okCounts = okCov(parsed)
+		if covered > total {
+			covered = total
+		}
+	}
 	if !okCounts {
 		return map[string]any{
 			"app": app, "case_id": caseID, "grounded": true, "mode": "casebook",
@@ -201,4 +216,69 @@ func parseJudgeJSON(text string) map[string]any {
 		return nil
 	}
 	return m
+}
+
+// okCov reports whether the model gave a usable covered count, independent of
+// whatever it said about the total.
+func okCov(parsed map[string]any) bool {
+	_, ok := judgeCount(parsed["covered"])
+	return ok
+}
+
+// judgeKeypoints pulls the rubric's keypoint list out of the ground truth.
+//
+// Shapes vary by question type — pillars each holding keypoints[], or a flat
+// keypoints[] — so this walks the structure rather than assuming one. Returns
+// empty when it cannot find them, and the caller falls back to the model's own
+// count rather than pretending to a precision it does not have.
+func judgeKeypoints(gt string) []string {
+	var doc map[string]any
+	if json.Unmarshal([]byte(gt), &doc) != nil {
+		return nil
+	}
+	key, _ := doc["structure_4_ground_truth"].(map[string]any)
+	if key == nil {
+		return nil
+	}
+	var out []string
+	var walk func(v any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if kps, ok := x["keypoints"].([]any); ok {
+				for _, k := range kps {
+					if s, ok := k.(string); ok && strings.TrimSpace(s) != "" {
+						out = append(out, s)
+					}
+				}
+			}
+			for _, nested := range x {
+				walk(nested)
+			}
+		case []any:
+			for _, nested := range x {
+				walk(nested)
+			}
+		}
+	}
+	walk(key)
+	return out
+}
+
+// judgeKeypointBlock renders the keypoints as an explicit numbered list.
+//
+// The app's judge template expects a pre-formatted {gt_text}; handing the model
+// raw JSON and hoping left it counting a different rubric each run.
+func judgeKeypointBlock(kps []string) string {
+	if len(kps) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\nScore against EXACTLY these " + strconv.Itoa(len(kps)) +
+		" keypoints, each worth one point:\n")
+	for i, k := range kps {
+		b.WriteString(strconv.Itoa(i+1) + ". " + k + "\n")
+	}
+	b.WriteString("`total` is " + strconv.Itoa(len(kps)) + ". Do not invent keypoints.\n")
+	return b.String()
 }

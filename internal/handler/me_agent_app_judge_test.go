@@ -100,3 +100,49 @@ func TestJudgeTotals(t *testing.T) {
 		})
 	}
 }
+
+// The total must come from the rubric, not the model: six runs on one question
+// returned totals of 1, 3 and 13 for a rubric whose size is fixed, which makes
+// two scores incomparable.
+func TestJudgeKeypoints(t *testing.T) {
+	gt := `{"structure_4_ground_truth":{
+	  "pillars":{
+	    "p1":{"keypoints":["Typical margins","Cost structure of peers","Major trends"]},
+	    "p2":{"keypoints":["Major accounts","Product portfolio"]}
+	  }}}`
+	got := judgeKeypoints(gt)
+	if len(got) != 5 {
+		t.Fatalf("expected 5 keypoints across both pillars, got %d: %v", len(got), got)
+	}
+	if got[0] != "Typical margins" {
+		t.Errorf("first keypoint = %q", got[0])
+	}
+
+	t.Run("flat shape", func(t *testing.T) {
+		if n := len(judgeKeypoints(`{"structure_4_ground_truth":{"keypoints":["a","b"]}}`)); n != 2 {
+			t.Errorf("flat keypoints = %d, want 2", n)
+		}
+	})
+	t.Run("absent yields none, not a guess", func(t *testing.T) {
+		if n := len(judgeKeypoints(`{"structure_1_client_basic_context":{"company":"x"}}`)); n != 0 {
+			t.Errorf("expected no keypoints, got %d", n)
+		}
+	})
+	t.Run("malformed yields none", func(t *testing.T) {
+		if judgeKeypoints("not json") != nil {
+			t.Error("expected nil for unparsable ground truth")
+		}
+	})
+}
+
+func TestJudgeKeypointBlockIsExplicit(t *testing.T) {
+	out := judgeKeypointBlock([]string{"alpha", "beta"})
+	for _, want := range []string{"EXACTLY these 2", "1. alpha", "2. beta", "`total` is 2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("block missing %q: %s", want, out)
+		}
+	}
+	if judgeKeypointBlock(nil) != "" {
+		t.Error("no keypoints should render no block, not an empty rubric")
+	}
+}

@@ -50,6 +50,16 @@ func TestOpusIsTheNormalisationPoint(t *testing.T) {
 	if w := ClaudeModelWeight("claude-sonnet-5"); w >= 1.0 {
 		t.Fatalf("Sonnet must be cheaper than Opus, got %v", w)
 	}
+	// Pin the ratios to Anthropic list rates (Opus $5, Sonnet $3, Haiku $1 per
+	// MTok input). These were once 0.2 / 0.053 because they had been normalised
+	// against a wrong Opus rate of $15 — under-charging Sonnet 3x. If a future
+	// price change makes these stale, this is the assertion that should fail.
+	if got := ClaudeModelWeight("claude-sonnet-5"); got != 3.0/5.0 {
+		t.Fatalf("Sonnet weight = %v, want 3/5 (its list price ratio to Opus)", got)
+	}
+	if got := ClaudeModelWeight("claude-haiku-4-5"); got != 1.0/5.0 {
+		t.Fatalf("Haiku weight = %v, want 1/5 (its list price ratio to Opus)", got)
+	}
 	if ClaudeModelWeight("claude-haiku-4-5") >= ClaudeModelWeight("claude-sonnet-5") {
 		t.Fatal("Haiku must be cheaper than Sonnet")
 	}
@@ -109,7 +119,7 @@ func TestClaudeWeightedTokens(t *testing.T) {
 		// necessary — 118k cache reads cost a tenth of 118k fresh tokens.
 		{"opus cached turn", "claude-opus-5", 4, 350, 118000, 0, 0, 4 + 350 + 11800},
 		// Same turn on Sonnet costs a fifth again.
-		{"sonnet cached turn", "claude-sonnet-5", 4, 350, 118000, 0, 0, 2431}, // (4+350+11800)*0.2 = 2430.8, rounded
+		{"sonnet cached turn", "claude-sonnet-5", 4, 350, 118000, 0, 0, 7292}, // (4+350+11800)*0.6 = 7292.4
 		// Cache WRITES are more expensive than fresh input, not less.
 		{"5m cache write premium", "claude-opus-5", 0, 0, 0, 1000, 0, 1250},
 		// A 1-hour write costs 2x, not 1.25x — pricing it at the 5-minute rate
@@ -119,9 +129,9 @@ func TestClaudeWeightedTokens(t *testing.T) {
 		{"mixed ttl writes", "claude-opus-5", 0, 0, 0, 1000, 600, 400*1.25 + 600*2},
 		// Malformed input must clamp, never yield a negative 5-minute term.
 		{"1h exceeds total clamps", "claude-opus-5", 0, 0, 0, 100, 500, 200},
-		{"haiku is nearly free", "claude-haiku-4-5", 0, 0, 100000, 0, 0, 530}, // 100000*0.1*0.053
+		{"haiku is a fifth of opus", "claude-haiku-4-5", 0, 0, 100000, 0, 0, 2000}, // 100000*0.1*0.2
 		// Unknown model bills at the conservative default, never free.
-		{"unknown model", "some-future-model", 1000, 0, 0, 0, 0, 200},
+		{"unknown model", "some-future-model", 1000, 0, 0, 0, 0, 600},
 	}
 	for _, c := range cases {
 		got := ClaudeWeightedTokens(c.model, c.in, c.out, c.cRead, c.cWrite, c.cWrite1h)
@@ -149,7 +159,7 @@ func TestClaudeWeightedTokensLegacyRowsPassThrough(t *testing.T) {
 	// And the model weight still applies to legacy rows exactly as it did before
 	// the cache columns were added.
 	oldSonnet := ClaudeWeightedTokens("claude-sonnet-5", legacyWeightedInput, 0, 0, 0, 0)
-	want := int(math.Round(float64(legacyWeightedInput) * 0.2))
+	want := int(math.Round(float64(legacyWeightedInput) * 0.6))
 	if oldSonnet != want {
 		t.Fatalf("legacy Sonnet row = %d, want %d", oldSonnet, want)
 	}

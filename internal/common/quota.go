@@ -250,9 +250,18 @@ func poolCapApplies(model string) bool {
 // counts so cost reporting and the per-model breakdown stay honest, the weights
 // apply retroactively, and changing them doesn't require rewriting history.
 const (
+	// Price ratios to Opus, from Anthropic list rates verified 2026-08-12:
+	// Opus $5/$25 per MTok, Sonnet $3/$15, Haiku $1/$5. Both the input and the
+	// output ratio give the same number, so one weight per model is exact.
+	//
+	// These were 0.2 / 0.053, derived by normalising against an Opus rate of
+	// $15 — which was itself wrong (see modelCostCents in claude-proxy). The
+	// effect was to under-charge Sonnet work 3x and Haiku ~3.8x relative to
+	// Opus, overstating how much cheaper they are and skewing the incentive
+	// further toward them than the real price gap justifies.
 	claudeWeightOpus    = 1.0
-	claudeWeightSonnet  = 0.2
-	claudeWeightHaiku   = 0.053
+	claudeWeightSonnet  = 0.6
+	claudeWeightHaiku   = 0.2
 	claudeWeightDefault = claudeWeightSonnet // conservative, matches modelCostCents' default
 
 	// Cached input is charged at a fraction of fresh input, so the quota weights

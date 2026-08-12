@@ -19,7 +19,9 @@ package handler
 // the dataset's own instruction and the whole basis of the benchmark.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -82,12 +84,47 @@ func caseContext(appDir, caseID string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	body := string(b)
-	// Hard stop: never let the answer key reach the analyst, whatever the file
-	// shape. Truncating at the ground-truth key is cheaper and far more robust
-	// than trying to re-serialise every dataset variant correctly.
-	if i := strings.Index(body, "structure_4_ground_truth"); i > 0 {
-		body = body[:i]
+	// PROJECT, don't truncate. Cutting at structure_4 kept the answer key out but
+	// still handed the analyst the interviewer's script (opening_prompt), every
+	// question Q1..Q4, and structure_2 — the facts it is supposed to have to ASK
+	// for. So the interview was never blind: the interviewee could see the whole
+	// case ahead, and (observed live) echoed the interviewer's prompt verbatim
+	// into the chat, revealing all four questions and inverting the roles.
+	//
+	// An allowlist is the only safe shape here. A new dataset field is invisible
+	// by default rather than leaked by default, which is the correct direction
+	// for a file that also carries the answer key.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return "", false
+	}
+	allowed := []string{
+		"case_id", "industry", "difficulty", "case_type",
+		"structure_1_client_basic_context", // company, situation, the ask
+	}
+	out := map[string]json.RawMessage{}
+	for _, k := range allowed {
+		if v, ok := raw[k]; ok {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return "", false
+	}
+	// Encoder with escaping off: json.Marshal HTML-escapes &, <, >, so an
+	// industry like "Energy / Oil & Gas" would reach the model as
+	// "Oil \u0026 Gas". Harmless to a parser, noise to a language model.
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(out); err != nil {
+		return "", false
+	}
+	body := strings.TrimSpace(buf.String())
+	// Belt and braces: if a dataset ever nests the key inside an allowed field,
+	// refuse rather than serve it.
+	if strings.Contains(body, "ground_truth") {
+		return "", false
 	}
 	const maxCase = 24 << 10
 	if len(body) > maxCase {

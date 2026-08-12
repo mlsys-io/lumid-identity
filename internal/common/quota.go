@@ -231,11 +231,18 @@ func poolCapApplies(model string) bool {
 
 // Model weighting for the pool quota.
 //
-// The cap counts COST, not raw tokens. Anthropic prices Opus at 5x Sonnet and
-// Sonnet at ~3.75x Haiku ($15/$75, $3/$15, $0.80/$4 per M in/out), but the gate
-// summed tokens flat — so a Sonnet token cost exactly as much quota as an Opus
-// token despite being ~4.6x cheaper in practice (measured 2026-08-12: one user's
-// Sonnet work was 31% of their tokens and 9% of their spend).
+// The cap counts COST, not raw tokens. Anthropic list rates per MTok in/out
+// (verified 2026-08-12): Opus $5/$25, Sonnet $3/$15, Haiku $1/$5 — so Opus is
+// ~1.67x Sonnet and Sonnet 3x Haiku. The gate summed tokens flat, so a Sonnet
+// token cost exactly as much quota as an Opus token despite being cheaper
+// (measured 2026-08-12: one user's Sonnet work was 31% of their tokens and 9%
+// of their spend).
+//
+// NOTE: an earlier revision of this comment cited Opus at $15/$75, and the
+// weights below were normalised against that wrong figure — which under-charged
+// Sonnet 3x and Haiku ~3.8x. The rates above are the corrected ones; the test
+// in claude_model_weight_test.go pins each weight to its list-price ratio so a
+// future price change fails an assertion instead of silently persisting.
 //
 // Flat counting doesn't just misprice, it inverts the incentive: under a binding
 // cap, Sonnet costs the same quota as Opus while delivering less, so the

@@ -917,6 +917,14 @@ func MeAgentModels(c *gin.Context) {
 		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
 		Default     bool   `json:"default"`
+		// AppTools — does this model get identity's tool catalog (casebook,
+		// app_answer, review_action, …)? The claude-code path delegates to the
+		// sandbox runner and is handed NO tools, so an app's data and scoring
+		// are simply unreachable there. Picking such a model inside an app
+		// silently changes what the app can do, which reads as the app being
+		// broken. Reported as a capability so the UI can warn rather than
+		// name-matching "claude-code" in the frontend.
+		AppTools bool `json:"app_tools"`
 	}
 	role := currentUserRole(c)
 	out := make([]item, 0, len(llmProviders))
@@ -925,7 +933,7 @@ func MeAgentModels(c *gin.Context) {
 		if !providerAllowed(role, p) {
 			continue // policy: hide providers above the caller's role
 		}
-		out = append(out, item{ID: p.id, DisplayName: p.displayName, Default: p.id == def})
+		out = append(out, item{ID: p.id, DisplayName: p.displayName, Default: p.id == def, AppTools: !isClaudeCodeProvider(p)})
 	}
 	c.JSON(http.StatusOK, gin.H{"models": out})
 }

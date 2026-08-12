@@ -580,15 +580,49 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		FiveHourReset: formatPoolReset(fiveReset),
 		SevenDayReset: formatPoolReset(sevenReset),
 	}
+	// OVERSPEND: a non-dry-run claude_proxy charge reporting tokens Anthropic has
+	// ALREADY served. It must be recorded even though it breaches the cap.
+	//
+	// The distinction is authorization vs accounting. For every other kind
+	// (cycle_start, cycle_llm, external_api) CheckAndCharge is called BEFORE the
+	// work happens, so a denial means it never happened and recording nothing is
+	// right. claude-proxy is the opposite: it gates on a DRY RUN carrying zero
+	// tokens, then charges for real once the response has been served. By then
+	// the tokens are spent and a denial cannot un-spend them.
+	//
+	// Dropping that record was a self-perpetuating deadlock that made the cap
+	// unenforceable:
+	//
+	//   pre-gate:  used(4,998,408) + 0       > cap(5,000,000)?  no  -> ALLOW
+	//   request runs, really burns ~300k
+	//   post-charge: used(4,998,408) + 300k  > cap?             yes -> deny,
+	//                                                            NOT recorded
+	//   counter still 4,998,408 -> next request allowed -> forever.
+	//
+	// The counter froze one request short of the cap and stayed there while the
+	// user consumed without limit. Observed live 2026-08-12: two users pinned at
+	// 4,998,408 and 4,982,885 against a 5,000,000 cap, still serving traffic,
+	// zero 429s ever issued. The cap could only deny someone ALREADY over it
+	// (i.e. who crossed while it was set higher) — it could never push anyone
+	// over itself, so for everyone else it was a no-op.
+	//
+	// Recording an overspend is also what makes the NEXT dry-run gate deny: the
+	// stored total finally exceeds the cap. res.Allowed stays false either way.
+	overspend := deny != "" && !req.DryRun && req.Kind == "claude_proxy" &&
+		poolCapApplies(req.Model) && (req.InputTokens > 0 || req.OutputTokens > 0)
+
 	if !res.Allowed {
-		// On deny: report current state, not the would-be after-state. A
-		// denied claude_proxy charge must NOT call ClaudePoolCommit below — a
-		// rejected, unrecorded request cannot be allowed to start or roll
-		// someone's clock.
+		// Report current state, not the would-be after-state.
 		res.Today = totals
-		return res, nil
+		// A REFUSED request (the dry-run gate, or any other kind) must not write
+		// an event or start anyone's clock — it never consumed anything.
+		if !overspend {
+			return res, nil
+		}
+		// An overspend falls through to be recorded. Its tokens were real.
+	} else {
+		res.Today = after
 	}
-	res.Today = after
 
 	if req.DryRun {
 		return res, nil

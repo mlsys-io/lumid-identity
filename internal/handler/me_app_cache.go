@@ -446,35 +446,48 @@ func repoIsRunnable(userSub, slug string) bool {
 	return len(doc.Loops) > 0 || len(doc.Tools) > 0
 }
 
+// ownerFromIntentPayload extracts the publishing owner from one install
+// intent's payload, when that install is the one that produced `app`.
+//
+// Pure and DB-free on purpose: the owner-resolution BUG was a wrong decision,
+// not a wrong query, and a test that needs MySQL is a test that skips in CI —
+// which is how the assumption survived a full green suite in the first place.
+func ownerFromIntentPayload(payload, app string) (string, bool) {
+	var pl map[string]any
+	if json.Unmarshal([]byte(payload), &pl) != nil {
+		return "", false
+	}
+	slug, _ := pl["slug"].(string)
+	slug = strings.TrimSpace(slug)
+	owner, name, ok := strings.Cut(slug, "/")
+	if !ok || owner == "" || name == "" {
+		return "", false
+	}
+	// installAppName applies `as` renames and strips -draft, so the local
+	// directory name is compared the same way everywhere else compares it.
+	if installAppName(pl) != app {
+		return "", false
+	}
+	return owner, true
+}
+
 // repoOwnerFor returns the sub that OWNS the published bundle for `app`.
 //
 // Defaults to the caller (an app they authored themselves), but an install
-// records the source slug in its intent payload — "<owner>/<name>" — so an app
-// installed from the marketplace resolves to its actual author. Without this the
-// bundle fetch asks for repos/<caller>/<app>, which only exists for the author.
+// records the source slug "<owner>/<name>", so an app installed from the
+// marketplace resolves to its actual author. Without this the bundle fetch
+// asks for repos/<caller>/<app>, which exists only for the author.
 func repoOwnerFor(userSub, app string) string {
 	if common.DB == nil {
 		return userSub
 	}
 	var rows []models.MeAppIntent
 	if err := common.DB.Where("user_sub = ? AND action = ?", userSub, "install").
-		Order("created_at DESC").Limit(20).Find(&rows).Error; err != nil {
+		Order("created_at DESC").Limit(50).Find(&rows).Error; err != nil {
 		return userSub
 	}
-	for _, r := range rows {
-		var pl struct {
-			Slug string `json:"slug"`
-			As   string `json:"as"`
-		}
-		if json.Unmarshal([]byte(r.Payload), &pl) != nil || pl.Slug == "" {
-			continue
-		}
-		owner, name, ok := strings.Cut(pl.Slug, "/")
-		if !ok || owner == "" || name == "" {
-			continue
-		}
-		// `as` renames the local install; match either.
-		if name == app || pl.As == app {
+	for i := range rows {
+		if owner, ok := ownerFromIntentPayload(rows[i].Payload, app); ok {
 			return owner
 		}
 	}

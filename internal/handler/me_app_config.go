@@ -62,8 +62,14 @@ func fetchRepoBlob(userID, app string, paths ...string) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
+	// The repo belongs to whoever PUBLISHED the app, which is only the caller
+	// when they authored it. Addressing repos/<caller>/<app> made every
+	// cloud-installed app 404 for everyone but its author — surfaces blank,
+	// spec missing, so no sidebar entry and no nav tabs. repoOwnerFor reads the
+	// owner off the install record and falls back to the caller.
+	owner := repoOwnerFor(userID, app)
 	for _, p := range safe {
-		url := xpcloudBaseURL() + "/api/v1/repos/" + userID + "/" + app + "/blob/main/" + p
+		url := xpcloudBaseURL() + "/api/v1/repos/" + owner + "/" + app + "/blob/main/" + p
 		code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
 		if err != nil || code >= 300 || resp == nil {
 			continue

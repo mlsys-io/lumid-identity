@@ -64,9 +64,68 @@ func skillCardsFor(promptsDir, question string) []string {
 	return out
 }
 
+// Case roles. The same dataset file serves three different seats at the table,
+// and they do NOT get the same view of it.
+const (
+	caseRoleInterviewee = "interviewee" // the AI is being tested — client brief only
+	caseRoleInterviewer = "interviewer" // the AI runs the case for a HUMAN candidate
+	caseRoleJudge       = "judge"       // the AI scores a finished transcript
+)
+
+// caseFieldsInterviewee is the analyst-safe projection: who the client is, what
+// the situation is, what the ask is — and nothing that would let the candidate
+// see the questions or the answers ahead of time. It is also the ANCHOR for
+// every other role: if a file cannot produce this much, no role gets anything.
+var caseFieldsInterviewee = []string{
+	"case_id", "industry", "difficulty", "case_type",
+	"structure_1_client_basic_context", // company, situation, the ask
+}
+
+// caseFieldsInterviewerExtra is what running the case requires and being tested
+// on it forbids: the interviewer's own script, the questions to put, and the
+// facts to release only when the candidate's answer touches them.
+var caseFieldsInterviewerExtra = []string{
+	"opening_prompt",
+	"structure_3_case_questions",
+	"structure_2_information_upon_request",
+}
+
+// caseFieldsJudgeExtra is the answer key. Only a role that scores a FINISHED
+// transcript may hold it — an interviewer that can see the key leaks it through
+// its own reactions long before it ever quotes it.
+var caseFieldsJudgeExtra = []string{
+	"structure_4_ground_truth",
+}
+
 // caseContext returns analyst-SAFE context for a labelled case: the client
-// setup and the question text, never structure_4_ground_truth.
+// setup only, never the questions and never structure_4_ground_truth. Thin
+// wrapper so existing callers keep the interviewee view and cannot silently
+// acquire a wider one.
 func caseContext(appDir, caseID string) (string, bool) {
+	return caseContextForRole(appDir, caseID, caseRoleInterviewee)
+}
+
+// caseContextForRole projects a labelled case for one seat at the table.
+//
+// A single global rule cannot serve all three: the interviewee must not see the
+// questions, the interviewer must, and only the judge may see the answer key.
+// So the allowlist is per role and it is additive — interviewer = interviewee +
+// script/questions/on-request facts, judge = interviewer + ground truth.
+//
+// It FAILS CLOSED. An unknown or empty role is treated as "interviewee", which
+// is the narrowest view, so a typo, a zero-value struct field or a stray query
+// parameter degrades to the safe projection rather than widening it. Widening
+// has to be spelled correctly and on purpose.
+// Per-role size ceilings. The interviewee sees a brief (0.5-1.2 KB measured);
+// the interviewer adds the script, questions and release rules; the judge adds
+// the rubric, which is the bulk of the file.
+const (
+	maxCaseInterviewee = 24 << 10
+	maxCaseInterviewer = 64 << 10
+	maxCaseJudge       = 192 << 10
+)
+
+func caseContextForRole(appDir, caseID, role string) (string, bool) {
 	if caseID == "" || strings.ContainsAny(caseID, "/\\") || strings.Contains(caseID, "..") {
 		return "", false
 	}
@@ -98,18 +157,32 @@ func caseContext(appDir, caseID string) (string, bool) {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return "", false
 	}
-	allowed := []string{
-		"case_id", "industry", "difficulty", "case_type",
-		"structure_1_client_basic_context", // company, situation, the ask
-	}
 	out := map[string]json.RawMessage{}
-	for _, k := range allowed {
+	for _, k := range caseFieldsInterviewee {
 		if v, ok := raw[k]; ok {
-			out[k] = v
+			out[k] = stripNoteKeys(v)
 		}
 	}
+	// The interviewee projection is the anchor for EVERY role. A file that
+	// cannot even produce a client brief is an unrecognised shape, and handing
+	// a judge the answer key out of a file we could not otherwise parse is
+	// exactly the partial dump this refusal exists to prevent.
 	if len(out) == 0 {
 		return "", false
+	}
+	wider := []string(nil)
+	switch role {
+	case caseRoleInterviewer:
+		wider = caseFieldsInterviewerExtra
+	case caseRoleJudge:
+		wider = append(append([]string{}, caseFieldsInterviewerExtra...), caseFieldsJudgeExtra...)
+	default:
+		role = caseRoleInterviewee // fail closed: unknown/empty → narrowest view
+	}
+	for _, k := range wider {
+		if v, ok := raw[k]; ok {
+			out[k] = stripNoteKeys(v)
+		}
 	}
 	// Encoder with escaping off: json.Marshal HTML-escapes &, <, >, so an
 	// industry like "Energy / Oil & Gas" would reach the model as
@@ -122,15 +195,63 @@ func caseContext(appDir, caseID string) (string, bool) {
 	}
 	body := strings.TrimSpace(buf.String())
 	// Belt and braces: if a dataset ever nests the key inside an allowed field,
-	// refuse rather than serve it.
-	if strings.Contains(body, "ground_truth") {
+	// refuse rather than serve it. The judge is the one role for which the key
+	// is the point, so it is exempt — every other role is not.
+	if role != caseRoleJudge && strings.Contains(body, "ground_truth") {
 		return "", false
 	}
-	const maxCase = 24 << 10
-	if len(body) > maxCase {
-		body = body[:maxCase]
+	// Cap PER ROLE, and REFUSE rather than truncate.
+	//
+	// A flat 24 KB cut was silently wrong for the wider roles: measured across
+	// the 50 shipped cases the judge projection runs 19-41 KB and the
+	// interviewer 12-22 KB (json.RawMessage carries the source file's
+	// indentation verbatim). Truncating mid-document yields invalid JSON AND a
+	// partial answer key — a judge would score against half a rubric with
+	// nothing to indicate anything was missing. An error is recoverable; a
+	// quietly halved rubric is not.
+	limit := maxCaseInterviewee
+	switch role {
+	case caseRoleInterviewer:
+		limit = maxCaseInterviewer
+	case caseRoleJudge:
+		limit = maxCaseJudge
+	}
+	if len(body) > limit {
+		return "", false
 	}
 	return body, true
+}
+
+// stripNoteKeys drops "_"-prefixed annotation keys from a projected object.
+//
+// They are authoring commentary for whoever edits the dataset, not case
+// content — and two of the 50 shipped cases name the answer key's FIELD inside
+// one ("... structure_4_ground_truth"). That tripped the substring guard and
+// made the interviewer refuse those cases outright: the guard working correctly
+// on text that was never the key. Dropping the commentary is the fix; relaxing
+// the guard would not have been.
+//
+// Re-encoding compactly also sheds the source indentation, which is most of
+// what pushed these projections toward the cap.
+func stripNoteKeys(v json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(v, &obj) != nil {
+		return v // string / array / number — nothing to strip
+	}
+	for k := range obj {
+		if strings.HasPrefix(k, "_") {
+			delete(obj, k)
+			continue
+		}
+		obj[k] = stripNoteKeys(obj[k])
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(obj) != nil {
+		return v
+	}
+	return json.RawMessage(bytes.TrimSpace(buf.Bytes()))
 }
 
 // toolAppAnswer answers as the app's analyst.

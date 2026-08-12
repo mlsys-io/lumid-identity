@@ -431,7 +431,13 @@ func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentCha
 		app, _ = body.Context["app"].(string)
 	}
 	if app == "" {
-		return nil, false // nothing to ground on; fall through to the model
+		// Falling through here produced an EMPTY turn: the caller asked for a
+		// specific tool, the tool could not be grounded, and the model — handed a
+		// forced choice it could not satisfy — returned nothing at all. The user
+		// saw a button that did nothing. Say what went wrong instead.
+		return map[string]any{
+			"error": "no app in context — a correction has to say which app it is about",
+		}, true
 	}
 	last := ""
 	for i := len(body.Messages) - 1; i >= 0; i-- {

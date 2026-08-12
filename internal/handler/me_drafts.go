@@ -60,6 +60,12 @@ type draftCard struct {
 	Confidence float64 `json:"confidence,omitempty"`
 	State      string  `json:"state"`
 	ActedAt    string  `json:"acted_at,omitempty"`
+	// Agent + CreatedAt exist on models.MeDraft but were dropped in the copy
+	// below, so a reviewer could not see WHO staged a draft or WHEN — the
+	// Review surface rendered those two columns as em-dashes for every row,
+	// which reads as "no drafts" rather than "fields not sent".
+	Agent     string `json:"agent,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 // draftID is the opaque public identifier — sha256[:16] of the relpath
@@ -273,6 +279,7 @@ func MeDraftsList(c *gin.Context) {
 				ID: r.ID, App: r.App, CycleTS: r.CycleTS,
 				To: r.To, Subject: r.Subject, Body: r.Body,
 				Confidence: r.Confidence, State: r.State, ActedAt: r.ActedAt,
+				Agent: r.Agent, CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339),
 			})
 		}
 	}

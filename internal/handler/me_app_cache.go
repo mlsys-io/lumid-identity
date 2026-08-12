@@ -21,6 +21,7 @@ package handler
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -30,6 +31,9 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
 )
 
 // How long a materialised copy is trusted before refetching. A single chat turn
@@ -65,12 +69,12 @@ func cacheFresh(dir string) bool {
 }
 
 // repoTree lists every blob path in the caller's published bundle.
-func repoTree(userSub, app, sub string) []string {
+func repoTree(owner, userSub, app, sub string) []string {
 	bearer, err := xpcloudUserJWT(userSub)
 	if err != nil {
 		return nil
 	}
-	url := xpcloudBaseURL() + "/api/v1/repos/" + userSub + "/" + app + "/tree/main"
+	url := xpcloudBaseURL() + "/api/v1/repos/" + owner + "/" + app + "/tree/main"
 	if sub != "" {
 		url += "/" + sub
 	}
@@ -95,7 +99,7 @@ func repoTree(userSub, app, sub string) []string {
 			path = sub + "/" + name
 		}
 		if kind == "tree" {
-			out = append(out, repoTree(userSub, app, path)...)
+			out = append(out, repoTree(owner, userSub, app, path)...)
 			continue
 		}
 		out = append(out, path)
@@ -126,7 +130,13 @@ func materialiseTenantApp(userSub, app string) string {
 		return dir
 	}
 
-	paths := repoTree(userSub, app, "")
+	// WHOSE repo? Not necessarily the caller's. An app installed from someone
+	// else lives under its AUTHOR's sub, so fetching repos/<caller>/<app> 404s
+	// and every surface and tool reports "app not found" — for an app /me/apps
+	// says is ready. The whole cross-node fallback worked only for an app's own
+	// author until now, which is why owner-only testing never saw it.
+	owner := repoOwnerFor(userSub, app)
+	paths := repoTree(owner, userSub, app, "")
 	if len(paths) == 0 {
 		return ""
 	}
@@ -144,7 +154,7 @@ func materialiseTenantApp(userSub, app string) string {
 	total := 0
 	wrote := 0
 	for _, p := range paths {
-		body, ok := fetchRepoBlob(userSub, app, p)
+		body, ok := fetchRepoBlobAt(userSub, owner+"/"+app, p)
 		if !ok {
 			continue
 		}
@@ -434,4 +444,39 @@ func repoIsRunnable(userSub, slug string) bool {
 		return false
 	}
 	return len(doc.Loops) > 0 || len(doc.Tools) > 0
+}
+
+// repoOwnerFor returns the sub that OWNS the published bundle for `app`.
+//
+// Defaults to the caller (an app they authored themselves), but an install
+// records the source slug in its intent payload — "<owner>/<name>" — so an app
+// installed from the marketplace resolves to its actual author. Without this the
+// bundle fetch asks for repos/<caller>/<app>, which only exists for the author.
+func repoOwnerFor(userSub, app string) string {
+	if common.DB == nil {
+		return userSub
+	}
+	var rows []models.MeAppIntent
+	if err := common.DB.Where("user_sub = ? AND action = ?", userSub, "install").
+		Order("created_at DESC").Limit(20).Find(&rows).Error; err != nil {
+		return userSub
+	}
+	for _, r := range rows {
+		var pl struct {
+			Slug string `json:"slug"`
+			As   string `json:"as"`
+		}
+		if json.Unmarshal([]byte(r.Payload), &pl) != nil || pl.Slug == "" {
+			continue
+		}
+		owner, name, ok := strings.Cut(pl.Slug, "/")
+		if !ok || owner == "" || name == "" {
+			continue
+		}
+		// `as` renames the local install; match either.
+		if name == app || pl.As == app {
+			return owner
+		}
+	}
+	return userSub
 }

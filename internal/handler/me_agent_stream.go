@@ -83,6 +83,10 @@ func releaseChatStream(userID string) {
 // auth, body shape, tool-use loop, and budget enforcement — different
 // transport.
 func MeAgentChatStream(c *gin.Context) {
+	// Stamped before the turn runs: run_ts should be when the user asked, not
+	// when the last token arrived.
+	turnStartedAt := time.Now()
+	var turnToolCalls []toolCallResult
 	userID, ok := currentUserID(c)
 	if !ok {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
@@ -400,6 +404,12 @@ func MeAgentChatStream(c *gin.Context) {
 			}
 			emit(ev)
 			payload, _ := json.Marshal(result)
+			// Same shape the non-stream handler collects, so one cycle recorder
+			// serves both paths — the UI streams, so wiring only the JSON handler
+			// would have recorded nothing in practice.
+			turnToolCalls = append(turnToolCalls, toolCallResult{
+				Name: tu.name, Args: tu.input, Result: result, OK: callOK,
+			})
 			toolResultBlocks = append(toolResultBlocks, map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": tu.id,
@@ -413,6 +423,17 @@ func MeAgentChatStream(c *gin.Context) {
 	// Record usage (best-effort; failure doesn't break the stream).
 	if totalInputTokens+totalOutputTokens > 0 {
 		_ = recordUsage(userID, "chat", "/me/agent/chat/stream", provider.upstreamModel, totalInputTokens, totalOutputTokens)
+	}
+
+	// An app-grounded turn is a cycle of the app's @trigger loop. Best-effort,
+	// after the stream's content is already delivered — telemetry never costs
+	// the user their answer.
+	if body.Context != nil && len(turnToolCalls) > 0 {
+		if app, ok := body.Context["app"].(string); ok && app != "" {
+			if loop := triggerLoopFor(userID, app); loop != "" {
+				recordChatCycle(userID, app, loop, provider.id, turnToolCalls, turnStartedAt)
+			}
+		}
 	}
 
 	emit(map[string]any{

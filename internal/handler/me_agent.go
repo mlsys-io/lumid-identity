@@ -1363,6 +1363,10 @@ type toolCallResult struct {
 
 // POST /api/v1/me/agent/chat
 func MeAgentChat(c *gin.Context) {
+	// Stamped BEFORE the turn runs so the recorded cycle's run_ts is when the
+	// user asked, not when the model finished — a 40s answer would otherwise
+	// place the cycle after events it actually preceded.
+	turnStartedAt := time.Now()
 	userID, ok := currentUserID(c)
 	if !ok {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
@@ -1645,6 +1649,20 @@ func MeAgentChat(c *gin.Context) {
 	if totalInputTokens+totalOutputTokens > 0 {
 		_ = recordUsage(userID, "chat", "/me/agent/chat", provider.upstreamModel,
 			totalInputTokens, totalOutputTokens)
+	}
+
+	// An app-grounded turn IS a cycle of the app's @trigger loop — that is what
+	// "@trigger: it runs when you talk" means, and the app's Workflows page
+	// promises the turn lands in the daily feed. It never did: chat called the
+	// tools directly and produced no run, so the trajectory stayed empty and
+	// last_run_ts stayed null. Same best-effort discipline as recordUsage above:
+	// telemetry must never cost the user their answer.
+	if body.Context != nil && len(toolCalls) > 0 {
+		if app, ok := body.Context["app"].(string); ok && app != "" {
+			if loop := triggerLoopFor(userID, app); loop != "" {
+				recordChatCycle(userID, app, loop, provider.id, toolCalls, turnStartedAt)
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

@@ -99,25 +99,32 @@ func TestClaudeModelWeightSQLQualifiesColumn(t *testing.T) {
 // property that lets the schema change ship without a backfill.
 func TestClaudeWeightedTokens(t *testing.T) {
 	cases := []struct {
-		name                   string
-		model                  string
-		in, out, cRead, cWrite int
-		want                   int
+		name                             string
+		model                            string
+		in, out, cRead, cWrite, cWrite1h int
+		want                             int
 	}{
 		// A Claude Code turn: tiny fresh input, huge cached context. This is the
 		// shape that made raw-token counting meaningless and weighted counting
 		// necessary — 118k cache reads cost a tenth of 118k fresh tokens.
-		{"opus cached turn", "claude-opus-5", 4, 350, 118000, 0, 4 + 350 + 11800},
+		{"opus cached turn", "claude-opus-5", 4, 350, 118000, 0, 0, 4 + 350 + 11800},
 		// Same turn on Sonnet costs a fifth again.
-		{"sonnet cached turn", "claude-sonnet-5", 4, 350, 118000, 0, 2431}, // (4+350+11800)*0.2 = 2430.8, rounded
+		{"sonnet cached turn", "claude-sonnet-5", 4, 350, 118000, 0, 0, 2431}, // (4+350+11800)*0.2 = 2430.8, rounded
 		// Cache WRITES are more expensive than fresh input, not less.
-		{"cache write premium", "claude-opus-5", 0, 0, 0, 1000, 1250},
-		{"haiku is nearly free", "claude-haiku-4-5", 0, 0, 100000, 0, 530}, // 100000*0.1*0.053
+		{"5m cache write premium", "claude-opus-5", 0, 0, 0, 1000, 0, 1250},
+		// A 1-hour write costs 2x, not 1.25x — pricing it at the 5-minute rate
+		// under-charges by 37.5%.
+		{"1h cache write premium", "claude-opus-5", 0, 0, 0, 1000, 1000, 2000},
+		// Mixed: the 1h count is a SUBSET, so 400 of the 1000 are 5-minute.
+		{"mixed ttl writes", "claude-opus-5", 0, 0, 0, 1000, 600, 400*1.25 + 600*2},
+		// Malformed input must clamp, never yield a negative 5-minute term.
+		{"1h exceeds total clamps", "claude-opus-5", 0, 0, 0, 100, 500, 200},
+		{"haiku is nearly free", "claude-haiku-4-5", 0, 0, 100000, 0, 0, 530}, // 100000*0.1*0.053
 		// Unknown model bills at the conservative default, never free.
-		{"unknown model", "some-future-model", 1000, 0, 0, 0, 200},
+		{"unknown model", "some-future-model", 1000, 0, 0, 0, 0, 200},
 	}
 	for _, c := range cases {
-		got := ClaudeWeightedTokens(c.model, c.in, c.out, c.cRead, c.cWrite)
+		got := ClaudeWeightedTokens(c.model, c.in, c.out, c.cRead, c.cWrite, c.cWrite1h)
 		if got != c.want {
 			t.Errorf("%s: ClaudeWeightedTokens = %d, want %d", c.name, got, c.want)
 		}
@@ -133,7 +140,7 @@ func TestClaudeWeightedTokensLegacyRowsPassThrough(t *testing.T) {
 	const legacyWeightedInput = 39812 // what an old row stored for one Opus turn
 
 	// Old row: everything in input_tokens, cache columns 0.
-	old := ClaudeWeightedTokens("claude-opus-5", legacyWeightedInput, 0, 0, 0)
+	old := ClaudeWeightedTokens("claude-opus-5", legacyWeightedInput, 0, 0, 0, 0)
 	if old != legacyWeightedInput {
 		t.Fatalf("legacy Opus row changed value: %d -> %d; a schema change must not "+
 			"re-scale history", legacyWeightedInput, old)
@@ -141,7 +148,7 @@ func TestClaudeWeightedTokensLegacyRowsPassThrough(t *testing.T) {
 
 	// And the model weight still applies to legacy rows exactly as it did before
 	// the cache columns were added.
-	oldSonnet := ClaudeWeightedTokens("claude-sonnet-5", legacyWeightedInput, 0, 0, 0)
+	oldSonnet := ClaudeWeightedTokens("claude-sonnet-5", legacyWeightedInput, 0, 0, 0, 0)
 	want := int(math.Round(float64(legacyWeightedInput) * 0.2))
 	if oldSonnet != want {
 		t.Fatalf("legacy Sonnet row = %d, want %d", oldSonnet, want)
@@ -152,12 +159,12 @@ func TestClaudeWeightedTokensLegacyRowsPassThrough(t *testing.T) {
 // cached usage silently stops counting toward the cap.
 func TestClaudeWeightedTokensSQLCoversAllColumns(t *testing.T) {
 	sql := ClaudeWeightedTokensSQL("ue.")
-	for _, col := range []string{"ue.input_tokens", "ue.output_tokens", "ue.cache_read_tokens", "ue.cache_creation_tokens"} {
+	for _, col := range []string{"ue.input_tokens", "ue.output_tokens", "ue.cache_read_tokens", "ue.cache_creation_tokens", "ue.cache_creation_1h_tokens"} {
 		if !strings.Contains(sql, col) {
 			t.Errorf("SQL is missing %s — that usage would not count toward the cap:\n%s", col, sql)
 		}
 	}
-	for _, w := range []float64{claudeCacheReadWeight, claudeCacheWriteWeight} {
+	for _, w := range []float64{claudeCacheReadWeight, claudeCacheWriteWeight, claudeCacheWrite1hWeight} {
 		if !strings.Contains(sql, fmt.Sprintf("%v", w)) {
 			t.Errorf("SQL is missing cache weight %v:\n%s", w, sql)
 		}

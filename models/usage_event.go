@@ -30,10 +30,17 @@ type UsageEvent struct {
 	// weighted cache columns rather than replacing InputTokens: on an old row
 	// the two cache terms contribute nothing and the historical value stands, so
 	// the transition needs no backfill and cannot double-count.
-	CacheReadTokens     int    `gorm:"column:cache_read_tokens;not null;default:0"     json:"cache_read_tokens"`
-	CacheCreationTokens int    `gorm:"column:cache_creation_tokens;not null;default:0" json:"cache_creation_tokens"`
-	CostCents           int    `gorm:"column:cost_cents;not null;default:0"    json:"cost_cents"`
-	Meta                string `gorm:"column:meta;type:text"               json:"meta"` // optional JSON blob
+	CacheReadTokens     int `gorm:"column:cache_read_tokens;not null;default:0"     json:"cache_read_tokens"`
+	CacheCreationTokens int `gorm:"column:cache_creation_tokens;not null;default:0" json:"cache_creation_tokens"`
+	// The 1-HOUR-TTL share of CacheCreationTokens — a SUBSET of it, not an
+	// addition. Stored separately because the two TTLs are priced differently
+	// (5-minute write 1.25x base input, 1-hour write 2x), and the flat total
+	// cannot distinguish them. Rows written before this column existed leave it
+	// 0, so the read-time formula prices their whole creation total at the
+	// 5-minute rate — exactly the prior behaviour, and no backfill is needed.
+	CacheCreation1hTokens int    `gorm:"column:cache_creation_1h_tokens;not null;default:0" json:"cache_creation_1h_tokens"`
+	CostCents             int    `gorm:"column:cost_cents;not null;default:0"    json:"cost_cents"`
+	Meta                  string `gorm:"column:meta;type:text"               json:"meta"` // optional JSON blob
 }
 
 func (UsageEvent) TableName() string { return "usage_events" }

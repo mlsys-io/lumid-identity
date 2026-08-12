@@ -188,10 +188,12 @@ type ChargeReq struct {
 	// faithful record that reconciles against Anthropic's own numbers.
 	CacheReadTokens     int
 	CacheCreationTokens int
-	Count               int // for cycle_start / external_api; defaults to 1 when 0
-	CostCents           int
-	DryRun              bool
-	Meta                string // optional JSON blob
+	// 1-hour-TTL share of CacheCreationTokens (a subset of it).
+	CacheCreation1hTokens int
+	Count                 int // for cycle_start / external_api; defaults to 1 when 0
+	CostCents             int
+	DryRun                bool
+	Meta                  string // optional JSON blob
 }
 
 // ChargeRes is the output. Same shape served by /internal/usage/charge.
@@ -263,6 +265,9 @@ const (
 	// numbers are what Anthropic reported, and the quota is a view over them.
 	claudeCacheReadWeight  = 0.1
 	claudeCacheWriteWeight = 1.25
+	// A 1-HOUR cache write costs 2x base input, not 1.25x. Pricing every write at
+	// the 5-minute rate under-charges 1-hour writes by 37.5%.
+	claudeCacheWrite1hWeight = 2.0
 )
 
 // ClaudeWeightedTokensSQL is the full quota unit as a SQL expression: raw token
@@ -277,18 +282,33 @@ const (
 // cache columns at 0, so they pass through this expression unchanged. No backfill
 // is needed and no row is double-counted.
 func ClaudeWeightedTokensSQL(pfx string) string {
+	// GREATEST(...,0) mirrors the Go clamp: cache_creation_1h_tokens is a subset
+	// of cache_creation_tokens, and a malformed row must not subtract past zero.
 	return fmt.Sprintf(`ROUND((%[1]sinput_tokens + %[1]soutput_tokens
 	   + %[1]scache_read_tokens * %[2]v
-	   + %[1]scache_creation_tokens * %[3]v) * (%[4]s))`,
-		pfx, claudeCacheReadWeight, claudeCacheWriteWeight, ClaudeModelWeightSQL(pfx+"model"))
+	   + GREATEST(%[1]scache_creation_tokens - %[1]scache_creation_1h_tokens, 0) * %[3]v
+	   + LEAST(%[1]scache_creation_1h_tokens, %[1]scache_creation_tokens) * %[4]v) * (%[5]s))`,
+		pfx, claudeCacheReadWeight, claudeCacheWriteWeight, claudeCacheWrite1hWeight,
+		ClaudeModelWeightSQL(pfx+"model"))
 }
 
 // ClaudeWeightedTokens is the Go twin of ClaudeWeightedTokensSQL, for weighting
 // the single in-flight request the gate is deciding on. Keep the two in step.
-func ClaudeWeightedTokens(model string, in, out, cacheRead, cacheWrite int) int {
+func ClaudeWeightedTokens(model string, in, out, cacheRead, cacheWrite, cacheWrite1h int) int {
+	// cacheWrite1h is a SUBSET of cacheWrite, so the 5-minute share is the
+	// remainder. Clamp: a malformed report claiming more 1h than total must not
+	// make the 5-minute term negative.
+	if cacheWrite1h > cacheWrite {
+		cacheWrite1h = cacheWrite
+	}
+	if cacheWrite1h < 0 {
+		cacheWrite1h = 0
+	}
+	write5m := cacheWrite - cacheWrite1h
 	raw := float64(in) + float64(out) +
 		float64(cacheRead)*claudeCacheReadWeight +
-		float64(cacheWrite)*claudeCacheWriteWeight
+		float64(write5m)*claudeCacheWriteWeight +
+		float64(cacheWrite1h)*claudeCacheWrite1hWeight
 	return int(math.Round(raw * ClaudeModelWeight(model)))
 }
 
@@ -572,7 +592,7 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		// tokens, so this is 0 there either way; it matters on the real
 		// post-response charge.
 		tok := ClaudeWeightedTokens(req.Model, req.InputTokens, req.OutputTokens,
-			req.CacheReadTokens, req.CacheCreationTokens)
+			req.CacheReadTokens, req.CacheCreationTokens, req.CacheCreation1hTokens)
 		if used5+tok > cap5 {
 			deny = "quota_exceeded_claude_5h"
 		} else if used7+tok > cap7 {
@@ -673,17 +693,18 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		return res, nil
 	}
 	ev := models.UsageEvent{
-		UserSub:             req.UserSub,
-		Ts:                  now,
-		Kind:                req.Kind,
-		Endpoint:            req.Endpoint,
-		Model:               req.Model,
-		InputTokens:         req.InputTokens,
-		OutputTokens:        req.OutputTokens,
-		CacheReadTokens:     req.CacheReadTokens,
-		CacheCreationTokens: req.CacheCreationTokens,
-		CostCents:           req.CostCents,
-		Meta:                req.Meta,
+		UserSub:               req.UserSub,
+		Ts:                    now,
+		Kind:                  req.Kind,
+		Endpoint:              req.Endpoint,
+		Model:                 req.Model,
+		InputTokens:           req.InputTokens,
+		OutputTokens:          req.OutputTokens,
+		CacheReadTokens:       req.CacheReadTokens,
+		CacheCreationTokens:   req.CacheCreationTokens,
+		CacheCreation1hTokens: req.CacheCreation1hTokens,
+		CostCents:             req.CostCents,
+		Meta:                  req.Meta,
 	}
 	if err := db.Create(&ev).Error; err != nil {
 		return ChargeRes{}, err

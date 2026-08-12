@@ -75,8 +75,8 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		}
 		parsed = parseJudgeJSON(text)
 		if parsed != nil {
-			if _, ok := judgeCount(parsed["covered"]); !ok {
-				parsed = nil // parsed, but not into a count — retry once
+			if _, _, ok := judgeTotals(parsed); !ok {
+				parsed = nil // parsed, but not into usable counts — retry once
 			}
 		}
 	}
@@ -94,9 +94,8 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 	// `covered` as a LIST of the keypoints it matched — accepted by the parser
 	// (the key was present) and then unusable, so the turn reported a score of
 	// nothing. Count a list, take a number, refuse anything else.
-	covered, okCov := judgeCount(parsed["covered"])
-	total, okTot := judgeCount(parsed["total"])
-	if !okCov || !okTot || total <= 0 {
+	covered, total, okCounts := judgeTotals(parsed)
+	if !okCounts {
 		return map[string]any{
 			"app": app, "case_id": caseID, "grounded": true, "mode": "casebook",
 			"error": "judge returned no usable covered/total count",
@@ -115,6 +114,27 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		}
 	}
 	return out, true
+}
+
+// judgeTotals extracts covered AND total, deriving total when the model omits
+// it but listed what was missed.
+//
+// The first retry checked only `covered`, so a reply with a good covered and a
+// missing total never retried and always failed — the fix made scoring fail
+// consistently where it had merely been flaky. Both are checked now, and
+// covered + len(missed) is a sound total when the model enumerated the misses.
+func judgeTotals(parsed map[string]any) (int, int, bool) {
+	covered, okCov := judgeCount(parsed["covered"])
+	if !okCov {
+		return 0, 0, false
+	}
+	if total, okTot := judgeCount(parsed["total"]); okTot && total > 0 && total >= covered {
+		return covered, total, true
+	}
+	if missed, okMiss := judgeCount(parsed["missed"]); okMiss && covered+missed > 0 {
+		return covered, covered + missed, true
+	}
+	return 0, 0, false
 }
 
 // judgeCount accepts the two shapes a model actually produces for a count: the

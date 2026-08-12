@@ -69,3 +69,34 @@ func TestJudgeCount(t *testing.T) {
 		})
 	}
 }
+
+// The first retry checked only `covered`, so a reply with a good covered and a
+// missing total never retried and always failed — turning a flaky judge into a
+// consistently broken one.
+func TestJudgeTotals(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		in               map[string]any
+		wantCov, wantTot int
+		ok               bool
+	}{
+		{"both present", map[string]any{"covered": 5.0, "total": 12.0}, 5, 12, true},
+		{"total derived from missed list",
+			map[string]any{"covered": 2.0, "missed": []any{"a", "b", "c"}}, 2, 5, true},
+		{"covered as a list, total present",
+			map[string]any{"covered": []any{"x", "y"}, "total": 10.0}, 2, 10, true},
+		{"total smaller than covered is rejected, falls back to missed",
+			map[string]any{"covered": 9.0, "total": 3.0, "missed": []any{"a"}}, 9, 10, true},
+		{"no total and no missed", map[string]any{"covered": 4.0}, 0, 0, false},
+		{"no covered at all", map[string]any{"total": 12.0}, 0, 0, false},
+		{"zero total and empty missed", map[string]any{"covered": 0.0, "missed": []any{}}, 0, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, tot, ok := judgeTotals(tc.in)
+			if ok != tc.ok || (ok && (c != tc.wantCov || tot != tc.wantTot)) {
+				t.Errorf("judgeTotals(%v) = (%d, %d, %v), want (%d, %d, %v)",
+					tc.in, c, tot, ok, tc.wantCov, tc.wantTot, tc.ok)
+			}
+		})
+	}
+}

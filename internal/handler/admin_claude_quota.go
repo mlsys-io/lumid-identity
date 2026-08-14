@@ -951,20 +951,33 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		row  models.ClaudeQuotaToken
 		snap *models.ClaudeQuotaSnapshot
 	}
+	// Why each row was passed over. A caller that gets nothing back needs to know
+	// WHICH constraint bound, because the operator response is different for each:
+	// quota frees itself on a rolling window, a bench expires on a timer, but a
+	// QUARANTINE is terminal until a human re-adds the account. Collapsing all
+	// three into one "no account with available quota" is what let a fully
+	// quarantined pool masquerade as a busy one on 2026-08-13 — every user was
+	// told to retry in 5 minutes, for a day, against a pool that could never
+	// recover on its own.
+	var nExcluded, nQuarantined, nBenched, nExhausted int
+
 	var cands []cand
 	for _, row := range rows {
 		if excluded[row.Email] {
+			nExcluded++
 			continue
 		}
 		// Quarantined family — its access token dies with the refresh token,
 		// so it can't serve proxy traffic. Skip until re-added.
 		if row.RevokedAt != nil {
+			nQuarantined++
 			continue
 		}
 		// Benched pool-wide after Anthropic 401/403'd it for some proxy replica.
 		// Honouring it here is what makes the bench apply to every replica
 		// instead of only the pod that saw the failure.
 		if row.BenchUntil != nil && time.Now().Before(*row.BenchUntil) {
+			nBenched++
 			continue
 		}
 		var snap models.ClaudeQuotaSnapshot
@@ -980,6 +993,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// snapshot falls through to the re-probe below.
 		if sp != nil && time.Since(sp.Ts) < quotaCacheTTL &&
 			(sp.Severity == "critical" || sp.FiveHourPct >= 98 || sp.SevenDayPct >= 98) {
+			nExhausted++
 			continue
 		}
 		cands = append(cands, cand{row, sp})
@@ -1169,7 +1183,32 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		return
 	}
 
-	fail(c, http.StatusServiceUnavailable, 1503, "no pooled account with available quota")
+	// Nothing leasable. Say which constraint bound, so the caller can tell a
+	// wait-it-out condition from one that needs a human.
+	//
+	// A quarantine is only the BINDING constraint when nothing else could have
+	// recovered on its own: if even one account is merely quota-exhausted or
+	// benched, waiting genuinely does help and the retryable wording is correct.
+	// Only when every non-excluded account is quarantined is retrying futile.
+	// The leading `pool_state=` token is the MACHINE contract with claude-proxy;
+	// the prose after it is for humans reading logs. Keep them separate: the
+	// counts that follow necessarily mention every constraint by name
+	// ("quarantined=0"), so a consumer matching on a bare word would classify a
+	// perfectly ordinary dry pool as a quarantined one. Match the token, not the
+	// vocabulary.
+	breakdown := fmt.Sprintf("total=%d quarantined=%d benched=%d exhausted=%d excluded=%d",
+		len(rows), nQuarantined, nBenched, nExhausted, nExcluded)
+	if nQuarantined > 0 && nBenched == 0 && nExhausted == 0 {
+		// Deliberately does NOT contain "available quota": claude-proxy's legacy
+		// path keys off that phrase, and this state must not reach users as a
+		// quota problem they can retry away.
+		log.Printf("claude-lease: pool UNAVAILABLE — every account quarantined (%s); re-add with a fresh `claude auth login`", breakdown)
+		fail(c, http.StatusServiceUnavailable, 1503,
+			"pool_state=quarantined no pooled account usable: all accounts quarantined — operator re-add required ("+breakdown+")")
+		return
+	}
+	fail(c, http.StatusServiceUnavailable, 1503,
+		"pool_state=quota_exhausted no pooled account with available quota ("+breakdown+")")
 }
 
 // AdminClaudeUserUsage lists per-user pool consumption over the fixed 5h/7d

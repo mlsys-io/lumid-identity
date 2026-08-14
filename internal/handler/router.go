@@ -513,6 +513,11 @@ func Register(r *gin.Engine) {
 			// the version transitions that matter.
 			internal.POST("/claude-fingerprint/observe", InternalClaudeFingerprintObserve)
 			internal.GET("/claude-fingerprint/pool", InternalClaudeFingerprintPool)
+			// Pool health for external monitoring (opsagent's claude_pool
+			// dimension). DB-only — deliberately NOT the /admin/claude-quota
+			// dashboard, which live-probes every account against Anthropic and
+			// is far too expensive to run on a sweep interval.
+			internal.GET("/claude-pool/health", InternalClaudePoolHealth)
 			// Per-user "act as <sub>" bridge credential — claude-proxy mints one
 			// to forward LumidOS tool calls to a backend as the resolved user,
 			// without the client ever holding a broad backend PAT.

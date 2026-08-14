@@ -34,6 +34,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strconv"
@@ -164,7 +165,7 @@ func withEmailLock(email string, fn func() error) error {
 // another refresher rotated within the last 30s the already-rotated access
 // token is returned without a second exchange. Rows quarantined by a prior
 // invalid_grant are never re-presented to Anthropic — re-add clears them.
-func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
+func tryRefreshToken(row *models.ClaudeQuotaToken, caller string) (string, error) {
 	f, leader := beginRefresh(row.Email)
 	if !leader {
 		// A refresh for this account is already in flight. Wait for it and take
@@ -190,14 +191,58 @@ func tryRefreshToken(row *models.ClaudeQuotaToken) (string, error) {
 	var tok string
 	err := withEmailLock(row.Email, func() error {
 		var innerErr error
-		tok, innerErr = refreshTokenLocked(row)
+		tok, innerErr = refreshTokenLocked(row, caller)
 		return innerErr
 	})
 	f.finish(row.Email, tok, err)
 	return tok, err
 }
 
-func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
+// recordExchange writes the outcome of one OAuth refresh attempt onto the row.
+// Every attempt is recorded, not just failures: a quarantine is only
+// interpretable next to the exchange that preceded it, and on 2026-08-13 that
+// context was exactly what was missing.
+//
+// Best-effort by construction — instrumentation must never fail a refresh, so
+// errors here are swallowed and the caller's result stands.
+func recordExchange(row *models.ClaudeQuotaToken, caller, outcome string, started time.Time, detail string) {
+	ms := int(time.Since(started).Milliseconds())
+	at := time.Now()
+	common.DB.Model(row).Updates(map[string]interface{}{
+		"last_exchange_at":      at,
+		"last_exchange_outcome": outcome,
+		"last_exchange_ms":      ms,
+	})
+	row.LastExchangeAt, row.LastExchangeOutcome, row.LastExchangeMs = &at, outcome, ms
+	if detail = strings.TrimSpace(detail); detail != "" {
+		detail = " detail=" + strconv.Quote(truncStr(detail, 200))
+	}
+	log.Printf("claude-refresh-exchange: account=%s caller=%s outcome=%s dur=%dms%s",
+		row.Email, caller, outcome, ms, detail)
+}
+
+// markIndeterminate records an exchange whose OUTCOME UPSTREAM IS UNKNOWN — the
+// request was sent (or answered 200) but we never got a usable response body.
+// Anthropic rotates the family on receipt, so from this instant our stored
+// refresh token may already be dead while still looking valid, and the next
+// exchange is what will discover it.
+//
+// The marker is deliberately NOT cleared by a later success. It is an evidence
+// trail, not a state machine: when a quarantine eventually lands, the question
+// "did we lose a rotation earlier?" must still be answerable.
+func markIndeterminate(row *models.ClaudeQuotaToken, caller string, started time.Time, reason string) {
+	at := time.Now()
+	common.DB.Model(row).Updates(map[string]interface{}{
+		"indeterminate_at":     at,
+		"indeterminate_reason": truncStr(reason, 500),
+	})
+	row.IndeterminateAt, row.IndeterminateReason = &at, truncStr(reason, 500)
+	recordExchange(row, caller, "indeterminate", started, reason)
+	log.Printf("claude-refresh: %s: INDETERMINATE caller=%s (%s) — the family may have rotated upstream; "+
+		"our stored refresh token could already be superseded", row.Email, caller, truncStr(reason, 200))
+}
+
+func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, error) {
 	// Re-read: another refresher (this pod or the other replica) may have
 	// rotated while we waited on the locks. singleflight collapses concurrent
 	// callers within one pod; this is the cross-replica arm of the same idea.
@@ -280,13 +325,38 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 
+	// Did the request actually reach Anthropic? This is the whole question when a
+	// refresh fails without an answer. Anthropic rotates the family ON RECEIPT,
+	// so a request we know was fully written but got no response leaves us
+	// holding a token that may already be superseded — while looking valid. A
+	// connection we never established rotates nothing and is harmless. The two
+	// are indistinguishable from the error alone (both surface as some transport
+	// error), so trace WroteRequest and let the wire tell us.
+	var wroteRequest bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest = true },
+	}))
+
 	cl := &http.Client{Timeout: refreshExchangeTimeout}
+	started := time.Now()
 	resp, err := cl.Do(req)
 	if err != nil {
+		if wroteRequest {
+			// Sent, never answered: the family's state upstream is UNKNOWN.
+			markIndeterminate(row, caller, started, fmt.Sprintf("no response after send: %v", err))
+			return "", fmt.Errorf("token refresh indeterminate (request sent, no response): %w", err)
+		}
+		recordExchange(row, caller, "unreachable", started, err.Error())
 		return "", fmt.Errorf("token refresh network error: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if readErr != nil && resp.StatusCode == 200 {
+		// A 200 we could not read is a rotation we cannot keep: Anthropic issued
+		// a new family and the only copy of it was in that body.
+		markIndeterminate(row, caller, started, fmt.Sprintf("200 with unreadable body: %v", readErr))
+		return "", fmt.Errorf("token refresh indeterminate (200, body unreadable): %w", readErr)
+	}
 
 	if resp.StatusCode != 200 {
 		var errResp struct {
@@ -306,12 +376,26 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 			})
 			row.RevokedAt = &now
 			row.RevokeReason = reason
-			log.Printf("claude-refresh: %s: QUARANTINED (%s) — re-add with a fresh `claude auth login` required", row.Email, reason)
+			recordExchange(row, caller, "invalid_grant", started, reason)
+			// The single most useful line in a post-mortem: did an exchange we
+			// never got an answer to precede this? If yes, the family was
+			// probably rotated behind our back (lost response) rather than by
+			// another party. If no, look elsewhere.
+			hist := "no prior indeterminate exchange on this row"
+			if row.IndeterminateAt != nil {
+				hist = fmt.Sprintf("PRIOR INDETERMINATE exchange %s ago (%s) — suspect lost-response rotation",
+					time.Since(*row.IndeterminateAt).Round(time.Second), row.IndeterminateReason)
+			}
+			log.Printf("claude-refresh: %s: QUARANTINED caller=%s (%s) — %s; re-add with a fresh `claude auth login` required",
+				row.Email, caller, reason, hist)
 			return "", fmt.Errorf("token refresh failed: %s (account quarantined — re-add required)", reason)
 		}
 		if errResp.Error != "" {
+			recordExchange(row, caller, "error:"+errResp.Error, started, errResp.Desc)
 			return "", fmt.Errorf("token refresh failed: %s — %s", errResp.Error, errResp.Desc)
 		}
+		recordExchange(row, caller, fmt.Sprintf("http_%d", resp.StatusCode), started,
+			strings.TrimSpace(string(raw[:min(len(raw), 200)])))
 		return "", fmt.Errorf("token refresh HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw[:min(len(raw), 200)])))
 	}
 
@@ -326,6 +410,10 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 		// makes a wrong-URL or throttled-upstream answer obvious on sight.
 		ct := resp.Header.Get("Content-Type")
 		snippet := strings.TrimSpace(string(raw[:min(len(raw), 160)]))
+		// Same class as a lost response: a 200 means the family rotated, and if
+		// we cannot read the new credential out of it, we no longer hold it.
+		markIndeterminate(row, caller, started,
+			fmt.Sprintf("200 unparseable (content-type=%q): %s", ct, snippet))
 		return "", fmt.Errorf("token refresh: HTTP 200 but unparseable body (url=%s, content-type=%q): %s",
 			refreshURL, ct, snippet)
 	}
@@ -353,6 +441,7 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken) (string, error) {
 		}
 	}
 	common.DB.Model(row).Updates(updates)
+	recordExchange(row, caller, "ok", started, "")
 	return tok.AccessToken, nil
 }
 
@@ -503,7 +592,7 @@ func refreshSnapshot(row *models.ClaudeQuotaToken, token string) (*models.Claude
 	if err != nil {
 		// On auth failure, try to refresh if we have a refresh token.
 		if strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403") {
-			newTok, refreshErr := tryRefreshToken(row)
+			newTok, refreshErr := tryRefreshToken(row, "snapshot-probe")
 			if refreshErr != nil {
 				return nil, fmt.Errorf("%w (refresh also failed: %s)", err, refreshErr.Error())
 			}
@@ -1132,7 +1221,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// this pairing exists to remove. Rotate first (coalesced, so a burst of
 		// callers still produces one exchange) and lease the result.
 		if tokenExpiringSoon(token) {
-			newTok, err := tryRefreshToken(&row)
+			newTok, err := tryRefreshToken(&row, "lease")
 			if err != nil {
 				log.Printf("claude-lease: %s: token near expiry and refresh failed: %v — skipping", row.Email, err)
 				continue
@@ -1821,7 +1910,7 @@ func sweepAllTokens() {
 			log.Printf("token-refresh-loop: %s: exp in %v — skipping", row.Email, time.Until(exp).Round(time.Minute))
 			continue
 		}
-		if _, err := tryRefreshToken(&row); err != nil {
+		if _, err := tryRefreshToken(&row, "sweep"); err != nil {
 			log.Printf("token-refresh-loop: %s: FAILED: %v", row.Email, err)
 		} else {
 			log.Printf("token-refresh-loop: %s: ok", row.Email)

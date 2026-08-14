@@ -53,6 +53,31 @@ type ClaudeQuotaToken struct {
 	// threshold. It is not self-clearing on a stray success — recovery is a
 	// deliberate operator re-add, matching the alert text the proxy emits.
 	BenchDead bool `gorm:"column:bench_dead;not null;default:false" json:"bench_dead,omitempty"`
+	// ── Refresh-exchange forensics ────────────────────────────────────────────
+	//
+	// Added 2026-08-14. When all four pooled accounts were quarantined on
+	// 2026-08-13 there was nothing to diagnose from: the logs died with the pods
+	// (no aggregation since the obs stack was removed) and the row recorded only
+	// that the family was gone, not what the last exchange did. Two theories —
+	// a second credential holder, and a LOST RESPONSE (request lands, Anthropic
+	// rotates, response never arrives, so we keep a token it has superseded) —
+	// were indistinguishable after the fact. These fields make the next
+	// occurrence answerable from the row alone.
+	//
+	// LastExchangeAt/Outcome/Ms record every attempt, success or not.
+	LastExchangeAt      *time.Time `gorm:"column:last_exchange_at"                json:"last_exchange_at,omitempty"`
+	LastExchangeOutcome string     `gorm:"column:last_exchange_outcome;size:64"  json:"last_exchange_outcome,omitempty"`
+	LastExchangeMs      int        `gorm:"column:last_exchange_ms"               json:"last_exchange_ms,omitempty"`
+	// IndeterminateAt is the load-bearing one: set when a request was SENT but
+	// no response was read (timeout, connection reset, pod killed mid-flight).
+	// After that instant our stored refresh token may already be superseded
+	// upstream while looking perfectly valid here — the family is in an unknown
+	// state and the next exchange is the one that will discover it. It is NOT
+	// cleared by a later success, so it survives as the evidence trail; compare
+	// it against RevokedAt to see whether a quarantine followed an indeterminate
+	// exchange (lost-response) or a clean one (something else entirely).
+	IndeterminateAt     *time.Time `gorm:"column:indeterminate_at"               json:"indeterminate_at,omitempty"`
+	IndeterminateReason string     `gorm:"column:indeterminate_reason;size:512"  json:"indeterminate_reason,omitempty"`
 }
 
 func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }

@@ -365,10 +365,34 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, er
 		}
 		_ = json.Unmarshal(raw, &errResp)
 		if errResp.Error == "invalid_grant" {
-			// The family is gone (typically rotation-reuse detection after the
-			// owner's own Claude Code refreshed a shared credential copy).
-			// Quarantine the row so no path re-presents the revoked token.
-			reason := strings.TrimSpace(errResp.Error + " — " + errResp.Desc)
+			// The family is gone. Quarantine the row so no path re-presents the
+			// revoked token, and classify the cause BEFORE persisting so the
+			// verdict lands in revoke_reason rather than only in the log.
+			//
+			// The classification already existed here but lived exclusively in the
+			// log line — which dies with the pod, and there has been no log
+			// aggregation since the obs stack was removed. So the one fact that
+			// decides what the operator must DO never survived the incident that
+			// produced it. Persisting it means the verdict rides revoke_reason into
+			// /internal/claude-pool/health, into the sweep's "quarantined account(s)
+			// awaiting re-add" line, and into the opsagent alert — i.e. it reaches a
+			// human while it still matters.
+			//
+			// The two causes need OPPOSITE responses, which is why guessing is
+			// expensive: a second holder means someone must stop using the credential
+			// (a re-add alone just gets revoked again), whereas a lost response means
+			// nothing is misconfigured and a re-add is the whole fix.
+			verdict := "SECOND-HOLDER SUSPECTED: no indeterminate exchange preceded this — " +
+				"another holder of this credential rotated the family. A pooled account " +
+				"must have exactly one holder: the pool. Find who ran `claude` as it."
+			if row.IndeterminateAt != nil {
+				verdict = fmt.Sprintf("LOST-RESPONSE SUSPECTED: prior indeterminate exchange %s ago (%s) — "+
+					"our own rotation may have landed without us reading the reply; no second holder implied.",
+					time.Since(*row.IndeterminateAt).Round(time.Second),
+					truncStr(row.IndeterminateReason, 80))
+			}
+			reason := truncStr(strings.TrimSpace(errResp.Error+" — "+errResp.Desc), 180) + " | " + verdict
+			reason = truncStr(reason, 500)
 			now := time.Now()
 			common.DB.Model(row).Updates(map[string]interface{}{
 				"revoked_at":    now,
@@ -377,17 +401,8 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, er
 			row.RevokedAt = &now
 			row.RevokeReason = reason
 			recordExchange(row, caller, "invalid_grant", started, reason)
-			// The single most useful line in a post-mortem: did an exchange we
-			// never got an answer to precede this? If yes, the family was
-			// probably rotated behind our back (lost response) rather than by
-			// another party. If no, look elsewhere.
-			hist := "no prior indeterminate exchange on this row"
-			if row.IndeterminateAt != nil {
-				hist = fmt.Sprintf("PRIOR INDETERMINATE exchange %s ago (%s) — suspect lost-response rotation",
-					time.Since(*row.IndeterminateAt).Round(time.Second), row.IndeterminateReason)
-			}
-			log.Printf("claude-refresh: %s: QUARANTINED caller=%s (%s) — %s; re-add with a fresh `claude auth login` required",
-				row.Email, caller, reason, hist)
+			log.Printf("claude-refresh: %s: QUARANTINED caller=%s — %s; re-add with a fresh `claude auth login` required",
+				row.Email, caller, reason)
 			return "", fmt.Errorf("token refresh failed: %s (account quarantined — re-add required)", reason)
 		}
 		if errResp.Error != "" {

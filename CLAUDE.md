@@ -11,7 +11,7 @@ authority.
 > **Where this runs (checked 2026-08-09).** Deployment `lumid-identity` (**2 replicas**, deliberate
 > — WebSocket sessions need cross-node reach) in ns `lumid` on cluster `lumid-prod2`, **service**
 > tier. Argo CD app `lumid-identity` from `/proj/deploy_infra/k8s-lift/lumid-identity/`. Live image
-> was `v0.4.6` (checked 2026-08-10). It is reachable only through the `lumid-landing` nginx, which proxies
+> was **`v0.5.59`** (checked 2026-08-15). It is reachable only through the `lumid-landing` nginx, which proxies
 > `https://lum.id/api/v1/*`, `/oauth/*` and `/.well-known/*` to `lumid-identity:9900`.
 > Database: the shared in-cluster `mysql-trading` (schema `lumid_identity`).
 >
@@ -20,9 +20,17 @@ authority.
 
 ## Release / deploy
 
-Tag-driven. Cut a `vX.Y.Z` tag → CI builds `ghcr.io/mlsys-io/lumid-identity:vX.Y.Z` → pin it in
-`/proj/deploy_infra/k8s-lift/lumid-identity/kustomization.yaml` → commit to `deploy_infra` branch
-`migration/uks` → Argo reconciles. Rollback = git revert the pin.
+Tag-driven, and **self-deploying**. Cut a `vX.Y.Z` tag → CI builds
+`ghcr.io/mlsys-io/lumid-identity:vX.Y.Z` → **Argo CD Image Updater** (semver strategy, allow-tags
+`^v\d+\.\d+\.\d+$`) writes the resolved tag back to
+`deploy_infra@migration/uks:k8s-lift/lumid-identity/.argocd-source-lumid-identity.yaml` and Argo
+rolls it. No manual pin step. Rollback = cut a higher tag from the good commit (Image Updater only
+moves *forward* on semver; reverting the write-back alone will be re-applied).
+
+The `digest:` in `kustomization.yaml` is the **adoption seed**, not the live pin — the
+`.argocd-source-*` override wins. Its comment block still names v0.3.8x and is stale; read the
+`.argocd-source-*` file for what is actually deployed. Checking the highest git tag is also NOT a
+way to learn what is live.
 **Never `kubectl set image`** — `selfHeal: true` reverts it within minutes.
 Protocol: `/proj/deploy_infra/k8s-lift/CD-PROTOCOL.md`.
 

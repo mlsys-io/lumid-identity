@@ -338,6 +338,13 @@ func MeDraftSend(c *gin.Context) {
 
 	abs, app, rel := resolveDraftByID(userID, id)
 	if abs == "" {
+		// DB-backed draft (app_feedback stages these). Same fallback the chat
+		// tools take, so the HTTP route and the chat cannot disagree about
+		// whether a draft the queue displays can be acted on.
+		if res, handled := dbDraftHTTP(userID, id, "send"); handled {
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "draft not found")
 		return
 	}
@@ -485,6 +492,10 @@ func MeDraftDismiss(c *gin.Context) {
 
 	_, app, _ := resolveDraftByID(userID, id)
 	if app == "" {
+		if res, handled := dbDraftHTTP(userID, id, "dismiss"); handled {
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "draft not found")
 		return
 	}
@@ -544,3 +555,14 @@ func (draftIDMatcher) MatchString(s string) bool {
 // Sanity-check the matcher format string is what the docstring claims.
 var _ = fmt.Sprintf // keep fmt import used if other code is trimmed
 var _ = draftIDRe   // referenced for documentation only
+
+// dbDraftHTTP adapts the DB-draft action path for the HTTP handlers. `handled`
+// is false only when no such draft exists in either store, so the caller still
+// 404s for a genuinely unknown id.
+func dbDraftHTTP(userID, id, action string) (map[string]any, bool) {
+	res := dbDraftAction(userID, id, action)
+	if e, _ := res["error"].(string); e == "draft not found" {
+		return nil, false
+	}
+	return res, true
+}

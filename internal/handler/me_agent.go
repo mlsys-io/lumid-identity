@@ -1954,6 +1954,37 @@ func renderViewingContext(ctx map[string]any) string {
 		// entity card) when explicitly asked. Never paste whole tables/lists.
 		b.WriteString("Style: this is the app's grounded chat beside its details panel. Be progressive/hierarchical — one focused point + the next step per turn; don't dump tables, run lists, or the whole surface (the panel already shows them); pull in a single card only when asked.\n")
 	}
+	// MODE — the launcher knows exactly what the user picked, so say so instead
+	// of making the model infer it from prose.
+	//
+	// The three case modes are fixed workflows chosen by a click, but they
+	// arrived as an ordinary sentence, so the first turn was spent deliberating:
+	// which of 102 tools, and which role am I? Measured 32s and 53s of thinking
+	// on first turns. Declaring the mode collapses that decision, and it also
+	// makes the ROLE unambiguous — the app's default posture is the analyst, so
+	// interviewer mode was the one most likely to be got wrong.
+	//
+	// Fails closed: an unrecognised mode renders nothing and the model falls back
+	// to reading the sentence, which is the behaviour we already had.
+	switch str("mode") {
+	case "interview":
+		cid := str("case_id")
+		fmt.Fprintf(&b, "MODE: interviewer. You RUN the case and the USER answers — do not answer the questions yourself.\n")
+		if cid != "" && app != "" {
+			fmt.Fprintf(&b, "First action: case_open(app=%s, case_id=%s, role=interviewer). Do not write the case from memory.\n", app, cid)
+		}
+		b.WriteString("Then: deliver the brief, stop, and wait. Ask the questions in order, one per turn. Release an on-request fact only when their answer touches it. Score each answer with app_judge.\n")
+	case "benchmark":
+		cid := str("case_id")
+		fmt.Fprintf(&b, "MODE: interviewee. The USER is the interviewer and you answer the case questions.\n")
+		if cid != "" && app != "" {
+			fmt.Fprintf(&b, "First action: case_open(app=%s, case_id=%s, role=interviewee). Do not write the case from memory.\n", app, cid)
+		}
+		b.WriteString("Answer with app_answer, then score with app_judge. Work the questions in order when the user says to move on.\n")
+	case "practice":
+		b.WriteString("MODE: open question. There is no case, so every score is ungrounded — carry the app's no-ground-truth caveat verbatim. Answer with app_answer and score with app_judge; do not answer from your own knowledge.\n")
+	}
+
 	if cy, ok := ctx["cycle"].(map[string]any); ok {
 		ca, _ := cy["app"].(string)
 		cl, _ := cy["loop"].(string)

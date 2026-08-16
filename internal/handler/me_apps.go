@@ -296,15 +296,36 @@ type pendingCard struct {
 // doubles as the node-agnostic install registry: a `done` row surfaces as a
 // `ready` card here even though the file isn't locally visible. user_sub
 // filtering is mandatory. Newest intent per app name wins.
+//
+// UNINSTALL MUST BE READ HERE TOO, and this is subtle enough to be worth
+// stating: because the DB queue *is* the install registry on UKS, an app is
+// only gone from My Apps once its install row stops producing a card. Scanning
+// `install` alone meant the picker archived every copy on disk (correctly) and
+// the card was still regenerated on the very next poll from the untouched
+// `done` install row — the app came back, which is the "delete doesn't work"
+// report. The `onDisk` guard cannot save us: identity can't read the PVC, so
+// onDisk is empty precisely when this matters.
+//
+// So take both actions newest-first and let the newest intent per app decide.
+// A FAILED uninstall deliberately falls through to the older install row: the
+// app really is still installed, and hiding it would be a lie that leaves the
+// user no way to retry.
 func pendingInstallCards(userSub string, onDisk map[string]bool) []pendingCard {
 	var rows []models.MeAppIntent
 	if err := common.DB.
-		Where("user_sub = ? AND action = ?", userSub, "install").
+		Where("user_sub = ? AND action IN ?", userSub, []string{"install", "uninstall"}).
 		Order("created_at desc").
-		Limit(200).
+		Limit(400).
 		Find(&rows).Error; err != nil {
 		return nil
 	}
+	return cardsFromIntents(rows, onDisk)
+}
+
+// cardsFromIntents is the newest-intent-wins decision, split out from the query
+// so it can be tested without a database — the install/uninstall interplay is
+// where this has gone wrong before. `rows` MUST be newest-first.
+func cardsFromIntents(rows []models.MeAppIntent, onDisk map[string]bool) []pendingCard {
 	seen := map[string]bool{}
 	var cards []pendingCard
 	for i := range rows {
@@ -313,8 +334,17 @@ func pendingInstallCards(userSub string, onDisk map[string]bool) []pendingCard {
 		if r.Payload != "" {
 			_ = json.Unmarshal([]byte(r.Payload), &payload)
 		}
-		appName := installAppName(payload)
+		appName := intentAppName(payload)
 		if appName == "" || onDisk[appName] || seen[appName] {
+			continue
+		}
+		if r.Action == "uninstall" {
+			// Newest intent for this app is an uninstall. Unless it outright
+			// failed, the app is gone or going — emit no card AND mark the
+			// name seen so the older install row can't resurrect it below.
+			if r.Status != "failed" {
+				seen[appName] = true
+			}
 			continue
 		}
 		switch r.Status {
@@ -391,6 +421,23 @@ func installResultOK(rb []byte) (bool, string) {
 
 // installAppName derives the display name for an install intent from its
 // payload: the explicit `as` rename, else the last path segment of the slug.
+// intentAppName resolves the app-directory name any queue intent refers to.
+// Install intents carry {slug, as}; uninstall carries {app} (see MeAppsUninstall).
+// Kept separate from installAppName so the install naming rules — `as` wins,
+// slug basename, `-draft` stripped — stay exactly as they were.
+func intentAppName(payload map[string]any) string {
+	if n := installAppName(payload); n != "" {
+		return n
+	}
+	if payload == nil {
+		return ""
+	}
+	if app, _ := payload["app"].(string); strings.TrimSpace(app) != "" {
+		return strings.TrimSpace(app)
+	}
+	return ""
+}
+
 func installAppName(payload map[string]any) string {
 	if payload == nil {
 		return ""

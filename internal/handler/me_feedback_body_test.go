@@ -131,3 +131,29 @@ func TestStagedNoteEmptyWithoutDraft(t *testing.T) {
 		t.Fatal("note should name the draft")
 	}
 }
+
+// The id gate runs before the store lookup, so anything it rejects is
+// unreachable — a DB draft id failing here returned 400 for a row the queue was
+// displaying at that moment.
+func TestDraftIDGateAcceptsBothStores(t *testing.T) {
+	m := draftIDMatcher{}
+	for _, ok := range []string{
+		"0123456789abcdef",            // filesystem: 16 hex
+		"fb-c8c46a69d585e9fe36c25f97", // DB: correction
+		"sk-c8c46a69d585e9fe36c25f97", // DB: skill card edit
+	} {
+		if !m.MatchString(ok) {
+			t.Fatalf("should be accepted: %q", ok)
+		}
+	}
+	for _, bad := range []string{
+		"", "0123456789abcde", "0123456789abcdefg", "0123456789ABCDEF",
+		"fb-", "fb-xyz", "fb-../../etc/passwd", "xx-c8c46a69d585e9fe",
+		"fb-c8c46a6", // too short after the prefix
+		"fb-" + "a123456789012345678901234567890123456789extra",
+	} {
+		if m.MatchString(bad) {
+			t.Fatalf("should be rejected: %q", bad)
+		}
+	}
+}

@@ -540,8 +540,30 @@ func mustCompileDraftIDRe() interface {
 
 type draftIDMatcher struct{}
 
+// Two id shapes, because there are two stores. A filesystem draft is 16 hex
+// chars; a DB-backed one carries a kind prefix ("fb-" a correction, "sk-" a
+// skill card edit) so its origin is legible in a log line.
+//
+// This gate ran BEFORE the store lookup, so a DB id was rejected as malformed
+// and the fallback below it was unreachable — approving one returned 400
+// "invalid draft id" for a draft the queue was displaying at that moment.
+// Measured against a real pending draft, not inferred.
 func (draftIDMatcher) MatchString(s string) bool {
-	if len(s) != 16 {
+	if isHex16(s) {
+		return true
+	}
+	for _, pfx := range []string{"fb-", "sk-"} {
+		if strings.HasPrefix(s, pfx) {
+			return isHexRun(s[len(pfx):], 8, 40)
+		}
+	}
+	return false
+}
+
+func isHex16(s string) bool { return isHexRun(s, 16, 16) }
+
+func isHexRun(s string, min, max int) bool {
+	if len(s) < min || len(s) > max {
 		return false
 	}
 	for _, r := range s {

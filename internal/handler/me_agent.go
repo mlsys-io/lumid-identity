@@ -702,15 +702,21 @@ type llmProvider struct {
 // fleet is already paid for), Anthropic as the hosted fallback.
 var llmProviders = []llmProvider{
 	{
-		// gemma4 — default. Served by the in-cluster lumid-llm gateway
+		// qwen3.8-27b — default. Served by the in-cluster lumid-llm gateway
 		// (LUMID_LLM_BASE, default http://lumid-llm:8088), which speaks the
 		// Anthropic /v1/messages API incl. SSE. Model id from
 		// GET lum.id/llm/v1/models. Reasoning model (emits thinking deltas,
 		// handled by the SSE parser). The old kv.run:5000 endpoint is dead.
+		//
+		// The id stays "kvrun-gemma4" ON PURPOSE even though Gemma-4 is retired:
+		// it is persisted in personas' preferred_model and referenced by the UI
+		// and e2e tests, so renaming it would orphan saved selections. Only the
+		// upstream model moved (Gemma-4 -> Qwen3.8-27B when the GB10 boxes were
+		// repurposed). 1M context, vision-capable.
 		id:                  "kvrun-gemma4",
-		displayName:         "Gemma-4-26B-A4B (Lumid GPU)",
+		displayName:         "Qwen3.8-27B (Lumid GPU)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "nvidia/Gemma-4-26B-A4B-NVFP4",
+		upstreamModel:       "qwen3.8-27b",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,

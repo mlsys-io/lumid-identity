@@ -12,6 +12,7 @@ import (
 	"lumid_identity/models"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -325,12 +326,62 @@ func dbDraftAction(userID, id, action string) map[string]any {
 		return map[string]any{"ok": true, "id": id, "state": "rejected",
 			"note": "dropped from the review queue; nothing was ingested"}
 	case "send":
-		return map[string]any{
-			"error": "this draft cannot be approved yet",
-			"why": "it is a " + found.Subject + " staged by app_feedback, not an outbound message. " +
-				"Approving it should ingest it into " + found.Agent + ", and that path is not built. " +
-				"It stays pending; Dismiss works if you want it out of the queue.",
-		}
+		return dbDraftApprove(userID, found)
 	}
 	return map[string]any{"error": "unsupported action for this draft: " + action}
+}
+
+// skillFromDraftBody reads the card name out of the marker line skillCardNote
+// writes ("Proposed edit to prompts/analyst_skill_<card>.md"). Parsing the body
+// rather than the subject keeps the machine-readable fact in one place, and the
+// allowlist is re-checked here because this value chooses a file path on the
+// other side of an intent boundary.
+var skillMarkerRe = regexp.MustCompile(`Proposed edit to prompts/analyst_skill_([a-z][a-z0-9_]{2,40})\.md`)
+
+func skillFromDraftBody(body string) string {
+	m := skillMarkerRe.FindStringSubmatch(body)
+	if len(m) != 2 || !knownSkillCards[m[1]] {
+		return ""
+	}
+	return m[1]
+}
+
+// dbDraftApprove is the last hop: mark the draft approved and hand the work to
+// the scheduler, which is the only side that can write the tenant tree (identity
+// runs on the service tier; the app PVC is RWO on compute).
+//
+// The state flip and the intent are deliberately ordered approve-then-enqueue,
+// and the flip is rolled back if the enqueue fails. The opposite order can leave
+// work queued against a draft the queue still shows as pending, which on a retry
+// ingests the same correction twice.
+func dbDraftApprove(userID string, d *models.MeDraft) map[string]any {
+	skill := skillFromDraftBody(d.Body)
+	if d.Agent == "" && skill == "" {
+		return map[string]any{"error": "draft names neither a memory agent nor a skill card; nothing to apply"}
+	}
+	if err := draftStoreAct(userID, d.ID, "approved"); err != nil {
+		return map[string]any{"error": "approve: " + err.Error()}
+	}
+	intentID := writeIntentDirect(userID, "ingest_draft", map[string]any{
+		"app":      d.App,
+		"draft_id": d.ID,
+		"agent":    d.Agent,
+		"subject":  d.Subject,
+		"body":     d.Body,
+		"skill":    skill,
+	})
+	if intentID == "" {
+		// Put it back so the user sees it still needs approving, rather than an
+		// approved row whose effect silently never happened.
+		_ = draftStoreAct(userID, d.ID, "pending")
+		return map[string]any{"error": "could not queue the work; draft left pending"}
+	}
+	out := map[string]any{"ok": true, "id": d.ID, "state": "approved", "intent_id": intentID}
+	if skill != "" {
+		out["applies"] = "appends the correction to prompts/analyst_skill_" + skill + ".md, so it shapes every future answer that uses that card"
+	} else {
+		out["applies"] = "ingests the correction into " + d.Agent + ", so it can be recalled in later answers"
+	}
+	out["next"] = "queued for the scheduler; it lands within a minute or two, not instantly"
+	return out
 }

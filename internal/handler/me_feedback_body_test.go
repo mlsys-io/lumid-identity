@@ -62,3 +62,32 @@ func TestFeedbackBodyClipsLongAnswer(t *testing.T) {
 		t.Fatal("clipped answer should be marked as clipped")
 	}
 }
+
+// The card name in an approved draft chooses a file path on the far side of an
+// intent boundary. Parse it from the marker line, and re-check the allowlist.
+func TestSkillFromDraftBody(t *testing.T) {
+	good := skillCardNote("mbb-consultant", "market_sizing", "size it first")
+	if got := skillFromDraftBody(good); got != "market_sizing" {
+		t.Fatalf("round-trip failed: got %q", got)
+	}
+	for _, bad := range []string{
+		"",
+		"just a plain correction with no marker",
+		"Proposed edit to prompts/analyst_skill_communication.md",   // off the allowlist
+		"Proposed edit to prompts/analyst_skill_not_a_real_card.md", // not a card
+		"Proposed edit to prompts/analyst_skill_../analyst_system.md",
+	} {
+		if got := skillFromDraftBody(bad); got != "" {
+			t.Fatalf("%q should yield no card, got %q", bad, got)
+		}
+	}
+}
+
+// A memory draft must not be mistaken for a card edit just because the user's
+// words happen to mention a skill.
+func TestPlainCorrectionIsNotACardEdit(t *testing.T) {
+	body := feedbackBody("your market_sizing was wrong", feedbackContext{CaseID: "Case_019"})
+	if got := skillFromDraftBody(body); got != "" {
+		t.Fatalf("plain correction parsed as card %q", got)
+	}
+}

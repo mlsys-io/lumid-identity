@@ -71,9 +71,17 @@ type appUINavItem struct {
 }
 
 // appUIOpenerChip is one starter chip in an app-declared opener.
+//
+// `mode` travels as CONTEXT, not prose. A chip is a fixed workflow the user
+// picked by clicking, so restating the setup in the prompt text makes the model
+// re-derive what the click already settled — and prose about roles is easy to
+// get wrong. Observed: a chip that said both "interview me" and "you're the
+// interviewer and I'm the candidate" made the model stop and reason about
+// whether the two halves contradicted each other before it could start.
 type appUIOpenerChip struct {
 	Label  string `yaml:"label"  json:"label"`
 	Prompt string `yaml:"prompt" json:"prompt"`
+	Mode   string `yaml:"mode"   json:"mode,omitempty"`
 }
 
 // appUIOpener lets an app own the chat's FIRST turn.

@@ -1972,8 +1972,13 @@ func renderViewingContext(ctx map[string]any) string {
 		fmt.Fprintf(&b, "MODE: interviewer. You RUN the case and the USER answers — do not answer the questions yourself.\n")
 		if cid != "" && app != "" {
 			fmt.Fprintf(&b, "First action: case_open(app=%s, case_id=%s, role=interviewer). Do not write the case from memory.\n", app, cid)
+		} else {
+			// Entered from a chip, so no case is chosen yet. Say so explicitly —
+			// otherwise "deliver the brief" refers to a case that does not exist
+			// and the model stalls trying to reconcile the two.
+			b.WriteString("No case is chosen yet: use `casebook` to list them, ask the user to pick, then case_open(role=interviewer) with the FULL case id they choose.\n")
 		}
-		b.WriteString("Then: deliver the brief, stop, and wait. Ask the questions in order, one per turn. Release an on-request fact only when their answer touches it. Score each answer with app_judge.\n")
+		b.WriteString("Once open: deliver the brief, stop, and wait. Ask the questions in order, one per turn. Release an on-request fact only when their answer touches it. Score each answer with app_judge.\n")
 	case "benchmark":
 		cid := str("case_id")
 		fmt.Fprintf(&b, "MODE: interviewee. The USER is the interviewer and you answer the case questions.\n")

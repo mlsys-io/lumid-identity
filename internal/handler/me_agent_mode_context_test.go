@@ -66,7 +66,28 @@ func TestRenderViewingContext_NoCaseIdStillDeclaresTheRole(t *testing.T) {
 	if !strings.Contains(out, "MODE: interviewer") {
 		t.Fatal("role must be declared without a case id")
 	}
-	if strings.Contains(out, "case_open(") {
-		t.Fatal("must not emit a case_open call with no case id")
+	// Banning the substring outright was too broad — the no-case branch names
+	// the call generically ("then case_open(role=interviewer) with the FULL case
+	// id they choose"), which is correct guidance. What must not appear is a
+	// CONCRETE call carrying an id we invented.
+	if strings.Contains(out, "case_open(app=") {
+		t.Fatal("must not emit a concrete case_open call with no case id")
+	}
+}
+
+func TestRenderViewingContext_InterviewWithoutACaseAsksForOne(t *testing.T) {
+	// Entered from a chip: no case chosen yet. Without this the directive said
+	// "deliver the brief" for a case that does not exist, and the model stalled
+	// trying to reconcile the two — observed as it announcing it would fetch the
+	// case list and then producing nothing.
+	out := renderViewingContext(map[string]any{"app": "mbb-consultant", "mode": "interview"})
+	if !strings.Contains(out, "No case is chosen yet") {
+		t.Fatalf("must say no case is chosen:\n%s", out)
+	}
+	if !strings.Contains(out, "casebook") {
+		t.Fatal("must name the tool that lists cases")
+	}
+	if strings.Contains(out, "case_open(app=") {
+		t.Fatal("must not emit a concrete case_open with no case id")
 	}
 }

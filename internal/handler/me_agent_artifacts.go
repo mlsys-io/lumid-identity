@@ -32,7 +32,7 @@ import (
 // artifact is the JSON envelope returned to the Studio panel.
 type artifact struct {
 	ID        string `json:"id"`
-	Kind      string `json:"kind"`               // markdown | code | json | text | image | audio
+	Kind      string `json:"kind"`               // artifactKinds + the media kinds image | audio | pdf
 	Title     string `json:"title"`              // human-readable label
 	Language  string `json:"language,omitempty"` // for kind=code: "python", "go", …
 	Content   string `json:"content"`

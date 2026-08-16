@@ -390,7 +390,32 @@ func answerWithAppVoiceModel(ctx context.Context, role, modelID, system, user st
 // Staged, never auto-applied: a claim that an answer was wrong is a claim about
 // quality, and an unreviewed one does not just sit there — it biases what the
 // app retrieves next. The human confirms before it compounds.
-func toolAppFeedback(userID, app, note string, rating int) (map[string]any, bool) {
+// feedbackContext is what the correction is ABOUT. Without it a draft is a bare
+// sentence — "you never sized the addressable market" — with no case, no
+// question and no answer beside it, which is not something a reviewer can judge.
+type feedbackContext struct {
+	CaseID   string
+	Question string
+	Answer   string
+	Skill    string
+}
+
+// skillCardNote turns a named skill card into the second rung of the feedback
+// ladder. A memory tells the analyst something to RECALL; a skill card changes
+// the SHAPE of every future answer of that kind. Corrections about how an answer
+// was built — "you never sized the market", "no units on the numbers" — are
+// card-shaped, and filed only as memories the systematic fix is lost among
+// per-case trivia. Staged separately so a reviewer approves the wording before
+// it shapes anything.
+func skillCardNote(app, skill, note string) string {
+	return "Proposed edit to prompts/analyst_skill_" + skill + ".md\n\n" +
+		"Evidence (one correction, not yet a rule — read it as a suggestion):\n" +
+		note + "\n\n" +
+		"Approving this stages a prompt change for " + app + ": every future answer " +
+		"that uses the " + skill + " card is shaped by it, not just this case."
+}
+
+func toolAppFeedback(userID, app, note string, rating int, fc feedbackContext) (map[string]any, bool) {
 	if app == "" || strings.TrimSpace(note) == "" {
 		return map[string]any{"error": "app and note are required"}, false
 	}
@@ -411,7 +436,7 @@ func toolAppFeedback(userID, app, note string, rating int) (map[string]any, bool
 	d := &models.MeDraft{
 		ID:      "fb-" + contentSHA([]byte(app + note + time.Now().UTC().String()))[:24],
 		UserSub: userID, App: app, Agent: agent,
-		Subject: "Correction", Body: strings.TrimSpace(note),
+		Subject: "Correction", Body: feedbackBody(note, fc),
 		State: "pending",
 	}
 	if rating != 0 {
@@ -420,11 +445,75 @@ func toolAppFeedback(userID, app, note string, rating int) (map[string]any, bool
 	if err := draftStoreStage(d); err != nil {
 		return map[string]any{"error": "could not stage: " + err.Error()}, false
 	}
-	return map[string]any{
+	out := map[string]any{
 		"ok": true, "app": app, "draft_id": d.ID, "agent": agent,
 		"state": "pending",
 		"next":  "waiting in this app's Review queue; approve it and it shapes later answers",
-	}, true
+	}
+
+	// Second rung: a card-shaped correction also proposes a PROMPT edit. Only
+	// when the caller could name the card — guessing sends the reviewer to edit
+	// a prompt that had nothing to do with the mistake, which is worse than not
+	// offering one. `communication` is appended to nearly every answer, so it is
+	// almost never what the correction is actually about.
+	if knownSkillCards[fc.Skill] {
+		sd := &models.MeDraft{
+			ID:      "sk-" + contentSHA([]byte(app + fc.Skill + note + time.Now().UTC().String()))[:24],
+			UserSub: userID, App: app, Agent: agent,
+			Subject: "Skill card edit — " + fc.Skill,
+			Body:    skillCardNote(app, fc.Skill, strings.TrimSpace(note)),
+			State:   "pending",
+		}
+		if err := draftStoreStage(sd); err == nil {
+			out["skill_draft_id"] = sd.ID
+			out["next"] = "TWO drafts are waiting in Review: a memory the analyst should recall, and an edit to the " +
+				fc.Skill + " skill card that shaped the answer. Neither changes anything until approved."
+		}
+	}
+	return out, true
+}
+
+// knownSkillCards is an allowlist, matching how every other projection in this
+// package is guarded. A model-supplied name is a guess; a guess that misses
+// stages an edit to a prompt file that does not exist, which the reviewer can
+// only discover by approving it. `communication` is deliberately absent — it is
+// appended to nearly every answer, so it attracts corrections that are really
+// about some other card.
+var knownSkillCards = map[string]bool{
+	"issue_tree": true, "market_sizing": true, "npv": true,
+	"profitability": true, "risk_mece": true, "options": true,
+	"hypothesis_first": true, "revenue_brainstorm": true,
+	"stakeholder_eval": true, "value_to_customer": true,
+}
+
+// feedbackBody renders the correction WITH what it was about.
+func feedbackBody(note string, fc feedbackContext) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(note))
+	if fc.CaseID == "" && fc.Question == "" && fc.Answer == "" {
+		return b.String()
+	}
+	b.WriteString("\n\n---\n")
+	if fc.CaseID != "" {
+		b.WriteString("Case: " + fc.CaseID + "\n")
+	}
+	if fc.Question != "" {
+		b.WriteString("Question: " + clip(fc.Question, 400) + "\n")
+	}
+	if fc.Answer != "" {
+		// The answer is the bulk of a turn and a reviewer needs enough to judge
+		// the correction, not the whole thing.
+		b.WriteString("Answer being corrected: " + clip(fc.Answer, 1200) + "\n")
+	}
+	return b.String()
+}
+
+func clip(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // firstMemoryAgent reads memory_agent / memory_agents[0] from a spec so a
@@ -489,7 +578,11 @@ func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentCha
 		if i := strings.Index(note, ":"); i > 0 && i < 60 {
 			note = strings.TrimSpace(note[i+1:])
 		}
-		res, _ := toolAppFeedback(userID, app, note, -1)
+		// No context here on purpose: this is the composer's explicit correction
+		// button, which fires before the model reads the turn, so nothing knows
+		// which case or answer is being corrected. The model-called path (with
+		// case_id/question/answer) is the one that produces a reviewable draft.
+		res, _ := toolAppFeedback(userID, app, note, -1, feedbackContext{})
 		return res, true
 	}
 	return nil, false // any other tool stays the model's business

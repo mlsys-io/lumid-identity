@@ -2304,7 +2304,7 @@ func buildToolDefs() []map[string]any {
 			// app_answer, which REQUIRES a question — so asked to "give me the
 			// opening" it called app_answer with just a case_id, got
 			// "app and question are required", and invented the case from memory.
-			"name": "case_open",
+			"name":        "case_open",
 			"description": "REQUIRED to start or read a labelled case. Returns that case's brief, projected for your seat: role=interviewee gives the client brief only (you are being tested); role=interviewer additionally gives the questions and the facts to release on request (you are running the case for a human). Use the FULL case id — a bare number like Case_001 names three different cases. Never write a case opening from memory.",
 			"input_schema": map[string]any{
 				"type": "object",
@@ -2369,13 +2369,17 @@ func buildToolDefs() []map[string]any {
 			// the agent apologised and re-answered, and staged nothing. The user
 			// then found Review empty, which reads as the feature being broken
 			// when in fact the tool was never called.
-			"description": "REQUIRED the moment the user says an answer was wrong, missed something, or should have been different — including a bare 'wrong', 'no', or 'that's not right'. Stages their correction for human review so it can shape later answers. Re-answering is NOT a substitute and does not record anything: if you only apologise and try again, the correction is lost and the user's Review queue stays empty. Call this FIRST, then re-answer if useful. Do NOT use give_feedback — that scores a scheduled cycle run and needs a loop + timestamp.",
+			"description": "REQUIRED the moment the user says an answer was wrong, missed something, or should have been different — including a bare 'wrong', 'no', or 'that's not right'. Stages their correction for human review so it can shape later answers. Re-answering is NOT a substitute and does not record anything: if you only apologise and try again, the correction is lost and the user's Review queue stays empty. Pass the context too — case_id, the question, and the answer being corrected — or the reviewer sees a bare sentence with nothing to judge it against. Call this FIRST, then re-answer if useful. Do NOT use give_feedback — that scores a scheduled cycle run and needs a loop + timestamp.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"app":    map[string]any{"type": "string"},
-					"note":   map[string]any{"type": "string", "description": "what was wrong, in the user's words"},
-					"rating": map[string]any{"type": "number", "description": "-1 negative, 1 positive; optional"},
+					"app":      map[string]any{"type": "string"},
+					"note":     map[string]any{"type": "string", "description": "what was wrong, in the user's words"},
+					"rating":   map[string]any{"type": "number", "description": "-1 negative, 1 positive; optional"},
+					"case_id":  map[string]any{"type": "string", "description": "the case this was about, if any"},
+					"question": map[string]any{"type": "string", "description": "the question that was answered"},
+					"answer":   map[string]any{"type": "string", "description": "the answer being corrected, verbatim"},
+					"skill":    map[string]any{"type": "string", "description": "the analyst skill card the answer leaned on, when the correction is about HOW the answer was built rather than a fact it got wrong. One of: issue_tree, market_sizing, npv, profitability, risk_mece, options, hypothesis_first, revenue_brainstorm, stakeholder_eval, value_to_customer. Omit rather than guess."},
 				},
 				"required": []string{"app", "note"},
 			},
@@ -3607,7 +3611,13 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if v, ok := args["rating"].(float64); ok {
 			rating = int(v)
 		}
-		return toolAppFeedback(userID, app, note, rating)
+		caseID, _ := args["case_id"].(string)
+		question, _ := args["question"].(string)
+		answer, _ := args["answer"].(string)
+		skill, _ := args["skill"].(string)
+		return toolAppFeedback(userID, app, note, rating, feedbackContext{
+			CaseID: caseID, Question: question, Answer: answer, Skill: skill,
+		})
 
 	case "case_open":
 		app, _ := args["app"].(string)

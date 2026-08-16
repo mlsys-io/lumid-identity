@@ -2264,6 +2264,23 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
+			// Opening a case had no verb. The agent's only case-aware tool was
+			// app_answer, which REQUIRES a question — so asked to "give me the
+			// opening" it called app_answer with just a case_id, got
+			// "app and question are required", and invented the case from memory.
+			"name": "case_open",
+			"description": "REQUIRED to start or read a labelled case. Returns that case's brief, projected for your seat: role=interviewee gives the client brief only (you are being tested); role=interviewer additionally gives the questions and the facts to release on request (you are running the case for a human). Use the FULL case id — a bare number like Case_001 names three different cases. Never write a case opening from memory.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":     map[string]any{"type": "string"},
+					"case_id": map[string]any{"type": "string", "description": "full case id, e.g. Case_001_PremierOil_PK21"},
+					"role":    map[string]any{"type": "string", "enum": []string{"interviewee", "interviewer"}, "description": "interviewee = you answer; interviewer = you run the case for a human"},
+				},
+				"required": []string{"app", "case_id"},
+			},
+		},
+		{
 			// Without this, an app's declared tools[] are unreachable from chat:
 			// app_run returns a PROCEDURE rather than executing one, and nothing
 			// else dispatches an app's own commands. So a free-form question got
@@ -3549,6 +3566,12 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			rating = int(v)
 		}
 		return toolAppFeedback(userID, app, note, rating)
+
+	case "case_open":
+		app, _ := args["app"].(string)
+		caseID, _ := args["case_id"].(string)
+		seat, _ := args["role"].(string)
+		return toolCaseOpen(userID, app, caseID, seat)
 
 	case "app_answer":
 		app, _ := args["app"].(string)

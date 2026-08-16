@@ -145,8 +145,11 @@ func caseContextForRole(appDir, caseID, role string) (string, bool) {
 	if len(matches) == 0 {
 		return "", false
 	}
-	sort.Strings(matches)
-	b, err := os.ReadFile(matches[0])
+	path, ok := resolveUniqueCase(caseID, matches)
+	if !ok {
+		return "", false
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", false
 	}
@@ -570,4 +573,89 @@ func httpProviderFor(role string) llmProvider {
 		}
 	}
 	return defaultProvider()
+}
+
+// resolveUniqueCase turns a glob result into ONE case file, or refuses.
+//
+// `case_id` in the corpus is only the NUMBER, so Case_001 exists three times —
+// Case_001_DieselTruck_PK20, Case_001_LasioVirus_PK23, Case_001_PremierOil_PK21.
+// Globbing caseID+"*.json" and taking matches[0] after a lexical sort therefore
+// resolved a bare "Case_001" to DieselTruck, whichever case the caller meant.
+//
+// Observed live and it is worse than a wrong lookup: an interview opened on
+// Premier Oil with the full id, then a follow-up passed the bare "Case_001" and
+// silently landed on the diesel-truck case. The model noticed the mismatch
+// mid-interview, announced it had "mislabeled the case", and restarted on the
+// wrong one — so the candidate was scored against a case they were never given.
+//
+// commands/_case.py has always raised on an ambiguous prefix rather than pick.
+// This mirrors that: an EXACT stem (with or without the _vN suffix) always wins,
+// a prefix is honoured only when it names exactly one case, and anything
+// ambiguous fails closed. Silently guessing is the one behaviour not on offer.
+func resolveUniqueCase(caseID string, matches []string) (string, bool) {
+	sort.Strings(matches)
+	distinct := map[string]string{} // case stem (minus _vN) → path
+	for _, m := range matches {
+		stem := strings.TrimSuffix(filepath.Base(m), filepath.Ext(m))
+		if stem == caseID {
+			return m, true // exact filename stem
+		}
+		base := stripCaseVersion(stem)
+		if base == caseID {
+			return m, true // exact case, versioned file
+		}
+		if _, seen := distinct[base]; !seen {
+			distinct[base] = m
+		}
+	}
+	if len(distinct) == 1 {
+		for _, p := range distinct {
+			return p, true // unambiguous prefix
+		}
+	}
+	return "", false // ambiguous — refuse rather than pick one
+}
+
+// toolCaseOpen returns a labelled case's brief so the agent can OPEN it.
+//
+// Both casebook modes need this and neither had it. The agent's only case-aware
+// verb was app_answer, which requires a question — so asked to "give me the
+// opening" it called app_answer with a case_id and no question, got
+// "app and question are required", and improvised the case from memory. Observed
+// live: it invented a Premier Oil opening, then contradicted itself a turn later.
+//
+// Role-projected through the same allowlist as everything else, so opening a
+// case as the interviewee cannot hand over the questions, and only the
+// interviewer seat gets the release inventory. Unknown role fails closed to
+// interviewee.
+func toolCaseOpen(userID, app, caseID, role string) (map[string]any, bool) {
+	if app == "" || caseID == "" {
+		return map[string]any{"error": "app and case_id are required"}, false
+	}
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		return map[string]any{"error": "app not found: " + app}, false
+	}
+	seat := caseRoleInterviewee
+	if role == caseRoleInterviewer {
+		seat = caseRoleInterviewer
+	}
+	ctxText, ok := caseContextForRole(appDir, caseID, seat)
+	if !ok {
+		// The commonest cause is an ambiguous id — `Case_001` names three
+		// different cases — so say that rather than "not found", which sends the
+		// agent looking for a file instead of qualifying the id it already has.
+		return map[string]any{
+			"error": "could not open '" + caseID + "' — use the full case id " +
+				"(e.g. Case_001_PremierOil_PK21); a bare number is ambiguous, and " +
+				"`casebook` lists the exact ids",
+		}, false
+	}
+	return map[string]any{
+		"app": app, "case_id": caseID, "role": seat, "case": ctxText,
+		"note": map[bool]string{
+			true:  "You are the INTERVIEWER. Deliver the brief, ask the questions in order, and release an on-request fact only when the candidate's answer touches it.",
+			false: "You are the INTERVIEWEE. This is the client brief only — the questions come one at a time from the interviewer.",
+		}[seat == caseRoleInterviewer],
+	}, true
 }

@@ -327,6 +327,20 @@ func answerWithAppVoice(ctx context.Context, role, system, user string) (string,
 // built to replace — just with more steps.
 func answerWithAppVoiceModel(ctx context.Context, role, modelID, system, user string) (string, error) {
 	provider := resolveProvider(modelID, role)
+	// This path speaks HTTP ONLY. Some providers are subprocess transports —
+	// claude-code-* runs the CLI in the sandbox and carries endpoint: "" — and
+	// super_admin's DEFAULT is claude-code-sonnet. So every app_answer by a
+	// super_admin (which is the operator + demo account) POSTed to "" and came
+	// back "unsupported protocol scheme". The chat itself was fine, because its
+	// own path knows how to run the subprocess; only this helper does not.
+	//
+	// It failed loudly but degraded quietly: the agent, seeing the tool error,
+	// just answered from its own knowledge — so the reply still looked like a
+	// consulting answer while carrying none of the app's analyst prompt, none of
+	// its skill cards, and no score at all.
+	if provider.endpoint == "" {
+		provider = httpProviderFor(role)
+	}
 	apiKey, err := provider.keyFn()
 	if err != nil {
 		return "", err
@@ -536,4 +550,24 @@ func caseContextAtQuestion(appDir, caseID string, qIdx int) (string, bool) {
 		return "", false
 	}
 	return body, true
+}
+
+// httpProviderFor returns the caller's highest-preference provider that has an
+// actual HTTP endpoint, for the paths that cannot run a subprocess transport.
+//
+// Falls back to the pinned scorer, which is HTTP by construction — better a
+// known-good backend than an error, since the alternative is the agent silently
+// improvising an answer that carries none of the app's voice or scoring.
+func httpProviderFor(role string) llmProvider {
+	for _, p := range llmProviders {
+		if p.endpoint != "" && providerAllowed(role, p) {
+			return p
+		}
+	}
+	for _, p := range llmProviders {
+		if p.id == judgeModelID {
+			return p
+		}
+	}
+	return defaultProvider()
 }

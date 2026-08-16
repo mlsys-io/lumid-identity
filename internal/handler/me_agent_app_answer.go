@@ -398,7 +398,12 @@ func toolAppFeedback(userID, app, note string, rating int) (map[string]any, bool
 		return map[string]any{"error": "app not found: " + app}, false
 	}
 	agent := "mbb-ai-analyst"
-	if xp, err := os.ReadFile(filepath.Join(resolveAppDir(userID, app), "xpcloud.yaml")); err == nil {
+	// Canonical spec first. `.xpcloud.yaml` is what the platform publishes and
+	// the runtime reads; the non-dot file is a legacy mirror that a bundle may
+	// not carry at all — reading only it meant the correction was silently
+	// attributed to a hardcoded agent instead of the app's own.
+	specPath, _ := ResolveSpecPath(resolveAppDir(userID, app))
+	if xp, err := os.ReadFile(specPath); err == nil {
 		if a := firstMemoryAgent(xp); a != "" {
 			agent = a
 		}

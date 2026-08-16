@@ -2326,8 +2326,14 @@ func buildToolDefs() []map[string]any {
 			// give_feedback needs app+loop+ts because it scores a scheduled CYCLE;
 			// an interactive answer has no run to point at, so a user correcting
 			// something in chat had nowhere to send it. This is that route.
-			"name":        "app_feedback",
-			"description": "Record a correction against an installed app and stage it for human review. Use when the user says an answer was wrong or should have been different. Do NOT use give_feedback for this — that scores a scheduled cycle run and needs a loop + timestamp.",
+			"name": "app_feedback",
+			// Imperative for the same reason app_answer and app_judge are: a tool
+			// that is merely AVAILABLE loses to the model's instinct to be
+			// helpful. Observed live — told "wrong — you never sized the market",
+			// the agent apologised and re-answered, and staged nothing. The user
+			// then found Review empty, which reads as the feature being broken
+			// when in fact the tool was never called.
+			"description": "REQUIRED the moment the user says an answer was wrong, missed something, or should have been different — including a bare 'wrong', 'no', or 'that's not right'. Stages their correction for human review so it can shape later answers. Re-answering is NOT a substitute and does not record anything: if you only apologise and try again, the correction is lost and the user's Review queue stays empty. Call this FIRST, then re-answer if useful. Do NOT use give_feedback — that scores a scheduled cycle run and needs a loop + timestamp.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

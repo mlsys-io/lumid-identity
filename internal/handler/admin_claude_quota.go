@@ -1311,6 +1311,30 @@ func InternalClaudeTokenLease(c *gin.Context) {
 			"pool_state=quarantined no pooled account usable: all accounts quarantined — operator re-add required ("+breakdown+")")
 		return
 	}
+	// SATURATION, not exhaustion. If the only reason nothing was leasable is
+	// that the CALLER excluded every account — each at its per-account in-flight
+	// ceiling, or locally benched by the proxy — then quota is untouched and the
+	// accounts are merely busy. A freed slot returns in SECONDS.
+	//
+	// Reporting this as quota_exhausted told users "out of quota — retry in ~5
+	// minutes" while the pool's own snapshots read 8% and 25% of their 5h
+	// windows at severity normal (measured 2026-08-16, breakdown
+	// "exhausted=0 excluded=2"). Wrong cause, and retry advice off by ~60x, on a
+	// condition the caller could not act on because nothing was exhausted. The
+	// real constraint was 2 accounts x 4 in-flight = 8 concurrent slots org-wide.
+	//
+	// Deliberately omits "available quota" for the same reason the quarantine
+	// branch does — but note that alone is NOT sufficient: claude-proxy's
+	// classifier also matches a bare "1503", which every refusal here carries.
+	// It ranks this state out explicitly (isPoolSaturated), so this change and
+	// claude-proxy cp-<sha> are a matched pair. Against an older proxy this
+	// still reads as a quota problem — no worse than before, just not yet fixed.
+	if nExcluded > 0 && nQuarantined == 0 && nBenched == 0 && nExhausted == 0 {
+		fail(c, http.StatusServiceUnavailable, 1503,
+			"pool_state=saturated no pooled account currently free: every candidate is at its "+
+				"in-flight ceiling — retry shortly ("+breakdown+")")
+		return
+	}
 	fail(c, http.StatusServiceUnavailable, 1503,
 		"pool_state=quota_exhausted no pooled account with available quota ("+breakdown+")")
 }

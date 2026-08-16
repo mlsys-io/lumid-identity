@@ -439,9 +439,23 @@ func repoIsRunnable(userSub, slug string) bool {
 	var doc struct {
 		Loops []map[string]any `yaml:"loops"`
 		Tools []map[string]any `yaml:"tools"`
+		UI    struct {
+			Surface  map[string]any `yaml:"surface"`
+			Surfaces map[string]any `yaml:"surfaces"`
+		} `yaml:"ui"`
 	}
 	if yaml.Unmarshal(spec, &doc) != nil {
 		return false
+	}
+	// A declared UI surface counts as runnable. loops/tools alone misses the
+	// SURFACE-ONLY app — a read-only viewer whose entire value is its Studio
+	// tabs, so it legitimately declares `loops: []` and `tools: []` and was
+	// indistinguishable here from a knowledge bank. lumid-data-lake is exactly
+	// that shape and was told to "subscribe instead", which is the wrong verb:
+	// subscribing gives you a memory bank, not the surfaces you actually want.
+	// A knowledge agent declares no ui: block, so this still separates them.
+	if len(doc.UI.Surface) > 0 || len(doc.UI.Surfaces) > 0 {
+		return true
 	}
 	return len(doc.Loops) > 0 || len(doc.Tools) > 0
 }

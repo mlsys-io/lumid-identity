@@ -820,7 +820,7 @@ func casebookCaseDetail(appDir, caseID string) (map[string]any, bool) {
 	}
 	// structure_1 is the client brief the interviewee is allowed to hear.
 	if ctx, ok := raw["structure_1_client_basic_context"].(map[string]any); ok {
-		out["client_context"] = ctx
+		out["client_context"] = stripMetaKeys(ctx)
 	}
 	// structure_3 questions: the prompt text only. NOT state_machine, NOT
 	// appendix, and above all NOT structure_4 — an interviewee may read the
@@ -904,4 +904,31 @@ func MeCasebookCase(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
+}
+
+// stripMetaKeys drops dataset BOOKKEEPING keys from a case sub-object.
+//
+// The corpus annotates cases with underscore-prefixed authoring notes —
+// `_note`, `_quality_note`, `_version_change_log` — and 6 of the 50 cases carry
+// a `_note` inside structure_1, the client brief the candidate DOES see. The
+// Python reader has always dropped these (commands/_case.py::_strip_meta); this
+// Go reader was written later and passed the map through raw, so the note
+// surfaced in the Studio case browser as a field labelled "note", containing
+// CJK instructions to the case author about what not to mix into the prompt.
+//
+// The convention is the underscore, so match on that rather than a list of
+// known names — a new `_foo` must be dropped the day it is added, not the day
+// someone notices it on screen.
+func stripMetaKeys(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if strings.HasPrefix(k, "_") {
+			continue
+		}
+		if nested, ok := v.(map[string]any); ok {
+			v = stripMetaKeys(nested)
+		}
+		out[k] = v
+	}
+	return out
 }

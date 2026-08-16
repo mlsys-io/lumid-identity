@@ -170,3 +170,42 @@ func TestStripCaseVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestCasebookCaseDetail_StripsAuthoringNotes(t *testing.T) {
+	// 6 of the 50 live cases carry a `_note` inside structure_1 — the client
+	// brief the CANDIDATE sees. The Python reader has always dropped
+	// underscore-prefixed keys (_strip_meta); this Go reader was written later
+	// and passed the map through raw, so the note rendered in the Studio case
+	// browser as a field called "note" holding CJK instructions to the case
+	// author. Caught by looking at a screenshot, not by any assertion.
+	raw := fullCase()
+	ctx := raw["structure_1_client_basic_context"].(map[string]any)
+	ctx["_note"] = "仅含 upfront 信息（casebook 'Prompt' 栏）。严禁混入任何 upon request 内容。"
+	ctx["_quality_note"] = "internal QA remark"
+	ctx["nested"] = map[string]any{"keep": "yes", "_drop": "no"}
+
+	out, blob := detailOf(t, raw, "Case_019_BetaOptics_PK21")
+
+	for _, meta := range []string{"_note", "_quality_note", "仅含", "internal QA remark", "_drop"} {
+		if strings.Contains(blob, meta) {
+			t.Fatalf("authoring note %q reached the candidate view", meta)
+		}
+	}
+	cc, _ := out["client_context"].(map[string]any)
+	if cc["company"] != "BetaOptics" {
+		t.Fatal("stripping removed real content")
+	}
+	if n, ok := cc["nested"].(map[string]any); !ok || n["keep"] != "yes" {
+		t.Fatal("nested real content must survive")
+	}
+}
+
+func TestStripMetaKeys_MatchesOnThePrefix(t *testing.T) {
+	// Match the CONVENTION, not a list of known names — a new `_foo` must be
+	// dropped the day it is added, not the day someone spots it on screen.
+	in := map[string]any{"a": 1, "_b": 2, "_anything_new": 3}
+	got := stripMetaKeys(in)
+	if len(got) != 1 || got["a"] != 1 {
+		t.Fatalf("stripMetaKeys = %v, want only {a:1}", got)
+	}
+}

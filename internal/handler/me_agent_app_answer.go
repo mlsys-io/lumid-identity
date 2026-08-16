@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -757,4 +758,76 @@ func toolCaseOpen(userID, app, caseID, role string) (map[string]any, bool) {
 			false: "You are the INTERVIEWEE. This is the client brief only — the questions come one at a time from the interviewer.",
 		}[seat == caseRoleInterviewer],
 	}, true
+}
+
+// correctionOpenerRe matches the syntax the app's own page advertises —
+// "wrong — …". Anchored, because a correction is how a turn OPENS; the same
+// words mid-sentence are usually the user describing the case, not judging the
+// answer. "no" alone is deliberately absent: in interviewer mode it is how a
+// candidate legitimately starts an answer, and a false stage is worse than a
+// missed one — it puts words in the user's mouth in a queue they trust.
+var correctionOpenerRe = regexp.MustCompile(`(?i)^\s*(wrong|that'?s not right|that is not right|incorrect)\b`)
+
+// autoStageCorrection records a correction BEFORE the model turn, then lets the
+// turn proceed normally.
+//
+// The app page tells the user that "wrong — …" stages a correction in Review.
+// Leaving that to the tool description does not hold: observed twice in a live
+// walk, the model answered "Fair — I jumped straight into cost buckets, let me
+// redo it properly" and staged nothing. The user gets a better answer and an
+// empty queue, which reads as the feature being broken.
+//
+// So the record is deterministic and the conversation is still the model's. The
+// alternative — tool_choice — replaces the model turn entirely and would trade
+// the reply for the draft; and the lumid-llm gateway silently drops tool_choice
+// anyway, so model-side forcing is not dependable across providers.
+func autoStageCorrection(userID string, body meAgentChatBody) (map[string]any, bool) {
+	if body.Context == nil {
+		return nil, false
+	}
+	app, _ := body.Context["app"].(string)
+	if app == "" {
+		return nil, false
+	}
+	last, prevAssistant := "", ""
+	for i := len(body.Messages) - 1; i >= 0; i-- {
+		if last == "" && body.Messages[i].Role == "user" {
+			last = strings.TrimSpace(body.Messages[i].Content)
+			continue
+		}
+		if last != "" && body.Messages[i].Role == "assistant" {
+			prevAssistant = strings.TrimSpace(body.Messages[i].Content)
+			break
+		}
+	}
+	if last == "" || !correctionOpenerRe.MatchString(last) {
+		return nil, false
+	}
+	caseID, _ := body.Context["case_id"].(string)
+	res, ok := toolAppFeedback(userID, app, last, -1, feedbackContext{
+		CaseID: caseID,
+		Answer: prevAssistant,
+		// No skill card: naming one is a judgement about WHY the answer was
+		// wrong, and that is the model's job, not a regex's. It can still stage
+		// a card edit by calling the tool itself.
+	})
+	if !ok {
+		return nil, false
+	}
+	return res, true
+}
+
+// stagedCorrectionNote tells the model what already happened, so it neither
+// re-stages nor claims nothing was recorded.
+func stagedCorrectionNote(res map[string]any) string {
+	id, _ := res["draft_id"].(string)
+	if id == "" {
+		return ""
+	}
+	return "\n\nALREADY DONE THIS TURN: the user's correction was staged in Review as draft " + id +
+		". Do NOT call app_feedback again for it. Acknowledge in one short line that it is recorded and waiting " +
+		"in Review, then respond to the substance of the correction. If naming the analyst skill card it is about " +
+		"would help (issue_tree, market_sizing, npv, profitability, risk_mece, options, hypothesis_first, " +
+		"revenue_brainstorm, stakeholder_eval, value_to_customer), call app_feedback ONCE more with only that " +
+		"`skill` set, to stage the prompt-level fix alongside it."
 }

@@ -195,6 +195,15 @@ func MeAgentChatStream(c *gin.Context) {
 		}
 	}
 
+	// Record the correction before the model gets a say — see
+	// autoStageCorrection. The turn then continues normally, so the user gets
+	// both the draft and a real reply.
+	stagedNote := ""
+	if res, ok := autoStageCorrection(userID, body); ok {
+		emit(map[string]any{"type": "tool_call", "name": "app_feedback", "result": res})
+		stagedNote = stagedCorrectionNote(res)
+	}
+
 	if !acquireChatStream(userID) {
 		emit(map[string]any{
 			"type": "error", "code": "concurrent_streams",
@@ -228,7 +237,7 @@ func MeAgentChatStream(c *gin.Context) {
 	// this path. The system prompt IS used (passed as context).
 	if isClaudeCodeProvider(provider) {
 		basePrompt, _, _ := resolvePromptAndTools(userID, role, body, false)
-		systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
+		systemPrompt := basePrompt + modeSystemSuffix(body.Mode) + stagedNote
 		// Liveness before the first upstream byte: the PAT mint (argon2id)
 		// + a sandbox cold-start precede any NDJSON.
 		if !emit(map[string]any{"type": "status", "status": "starting"}) {
@@ -252,7 +261,7 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body, true)
-	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
+	systemPrompt := basePrompt + modeSystemSuffix(body.Mode) + stagedNote
 	totalInputTokens := 0
 	totalOutputTokens := 0
 

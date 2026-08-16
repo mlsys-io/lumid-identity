@@ -91,3 +91,43 @@ func TestPlainCorrectionIsNotACardEdit(t *testing.T) {
 		t.Fatalf("plain correction parsed as card %q", got)
 	}
 }
+
+// The advertised syntax is "wrong — …". It must fire on that and stay quiet on
+// everything else: a false stage puts words in the user's mouth in a queue they
+// are being asked to trust.
+func TestCorrectionOpenerMatches(t *testing.T) {
+	for _, yes := range []string{
+		"wrong — you never sized the addressable market",
+		"Wrong, that skips the cost side",
+		"that's not right — margin is per barrel",
+		"Thats not right",
+		"incorrect — the client is independent",
+	} {
+		if !correctionOpenerRe.MatchString(yes) {
+			t.Fatalf("should stage: %q", yes)
+		}
+	}
+	for _, no := range []string{
+		"no — I'd start with the cost side",        // a candidate's answer in interviewer mode
+		"I think the margin number is wrong",       // mid-sentence, describing not judging
+		"what would be wrong with that approach?",  // a question
+		"the case says the wrong price was quoted", // narration
+		"next question",
+		"",
+	} {
+		if correctionOpenerRe.MatchString(no) {
+			t.Fatalf("should NOT stage: %q", no)
+		}
+	}
+}
+
+// Without a draft_id there is nothing to tell the model, and an empty note must
+// not append stray instructions to every system prompt.
+func TestStagedNoteEmptyWithoutDraft(t *testing.T) {
+	if stagedCorrectionNote(map[string]any{}) != "" {
+		t.Fatal("no draft id should produce no note")
+	}
+	if !strings.Contains(stagedCorrectionNote(map[string]any{"draft_id": "fb-9"}), "fb-9") {
+		t.Fatal("note should name the draft")
+	}
+}

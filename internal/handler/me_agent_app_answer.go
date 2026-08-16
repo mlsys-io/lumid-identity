@@ -448,7 +448,7 @@ func toolAppFeedback(userID, app, note string, rating int, fc feedbackContext) (
 	out := map[string]any{
 		"ok": true, "app": app, "draft_id": d.ID, "agent": agent,
 		"state": "pending",
-		"next":  "waiting in this app's Review queue; approve it and it shapes later answers",
+		"next":  "captured in this app's Review queue, where it can be read in full or dismissed. Ingestion into the analyst's memory is not wired yet — say so if the user asks what happens next, rather than implying it already shapes answers",
 	}
 
 	// Second rung: a card-shaped correction also proposes a PROMPT edit. Only
@@ -466,8 +466,9 @@ func toolAppFeedback(userID, app, note string, rating int, fc feedbackContext) (
 		}
 		if err := draftStoreStage(sd); err == nil {
 			out["skill_draft_id"] = sd.ID
-			out["next"] = "TWO drafts are waiting in Review: a memory the analyst should recall, and an edit to the " +
-				fc.Skill + " skill card that shaped the answer. Neither changes anything until approved."
+			out["next"] = "TWO drafts are in Review: a memory the analyst should recall, and an edit to the " +
+				fc.Skill + " skill card that shaped the answer. Both are readable and dismissable; neither is applied, " +
+				"and the ingest step that would apply them is not built yet."
 		}
 	}
 	return out, true

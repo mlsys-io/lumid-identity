@@ -9,6 +9,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"lumid_identity/models"
 	"os"
 	"path/filepath"
 	"sort"
@@ -135,6 +136,22 @@ func toolListDrafts(userID, appFilter string) map[string]any {
 			})
 		}
 	}
+	// Union the DB-backed store, exactly as MeDraftsList does. Without this the
+	// chat sees a strictly smaller set than the Review table it is meant to
+	// operate on: app_feedback stages into the DB, and a CLOUD-installed app
+	// (or any kind=agent app, which lives under .xp/agents/ rather than the
+	// .xp/apps/ tree walked above) has nothing on disk here at all. Observed
+	// live — the user pressed Open on a visible pending row and the agent
+	// correctly reported 0 drafts and no such id, because the row it was
+	// looking at came from a store this tool could not see.
+	if rows, err := draftStoreList(userID, appFilter, "pending"); err == nil {
+		for _, r := range rows {
+			out = append(out, map[string]any{
+				"id": r.ID, "app": r.App, "agent": r.Agent,
+				"subject": r.Subject, "body": r.Body,
+			})
+		}
+	}
 	return map[string]any{"drafts": out, "count": len(out)}
 }
 
@@ -143,7 +160,15 @@ func toolListDrafts(userID, appFilter string) map[string]any {
 func toolDraftAction(userID, id, action string, patch map[string]any) map[string]any {
 	abs, app, rel := resolveDraftByID(userID, id)
 	if abs == "" {
-		return map[string]any{"error": "draft not found"}
+		// Not on disk — try the DB store. The filesystem path below is the
+		// EMAIL pipeline: "send" enqueues an intent the scheduler drains through
+		// the app's skills/email/send.py under the tenant's Gmail grant. A
+		// feedback draft has no such file and no recipient, so routing it there
+		// fails deep in the scheduler rather than here. Dismiss is the same
+		// gesture for both, so it is honoured; approval is not, because for a
+		// feedback draft "approve" means ingest into the knowledge graph, which
+		// is not this path and does not yet exist.
+		return dbDraftAction(userID, id, action)
 	}
 	appDir := filepath.Join(tenantAppsDir(userID), app)
 	stateMap := loadStateMap(appDir)
@@ -271,4 +296,41 @@ func toolPatchLoop(userID, app, loop string, patch map[string]any) map[string]an
 		"overrides": loopOver,
 		"note":      "Override saved. Scheduler picks it up on next refresh tick (≤60s).",
 	}
+}
+
+// dbDraftAction handles the DB-backed drafts app_feedback stages. Dismiss is
+// real. Approval deliberately refuses rather than flipping a state nothing
+// consumes: a button that reports success and changes nothing is worse than one
+// that says it is not wired yet, because the user stops watching for the effect.
+func dbDraftAction(userID, id, action string) map[string]any {
+	rows, err := draftStoreList(userID, "", "")
+	if err != nil {
+		return map[string]any{"error": "draft not found"}
+	}
+	var found *models.MeDraft
+	for i := range rows {
+		if rows[i].ID == id {
+			found = &rows[i]
+			break
+		}
+	}
+	if found == nil {
+		return map[string]any{"error": "draft not found"}
+	}
+	switch action {
+	case "dismiss":
+		if err := draftStoreAct(userID, id, "rejected"); err != nil {
+			return map[string]any{"error": "dismiss: " + err.Error()}
+		}
+		return map[string]any{"ok": true, "id": id, "state": "rejected",
+			"note": "dropped from the review queue; nothing was ingested"}
+	case "send":
+		return map[string]any{
+			"error": "this draft cannot be approved yet",
+			"why": "it is a " + found.Subject + " staged by app_feedback, not an outbound message. " +
+				"Approving it should ingest it into " + found.Agent + ", and that path is not built. " +
+				"It stays pending; Dismiss works if you want it out of the queue.",
+		}
+	}
+	return map[string]any{"error": "unsupported action for this draft: " + action}
 }

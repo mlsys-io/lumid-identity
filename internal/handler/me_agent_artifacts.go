@@ -49,6 +49,40 @@ const (
 
 var artifactIDRe = regexp.MustCompile(`^art-[a-f0-9]{16}$`)
 
+// artifactKinds — the kinds lumid_ui's ArtifactView can render, in the order it
+// declares them. Shared by the native save_artifact tool AND POST /me/artifacts
+// so the two entry points cannot drift (they did drift once: ArtifactView grew
+// `chart` support that save_artifact's enum never allowed, so no chart could ever
+// be created).
+//
+// The spec-bearing kinds carry JSON in Content:
+//
+//	chart    {type,xKey,data,series}                      recharts; legacy shape, still rendered
+//	vega     a Vega-Lite spec                             the richer default for new charts
+//	candles  {data:[{time,open,high,low,close,volume?}]}   OHLC on a financial time scale
+//	table    [rows] | {columns,rows}                       sortable/filterable result grid
+//
+// image / audio / pdf are deliberately absent: those are data: URLs written by
+// the media tools through persistMediaArtifact, which carries a larger ceiling.
+var artifactKinds = []string{"markdown", "code", "json", "text", "chart", "vega", "candles", "table"}
+
+// normalizeArtifactKind lower-cases and defaults the kind, reporting whether it
+// is renderable. Empty means "markdown" — the historical default.
+func normalizeArtifactKind(k string) (string, bool) {
+	k = strings.ToLower(strings.TrimSpace(k))
+	if k == "" {
+		return "markdown", true
+	}
+	for _, ok := range artifactKinds {
+		if k == ok {
+			return k, true
+		}
+	}
+	return k, false
+}
+
+func artifactKindsHint() string { return strings.Join(artifactKinds, "|") }
+
 func newArtifactID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
@@ -114,14 +148,9 @@ func toolSaveArtifact(userID string, args map[string]any) (map[string]any, bool)
 	if content == "" {
 		return map[string]any{"error": "content required"}, false
 	}
-	kind = strings.ToLower(strings.TrimSpace(kind))
-	switch kind {
-	case "":
-		kind = "markdown"
-	case "markdown", "code", "json", "text":
-		// ok
-	default:
-		return map[string]any{"error": "kind must be one of markdown|code|json|text"}, false
+	kind, kindOK := normalizeArtifactKind(kind)
+	if !kindOK {
+		return map[string]any{"error": "kind must be one of " + artifactKindsHint()}, false
 	}
 	return persistArtifact(userID, artifact{
 		Kind: kind, Title: title, Language: language, Content: content, SourceTool: srcTool,
@@ -235,4 +264,68 @@ func MeArtifactDelete(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"id": id}})
+}
+
+// MeArtifactCreate — POST /api/v1/me/artifacts.
+//
+// The write counterpart to the three read routes above. It exists because the
+// Claude Code provider path had NO way to save an artifact at all: the native
+// save_artifact tool (toolSaveArtifact) is dispatched inside this service's own
+// tool loop, but a Claude Code turn runs in claude-sandbox and reaches Lumid only
+// through MCP. So ArtifactView could render a chart that nothing was able to
+// produce. LumidOS's `save_artifact` MCP tool POSTs here with the per-turn
+// ephemeral PAT, which authenticates as the user like any other /me call.
+//
+// Same ceiling, pruning and kind validation as the native tool — persistArtifact
+// and normalizeArtifactKind are shared, so the two paths cannot diverge.
+func MeArtifactCreate(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	var body struct {
+		Title      string `json:"title"`
+		Content    string `json:"content"`
+		Kind       string `json:"kind"`
+		Language   string `json:"language"`
+		SourceTool string `json:"source_tool"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	title := strings.TrimSpace(body.Title)
+	content := strings.TrimSpace(body.Content)
+	if title == "" {
+		fail(c, http.StatusBadRequest, 1400, "title required")
+		return
+	}
+	if content == "" {
+		fail(c, http.StatusBadRequest, 1400, "content required")
+		return
+	}
+	kind, kindOK := normalizeArtifactKind(body.Kind)
+	if !kindOK {
+		fail(c, http.StatusBadRequest, 1400, "kind must be one of "+artifactKindsHint())
+		return
+	}
+	out, saved := persistArtifact(userID, artifact{
+		Kind: kind, Title: title, Language: body.Language,
+		Content: content, SourceTool: body.SourceTool,
+	}, artifactMaxContent)
+	if !saved {
+		msg, _ := out["error"].(string)
+		if msg == "" {
+			msg = "save failed"
+		}
+		// A content-too-long rejection is the caller's fault, not the server's.
+		status := http.StatusInternalServerError
+		if strings.Contains(msg, "too long") || strings.Contains(msg, "required") {
+			status = http.StatusBadRequest
+		}
+		fail(c, status, 1400, msg)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": out})
 }

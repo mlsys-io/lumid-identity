@@ -58,6 +58,11 @@ const (
 	rebalanceSkewFactor = 2.0
 	// Accounts with no load still need a denominator for the skew ratio.
 	skewFloor = 1.0
+	// How long after a user's last pooled request they are treated as mid-session
+	// and shielded from DISCRETIONARY moves. Long enough to span the pauses inside
+	// a real conversation (reading a diff, running a build), short enough that the
+	// user cap is still enforced within an hour of a busy pool going quiet.
+	activeSessionWindow = 30 * time.Minute
 )
 
 var lastAssignmentRun time.Time
@@ -406,6 +411,114 @@ func computeAssignment(loads []userLoad, accounts []string, maxPer int) map[stri
 	return out
 }
 
+// placementInputs is everything the per-user placement decision reads. Grouped
+// into a struct so the decision itself stays a pure function that a test can
+// drive without a database.
+type placementInputs struct {
+	ideal          map[string]string // where each user should be
+	cur            map[string]string // where each user is now
+	load           map[string]int64
+	valid          map[string]bool // account still in the pool at all
+	servable       map[string]bool // account can currently take traffic
+	active         map[string]bool // user made a pooled request very recently
+	rebalance      bool
+	sharingTooWide bool
+	curSkew        float64
+}
+
+// placementWrites decides which users to move, and reports how many moves were
+// deferred because the user is mid-conversation.
+//
+// A DISCRETIONARY move (load skew, user-cap de-sharing) changes which
+// subscription serves someone RIGHT NOW, so a conversation already in flight
+// continues on a different account: subscription B receives turn N of a session
+// it has never seen, with no prompt-cache history, carrying content that
+// references context it never got.
+//
+// Measured 2026-08-16: ac5 was added at 14:53:07; four minutes later a
+// `rebalance` moved 2 users — including the heaviest at 218M — off ac7
+// mid-conversation, and ac7 was dead at 15:06:59. The user cap that fired it
+// exists to REDUCE suspension risk by bounding how many humans share one
+// subscription, so satisfying it that way trades one suspension signal for
+// another.
+//
+// Deferring is not cancelling: `sharingTooWide` stays true, EnsureAssignments
+// re-runs on its 10-minute cadence, and the move lands as soon as the user goes
+// quiet. Only the TIMING changes.
+//
+// `initial`, `account-gone` and `exhausted` are deliberately NOT deferred —
+// those users have no stable origin to protect, because lease-time is already
+// sending them elsewhere on every request. Moving them is placement catching up
+// to reality, not new churn.
+func placementWrites(in placementInputs) ([]models.ClaudeUserAssignment, int) {
+	var writes []models.ClaudeUserAssignment
+	deferred := 0
+	for sub, want := range in.ideal {
+		have, placed := in.cur[sub]
+		reason := ""
+		switch {
+		case !placed:
+			reason = "initial"
+		case !in.valid[have]:
+			reason = "account-gone"
+		case in.rebalance && have != want && in.servable[have] && in.active[sub]:
+			// Mid-session, and their current origin still works — leave them.
+			deferred++
+			continue
+		case in.rebalance && have != want:
+			// Distinguish the triggers: an operator reading the table should be
+			// able to tell a load correction from a deliberate de-sharing from an
+			// evacuation, since they mean different things — only de-sharing is
+			// about suspension risk, and only evacuation says the old account had
+			// run out of quota.
+			reason = "rebalance"
+			switch {
+			case !in.servable[have]:
+				reason = "exhausted"
+			case in.sharingTooWide && in.curSkew <= rebalanceSkewFactor:
+				reason = "user-cap"
+			}
+		default:
+			continue // keep the existing origin
+		}
+		writes = append(writes, models.ClaudeUserAssignment{
+			UserSub: sub, Account: want, Load7d: in.load[sub], Reason: reason,
+		})
+	}
+	return writes, deferred
+}
+
+// activeUsers reports who has made a pooled request within `window`, i.e. who is
+// plausibly mid-conversation right now.
+//
+// On any query failure it returns an EMPTY set, not an error. The caller uses
+// this only to defer discretionary moves, so an empty set degrades to the old
+// always-move behaviour. Failing the other way — treating everyone as active
+// because the lookup broke — would silently stop the balancer from ever placing
+// anyone, which is a far worse failure than churn.
+func activeUsers(window time.Duration) map[string]bool {
+	active := map[string]bool{}
+	if window <= 0 {
+		return active
+	}
+	rows, err := common.DB.Raw(
+		`SELECT user_sub FROM usage_events WHERE kind = 'claude_proxy' GROUP BY user_sub HAVING MAX(ts) > ?`,
+		time.Now().UTC().Add(-window),
+	).Rows()
+	if err != nil {
+		log.Printf("claude-pool: active-user lookup failed, treating all as idle: %v", err)
+		return active
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sub string
+		if rows.Scan(&sub) == nil {
+			active[sub] = true
+		}
+	}
+	return active
+}
+
 // placementPopulation is everyone the balancer must place: users with recent
 // load, plus anyone already homed who has gone quiet.
 //
@@ -630,38 +743,23 @@ func EnsureAssignments(force bool) error {
 		}
 		rebalance := curSkew > rebalanceSkewFactor || sharingTooWide || stranded > 0
 
-		var writes []models.ClaudeUserAssignment
 		load := make(map[string]int64, len(loads))
 		for _, u := range loads {
 			load[u.UserSub] = u.Tokens
 		}
-		for sub, want := range ideal {
-			have, placed := cur[sub]
-			reason := ""
-			switch {
-			case !placed:
-				reason = "initial"
-			case !valid[have]:
-				reason = "account-gone"
-			case rebalance && have != want:
-				// Distinguish the triggers: an operator reading the table should
-				// be able to tell a load correction from a deliberate de-sharing
-				// from an evacuation, since they mean different things —
-				// only de-sharing is about suspension risk, and only evacuation
-				// says the old account had run out of quota.
-				reason = "rebalance"
-				switch {
-				case !servable[have]:
-					reason = "exhausted"
-				case sharingTooWide && curSkew <= rebalanceSkewFactor:
-					reason = "user-cap"
-				}
-			default:
-				continue // keep the existing origin
-			}
-			writes = append(writes, models.ClaudeUserAssignment{
-				UserSub: sub, Account: want, Load7d: load[sub], Reason: reason,
-			})
+		writes, deferred := placementWrites(placementInputs{
+			ideal: ideal, cur: cur, load: load,
+			valid: valid, servable: servable,
+			active:         activeUsers(activeSessionWindow),
+			rebalance:      rebalance,
+			sharingTooWide: sharingTooWide,
+			curSkew:        curSkew,
+		})
+		if deferred > 0 {
+			// Visible on purpose: while this is non-zero the cap may read as
+			// violated on the dashboard and that is the intended state, not a
+			// stuck balancer. It clears on its own as those users go quiet.
+			log.Printf("claude-pool: deferred %d mid-session move(s) to the next tick (skew %.2f, cap-wide %v)", deferred, curSkew, sharingTooWide)
 		}
 		if len(writes) == 0 {
 			return nil

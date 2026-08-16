@@ -246,3 +246,121 @@ func TestOverCapForcesARebalance(t *testing.T) {
 		t.Error("a user on a removed account was counted against a live account")
 	}
 }
+
+// --- mid-session deferral ---------------------------------------------------
+
+func basePlacement() placementInputs {
+	return placementInputs{
+		ideal:          map[string]string{"u1": "b"},
+		cur:            map[string]string{"u1": "a"},
+		load:           map[string]int64{"u1": 100},
+		valid:          map[string]bool{"a": true, "b": true},
+		servable:       map[string]bool{"a": true, "b": true},
+		active:         map[string]bool{},
+		rebalance:      true,
+		sharingTooWide: true,
+		curSkew:        1.0,
+	}
+}
+
+func TestActiveUserIsNotMovedMidSession(t *testing.T) {
+	in := basePlacement()
+	in.active = map[string]bool{"u1": true}
+	writes, deferred := placementWrites(in)
+	if len(writes) != 0 {
+		t.Fatalf("moved a mid-session user: %+v", writes)
+	}
+	if deferred != 1 {
+		t.Fatalf("deferred = %d, want 1", deferred)
+	}
+}
+
+func TestIdleUserIsStillMoved(t *testing.T) {
+	writes, deferred := placementWrites(basePlacement())
+	if len(writes) != 1 || writes[0].Account != "b" {
+		t.Fatalf("idle user not moved: %+v", writes)
+	}
+	if deferred != 0 {
+		t.Fatalf("deferred = %d, want 0", deferred)
+	}
+	if writes[0].Reason != "user-cap" {
+		t.Fatalf("reason = %q, want user-cap", writes[0].Reason)
+	}
+}
+
+// Being mid-conversation must not strand someone on an account that cannot
+// serve them: an evacuation is not discretionary, so it overrides the deferral.
+func TestActiveUserIsStillEvacuatedFromExhaustedAccount(t *testing.T) {
+	in := basePlacement()
+	in.active = map[string]bool{"u1": true}
+	in.servable = map[string]bool{"a": false, "b": true}
+	writes, deferred := placementWrites(in)
+	if len(writes) != 1 || writes[0].Reason != "exhausted" {
+		t.Fatalf("active user not evacuated: %+v (deferred=%d)", writes, deferred)
+	}
+}
+
+func TestActiveUserIsStillMovedOffARemovedAccount(t *testing.T) {
+	in := basePlacement()
+	in.active = map[string]bool{"u1": true}
+	in.valid = map[string]bool{"a": false, "b": true}
+	writes, _ := placementWrites(in)
+	if len(writes) != 1 || writes[0].Reason != "account-gone" {
+		t.Fatalf("active user not moved off a removed account: %+v", writes)
+	}
+}
+
+// A brand-new user has no origin to protect, so activity must not block them.
+func TestActiveUnplacedUserIsStillPlaced(t *testing.T) {
+	in := basePlacement()
+	in.cur = map[string]string{}
+	in.active = map[string]bool{"u1": true}
+	writes, _ := placementWrites(in)
+	if len(writes) != 1 || writes[0].Reason != "initial" {
+		t.Fatalf("new active user not placed: %+v", writes)
+	}
+}
+
+// The deferral must hold a move, never drop it: once the user goes quiet the
+// very next tick performs it, with no other input changing.
+func TestDeferredMoveLandsOnceUserGoesQuiet(t *testing.T) {
+	in := basePlacement()
+	in.active = map[string]bool{"u1": true}
+	if w, d := placementWrites(in); len(w) != 0 || d != 1 {
+		t.Fatalf("tick 1 should defer, got writes=%+v deferred=%d", w, d)
+	}
+	in.active = map[string]bool{}
+	w, d := placementWrites(in)
+	if len(w) != 1 || w[0].Account != "b" || d != 0 {
+		t.Fatalf("tick 2 should move, got writes=%+v deferred=%d", w, d)
+	}
+}
+
+// Deferring keeps `rebalance` true for longer, which disables the skew
+// hysteresis for everyone else. That must not make settled users churn: with a
+// stable `ideal`, a user already on their target produces no write no matter
+// how many ticks run.
+func TestSettledUsersDoNotChurnWhileAMoveIsDeferred(t *testing.T) {
+	in := placementInputs{
+		ideal:          map[string]string{"active": "b", "settled": "a"},
+		cur:            map[string]string{"active": "a", "settled": "a"},
+		load:           map[string]int64{"active": 100, "settled": 10},
+		valid:          map[string]bool{"a": true, "b": true},
+		servable:       map[string]bool{"a": true, "b": true},
+		active:         map[string]bool{"active": true},
+		rebalance:      true, // stays true precisely because the move is deferred
+		sharingTooWide: true,
+		curSkew:        9.0,
+	}
+	for tick := 0; tick < 5; tick++ {
+		writes, deferred := placementWrites(in)
+		if deferred != 1 {
+			t.Fatalf("tick %d: deferred = %d, want 1", tick, deferred)
+		}
+		for _, w := range writes {
+			if w.UserSub == "settled" {
+				t.Fatalf("tick %d: settled user churned to %s", tick, w.Account)
+			}
+		}
+	}
+}

@@ -157,3 +157,36 @@ func TestDraftIDGateAcceptsBothStores(t *testing.T) {
 		}
 	}
 }
+
+// The vocabulary map fires only on the words a user actually uses to name a
+// failure, and fails closed. A wrong card sends the reviewer to edit a prompt
+// that had nothing to do with the mistake.
+func TestCardFromCorrection(t *testing.T) {
+	cases := map[string]string{
+		"wrong — you never sized the addressable market before splitting costs": "market_sizing",
+		"that's not right, the issue tree is not MECE":                          "issue_tree",
+		"wrong — you skipped NPV entirely":                                      "npv",
+		"incorrect — no downside case at all":                                   "risk_mece",
+		"wrong — you didn't state a hypothesis first":                           "hypothesis_first",
+		// no vocabulary match → the model may still name one
+		"wrong — that whole answer is off":                "",
+		"wrong — the client is independent, not PE-owned": "",
+		// two cards named at once is one correction about two things
+		"wrong — no market sizing and the issue tree is not MECE": "",
+	}
+	for note, want := range cases {
+		if got := cardFromCorrection(note); got != want {
+			t.Errorf("%q → %q, want %q", note, got, want)
+		}
+	}
+}
+
+// Anything the vocabulary produces must survive the allowlist that guards the
+// file path — the two lists cannot be allowed to drift apart.
+func TestVocabularyCardsAreAllAllowlisted(t *testing.T) {
+	for _, v := range cardVocabulary {
+		if !knownSkillCards[v.card] {
+			t.Fatalf("%q is in the vocabulary but not the allowlist — it would stage a draft that can never apply", v.card)
+		}
+	}
+}

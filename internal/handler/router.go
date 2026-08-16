@@ -338,9 +338,18 @@ func Register(r *gin.Engine) {
 			me.POST("/personas", MePersonaSave)
 			me.DELETE("/personas/:id", MePersonaDelete)
 
-			// Artifacts — saved long-form output from chat. Backed
-			// by ~/.tenants/<userID>/.artifacts/<id>.json.
+			// Artifacts — saved long-form output from chat: markdown/code/
+			// json/text plus the rendered kinds (chart, vega, candles, table)
+			// and the media kinds (image, audio, pdf). Backed by the
+			// `me_artifacts` table via models.MeArtifact — NOT by tenant files,
+			// which is what an earlier version of this comment claimed.
+			//
+			// POST is the write path for the Claude Code provider, whose turn runs
+			// in claude-sandbox and can only reach Lumid over MCP; the native
+			// save_artifact tool is dispatched in-process and never passes through
+			// here. See MeArtifactCreate.
 			me.GET("/artifacts", MeArtifactsList)
+			me.POST("/artifacts", MeArtifactCreate)
 			me.GET("/artifacts/:id", MeArtifactGet)
 			me.DELETE("/artifacts/:id", MeArtifactDelete)
 

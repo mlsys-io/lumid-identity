@@ -2855,13 +2855,13 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "save_artifact",
-			"description": "Save a piece of output (markdown brief, code listing, JSON dataset, plain text) as a persistent artifact in the user's tenant. The artifact appears in the Studio artifact panel and survives across sessions. Use this when the chat produces a long-form deliverable the user is likely to revisit: a research brief from deep_research, a generated script from code_run, a structured summary they asked you to compile. Always set a clear `title` (e.g. 'AAPL Q1 earnings brief' — not 'untitled'). The returned `id` + `url` can be referenced in follow-up turns.",
+			"description": "Save a piece of output as a persistent artifact in the user's tenant. The artifact appears in the Studio artifact panel and survives across sessions. Use this when the chat produces a long-form deliverable the user is likely to revisit: a research brief from deep_research, a generated script from code_run, a structured summary they asked you to compile. ALSO reach for this to VISUALIZE query results — after fetching rows, save a `vega` chart (or `candles` for a price series, `table` for rows worth sorting) instead of typing numbers into prose. Always set a clear `title` (e.g. 'AAPL Q1 earnings brief' — not 'untitled'). The returned `id` + `url` can be referenced in follow-up turns.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"title":       map[string]any{"type": "string", "description": "Human-readable name for the artifact, max ~80 chars ideal."},
-					"content":     map[string]any{"type": "string", "description": "Body of the artifact. Plain text, markdown, code, or JSON — match the `kind`."},
-					"kind":        map[string]any{"type": "string", "enum": []string{"markdown", "code", "json", "text"}, "description": "Rendering hint. Default: markdown."},
+					"content":     map[string]any{"type": "string", "description": "Body of the artifact. Prose/markdown/code for the text kinds; a JSON string for chart|vega|candles|table (see `kind`)."},
+					"kind":        map[string]any{"type": "string", "enum": artifactKinds, "description": "Rendering hint. Default: markdown. `vega` = a Vega-Lite spec (preferred for charts — supports layering, faceting, binning, dual axis, heatmaps, and interactive tooltips/zoom). `candles` = {\"data\":[{\"time\":\"YYYY-MM-DD\",\"open\":..,\"high\":..,\"low\":..,\"close\":..,\"volume\":..}]} on a financial time scale. `table` = an array of row objects (sortable + filterable in the panel). `chart` = the older recharts shape {\"type\":\"line|bar|area\",\"xKey\":\"..\",\"data\":[..]} where `series` may be omitted."},
 					"language":    map[string]any{"type": "string", "description": "For kind=code: source language (python, go, js, sql, …)."},
 					"source_tool": map[string]any{"type": "string", "description": "Optional — which prior tool produced this content (e.g. deep_research, code_run). Surfaces as a badge in the panel."},
 				},

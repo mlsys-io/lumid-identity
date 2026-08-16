@@ -807,9 +807,10 @@ func autoStageCorrection(userID string, body meAgentChatBody) (map[string]any, b
 	res, ok := toolAppFeedback(userID, app, last, -1, feedbackContext{
 		CaseID: caseID,
 		Answer: prevAssistant,
-		// No skill card: naming one is a judgement about WHY the answer was
-		// wrong, and that is the model's job, not a regex's. It can still stage
-		// a card edit by calling the tool itself.
+		// Only when the correction names the failure in a card's own vocabulary.
+		// Judging WHY an answer was wrong stays the model's job; this stops the
+		// second rung from depending on it choosing to act.
+		Skill: cardFromCorrection(last),
 	})
 	if !ok {
 		return nil, false
@@ -830,4 +831,45 @@ func stagedCorrectionNote(res map[string]any) string {
 		"would help (issue_tree, market_sizing, npv, profitability, risk_mece, options, hypothesis_first, " +
 		"revenue_brainstorm, stakeholder_eval, value_to_customer), call app_feedback ONCE more with only that " +
 		"`skill` set, to stage the prompt-level fix alongside it."
+}
+
+// cardVocabulary maps the words a user actually uses when they say what went
+// wrong onto the skill card that governs it.
+//
+// This is NOT the model's job of judging WHY an answer was wrong — it only
+// fires when the correction names the failure in the card's own vocabulary
+// ("you never sized the market" → market_sizing). Everything else falls through
+// to no card at all, and the model can still stage one by calling app_feedback
+// with `skill` itself. Inclusion-based and failing closed, because a wrong card
+// sends the reviewer to edit a prompt that had nothing to do with the mistake.
+var cardVocabulary = []struct {
+	card   string
+	phrase *regexp.Regexp
+}{
+	{"market_sizing", regexp.MustCompile(`(?i)\b(siz(e|ed|ing) the (addressable )?market|market siz(e|ing)|addressable market|tam\b|bottom.?up estimate)`)},
+	{"issue_tree", regexp.MustCompile(`(?i)\b(issue tree|not mece|isn'?t mece|overlap(s|ping)? branches|structure (is|was) flat|buckets overlap)`)},
+	{"profitability", regexp.MustCompile(`(?i)\b(profit(ability)? (tree|driver|equation)|revenue minus cost|didn'?t split (revenue|cost))`)},
+	{"npv", regexp.MustCompile(`(?i)\b(npv|discount(ed|ing)? (the )?cash ?flows?|time value of money|payback period)`)},
+	{"risk_mece", regexp.MustCompile(`(?i)\b(no downside|didn'?t (consider|mention) risk|risks?( were)? missing|sensitivity analysis)`)},
+	{"options", regexp.MustCompile(`(?i)\b(only one option|didn'?t compare (the )?alternatives?|no alternatives)`)},
+	{"hypothesis_first", regexp.MustCompile(`(?i)\b(no hypothesis|didn'?t (state|lead with) (a|your) hypothesis|boiled the ocean)`)},
+	{"revenue_brainstorm", regexp.MustCompile(`(?i)\b(revenue (ideas|levers|streams) )?(too thin|missed obvious)|didn'?t brainstorm`)},
+	{"stakeholder_eval", regexp.MustCompile(`(?i)\b(stakeholder|who owns|ignored (the )?(ceo|board|investors))`)},
+	{"value_to_customer", regexp.MustCompile(`(?i)\b(willingness to pay|value to (the )?customer|customer value)`)},
+}
+
+// cardFromCorrection returns the card the user's own words name, or "".
+func cardFromCorrection(note string) string {
+	hit := ""
+	for _, v := range cardVocabulary {
+		if v.phrase.MatchString(note) {
+			if hit != "" {
+				// Two cards named at once is one correction about two things.
+				// Staging either would be a guess about which they meant.
+				return ""
+			}
+			hit = v.card
+		}
+	}
+	return hit
 }

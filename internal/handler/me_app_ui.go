@@ -70,8 +70,31 @@ type appUINavItem struct {
 	Label   string `yaml:"label"   json:"label,omitempty"`
 }
 
+// appUIOpenerChip is one starter chip in an app-declared opener.
+type appUIOpenerChip struct {
+	Label  string `yaml:"label"  json:"label"`
+	Prompt string `yaml:"prompt" json:"prompt"`
+}
+
+// appUIOpener lets an app own the chat's FIRST turn.
+//
+// The default opener is operator-shaped — "N workflows, last run 1h ago" with
+// chips like "run a workflow" / "improve a workflow" — which is right for an
+// app you OPERATE and wrong for one you USE. A person who opened
+// mbb-consultant to practise a consulting case was greeted with workflow
+// telemetry, none of which is anything they can act on.
+//
+// Declaring this is opt-in: an app without it keeps the live-state default, so
+// nothing changes for the ops apps that the default was written for.
+type appUIOpener struct {
+	Line  string            `yaml:"line"  json:"line,omitempty"`
+	Chips []appUIOpenerChip `yaml:"chips" json:"chips,omitempty"`
+}
+
 type appUI struct {
 	Sidebar *appUISidebar `yaml:"sidebar" json:"sidebar,omitempty"`
+	// Opener overrides the chat's first turn for THIS app. See appUIOpener.
+	Opener *appUIOpener `yaml:"opener" json:"opener,omitempty"`
 	// Surface is the default ("home") surface — kept for back-compat.
 	Surface *appUISurface `yaml:"surface" json:"surface,omitempty"`
 	// Surfaces is the optional named-markdown map (name → bundle-relative .md).

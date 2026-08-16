@@ -750,3 +750,158 @@ func sign(f float64) float64 {
 	}
 	return 1
 }
+
+// ─── Case detail — the analyst-safe read behind the Studio case browser ───
+//
+// The roster (casebookRoster) can only carry scalar `fields`, truncated to 160
+// chars by caseFieldsPreview, so a user can see that a case EXISTS but never
+// what it says. This is the read that lets them actually open one.
+//
+// SAFETY: built by INCLUSION, never by stripping. `structure_4_ground_truth` is
+// the answer key, and mbb-consultant's procedure.md calls not reading it "the
+// one rule in this file that has no exception" — so this mirrors the Python
+// _case.analyst_view(), which is safe because it structurally cannot return it.
+// A deny-list would leak the moment the case schema grows a new field; an
+// allow-list fails closed instead. Do not "simplify" this into a delete.
+func casebookCaseDetail(appDir, caseID string) (map[string]any, bool) {
+	if caseID == "" || strings.ContainsAny(caseID, "/\\") || strings.Contains(caseID, "..") {
+		return map[string]any{"error": "invalid case id"}, false
+	}
+	// Resolve through the SAME roster the picker renders, so a case the UI
+	// offers is by construction a case this can open — and an id that is not
+	// on the roster is never turned into a filesystem path.
+	var path string
+	for _, rel := range casebookCaseDirs {
+		dirAbs := filepath.Join(appDir, rel)
+		ents, err := os.ReadDir(dirAbs)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			if e.IsDir() || strings.ToLower(filepath.Ext(e.Name())) != ".json" {
+				continue
+			}
+			stem := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			// Case identity is the file stem minus a trailing _vN, matching
+			// commands/_case.py — the in-file case_id is NOT unique (Case_001
+			// exists three times across PK20/PK21/PK23).
+			if stem == caseID || stripCaseVersion(stem) == caseID {
+				path = filepath.Join(dirAbs, e.Name())
+				break
+			}
+		}
+		if path != "" {
+			break
+		}
+	}
+	if path == "" {
+		return map[string]any{"error": "case not found: " + caseID}, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || int64(len(b)) > 2*1024*1024 {
+		return map[string]any{"error": "case unreadable"}, false
+	}
+	var raw map[string]any
+	if json.Unmarshal(b, &raw) != nil {
+		return map[string]any{"error": "case is not valid json"}, false
+	}
+
+	out := map[string]any{"id": caseID}
+	for _, k := range []string{
+		"case_type", "difficulty", "industry", "topic",
+		"expected_duration_minutes", "opening_prompt",
+	} {
+		if v, ok := raw[k]; ok && v != nil {
+			out[k] = v
+		}
+	}
+	if src, ok := raw["source"].(map[string]any); ok {
+		out["source"] = map[string]any{"title": src["title"], "year": src["year"]}
+	}
+	// structure_1 is the client brief the interviewee is allowed to hear.
+	if ctx, ok := raw["structure_1_client_basic_context"].(map[string]any); ok {
+		out["client_context"] = ctx
+	}
+	// structure_3 questions: the prompt text only. NOT state_machine, NOT
+	// appendix, and above all NOT structure_4 — an interviewee may read the
+	// question, never the marking scheme.
+	if qs, ok := raw["structure_3_case_questions"].(map[string]any); ok {
+		ids := make([]string, 0, len(qs))
+		for qid := range qs {
+			ids = append(ids, qid)
+		}
+		sort.Strings(ids)
+		questions := make([]map[string]any, 0, len(ids))
+		for _, qid := range ids {
+			q, _ := qs[qid].(map[string]any)
+			if q == nil {
+				continue
+			}
+			row := map[string]any{"q_id": qid}
+			for _, k := range []string{"type", "question_text", "information_to_share_upfront"} {
+				if v, ok := q[k]; ok && v != nil {
+					row[k] = v
+				}
+			}
+			questions = append(questions, row)
+		}
+		out["questions"] = questions
+	}
+	return out, true
+}
+
+// stripCaseVersion drops a trailing _vN so "Case_019_BetaOptics_PK21_v10"
+// and "Case_019_BetaOptics_PK21" name the same case.
+func stripCaseVersion(stem string) string {
+	i := strings.LastIndex(stem, "_v")
+	if i <= 0 {
+		return stem
+	}
+	for _, r := range stem[i+2:] {
+		if r < '0' || r > '9' {
+			return stem
+		}
+	}
+	if len(stem[i+2:]) == 0 {
+		return stem
+	}
+	return stem[:i]
+}
+
+// MeCasebookCase — GET /me/apps/:app/casebook/:case_id
+//
+// The case a user actually clicked. Deliberately NOT an entry in
+// readOnlyAppDataTools (me_app_data.go): that allowlist's funcs take no
+// arguments on purpose, because a surface renders unattended on page load and
+// anything reachable there runs without user intent behind it. A case id IS
+// user intent, so it gets its own route rather than widening that contract.
+//
+// Returns the analyst-safe view only — see casebookCaseDetail.
+func MeCasebookCase(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	if !slugRe.MatchString(app) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app")
+		return
+	}
+	caseID := c.Param("case_id")
+	appDir := resolveAppDir(userID, app)
+	if appDir == "" {
+		// Mirror MeCasebook: graceful, not a console 404 — the browser renders
+		// a clean empty state rather than looking broken.
+		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
+			"data": gin.H{"id": caseID, "unavailable": true}})
+		return
+	}
+	res, okRes := casebookCaseDetail(appDir, caseID)
+	if !okRes {
+		c.JSON(http.StatusNotFound, gin.H{"ret_code": 1404,
+			"message": "case not found", "data": res})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
+}

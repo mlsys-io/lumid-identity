@@ -397,6 +397,10 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/datasets", MeAppDatasets)
 			me.GET("/apps/:app/dataset-file", MeAppDatasetFile)
 			me.GET("/apps/:app/casebook", MeCasebook)
+			// One case, analyst-safe (no ground truth) — the Studio case
+			// browser's detail read. See MeCasebookCase for why this is a
+			// route and not a readOnlyAppDataTools entry.
+			me.GET("/apps/:app/casebook/:case_id", MeCasebookCase)
 			// Per-case data↔metric mapping log (AI labeling/scoring records).
 			me.GET("/apps/:app/casebook/case-log", MeCaseLog)
 			// A case's full evaluation report (per-Q breakdown + cited evidence).

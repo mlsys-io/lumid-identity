@@ -48,6 +48,12 @@ func main() {
 	// Sweep expired auto-minted claude-sandbox PATs hourly.
 	handler.StartClaudeSandboxPATSweep()
 
+	// Delete long-expired rows from `sessions`. Nothing pruned that table: it had
+	// reached 238,758 rows of which 238,732 were expired, i.e. 26 live sessions
+	// inside 161 MB, on a 2Gi PVC that had hit 95% full. This IS the auth
+	// authority's database.
+	handler.StartSessionReclaimLoop()
+
 	// Drop client-fingerprint observations too old for any window to read.
 	handler.StartClaudeFingerprintGC()
 

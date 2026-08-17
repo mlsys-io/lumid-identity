@@ -50,7 +50,7 @@ type ClaudeSessionTurn struct {
 	ID        uint64    `gorm:"primaryKey;autoIncrement"                                   json:"id"`
 	ConvKey   string    `gorm:"column:conv_key;size:32;index:idx_cturn_conv,priority:1;not null" json:"conv_key"`
 	TurnIndex int       `gorm:"column:turn_index;index:idx_cturn_conv,priority:2;not null" json:"turn_index"`
-	Ts        time.Time `gorm:"column:ts;autoCreateTime"                                   json:"ts"`
+	Ts        time.Time `gorm:"column:ts;autoCreateTime;index:idx_cturn_session,priority:2" json:"ts"`
 	Model     string    `gorm:"column:model;size:64"                                       json:"model"`
 	Endpoint  string    `gorm:"column:endpoint;size:128"                                   json:"endpoint"`
 	// FieldBox: which field-box relay carried THIS turn (account Label);
@@ -61,6 +61,18 @@ type ClaudeSessionTurn struct {
 	// ViaRelay: whether THIS turn actually took the relay hop (delivery),
 	// vs FieldBox which is only where it was meant to go (intent).
 	ViaRelay bool `gorm:"column:via_relay;not null;default:false"                     json:"via_relay"`
+	// SessionID is claude-proxy's lease stickiness unit for this turn — the
+	// client's x-claude-code-session-id, or the user sub when absent.
+	//
+	// ConvKey CANNOT substitute for it. ConvKey is hash(model + first user
+	// message), so distinct sessions opening with the same prompt (agent loops,
+	// repeated tasks, cron runs) share one ConvKey; grouping by it makes their
+	// legitimate placement on different accounts look like mid-session
+	// flapping. Indexed with Ts so the teleport query — consecutive turns of one
+	// SessionID whose FieldBox changes — is a range scan.
+	//
+	// Empty on rows written before 2026-08-17 and by any older proxy.
+	SessionID string `gorm:"column:session_id;size:64;index:idx_cturn_session,priority:1" json:"session_id"`
 	// TRUE wire bytes for this turn. ResponseBytes is counted per-chunk by the
 	// proxy, so it is NOT limited by the transcript blob cap — a truncated
 	// recording still reports its real size.

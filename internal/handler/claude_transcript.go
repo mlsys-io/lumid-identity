@@ -87,6 +87,9 @@ type transcriptBody struct {
 	// ViaRelay: delivery, vs FieldBox's intent. Labeled + via_relay=false is
 	// the silent-degradation case worth alerting on.
 	ViaRelay bool `json:"via_relay"`
+	// SessionID: the proxy's lease stickiness unit (x-claude-code-session-id,
+	// or the user sub when the client omits it). Empty from an older proxy.
+	SessionID string `json:"session_id"`
 	// TRUE wire sizes from the proxy (response counted per-chunk, so unaffected
 	// by the transcript cap).
 	RequestBytes  int64           `json:"request_bytes"`
@@ -157,6 +160,7 @@ func InternalClaudeTranscript(c *gin.Context) {
 		Truncated:     body.Truncated,
 		FieldBox:      body.FieldBox,
 		ViaRelay:      body.ViaRelay,
+		SessionID:     body.SessionID,
 		RequestBytes:  body.RequestBytes,
 		ResponseBytes: body.ResponseBytes,
 	}

@@ -30,6 +30,7 @@ import (
 	base64Stdlib "encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -382,14 +383,31 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, er
 			// expensive: a second holder means someone must stop using the credential
 			// (a re-add alone just gets revoked again), whereas a lost response means
 			// nothing is misconfigured and a re-add is the whole fix.
-			verdict := "SECOND-HOLDER SUSPECTED: no indeterminate exchange preceded this — " +
-				"another holder of this credential rotated the family. A pooled account " +
-				"must have exactly one holder: the pool. Find who ran `claude` as it."
-			if row.IndeterminateAt != nil {
+			// THREE causes, not two. The original binary split treated "not a lost
+			// response" as proof of a second holder, which is a non-sequitur — it
+			// is only proof that WE did not lose a rotation. On 2026-08-18
+			// ac9@yao.lu was quarantined with this verdict while no second holder
+			// existed: its access token was refused 31 minutes into a life that a
+			// sibling account minted 2 seconds earlier survived for 43, i.e. the
+			// family was killed upstream mid-life. Asserting a second holder there
+			// sent the operator hunting a person who was never there, so the bare
+			// case now names its own ambiguity instead of guessing.
+			verdict := "SECOND-HOLDER OR UPSTREAM REVOCATION: no indeterminate exchange preceded " +
+				"this, so no rotation of ours was lost — but that does not distinguish another " +
+				"holder rotating the family from Anthropic revoking it. Read the upstream detail " +
+				"above before going looking for a holder."
+			switch {
+			case row.IndeterminateAt != nil:
 				verdict = fmt.Sprintf("LOST-RESPONSE SUSPECTED: prior indeterminate exchange %s ago (%s) — "+
 					"our own rotation may have landed without us reading the reply; no second holder implied.",
 					time.Since(*row.IndeterminateAt).Round(time.Second),
 					truncStr(row.IndeterminateReason, 80))
+			case strings.Contains(caller, preExpiry401Marker):
+				verdict = "REVOKED-UPSTREAM: the access token was refused while still INSIDE its own " +
+					"JWT expiry and our last exchange completed cleanly, so nothing stale of ours was " +
+					"re-presented and no rotation was lost. The family was invalidated upstream rather " +
+					"than by anything this pool did. A re-add restores service but will NOT stop it " +
+					"recurring — the question is what upstream objected to, not who else holds the token."
 			}
 			reason := truncStr(strings.TrimSpace(errResp.Error+" — "+errResp.Desc), 180) + " | " + verdict
 			reason = truncStr(reason, 500)
@@ -434,9 +452,25 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, er
 	}
 
 	// Persist updated access token (and new refresh token if rotated).
+	//
+	// EVERY LINE BELOW IS POST-ROTATION. Anthropic rotated the family the instant
+	// it answered 200, so a failure from here on is exactly as destructive as a
+	// lost response: we are holding a credential the server has already
+	// superseded. Until 2026-08-18 all three failure paths here were SILENT —
+	// the access-token encrypt error returned the token without persisting it,
+	// the rotated refresh token's encrypt error was dropped on the floor with
+	// `_`, and the UPDATE's error was never checked at all. A lost rotation was
+	// therefore indistinguishable from a clean one, the row kept a bumped
+	// rotated_at and kept passing probes, and the NEXT exchange took the blame —
+	// with a confident "SECOND-HOLDER SUSPECTED" verdict naming a person who did
+	// not exist. markIndeterminate is precisely the right marker for all three:
+	// it says "the family may have moved upstream without us", and it flips the
+	// eventual quarantine verdict to LOST-RESPONSE, which is the truth.
 	newEnc, err := common.EncryptGrant(tok.AccessToken)
 	if err != nil {
-		return tok.AccessToken, fmt.Errorf("encrypt new token: %w", err)
+		markIndeterminate(row, caller, started,
+			fmt.Sprintf("200 but the new access token could not be encrypted: %v", err))
+		return "", fmt.Errorf("token refresh indeterminate (200, access token unstorable): %w", err)
 	}
 	now := time.Now()
 	updates := map[string]interface{}{
@@ -448,14 +482,38 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, er
 		// The true rotation clock the sweep damps on. See ClaudeQuotaToken.
 		"rotated_at": now,
 	}
-	row.RotatedAt = &now
 	if tok.RefreshToken != "" && tok.RefreshToken != refreshTok {
-		newRefEnc, _ := common.EncryptGrant(tok.RefreshToken)
-		if newRefEnc != "" {
-			updates["refresh_token_encrypted"] = newRefEnc
+		newRefEnc, encErr := common.EncryptGrant(tok.RefreshToken)
+		if encErr != nil || newRefEnc == "" {
+			// Storing the new ACCESS token while silently keeping the OLD refresh
+			// token is the worst outcome on offer: the row looks freshly rotated
+			// and probes keep succeeding for the access token's whole life, while
+			// the stored refresh token is already dead upstream. The failure then
+			// surfaces up to an hour later, on an unrelated caller, with every
+			// local signal saying the last rotation was clean.
+			if encErr == nil {
+				encErr = errors.New("encrypt returned empty ciphertext")
+			}
+			markIndeterminate(row, caller, started,
+				fmt.Sprintf("200 but the rotated refresh token could not be stored: %v", encErr))
+			return "", fmt.Errorf("token refresh indeterminate (200, rotated refresh token unstorable): %w", encErr)
 		}
+		updates["refresh_token_encrypted"] = newRefEnc
 	}
-	common.DB.Model(row).Updates(updates)
+	if err := common.DB.Model(row).Updates(updates).Error; err != nil {
+		markIndeterminate(row, caller, started,
+			fmt.Sprintf("200 but the rotation could not be persisted: %v", err))
+		return "", fmt.Errorf("token refresh indeterminate (200, persist failed): %w", err)
+	}
+	// Only now is the in-memory row true. ValueEncrypted especially: leaving it
+	// stale made this row claim a value the DB no longer held, which is the exact
+	// input the collapse guard above compares against.
+	row.RotatedAt = &now
+	row.ValueEncrypted = newEnc
+	if enc, ok := updates["refresh_token_encrypted"].(string); ok {
+		row.RefreshTokenEncrypted = enc
+	}
+	row.RevokedAt, row.RevokeReason = nil, ""
 	recordExchange(row, caller, "ok", started, "")
 	return tok.AccessToken, nil
 }
@@ -507,10 +565,17 @@ func fetchClaudeUsage(token string) (*models.ClaudeQuotaSnapshot, error) {
 		return nil, fmt.Errorf("api.anthropic.com unreachable: %w", err)
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	probeBodyRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return nil, fmt.Errorf("token invalid or unauthorized (HTTP %d)", resp.StatusCode)
+		// KEEP THE BODY. It is the only place Anthropic states WHY a credential
+		// was refused, and an ordinary expiry, a rotated family and a policy
+		// revocation are distinguishable there and nowhere else on our side.
+		// Discarding it (as this did until 2026-08-18) is exactly what left the
+		// ac9@yao.lu quarantine unattributable: the row recorded "HTTP 401" and
+		// the sentence that would have explained it was thrown away unread.
+		return nil, fmt.Errorf("token invalid or unauthorized (HTTP %d): %s",
+			resp.StatusCode, truncStr(strings.TrimSpace(string(probeBodyRaw)), 300))
 	}
 	// 200=ok, 429=rate-limited (headers still present), 400=keyed but bad body — all usable.
 	if resp.StatusCode != 200 && resp.StatusCode != 429 && resp.StatusCode != 400 {
@@ -599,6 +664,13 @@ func severityFromStatus(status string, pct float64) string {
 	return "normal"
 }
 
+// preExpiry401Marker rides in the refresh caller string when the access token
+// that triggered the refresh was refused while still inside its own JWT expiry.
+// It travels as part of `caller` deliberately: caller is already threaded into
+// recordExchange, the exchange log line and the quarantine verdict, so the fact
+// reaches all three without a schema change or a new parameter on every hop.
+const preExpiry401Marker = "pre-expiry-401"
+
 // refreshSnapshot fetches live quota and upserts a ClaudeQuotaSnapshot row.
 // If the probe returns 401 and the row has a refresh token, it auto-refreshes
 // the access token and retries once.
@@ -607,7 +679,21 @@ func refreshSnapshot(row *models.ClaudeQuotaToken, token string) (*models.Claude
 	if err != nil {
 		// On auth failure, try to refresh if we have a refresh token.
 		if strings.Contains(err.Error(), "HTTP 401") || strings.Contains(err.Error(), "HTTP 403") {
-			newTok, refreshErr := tryRefreshToken(row, "snapshot-probe")
+			// Was the token refused BEFORE it was due to expire? A token that
+			// simply aged out is routine bookkeeping; one refused mid-life means
+			// the family was invalidated under us, and that is the difference
+			// between "re-add it" and "find out what upstream objected to". It
+			// MUST be decided here: once the refresh has failed, the expiry of
+			// the token that actually got the 401 is no longer recoverable.
+			caller := "snapshot-probe"
+			if exp := jwtExpiry(token); !exp.IsZero() && time.Now().Before(exp) {
+				caller += "(" + preExpiry401Marker + ")"
+				log.Printf("claude-quota: %s: access token REFUSED with %s of its own life left "+
+					"(exp %s) — the family was invalidated upstream, not by expiry: %v",
+					row.Email, time.Until(exp).Round(time.Second),
+					exp.UTC().Format(time.RFC3339), err)
+			}
+			newTok, refreshErr := tryRefreshToken(row, caller)
 			if refreshErr != nil {
 				return nil, fmt.Errorf("%w (refresh also failed: %s)", err, refreshErr.Error())
 			}
@@ -1095,6 +1181,15 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// "warning", and leasing it wastes a request that Anthropic 429s (no
 		// weekly budget), which then cascades the whole retry loop. A stale
 		// snapshot falls through to the re-probe below.
+		// An exhausted snapshot outlives quotaCacheTTL (see
+		// exhaustedSnapshotStillTrue). Without this, a stale-but-still-true
+		// exhausted row fell through to the live re-probe below, so slowing the
+		// background sweep would only have relocated those probes onto the lease
+		// path — inline, on a user's latency, and just as synthetic.
+		if exhaustedSnapshotStillTrue(sp, time.Now()) {
+			nExhausted++
+			continue
+		}
 		if sp != nil && time.Since(sp.Ts) < quotaCacheTTL &&
 			(sp.Severity == "critical" || sp.FiveHourPct >= 98 || sp.SevenDayPct >= 98) {
 			nExhausted++
@@ -1858,6 +1953,44 @@ func refreshAllSnapshots() {
 	})
 }
 
+// leaseExhaustPct is the per-window utilization at which the lease path refuses
+// an account outright (see InternalClaudeTokenLease). Named so the probe-
+// suppression rule below cannot drift away from the rule it is reasoning about.
+const leaseExhaustPct = 98.0
+
+// exhaustedSnapshotStillTrue reports whether a snapshot showing an exhausted
+// window can still be believed past quotaCacheTTL.
+//
+// It can, and this is the whole basis of the fix. Utilization only ever RISES
+// until its window resets, and anything that could raise it is traffic — which
+// would itself refresh the snapshot, because claude-proxy reports the real
+// rate-limit headers off live responses roughly once a minute per account. So
+// "98%, resets Saturday" is still 98%-or-worse on Thursday, and an account that
+// is already excluded stays excluded. Re-probing to rediscover that costs a
+// synthetic /v1/messages call and learns nothing.
+//
+// WHY IT MATTERS BEYOND COST. The probe is a bare Go HTTP client — no
+// User-Agent, none of the Claude Code identity that account's real traffic
+// carries — and it egresses from the cluster, not from the account's field
+// relay. On a BUSY account that is a rounding error hidden in real traffic. On
+// an idle, exhausted account it is the ONLY thing the credential does: ac9@yao.lu
+// spent its last ~6 hours emitting nothing but ~90 of these before its token
+// family was revoked mid-life on 2026-08-18. Suppressing them removes the
+// anomaly by removing the request, which is the only honest way to remove it.
+//
+// Returns false for a nil snapshot (nothing known — a probe is warranted) and
+// false once the reset has passed (the window rolled; go find out what is true).
+func exhaustedSnapshotStillTrue(snap *models.ClaudeQuotaSnapshot, now time.Time) bool {
+	if snap == nil {
+		return false
+	}
+	spent := func(pct float64, reset time.Time) bool {
+		return pct >= leaseExhaustPct && !reset.IsZero() && reset.After(now)
+	}
+	return spent(snap.FiveHourPct, snap.FiveHourReset) ||
+		spent(snap.SevenDayPct, snap.SevenDayReset)
+}
+
 // sweepStaleSnapshots refreshes any non-revoked account whose latest snapshot is
 // missing, older than (quotaCacheTTL - snapshotRefreshInterval), or past a
 // window reset — i.e. anything that would otherwise force the lease path to
@@ -1875,6 +2008,11 @@ func sweepStaleSnapshots() {
 		if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil {
 			resetPassed := (!snap.FiveHourReset.IsZero() && now.After(snap.FiveHourReset)) ||
 				(!snap.SevenDayReset.IsZero() && now.After(snap.SevenDayReset))
+			// Known out of quota, window not yet rolled: the answer cannot have
+			// changed, so do not go ask for it again.
+			if exhaustedSnapshotStillTrue(&snap, now) {
+				continue
+			}
 			if time.Since(snap.Ts) < staleAfter && !resetPassed {
 				continue // still warm — leave it (also spares a rotation)
 			}

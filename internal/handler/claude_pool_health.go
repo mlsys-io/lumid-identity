@@ -35,6 +35,60 @@ type quarantinedAccount struct {
 	Since  string `json:"since"`
 }
 
+// atRiskAccount is an account that is still SERVING but carries an unresolved
+// lost rotation — i.e. we are one exchange away from quarantining it.
+//
+// WHY: refreshTokenLocked already detects the fatal case precisely. Anthropic
+// rotates the token family on RECEIPT of a refresh, so a request we know was
+// written but never answered leaves the stored refresh token possibly already
+// superseded — and the NEXT exchange is what discovers it, as invalid_grant,
+// as a quarantine, as a human doing `claude auth login`. markIndeterminate
+// records exactly that moment.
+//
+// But it recorded it into a column nothing read. Every consumer — this
+// endpoint, the sweep's warning line, opsagent's claude_pool dimension — keyed
+// on RevokedAt, which is the OUTCOME. So the pool's one true leading indicator
+// was available only to a human running a forensic query after the account was
+// already dead, which is the same shape as the 2026-08-13 incident this file
+// was written for: the signal existed, nothing read it.
+//
+// The window between the two is real and usable. The account keeps working on
+// the access token it already holds, so an operator told NOW can mint and swap
+// a replacement before anything fails; told at quarantine, they are restoring
+// an outage instead of avoiding one.
+type atRiskAccount struct {
+	Email  string `json:"email"`
+	Label  string `json:"label"`
+	Signal string `json:"signal"`
+	Detail string `json:"detail"`
+	Since  string `json:"since"`
+}
+
+// lostRotationUnresolved reports whether an account carries an indeterminate
+// exchange that no later success has cleared.
+//
+// Self-clearing by construction, and deliberately not on a timer. A successful
+// exchange AFTER the indeterminate is proof the family survived — we presented
+// the stored refresh token and Anthropic accepted it, which it would not have
+// done had the lost rotation superseded it. Until that proof arrives the risk
+// is live, however long ago the indeterminate was.
+//
+// A time window would get this wrong in both directions: too short and it
+// silences a real risk on an account the sweep has not reached yet, too long
+// and it alerts forever on an account that recovered — and markIndeterminate
+// never clears the marker on purpose, because it is an evidence trail. Reading
+// it against LastExchange makes the alert self-clearing without touching that
+// trail.
+func lostRotationUnresolved(row *models.ClaudeQuotaToken) bool {
+	if row.IndeterminateAt == nil {
+		return false
+	}
+	provenSince := row.LastExchangeOutcome == "ok" &&
+		row.LastExchangeAt != nil &&
+		row.LastExchangeAt.After(*row.IndeterminateAt)
+	return !provenSince
+}
+
 // InternalClaudePoolHealth — GET /api/v1/internal/claude-pool/health (RequireBridge)
 //
 // Reports the pool's leasability in the same terms the lease path uses, so a
@@ -76,6 +130,7 @@ func InternalClaudePoolHealth(c *gin.Context) {
 	now := time.Now()
 	var refreshable, exhausted, benched, quarantined int
 	quarantinedList := make([]quarantinedAccount, 0, len(rows))
+	atRiskList := make([]atRiskAccount, 0, len(rows))
 
 	for _, row := range rows {
 		switch {
@@ -103,6 +158,18 @@ func InternalClaudePoolHealth(c *gin.Context) {
 			if row.BenchUntil != nil && now.Before(*row.BenchUntil) {
 				benched++
 			}
+			// Only for accounts that are still alive — a quarantined one is
+			// already the loudest thing in this payload, and listing it twice
+			// would just dilute the alert that matters.
+			if lostRotationUnresolved(&row) {
+				atRiskList = append(atRiskList, atRiskAccount{
+					Email:  row.Email,
+					Label:  row.Label,
+					Signal: "lost-rotation",
+					Detail: row.IndeterminateReason,
+					Since:  row.IndeterminateAt.UTC().Format(time.RFC3339),
+				})
+			}
 		}
 	}
 
@@ -115,6 +182,9 @@ func InternalClaudePoolHealth(c *gin.Context) {
 	// change only when the pool actually changed, not because Go reordered rows.
 	sort.Slice(quarantinedList, func(i, j int) bool {
 		return quarantinedList[i].Email < quarantinedList[j].Email
+	})
+	sort.Slice(atRiskList, func(i, j int) bool {
+		return atRiskList[i].Email < atRiskList[j].Email
 	})
 
 	c.JSON(http.StatusOK, gin.H{
@@ -129,6 +199,13 @@ func InternalClaudePoolHealth(c *gin.Context) {
 			"floor":                minHealthyPoolAccounts,
 			"healthy":              servable >= minHealthyPoolAccounts,
 			"quarantined_accounts": quarantinedList,
+			// at_risk does NOT subtract from servable or flip `healthy`: these
+			// accounts are serving normally right now. It is a separate,
+			// forward-looking signal — "this one is likely to quarantine on its
+			// next exchange" — and conflating it with current capacity would
+			// make the pool read as degraded while it is fully up.
+			"at_risk":          len(atRiskList),
+			"at_risk_accounts": atRiskList,
 		},
 	})
 }

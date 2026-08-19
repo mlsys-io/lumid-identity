@@ -102,3 +102,82 @@ func TestServableExcludesExhaustedFromHealthyFloor(t *testing.T) {
 			"got false, meaning this test no longer reproduces the reported gap (refreshable=%d, floor=%d)", refreshable, floor)
 	}
 }
+
+// The pool's one leading indicator of a quarantine is an indeterminate exchange
+// with no later success. Before this it lived in a column no consumer read, so
+// the operator learned about a lost rotation only once the account was already
+// dead and lum.id/claude was already down an account.
+//
+// The predicate must be self-clearing WITHOUT a timer: a later successful
+// exchange is proof the family survived (Anthropic accepted the stored refresh
+// token, which it could not have done if the lost rotation had superseded it),
+// and markIndeterminate deliberately never clears its own marker because that
+// marker is the forensic trail.
+func TestLostRotationUnresolved(t *testing.T) {
+	at := time.Now().Add(-90 * time.Minute)
+	after := at.Add(10 * time.Minute)
+	before := at.Add(-10 * time.Minute)
+
+	cases := []struct {
+		name string
+		row  models.ClaudeQuotaToken
+		want bool
+	}{
+		{
+			"never had an indeterminate — nothing at risk",
+			models.ClaudeQuotaToken{Email: "ac3@nati"},
+			false,
+		},
+		{
+			"indeterminate, nothing since — LIVE RISK, the next exchange may quarantine it",
+			models.ClaudeQuotaToken{Email: "ac3@nati", IndeterminateAt: &at},
+			true,
+		},
+		{
+			"indeterminate, then a successful exchange — the family provably survived",
+			models.ClaudeQuotaToken{
+				Email: "ac3@nati", IndeterminateAt: &at,
+				LastExchangeOutcome: "ok", LastExchangeAt: &after,
+			},
+			false,
+		},
+		{
+			"the only success PREDATES the indeterminate — proves nothing about it",
+			models.ClaudeQuotaToken{
+				Email: "ac3@nati", IndeterminateAt: &at,
+				LastExchangeOutcome: "ok", LastExchangeAt: &before,
+			},
+			true,
+		},
+		{
+			"a later exchange that FAILED is not proof of survival",
+			models.ClaudeQuotaToken{
+				Email: "ac3@nati", IndeterminateAt: &at,
+				LastExchangeOutcome: "error:invalid_request", LastExchangeAt: &after,
+			},
+			true,
+		},
+		{
+			"a later INDETERMINATE is certainly not proof of survival",
+			models.ClaudeQuotaToken{
+				Email: "ac3@nati", IndeterminateAt: &at,
+				LastExchangeOutcome: "indeterminate", LastExchangeAt: &after,
+			},
+			true,
+		},
+		{
+			"old indeterminate stays at risk however long ago — a timer would silence a real risk",
+			models.ClaudeQuotaToken{
+				Email:           "ac3@nati",
+				IndeterminateAt: func() *time.Time { d := time.Now().Add(-30 * 24 * time.Hour); return &d }(),
+			},
+			true,
+		},
+	}
+
+	for _, c := range cases {
+		if got := lostRotationUnresolved(&c.row); got != c.want {
+			t.Errorf("%s: lostRotationUnresolved = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

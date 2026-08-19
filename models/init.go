@@ -29,6 +29,7 @@ var AllTables = []interface{}{
 	&MeAppRun{},
 	&MeArtifact{},
 	&ClaudeQuotaToken{},
+	&ClaudeSessionBinding{},
 	&ClaudeQuotaSnapshot{},
 	&ClaudeSession{},
 	&ClaudeSessionTurn{},

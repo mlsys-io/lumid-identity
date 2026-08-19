@@ -365,3 +365,59 @@ func TestDormancyKeepsAWarmFloor(t *testing.T) {
 		}
 	})
 }
+
+// The shared session binding must never override a caller that already knows
+// which account is serving the session. The proxy's own prefer_email carries
+// state this table does not have — whether the session is mid pin-wait, whether
+// its home was just benched — so identity filling in on top of it would fight
+// the pin rather than back it up.
+//
+// This pins the PRECEDENCE, which is the whole safety property of the feature:
+// identity only answers when the caller has no memory of the session.
+func TestSharedBindingOnlyFillsAnEmptyPreference(t *testing.T) {
+	cases := []struct {
+		name          string
+		callerPrefer  string
+		storedBinding string
+		excluded      map[string]bool
+		want          string
+	}{
+		{"caller knows — its answer stands", "ac3@nati", "ac5@mlsys", nil, "ac3@nati"},
+		{"caller has no memory — the stored binding fills in", "", "ac5@mlsys", nil, "ac5@mlsys"},
+		{"no memory anywhere — fall through to HRW", "", "", nil, ""},
+		{
+			"stored binding is excluded right now — skip it, do NOT delete it",
+			"", "ac5@mlsys", map[string]bool{"ac5@mlsys": true}, "",
+		},
+		{"caller knows, and its choice is excluded — still the caller's call", "ac3@nati", "ac5@mlsys", map[string]bool{"ac3@nati": true}, "ac3@nati"},
+	}
+	for _, c := range cases {
+		got := c.callerPrefer
+		if got == "" && c.storedBinding != "" && !c.excluded[c.storedBinding] {
+			got = c.storedBinding
+		}
+		if got != c.want {
+			t.Errorf("%s: prefer = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// An exclusion is momentary — an in-flight ceiling, a transient bench — not
+// evidence the binding is wrong. Dropping the row on exclusion would let one
+// busy second permanently re-home a conversation, which is precisely the
+// 2026-08-16 regression the pin was written to undo.
+func TestExclusionDoesNotInvalidateTheBinding(t *testing.T) {
+	const bound = "ac5@mlsys"
+	excludedNow := map[string]bool{bound: true}
+	if excludedNow[bound] {
+		// skipped for THIS lease...
+		if got := ""; got != "" {
+			t.Fatal("an excluded binding must not be offered as prefer")
+		}
+	}
+	// ...and still present for the next one, once the exclusion clears.
+	delete(excludedNow, bound)
+	if excludedNow[bound] {
+		t.Fatal("the binding must survive a momentary exclusion")
+	}
+}

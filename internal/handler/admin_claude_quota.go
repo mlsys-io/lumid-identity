@@ -1142,6 +1142,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	var body struct {
 		PreferEmail string   `json:"prefer_email"`
 		UserSub     string   `json:"user_sub"`
+		SessionKey  string   `json:"session_key"`
 		Exclude     []string `json:"exclude"`
 	}
 	_ = c.ShouldBindJSON(&body) // empty body is fine
@@ -1151,6 +1152,27 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		excluded[strings.ToLower(strings.TrimSpace(e))] = true
 	}
 	prefer := strings.ToLower(strings.TrimSpace(body.PreferEmail))
+	sessionKey := truncStr(strings.TrimSpace(body.SessionKey), 128)
+
+	// SHARED SESSION PIN. The caller's own prefer_email always wins — it is that
+	// pod's live binding and it knows things this table does not (whether the
+	// session is mid-wait, whether the home was just benched). This only fills in
+	// when the caller has NO memory of the session, which is exactly the two holes
+	// an in-memory pin cannot cover: the sibling replica seeing the session for the
+	// first time, and every pod after a rollout. See models.ClaudeSessionBinding.
+	//
+	// Excluded accounts are skipped rather than deleted: an exclusion is a
+	// momentary condition (in-flight ceiling, a transient bench), not evidence the
+	// binding is wrong. Deleting here would let one busy moment permanently
+	// re-home a conversation, which is the 2026-08-16 regression.
+	if prefer == "" && sessionKey != "" {
+		var b models.ClaudeSessionBinding
+		if common.DB.Where("session_key = ?", sessionKey).First(&b).Error == nil {
+			if e := strings.ToLower(strings.TrimSpace(b.Email)); e != "" && !excluded[e] {
+				prefer = e
+			}
+		}
+	}
 
 	// Keep placements current: no-op unless the table is stale (assignmentTTL)
 	// AND the pool is genuinely skewed. Errors are non-fatal — a stale
@@ -1389,6 +1411,21 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		var tokenExp int64
 		if exp := jwtExpiry(token); !exp.IsZero() {
 			tokenExp = exp.Unix()
+		}
+		// Remember which account served this session, for whichever pod sees it
+		// next. Written on every successful lease rather than only on the first:
+		// the account CAN legitimately change (a bench, a pin release), and a
+		// stale row would then hand the next pod an answer the pin has already
+		// moved on from.
+		if sessionKey != "" {
+			now := time.Now()
+			common.DB.Save(&models.ClaudeSessionBinding{
+				SessionKey: sessionKey,
+				Email:      row.Email,
+				UserSub:    truncStr(body.UserSub, 64),
+				CreatedAt:  now,
+				LastSeenAt: now,
+			})
 		}
 		// Mark the account in use, so the background loops know it is not
 		// dormant. Throttled: dormancy is judged in hours, so a write per lease
@@ -1863,6 +1900,11 @@ func InternalClaudeQuotaReport(c *gin.Context) {
 // are refreshed before expiry even if the proxy hasn't been used recently.
 const tokenRefreshInterval = 45 * time.Minute
 
+// claudeSessionBindingTTL matches claude-proxy's own sessionSeenTTL. Both bound
+// the binding by LAST USE rather than age, because outliving the 30-minute token
+// lease is the entire point.
+const claudeSessionBindingTTL = 24 * time.Hour
+
 // minHealthyPoolAccounts is the floor below which the sweep warns. Two is not a
 // comfort level, it is the point at which losing one more account leaves the
 // pool with a single credential serving every user.
@@ -2268,6 +2310,14 @@ func sweepAllTokens() {
 		log.Printf("token-refresh-loop: WARNING pool is down to %d servable account(s) "+
 			"(%d refreshable, %d exhausted; want servable >= %d) — re-add quarantined accounts "+
 			"or wait out the exhausted window(s)", servable, len(rows), exhaustedNow, minHealthyPoolAccounts)
+	}
+
+	// Bound the session-binding table on the same clock the proxy uses in memory
+	// (sessionSeenTTL). Cheap, and it rides a sweep that already holds the
+	// single-sweeper lock, so it needs no scheduling of its own.
+	if err := common.DB.Where("last_seen_at < ?", now.Add(-claudeSessionBindingTTL)).
+		Delete(&models.ClaudeSessionBinding{}).Error; err != nil {
+		log.Printf("token-refresh-loop: session-binding prune failed: %v", err)
 	}
 
 	if len(rows) == 0 {

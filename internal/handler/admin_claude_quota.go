@@ -1042,12 +1042,28 @@ func hrwScore(userSub, email string) float64 {
 // suspension rather than containing it. Identity is where every replica already
 // agrees on pool state, so the bench belongs here.
 //
-// seconds <= 0 releases the bench (the proxy sends this when a request on the
-// account succeeds, proving the credential live). A bench flagged `dead` is NOT
-// released that way: it means the proxy saw a full consecutive-failure streak,
-// and recovery is a deliberate operator re-add — same contract as the alert the
-// proxy prints. Benches are extend-only, so a short probe bench from one replica
-// can never shorten a longer one already set by the other.
+// seconds <= 0 releases the bench, including a `dead` one — the proxy only ever
+// sends seconds<=0 from one call site (main.go, ModifyResponse), gated on an
+// ACTUAL non-error response from api.anthropic.com for that account
+// (resp.StatusCode < 400) via noteAccountSuccess. That is unfalsifiable proof
+// the credential is live: a truly dead/revoked token cannot produce a 200.
+//
+// This used to be a one-way ratchet ("dead bench held; re-add the account to
+// restore it"), on the theory that a full 3-strike streak was strong enough
+// evidence to require a human before trusting the account again. Reversed
+// 2026-08-19 after it caused a real outage: ac2@nati hit a false 3-streak
+// during a token-refresh race (three probes all replayed the SAME stale
+// sticky-cached access token — see the leaseByKey comment in claude-proxy —
+// while fresh leases on the account kept succeeding the whole time), got
+// marked bench_dead at 17:02:14, and then served a real 200 thirty-six seconds
+// later and hundreds more overnight. Because the dashboard had no way to ever
+// un-say "dead — re-add", an operator reading it hours later, with no way to
+// see the overnight successes, deleted the (perfectly healthy) account —
+// collapsing the pool to one already-quota-exhausted account and taking
+// lum.id/claude down. A proven-live credential must not stay flagged dead.
+// Benches are still extend-only for EXTENDING (seconds>0), so a short probe
+// bench from one replica can never shorten a longer one already set by the
+// other — that part is unchanged.
 func InternalClaudeAccountBench(c *gin.Context) {
 	var body struct {
 		Email   string `json:"email"`
@@ -1072,15 +1088,13 @@ func InternalClaudeAccountBench(c *gin.Context) {
 	}
 
 	if body.Seconds <= 0 {
-		if row.BenchDead {
-			// Deliberately not self-clearing — see the doc comment.
-			c.JSON(http.StatusOK, gin.H{"ok": true, "benched": true, "dead": true,
-				"note": "dead bench held; re-add the account to restore it"})
-			return
-		}
+		wasDead := row.BenchDead
 		common.DB.Model(&row).Updates(map[string]interface{}{
 			"bench_until": nil, "bench_reason": "", "bench_dead": false,
 		})
+		if wasDead {
+			log.Printf("claude-pool: %s bench_dead CLEARED — proxy reported a live success, overriding the earlier dead verdict", email)
+		}
 		c.JSON(http.StatusOK, gin.H{"ok": true, "benched": false})
 		return
 	}

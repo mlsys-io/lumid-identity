@@ -702,7 +702,7 @@ type llmProvider struct {
 // fleet is already paid for), Anthropic as the hosted fallback.
 var llmProviders = []llmProvider{
 	{
-		// qwen3.8-27b — default. Served by the in-cluster lumid-llm gateway
+		// deepseek-v4-flash — default. Served by the in-cluster lumid-llm gateway
 		// (LUMID_LLM_BASE, default http://lumid-llm:8088), which speaks the
 		// Anthropic /v1/messages API incl. SSE. Model id from
 		// GET lum.id/llm/v1/models. Reasoning model (emits thinking deltas,
@@ -711,12 +711,17 @@ var llmProviders = []llmProvider{
 		// The id stays "kvrun-gemma4" ON PURPOSE even though Gemma-4 is retired:
 		// it is persisted in personas' preferred_model and referenced by the UI
 		// and e2e tests, so renaming it would orphan saved selections. Only the
-		// upstream model moved (Gemma-4 -> Qwen3.8-27B when the GB10 boxes were
-		// repurposed). 1M context, vision-capable.
+		// upstream model moves (Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash as the
+		// GB10 pair was repurposed). 256K context.
+		//
+		// KEEP upstreamModel IN SYNC WITH THE GATEWAY. A retired id does NOT fail
+		// loudly: LUMID_LLM_BACKENDS is an allowlist but unknown ids fall through
+		// to the OpenRouter catch-all, so a stale value here silently bills
+		// OpenRouter and can return an empty completion instead of erroring.
 		id:                  "kvrun-gemma4",
-		displayName:         "Qwen3.8-27B (Lumid GPU)",
+		displayName:         "DeepSeek-V4-Flash (Lumid GPU)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "qwen3.8-27b",
+		upstreamModel:       "deepseek-v4-flash",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,

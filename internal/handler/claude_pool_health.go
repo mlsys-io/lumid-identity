@@ -44,12 +44,28 @@ type quarantinedAccount struct {
 //	refreshable — has a refresh token AND is not quarantined. This is the
 //	              sweep's own definition (sweepAllTokens), and the population
 //	              that can still be kept alive without a human.
-//	benched     — pool-wide 401/403 cooldown; recovers on a timer.
+//	exhausted   — refreshable but currently excluded from a lease by
+//	              snapshotIsExhausted (≥98% on the 5h or 7d window) — the same
+//	              check InternalClaudeTokenLease applies to its own candidates.
+//	              Recovers on its own window reset, not on a re-add, but until
+//	              then it cannot take traffic — a fixed 5h wait for the 5h
+//	              window, or the rest of the week for the 7d window.
+//	servable    — refreshable minus exhausted: accounts that would actually be
+//	              picked if a lease came in right now. This, not refreshable,
+//	              is what `healthy` is judged against.
+//	benched     — pool-wide 401/403 cooldown; recovers on a timer (seconds to a
+//	              few minutes), so — like the sweep's own accounting — it is
+//	              reported but does NOT subtract from servable.
 //	quarantined — family revoked; recovers ONLY via a fresh `claude auth login`
 //	              plus a re-add. This is the one worth waking someone for.
 //
-// `healthy` is false as soon as the pool drops below the floor the sweep warns
-// at, so the caller never has to re-derive the threshold.
+// `healthy` is false as soon as SERVABLE drops below the floor the sweep warns
+// at. Before `servable` existed this compared `refreshable` to the floor, so a
+// pool sitting on one genuinely usable account (the rest quarantined or spent)
+// with one merely-refreshable-but-98%-spent account alongside it still read
+// `healthy:true` — floor satisfied on paper, one account actually able to
+// serve. opsagent's P0 alert trusts this field verbatim, so that gap meant no
+// page while lum.id/claude was already effectively down to a single account.
 func InternalClaudePoolHealth(c *gin.Context) {
 	var rows []models.ClaudeQuotaToken
 	if err := common.DB.Find(&rows).Error; err != nil {
@@ -58,7 +74,7 @@ func InternalClaudePoolHealth(c *gin.Context) {
 	}
 
 	now := time.Now()
-	var refreshable, benched, quarantined int
+	var refreshable, exhausted, benched, quarantined int
 	quarantinedList := make([]quarantinedAccount, 0, len(rows))
 
 	for _, row := range rows {
@@ -78,11 +94,21 @@ func InternalClaudePoolHealth(c *gin.Context) {
 			// account from the population that can recover unattended.
 			if row.RefreshTokenEncrypted != "" {
 				refreshable++
+				var snap models.ClaudeQuotaSnapshot
+				if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil &&
+					snapshotIsExhausted(&snap, now) {
+					exhausted++
+				}
 			}
 			if row.BenchUntil != nil && now.Before(*row.BenchUntil) {
 				benched++
 			}
 		}
+	}
+
+	servable := refreshable - exhausted
+	if servable < 0 { // defensive only; refreshable/exhausted share the same population
+		servable = 0
 	}
 
 	// Stable order — a monitor diffing this payload between sweeps should see a
@@ -96,10 +122,12 @@ func InternalClaudePoolHealth(c *gin.Context) {
 		"data": gin.H{
 			"total":                len(rows),
 			"refreshable":          refreshable,
+			"exhausted":            exhausted,
+			"servable":             servable,
 			"benched":              benched,
 			"quarantined":          quarantined,
 			"floor":                minHealthyPoolAccounts,
-			"healthy":              refreshable >= minHealthyPoolAccounts,
+			"healthy":              servable >= minHealthyPoolAccounts,
 			"quarantined_accounts": quarantinedList,
 		},
 	})

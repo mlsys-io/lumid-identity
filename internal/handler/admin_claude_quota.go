@@ -1186,12 +1186,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// exhausted row fell through to the live re-probe below, so slowing the
 		// background sweep would only have relocated those probes onto the lease
 		// path — inline, on a user's latency, and just as synthetic.
-		if exhaustedSnapshotStillTrue(sp, time.Now()) {
-			nExhausted++
-			continue
-		}
-		if sp != nil && time.Since(sp.Ts) < quotaCacheTTL &&
-			(sp.Severity == "critical" || sp.FiveHourPct >= 98 || sp.SevenDayPct >= 98) {
+		if snapshotIsExhausted(sp, time.Now()) {
 			nExhausted++
 			continue
 		}
@@ -1991,6 +1986,24 @@ func exhaustedSnapshotStillTrue(snap *models.ClaudeQuotaSnapshot, now time.Time)
 		spent(snap.SevenDayPct, snap.SevenDayReset)
 }
 
+// snapshotIsExhausted reports whether sp currently excludes its account from a
+// lease — either a persisted exhaustion that hasn't rolled past its reset
+// (exhaustedSnapshotStillTrue) or a fresh snapshot already at leaseExhaustPct.
+// Factored out of the lease-candidate loop so InternalClaudePoolHealth can
+// answer "would this account actually be leased right now" the same way the
+// lease path does — see that endpoint's doc comment. Before this existed, the
+// health endpoint counted an account as healthy purely on having a live
+// refresh token, so a pool sitting on ONE genuinely servable account (the rest
+// quarantined or ≥98% spent) still reported `healthy:true`, and opsagent's P0
+// alert — which trusts that field verbatim — never fired.
+func snapshotIsExhausted(sp *models.ClaudeQuotaSnapshot, now time.Time) bool {
+	if exhaustedSnapshotStillTrue(sp, now) {
+		return true
+	}
+	return sp != nil && time.Since(sp.Ts) < quotaCacheTTL &&
+		(sp.Severity == "critical" || sp.FiveHourPct >= leaseExhaustPct || sp.SevenDayPct >= leaseExhaustPct)
+}
+
 // sweepStaleSnapshots refreshes any non-revoked account whose latest snapshot is
 // missing, older than (quotaCacheTTL - snapshotRefreshInterval), or past a
 // window reset — i.e. anything that would otherwise force the lease path to
@@ -2054,9 +2067,25 @@ func sweepAllTokens() {
 	// A pool this thin is one bad credential away from a total outage, and the
 	// symptom (every user pinned to one account) is invisible from any single
 	// request. Warn on the sweep so it lands before the outage does.
-	if healthy := len(rows); healthy < minHealthyPoolAccounts {
-		log.Printf("token-refresh-loop: WARNING pool is down to %d refreshable account(s) "+
-			"(want >= %d) — re-add quarantined accounts", healthy, minHealthyPoolAccounts)
+	//
+	// Refreshable alone undercounts the risk: an account can hold a live
+	// refresh token and still be unable to take a lease right now because it's
+	// ≥98% spent on its 5h/7d window (snapshotIsExhausted — the same check
+	// InternalClaudePoolHealth and the lease path use). Report servable so this
+	// line and /internal/claude-pool/health can't tell two different stories.
+	now := time.Now()
+	exhaustedNow := 0
+	for _, row := range rows {
+		var snap models.ClaudeQuotaSnapshot
+		if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil &&
+			snapshotIsExhausted(&snap, now) {
+			exhaustedNow++
+		}
+	}
+	if servable := len(rows) - exhaustedNow; servable < minHealthyPoolAccounts {
+		log.Printf("token-refresh-loop: WARNING pool is down to %d servable account(s) "+
+			"(%d refreshable, %d exhausted; want servable >= %d) — re-add quarantined accounts "+
+			"or wait out the exhausted window(s)", servable, len(rows), exhaustedNow, minHealthyPoolAccounts)
 	}
 
 	if len(rows) == 0 {

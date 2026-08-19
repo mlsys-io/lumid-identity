@@ -688,10 +688,23 @@ func refreshSnapshot(row *models.ClaudeQuotaToken, token string) (*models.Claude
 			caller := "snapshot-probe"
 			if exp := jwtExpiry(token); !exp.IsZero() && time.Now().Before(exp) {
 				caller += "(" + preExpiry401Marker + ")"
+				reason := fmt.Sprintf("refused with %s of its own life left (exp %s): %v",
+					time.Until(exp).Round(time.Second), exp.UTC().Format(time.RFC3339), err)
 				log.Printf("claude-quota: %s: access token REFUSED with %s of its own life left "+
 					"(exp %s) — the family was invalidated upstream, not by expiry: %v",
 					row.Email, time.Until(exp).Round(time.Second),
 					exp.UTC().Format(time.RFC3339), err)
+				// Persist it. Until now this fact reached only the log — and, if a
+				// quarantine happened to follow, revoke_reason. A pre-expiry 401
+				// whose refresh then succeeds was logged and forgotten, which is
+				// the case that most needs to be seen: it means something else is
+				// touching the family while the account still works.
+				at := time.Now()
+				common.DB.Model(row).Updates(map[string]interface{}{
+					"pre_expiry_401_at":     at,
+					"pre_expiry_401_reason": truncStr(reason, 500),
+				})
+				row.PreExpiry401At, row.PreExpiry401Reason = &at, truncStr(reason, 500)
 			}
 			newTok, refreshErr := tryRefreshToken(row, caller)
 			if refreshErr != nil {
@@ -1376,6 +1389,15 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		if exp := jwtExpiry(token); !exp.IsZero() {
 			tokenExp = exp.Unix()
 		}
+		// Mark the account in use, so the background loops know it is not
+		// dormant. Throttled: dormancy is judged in hours, so a write per lease
+		// would be pure churn on the row claude-proxy's bench reporter already
+		// writes to most often.
+		if row.LastLeasedAt == nil || time.Since(*row.LastLeasedAt) > leaseStampThrottle {
+			at := time.Now()
+			common.DB.Model(&row).Update("last_leased_at", at)
+			row.LastLeasedAt = &at
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"ret_code": 0, "message": "ok",
 			"data": gin.H{
@@ -1908,6 +1930,64 @@ func base64DecodeJWT(s string) ([]byte, error) {
 	return base64Stdlib.StdEncoding.DecodeString(s)
 }
 
+// claudeIdleAfter / claudeIdleHeartbeat govern DORMANCY — the pool's answer to
+// the fact that every refresh exchange is a draw at the lost-response window
+// that permanently kills a token family.
+//
+// Measured 2026-08-19: the sweep exchanged every account at every 45-minute
+// tick, ~32 a day each, and ac5@mlsys took its full share while serving ZERO
+// requests all day. The two gates that look like they prevent that — skip if the
+// token has >2×tokenRefreshInterval of life left, damp if rotated within
+// tokenRefreshInterval/2 — never fire, because the access token does not live
+// that long. So an idle account was paying full quarantine exposure for a
+// credential nobody was going to use.
+//
+// A dormant account is skipped by BOTH background loops. Gating only the token
+// sweep would make things worse, not better: the snapshot sweeper probes with
+// the ACCESS token every few minutes, so letting it expire would turn a
+// 45-minute rotation into a 401-driven one every snapshot cycle.
+//
+// The heartbeat is what bounds the two risks of doing this at all:
+//
+//   - a refresh token left unused indefinitely might expire on its own (we do
+//     not know Anthropic's TTL, and finding out by losing an account is the
+//     wrong experiment);
+//   - a standby account that has silently died is worth nothing, and dormancy
+//     delays discovering it.
+//
+// Exchanging at least every claudeIdleHeartbeat caps both: the family is
+// exercised well inside any plausible TTL, and "this standby still works" is
+// never more than one heartbeat stale. At the defaults that is 4 exchanges a
+// day instead of 32 — an 8× cut in exposure for the accounts that were getting
+// nothing for it — while a busy account is completely unaffected.
+var (
+	claudeIdleAfter     = envDurationOr("CLAUDE_POOL_IDLE_AFTER", 2*time.Hour)
+	claudeIdleHeartbeat = envDurationOr("CLAUDE_POOL_IDLE_HEARTBEAT", 6*time.Hour)
+)
+
+// accountIsDormant reports whether the background loops should leave an account
+// alone this tick. Never true for an account in recent use, never true for one
+// that has never been exchanged, and never true once the heartbeat is due.
+//
+// Self-healing: the lease path stamps LastLeasedAt, so an account wakes the
+// instant it is used. The cost of waking is one inline refresh plus one inline
+// snapshot probe on that first lease — the path that already exists for a cold
+// account, paid once instead of avoided 32 times a day.
+// leaseStampThrottle bounds how often the lease path rewrites last_leased_at.
+// Far below claudeIdleAfter, so throttling can never make a busy account look
+// dormant.
+const leaseStampThrottle = 5 * time.Minute
+
+func accountIsDormant(row *models.ClaudeQuotaToken, now time.Time) bool {
+	if row.LastLeasedAt != nil && now.Sub(*row.LastLeasedAt) < claudeIdleAfter {
+		return false // in use
+	}
+	if row.RotatedAt == nil {
+		return false // never exchanged — a new account must get its first refresh
+	}
+	return now.Sub(*row.RotatedAt) < claudeIdleHeartbeat
+}
+
 func proactiveRefreshAll() {
 	// Single-sweeper election across replicas: GET_LOCK with 0 timeout —
 	// if the other pod is mid-sweep, skip this tick entirely. Every sweep
@@ -2031,6 +2111,15 @@ func sweepStaleSnapshots() {
 	staleAfter := quotaCacheTTL - snapshotRefreshInterval // 3m at defaults
 	now := time.Now()
 	for _, row := range rows {
+		// Dormant accounts are skipped here too, and this arm is the load-bearing
+		// one. This loop probes with the ACCESS token; if the token sweep has
+		// stopped refreshing a dormant account, probing it would 401 and trigger
+		// a refresh every few minutes — turning an 8× reduction into a large
+		// increase. The snapshot exists to keep the lease path off the slow path,
+		// and an account nobody leases has no lease path to keep warm.
+		if accountIsDormant(&row, now) {
+			continue
+		}
 		var snap models.ClaudeQuotaSnapshot
 		if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil {
 			resetPassed := (!snap.FiveHourReset.IsZero() && now.After(snap.FiveHourReset)) ||
@@ -2117,6 +2206,16 @@ func sweepAllTokens() {
 		// their tokens drifted to expiry and the pool rediscovered it as a 401
 		// burst. A row that has never rotated (nil) is always eligible.
 		if row.RotatedAt != nil && time.Since(*row.RotatedAt) < tokenRefreshInterval/2 {
+			continue
+		}
+		// Dormant: nobody is leasing this account, and it was exchanged recently
+		// enough that the family is still being exercised. Skip the draw.
+		if accountIsDormant(&row, now) {
+			log.Printf("token-refresh-loop: %s: dormant (no lease in %v, rotated %v ago) — skipping; "+
+				"heartbeat exchange due in %v",
+				row.Email, claudeIdleAfter,
+				time.Since(*row.RotatedAt).Round(time.Minute),
+				(claudeIdleHeartbeat - time.Since(*row.RotatedAt)).Round(time.Minute))
 			continue
 		}
 		tok, err := common.DecryptGrant(row.ValueEncrypted)

@@ -79,6 +79,26 @@ type atRiskAccount struct {
 // never clears the marker on purpose, because it is an evidence trail. Reading
 // it against LastExchange makes the alert self-clearing without touching that
 // trail.
+// preExpiry401Window is how long a mid-life token refusal stays worth alerting
+// on.
+//
+// A TIME window here, where lostRotationUnresolved deliberately refuses one —
+// because the two are different kinds of fact. A lost rotation is a STATE: the
+// family may be dead right now, and only a successful exchange disproves it, so
+// it must persist until disproved. A pre-expiry 401 is an EVENT: something
+// invalidated a token under us at a moment in time. A later success does not
+// disprove it (a second holder rotating the family would leave our refresh token
+// dead, so a success actually means the family survived that particular event) —
+// it just means the event has passed. What makes it worth a page is recency,
+// and above all proximity to an add: ac9@yao.lu was quarantined 3m04s after
+// being added, and the whole value of the signal is reaching a human while
+// "stop the other holder" is still cheap advice.
+const preExpiry401Window = 6 * time.Hour
+
+func preExpiry401Recent(row *models.ClaudeQuotaToken, now time.Time) bool {
+	return row.PreExpiry401At != nil && now.Sub(*row.PreExpiry401At) < preExpiry401Window
+}
+
 func lostRotationUnresolved(row *models.ClaudeQuotaToken) bool {
 	if row.IndeterminateAt == nil {
 		return false
@@ -170,6 +190,20 @@ func InternalClaudePoolHealth(c *gin.Context) {
 					Since:  row.IndeterminateAt.UTC().Format(time.RFC3339),
 				})
 			}
+			// A second, independent signal with a different cause and a different
+			// remedy: our access token was refused mid-life, i.e. something else
+			// invalidated the family. Listed separately rather than merged, since
+			// "someone else holds this credential" and "we lost a rotation" send
+			// the operator to opposite places.
+			if preExpiry401Recent(&row, now) {
+				atRiskList = append(atRiskList, atRiskAccount{
+					Email:  row.Email,
+					Label:  row.Label,
+					Signal: "pre-expiry-401",
+					Detail: row.PreExpiry401Reason,
+					Since:  row.PreExpiry401At.UTC().Format(time.RFC3339),
+				})
+			}
 		}
 	}
 
@@ -184,7 +218,10 @@ func InternalClaudePoolHealth(c *gin.Context) {
 		return quarantinedList[i].Email < quarantinedList[j].Email
 	})
 	sort.Slice(atRiskList, func(i, j int) bool {
-		return atRiskList[i].Email < atRiskList[j].Email
+		if atRiskList[i].Email != atRiskList[j].Email {
+			return atRiskList[i].Email < atRiskList[j].Email
+		}
+		return atRiskList[i].Signal < atRiskList[j].Signal
 	})
 
 	c.JSON(http.StatusOK, gin.H{

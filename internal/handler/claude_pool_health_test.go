@@ -181,3 +181,113 @@ func TestLostRotationUnresolved(t *testing.T) {
 		}
 	}
 }
+
+// The second at-risk signal: our access token refused mid-life, i.e. something
+// else invalidated the family. Unlike a lost rotation this is an EVENT, so it
+// ages out rather than waiting to be disproved — a later success does not mean
+// it did not happen, only that the family survived that particular one.
+func TestPreExpiry401Recent(t *testing.T) {
+	now := time.Now()
+	mk := func(d time.Duration) *time.Time { v := now.Add(d); return &v }
+
+	cases := []struct {
+		name string
+		row  models.ClaudeQuotaToken
+		want bool
+	}{
+		{"never happened", models.ClaudeQuotaToken{Email: "ac3@nati"}, false},
+		{
+			"three minutes ago — this is the ac9 shape, quarantined 3m04s after an add",
+			models.ClaudeQuotaToken{Email: "ac9@yao.lu", PreExpiry401At: mk(-3 * time.Minute)},
+			true,
+		},
+		{
+			"a later success does NOT clear it — the event still happened",
+			models.ClaudeQuotaToken{
+				Email: "ac9@yao.lu", PreExpiry401At: mk(-3 * time.Minute),
+				LastExchangeOutcome: "ok", LastExchangeAt: mk(-1 * time.Minute),
+			},
+			true,
+		},
+		{
+			"older than the window — aged out, no longer actionable",
+			models.ClaudeQuotaToken{Email: "ac3@nati", PreExpiry401At: mk(-preExpiry401Window - time.Minute)},
+			false,
+		},
+	}
+	for _, c := range cases {
+		if got := preExpiry401Recent(&c.row, now); got != c.want {
+			t.Errorf("%s: preExpiry401Recent = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// Dormancy: an account nobody leases must stop paying for a credential nobody
+// uses, without ever letting the family go unexercised past the heartbeat.
+func TestAccountIsDormant(t *testing.T) {
+	now := time.Now()
+	mk := func(d time.Duration) *time.Time { v := now.Add(d); return &v }
+
+	cases := []struct {
+		name string
+		row  models.ClaudeQuotaToken
+		want bool
+	}{
+		{
+			"leased minutes ago — in use, never dormant",
+			models.ClaudeQuotaToken{LastLeasedAt: mk(-5 * time.Minute), RotatedAt: mk(-10 * time.Minute)},
+			false,
+		},
+		{
+			"idle and rotated recently — dormant, skip the draw",
+			models.ClaudeQuotaToken{LastLeasedAt: mk(-8 * time.Hour), RotatedAt: mk(-time.Hour)},
+			true,
+		},
+		{
+			"never leased but rotated recently — a standby is still dormant",
+			models.ClaudeQuotaToken{RotatedAt: mk(-time.Hour)},
+			true,
+		},
+		{
+			"never exchanged — a new account must get its first refresh",
+			models.ClaudeQuotaToken{},
+			false,
+		},
+		{
+			"idle but the heartbeat is due — exchange anyway, so a dead standby is found",
+			models.ClaudeQuotaToken{
+				LastLeasedAt: mk(-3 * 24 * time.Hour),
+				RotatedAt:    mk(-claudeIdleHeartbeat - time.Minute),
+			},
+			false,
+		},
+		{
+			"leased just inside the idle threshold — still in use",
+			models.ClaudeQuotaToken{LastLeasedAt: mk(-claudeIdleAfter + time.Minute), RotatedAt: mk(-time.Hour)},
+			false,
+		},
+	}
+	for _, c := range cases {
+		if got := accountIsDormant(&c.row, now); got != c.want {
+			t.Errorf("%s: accountIsDormant = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// The lease-path stamp must never be able to make a busy account look dormant.
+func TestLeaseStampThrottleIsWellInsideIdleThreshold(t *testing.T) {
+	if leaseStampThrottle >= claudeIdleAfter {
+		t.Fatalf("leaseStampThrottle (%v) must stay far below claudeIdleAfter (%v), or a "+
+			"continuously-leased account could age into dormancy between stamps",
+			leaseStampThrottle, claudeIdleAfter)
+	}
+}
+
+// The heartbeat has to be the outer bound: exercising the family less often than
+// we declare accounts dormant would let a dormant account drift unexchanged.
+func TestHeartbeatOutlivesTheIdleThreshold(t *testing.T) {
+	if claudeIdleHeartbeat <= claudeIdleAfter {
+		t.Fatalf("claudeIdleHeartbeat (%v) must exceed claudeIdleAfter (%v) or dormancy "+
+			"never actually skips anything", claudeIdleHeartbeat, claudeIdleAfter)
+	}
+}

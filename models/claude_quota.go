@@ -78,6 +78,37 @@ type ClaudeQuotaToken struct {
 	// exchange (lost-response) or a clean one (something else entirely).
 	IndeterminateAt     *time.Time `gorm:"column:indeterminate_at"               json:"indeterminate_at,omitempty"`
 	IndeterminateReason string     `gorm:"column:indeterminate_reason;size:512"  json:"indeterminate_reason,omitempty"`
+	// PreExpiry401At — our access token was refused while still INSIDE its own
+	// JWT expiry. A token that merely aged out is routine; one refused mid-life
+	// means the family was invalidated under us, which is the clearest evidence
+	// of a SECOND HOLDER — the dominant quarantine cause here (a machine that
+	// minted the credential and kept running Claude Code, refreshing the family
+	// on its own schedule).
+	//
+	// refreshSnapshot has always DETECTED this and threaded a marker through the
+	// caller string, but that reached only the log line and — solely if a
+	// quarantine happened to follow — revoke_reason. A pre-expiry 401 whose
+	// refresh then succeeds was logged and forgotten, and since the obs stack
+	// was torn down logs die with the pod. Persisting it makes the signal
+	// survive the pod, which matters most in the minutes after an add: ac9@yao.lu
+	// was quarantined 3m04s after being added, and that window is the only one
+	// in which "stop the other holder" is still cheap advice.
+	PreExpiry401At     *time.Time `gorm:"column:pre_expiry_401_at"              json:"pre_expiry_401_at,omitempty"`
+	PreExpiry401Reason string     `gorm:"column:pre_expiry_401_reason;size:512" json:"pre_expiry_401_reason,omitempty"`
+	// LastLeasedAt — when this account was last handed to a caller.
+	//
+	// The pool's own definition of "in use". Every refresh exchange is a draw at
+	// the lost-response window that permanently kills a family, so an account
+	// nobody leases should not be paying that cost on a 45-minute timer: see
+	// accountIsDormant. Stamped by the lease path (throttled — it only needs to
+	// be accurate to a few minutes), so an account wakes out of dormancy the
+	// instant it is used again.
+	//
+	// Deliberately NOT inferred from snapshots or usage_events: snapshots are
+	// written by the background sweeper too (so they stay fresh on an idle
+	// account, which is exactly backwards), and usage_events is keyed by user,
+	// not by account.
+	LastLeasedAt *time.Time `gorm:"column:last_leased_at" json:"last_leased_at,omitempty"`
 }
 
 func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }

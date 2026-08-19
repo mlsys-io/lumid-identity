@@ -38,6 +38,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1973,6 +1974,83 @@ var (
 // instant it is used. The cost of waking is one inline refresh plus one inline
 // snapshot probe on that first lease — the path that already exists for a cold
 // account, paid once instead of avoided 32 times a day.
+// dormancyFloor decides which accounts may actually be left alone this tick.
+//
+// accountIsDormant answers "is this account unused"; that is NOT the same
+// question as "is it safe to let it go cold", and conflating the two was a real
+// flaw in the first cut of dormancy. The accounts dormancy puts to sleep are
+// BY DEFINITION the ones the pool fails over TO. On the live pool that meant
+// one busy account hot and both reserves cold — so at the moment the busy one
+// quarantined, every candidate needed an inline token refresh AND an inline
+// snapshot probe before it could serve. That is exactly the cost
+// snapshotRefreshInterval exists to avoid, and its own comment records what it
+// looks like: inline re-probes serialize a fan-out burst and produced spurious
+// "no pooled account with available quota" 503s on the tail.
+//
+// An out-of-quota account is the sharpest case. It is never leased, so it looks
+// idle forever, while being precisely the reserve the pool is waiting on to
+// come back. Its family stayed alive on the heartbeat, but its readiness did
+// not, so the window rolling over would have been discovered the expensive way.
+//
+// So: keep at least minHealthyPoolAccounts accounts warm at all times, and only
+// let the SURPLUS sleep. As the pool thins the reserves wake automatically —
+// when the busy account is quarantined it leaves this population entirely, hot
+// drops below the floor, and both reserves are promoted on the next tick.
+//
+// Ranking for promotion prefers accounts that could take a lease right now:
+// not-exhausted before exhausted (an exhausted one cannot serve this minute
+// however warm it is), then oldest-rotated, then email for determinism.
+func dormancyFloor(rows []models.ClaudeQuotaToken, now time.Time) map[string]bool {
+	// The exhaustion lookup is injected so the policy above can be tested
+	// without a database; nothing else in it touches one.
+	return dormancyFloorWith(rows, now, func(email string) bool {
+		var snap models.ClaudeQuotaSnapshot
+		if common.DB.Where("email = ?", email).Order("ts DESC").First(&snap).Error != nil {
+			return false
+		}
+		return snapshotIsExhausted(&snap, now)
+	})
+}
+
+func dormancyFloorWith(rows []models.ClaudeQuotaToken, now time.Time, isExhausted func(string) bool) map[string]bool {
+	dormant := map[string]bool{}
+	var candidates []models.ClaudeQuotaToken
+	hot := 0
+	for _, row := range rows {
+		if accountIsDormant(&row, now) {
+			candidates = append(candidates, row)
+		} else {
+			hot++
+		}
+	}
+	if len(candidates) == 0 {
+		return dormant
+	}
+	keepHot := minHealthyPoolAccounts - hot
+	if keepHot < 0 {
+		keepHot = 0
+	}
+	if keepHot > 0 {
+		sort.Slice(candidates, func(i, j int) bool {
+			a, b := candidates[i], candidates[j]
+			if ea, eb := isExhausted(a.Email), isExhausted(b.Email); ea != eb {
+				return !ea // usable reserves warm first
+			}
+			if a.RotatedAt != nil && b.RotatedAt != nil && !a.RotatedAt.Equal(*b.RotatedAt) {
+				return a.RotatedAt.Before(*b.RotatedAt)
+			}
+			return a.Email < b.Email
+		})
+	}
+	for i, row := range candidates {
+		if i < keepHot {
+			continue // held warm to satisfy the floor
+		}
+		dormant[row.Email] = true
+	}
+	return dormant
+}
+
 // leaseStampThrottle bounds how often the lease path rewrites last_leased_at.
 // Far below claudeIdleAfter, so throttling can never make a busy account look
 // dormant.
@@ -2110,14 +2188,15 @@ func sweepStaleSnapshots() {
 	}
 	staleAfter := quotaCacheTTL - snapshotRefreshInterval // 3m at defaults
 	now := time.Now()
+	dormantRows := dormancyFloor(rows, now)
 	for _, row := range rows {
 		// Dormant accounts are skipped here too, and this arm is the load-bearing
 		// one. This loop probes with the ACCESS token; if the token sweep has
 		// stopped refreshing a dormant account, probing it would 401 and trigger
 		// a refresh every few minutes — turning an 8× reduction into a large
-		// increase. The snapshot exists to keep the lease path off the slow path,
-		// and an account nobody leases has no lease path to keep warm.
-		if accountIsDormant(&row, now) {
+		// increase. Both loops share dormancyFloor so they can never disagree
+		// about which accounts are being kept warm.
+		if dormantRows[row.Email] {
 			continue
 		}
 		var snap models.ClaudeQuotaSnapshot
@@ -2194,6 +2273,7 @@ func sweepAllTokens() {
 	if len(rows) == 0 {
 		return
 	}
+	dormantRows := dormancyFloor(rows, now)
 	for _, row := range rows {
 		// Damping: if any refresher (a lease, a dashboard probe, the other
 		// replica's earlier sweep) rotated this row recently, leave it alone —
@@ -2208,9 +2288,10 @@ func sweepAllTokens() {
 		if row.RotatedAt != nil && time.Since(*row.RotatedAt) < tokenRefreshInterval/2 {
 			continue
 		}
-		// Dormant: nobody is leasing this account, and it was exchanged recently
-		// enough that the family is still being exercised. Skip the draw.
-		if accountIsDormant(&row, now) {
+		// Dormant AND surplus to the warm floor (see dormancyFloor): nobody is
+		// leasing it, the family is still being exercised, and the pool has
+		// enough warm reserves without it. Skip the draw.
+		if dormantRows[row.Email] {
 			log.Printf("token-refresh-loop: %s: dormant (no lease in %v, rotated %v ago) — skipping; "+
 				"heartbeat exchange due in %v",
 				row.Email, claudeIdleAfter,

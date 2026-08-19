@@ -291,3 +291,77 @@ func TestHeartbeatOutlivesTheIdleThreshold(t *testing.T) {
 			"never actually skips anything", claudeIdleHeartbeat, claudeIdleAfter)
 	}
 }
+
+// Dormancy must never put the pool's last warm reserves to sleep.
+//
+// The first cut of dormancy asked only "is this account unused", which is not
+// the same question as "is it safe to let it go cold" — the accounts it slept
+// are BY DEFINITION the ones the pool fails over to. On the live pool that left
+// one busy account hot and both reserves cold, so at the moment the busy one
+// quarantined every candidate needed an inline refresh AND an inline snapshot
+// probe before it could serve: the exact cost snapshotRefreshInterval exists to
+// avoid, arriving precisely when the pool is already in trouble.
+func TestDormancyKeepsAWarmFloor(t *testing.T) {
+	now := time.Now()
+	lease := func(d time.Duration) *time.Time { v := now.Add(d); return &v }
+	rot := func(d time.Duration) *time.Time { v := now.Add(d); return &v }
+
+	busy := models.ClaudeQuotaToken{Email: "ac3@nati", LastLeasedAt: lease(-2 * time.Minute), RotatedAt: rot(-30 * time.Minute)}
+	idle := models.ClaudeQuotaToken{Email: "ac2@nati", RotatedAt: rot(-30 * time.Minute)}
+	spent := models.ClaudeQuotaToken{Email: "ac5@mlsys", RotatedAt: rot(-30 * time.Minute)}
+	none := func(string) bool { return false }
+	spentOnly := func(e string) bool { return e == "ac5@mlsys" }
+
+	t.Run("the live shape: one busy, one healthy reserve, one out of quota", func(t *testing.T) {
+		d := dormancyFloorWith([]models.ClaudeQuotaToken{busy, idle, spent}, now, spentOnly)
+		if d["ac3@nati"] {
+			t.Error("a busy account is never dormant")
+		}
+		if d["ac2@nati"] {
+			t.Error("the healthy reserve must stay WARM — it is what the pool fails over to")
+		}
+		if !d["ac5@mlsys"] {
+			t.Error("the out-of-quota surplus may sleep: it cannot serve this minute however warm it is")
+		}
+	})
+
+	t.Run("busy account quarantined — both reserves wake on the next tick", func(t *testing.T) {
+		// A quarantined account leaves the sweep population entirely, so hot
+		// drops below the floor and the promotion has to cover it.
+		d := dormancyFloorWith([]models.ClaudeQuotaToken{idle, spent}, now, spentOnly)
+		if d["ac2@nati"] || d["ac5@mlsys"] {
+			t.Fatalf("with the busy account gone, hot=0 < floor — every reserve must wake, got %v", d)
+		}
+	})
+
+	t.Run("plenty of hot accounts — the surplus may all sleep", func(t *testing.T) {
+		busy2 := models.ClaudeQuotaToken{Email: "ac1@nati", LastLeasedAt: lease(-time.Minute), RotatedAt: rot(-time.Hour)}
+		d := dormancyFloorWith([]models.ClaudeQuotaToken{busy, busy2, idle, spent}, now, none)
+		if !d["ac2@nati"] || !d["ac5@mlsys"] {
+			t.Errorf("floor already met by 2 busy accounts, both idle ones should sleep, got %v", d)
+		}
+	})
+
+	t.Run("a single-account pool never sleeps it", func(t *testing.T) {
+		lonely := models.ClaudeQuotaToken{Email: "ac3@nati", RotatedAt: rot(-30 * time.Minute)}
+		if d := dormancyFloorWith([]models.ClaudeQuotaToken{lonely}, now, none); d["ac3@nati"] {
+			t.Fatal("the only account in the pool must stay warm")
+		}
+	})
+
+	t.Run("promotion is deterministic across replicas", func(t *testing.T) {
+		rows := []models.ClaudeQuotaToken{spent, idle}
+		a := dormancyFloorWith(rows, now, spentOnly)
+		b := dormancyFloorWith([]models.ClaudeQuotaToken{idle, spent}, now, spentOnly)
+		if len(a) != len(b) || a["ac5@mlsys"] != b["ac5@mlsys"] || a["ac2@nati"] != b["ac2@nati"] {
+			t.Fatalf("input order changed the outcome: %v vs %v — the two replicas would disagree", a, b)
+		}
+	})
+
+	t.Run("never-exchanged accounts are not candidates at all", func(t *testing.T) {
+		fresh := models.ClaudeQuotaToken{Email: "ac9@yao.lu"} // RotatedAt nil
+		if d := dormancyFloorWith([]models.ClaudeQuotaToken{busy, idle, fresh}, now, none); d["ac9@yao.lu"] {
+			t.Fatal("a newly added account must get its first refresh, never be slept")
+		}
+	})
+}

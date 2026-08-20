@@ -24,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -369,6 +370,80 @@ func ClaudePoolLimits() (short, sevenD int) {
 		envIntPos("LUMID_QUOTA_CLAUDE_7D_TOKENS", DefaultClaude7dTokens)
 }
 
+// ── role-tiered caps ────────────────────────────────────────────────────────
+//
+// The caps above are GLOBAL: one number for everyone. That was fine for a small
+// team, and breaks as soon as a large cohort shares the pool with its operators.
+// The live values (35M short / 450M 7d) are ~17x the code defaults because they
+// were sized for a handful of heavy users; applied to ~20 students on 2 pooled
+// accounts they are not a limit at all, since the org's own Anthropic quota is
+// exhausted long before any individual reaches 35M.
+//
+// Simply lowering the global number is the obvious move and the wrong one: it
+// throttles the operators doing the heaviest legitimate work by exactly as much
+// as it throttles a student. So the budget is tiered by role instead.
+//
+// LUMID_QUOTA_CLAUDE_USER_{5H,7D}_TOKENS set the cap for role="user"; admins and
+// super_admins keep ClaudePoolLimits(). Both DEFAULT to the global values, so
+// this function changes nothing until an operator sets them — the policy is
+// config, not a silent behaviour change shipped in a binary.
+func ClaudePoolLimitsForRole(role string) (short, sevenD int) {
+	gShort, gSeven := ClaudePoolLimits()
+	if role == "admin" || role == "super_admin" {
+		return gShort, gSeven
+	}
+	return envIntPos("LUMID_QUOTA_CLAUDE_USER_5H_TOKENS", gShort),
+		envIntPos("LUMID_QUOTA_CLAUDE_USER_7D_TOKENS", gSeven)
+}
+
+// roleCache memoises the users lookup on the charge path.
+//
+// Every charge would otherwise add a SELECT to a hot path that already runs the
+// window aggregate. A short TTL is the right trade: the only thing a stale entry
+// can do is bill one user at the wrong tier for under a minute, and role changes
+// are rare and administrative.
+var (
+	roleCacheMu  sync.Mutex
+	roleCache    = map[string]roleCacheEntry{}
+	roleCacheTTL = time.Minute
+)
+
+type roleCacheEntry struct {
+	role string
+	exp  time.Time
+}
+
+// ClaudePoolLimitsForUser resolves userSub's role and returns that tier's caps.
+//
+// On ANY lookup failure it falls back to the global caps rather than the
+// (possibly tighter) user tier. Failing open matters here: a transient DB error
+// must not silently start denying quota to admins, which would look exactly like
+// the pool being exhausted and send someone hunting a nonexistent capacity
+// problem. Under-charging for a moment is the cheaper failure.
+func ClaudePoolLimitsForUser(db *gorm.DB, userSub string) (short, sevenD int) {
+	if db == nil || userSub == "" {
+		return ClaudePoolLimits()
+	}
+	roleCacheMu.Lock()
+	e, ok := roleCache[userSub]
+	roleCacheMu.Unlock()
+	if ok && time.Now().Before(e.exp) {
+		return ClaudePoolLimitsForRole(e.role)
+	}
+	var role string
+	// users.id IS the sub (see models.User — every downstream service FKs it).
+	// Selecting the single column rather than loading the User row: this runs on
+	// the charge path, and the row carries an avatar mediumtext.
+	if err := db.Raw(`SELECT role FROM users WHERE id = ?`, userSub).
+		Scan(&role).Error; err != nil || role == "" {
+		return ClaudePoolLimits()
+	}
+	roleCacheMu.Lock()
+	roleCache[userSub] = roleCacheEntry{role: role, exp: time.Now().Add(roleCacheTTL)}
+	roleCacheMu.Unlock()
+	return ClaudePoolLimitsForRole(role)
+}
+
 // DefaultClaudeShortWindow is the length of the per-user short window.
 //
 // The DB column is still `five_hour_anchor`: renaming it needs a migration for
@@ -596,7 +671,10 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		if !poolCapApplies(req.Model) {
 			break
 		}
-		cap5, cap7 := ClaudePoolLimits()
+		// Role-tiered: a student on the shared pool and an operator doing the
+		// heaviest work on it should not get the same budget. Defaults to the
+		// global caps unless LUMID_QUOTA_CLAUDE_USER_* is set.
+		cap5, cap7 := ClaudePoolLimitsForUser(db, req.UserSub)
 		status, werr := ClaudePoolUsage(db, req.UserSub, now)
 		if werr != nil {
 			return ChargeRes{}, werr

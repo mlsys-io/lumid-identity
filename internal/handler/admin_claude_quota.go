@@ -866,6 +866,34 @@ func AdminClaudeQuota(c *gin.Context) {
 	})
 }
 
+// claudeTokenReAddColumns is the ON DUPLICATE KEY UPDATE set a re-add writes.
+//
+// Extracted so the tombstone test can assert against the SET THE HANDLER USES
+// rather than a copy of it — the whole failure mode here is a column quietly
+// going missing from this list.
+//
+// "deleted_at" is the load-bearing one: the row may be a TOMBSTONE from a
+// previous removal (AdminClaudeTokenDelete soft-deletes so the forensics
+// survive). Its unique key is still occupied, so the INSERT ... ON DUPLICATE
+// KEY UPDATE lands on the tombstone; without clearing deleted_at the new
+// credential is written onto a row every query still filters out, and the
+// account silently never rejoins the pool.
+//
+// "label" is included ONLY when the caller supplied one — an unrelated re-add
+// (e.g. a refresh-token rotation) must not wipe an existing field-box tag.
+func claudeTokenReAddColumns(withLabel bool) []string {
+	cols := []string{
+		"value_encrypted", "refresh_token_encrypted", "updated_at",
+		"revoked_at", "revoke_reason",
+		"bench_until", "bench_reason", "bench_dead",
+		"deleted_at",
+	}
+	if withLabel {
+		cols = append(cols, "label")
+	}
+	return cols
+}
+
 // POST /api/v1/admin/claude-token  (RequireAdmin)
 func AdminClaudeTokenAdd(c *gin.Context) {
 	var body struct {
@@ -925,11 +953,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	// "label" is only included in the update set when this request actually
 	// supplied one — an unrelated re-add (e.g. refresh-token rotation) with no
 	// label field must not silently wipe an existing field-box tag.
-	updateCols := []string{"value_encrypted", "refresh_token_encrypted", "updated_at", "revoked_at", "revoke_reason",
-		"bench_until", "bench_reason", "bench_dead"}
-	if label != "" {
-		updateCols = append(updateCols, "label")
-	}
+	updateCols := claudeTokenReAddColumns(label != "")
 	if err := common.DB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
 		DoUpdates: clause.AssignmentColumns(updateCols),
@@ -948,8 +972,20 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	})
 }
 
-// AdminClaudeTokenDelete removes a tracked Claude token (and its snapshots) by email.
+// AdminClaudeTokenDelete removes a tracked Claude account from the pool by email.
 // DELETE /api/v1/admin/claude-token/:email  (RequireSuperAdmin)
+//
+// SOFT delete, and the snapshots are deliberately KEPT. Removing an account is
+// what an operator does in the first minutes of a quarantine incident, and the
+// old hard delete + snapshot cascade destroyed the entire forensic record at
+// exactly that moment: revoke_reason, rotated_at, indeterminate_at,
+// pre_expiry_401_at and last_exchange_* all went with the row, and the snapshot
+// history went with them. See the DeletedAt comment on models.ClaudeQuotaToken
+// for the two incidents this cost.
+//
+// The account leaves the pool just as completely as before — GORM filters
+// soft-deleted rows out of every Find/First, so lease, sweep, placement and
+// pool health stop seeing it without any change at their call sites.
 func AdminClaudeTokenDelete(c *gin.Context) {
 	email := strings.TrimSpace(strings.ToLower(c.Param("email")))
 	if email == "" {
@@ -960,8 +996,10 @@ func AdminClaudeTokenDelete(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "delete token: "+err.Error())
 		return
 	}
-	// Best-effort cleanup of historical snapshots.
-	common.DB.Where("email = ?", email).Delete(&models.ClaudeQuotaSnapshot{})
+	// Snapshots are NOT cascaded. They are the only record of how long this
+	// account's tokens actually lived, which is what distinguishes a mid-life
+	// revocation from an ordinary expiry when the next account dies.
+	log.Printf("claude-pool: %s removed from the pool (tombstoned — row and snapshots retained for forensics)", email)
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
 }
 
@@ -1136,6 +1174,96 @@ func InternalClaudeAccountBench(c *gin.Context) {
 			email, until.Format(time.RFC3339), reason)
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true, "benched": true, "until": until, "dead": body.Dead || row.BenchDead})
+}
+
+// InternalClaudeAccountMidLife401 records that claude-proxy was refused on a
+// FRESHLY LEASED access token — the serving-path half of the pre-expiry-401
+// signal.
+//
+// Why this exists, and why it is not folded into the bench report above.
+//
+// pre_expiry_401_at had exactly one writer: refreshSnapshot, which sets it just
+// before calling tryRefreshToken. That is too late to be a warning. When the
+// probe is the discoverer and the refresh then fails, the marker and the
+// quarantine are written in the same call — at_risk and quarantined go from 0
+// to 1 together and nobody is ever paged during the window when the cheap fix
+// ("find the other holder") still exists. Worse, refreshSnapshot only sets it
+// when jwtExpiry() can prove the token had life left; our own 45-minute sweep
+// means the probe usually meets a token that has aged out naturally, so the
+// branch is skipped and the signal is never written at all. That is exactly
+// what happened on 2026-08-21: both quarantine lines read caller=snapshot-probe
+// with no (pre-expiry-401) marker, and at_risk was 0 throughout.
+//
+// claude-proxy is the earliest and by far the highest-volume 401 detector in
+// the system — it serves thousands of requests against every account, where the
+// probe touches each one every couple of minutes. On 2026-08-21 it saw ac2@nati
+// refused at 19:28:41; identity's probe did not find out until 19:32:55. Those
+// four minutes were available and unused.
+//
+// The signal is deliberately NARROW: the proxy calls this only for a 401 whose
+// upstream body says the access token was REVOKED, and only after its rotation
+// excuse has declined to absorb it — i.e. the proxy re-leased, got a token
+// identity considers current, and was refused on that. A token we just leased
+// being refused is a mid-life refusal by definition, which is why this can set
+// the same column refreshSnapshot does without widening its meaning.
+//
+// Separate from /claude-account/bench on purpose. That handler's seconds<=0
+// path RELEASES a bench, including a dead one, and its semantics were the
+// subject of a real outage (see its comment); overloading it with a
+// signal-only mode would put an evidence write behind a branch nobody wants to
+// re-reason about. It also could not carry this signal anyway: the proxy
+// reports a bench only once it goes pool-wide, and the first genuine revoked
+// 401 — the one that matters — benches locally and is never reported.
+//
+// Never quarantines and never benches. It writes evidence; the operator and
+// the at-risk alert decide what to do with it.
+func InternalClaudeAccountMidLife401(c *gin.Context) {
+	var body struct {
+		Email  string `json:"email"`
+		Detail string `json:"detail"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(body.Email))
+	if email == "" {
+		fail(c, http.StatusBadRequest, 1400, "email required")
+		return
+	}
+
+	var row models.ClaudeQuotaToken
+	if err := common.DB.Where("email = ?", email).First(&row).Error; err != nil {
+		fail(c, http.StatusNotFound, 1404, "no such pooled account")
+		return
+	}
+	// An already-quarantined family has nothing left to warn about, and
+	// stamping it would only restart the 6h at-risk window on a dead account.
+	if row.RevokedAt != nil {
+		c.JSON(http.StatusOK, gin.H{"ok": true, "recorded": false, "reason": "already quarantined"})
+		return
+	}
+
+	at := time.Now()
+	reason := truncStr("claude-proxy: refused on a freshly leased access token: "+
+		strings.TrimSpace(body.Detail), 500)
+	// Fresh signal = no previous mark, or the previous one has aged out of the
+	// alert window. Re-stamping inside the window keeps the alert alive (the
+	// condition is still true) but must not re-log on every request of a burst.
+	fresh := row.PreExpiry401At == nil || at.Sub(*row.PreExpiry401At) >= preExpiry401Window
+	if err := common.DB.Model(&row).Updates(map[string]interface{}{
+		"pre_expiry_401_at":     at,
+		"pre_expiry_401_reason": reason,
+	}).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "persist mid-life 401: "+err.Error())
+		return
+	}
+	if fresh {
+		log.Printf("claude-quota: %s: access token REFUSED mid-life on the SERVING path (claude-proxy) — "+
+			"the family is being invalidated by something other than our rotation; "+
+			"find the other holder before it quarantines: %s", email, reason)
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "recorded": true, "fresh": fresh})
 }
 
 func InternalClaudeTokenLease(c *gin.Context) {

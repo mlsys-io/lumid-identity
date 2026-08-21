@@ -1,6 +1,10 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 // ClaudeQuotaToken — admin-managed token store for org members' Claude
 // Code OAuth tokens, keyed by email. Intentionally decoupled from the
@@ -109,6 +113,30 @@ type ClaudeQuotaToken struct {
 	// account, which is exactly backwards), and usage_events is keyed by user,
 	// not by account.
 	LastLeasedAt *time.Time `gorm:"column:last_leased_at" json:"last_leased_at,omitempty"`
+	// DeletedAt — TOMBSTONE, not a convenience.
+	//
+	// AdminClaudeTokenDelete used to hard-DELETE this row and cascade the
+	// account's claude_quota_snapshots with it. Removing a quarantined account
+	// is the FIRST thing an operator does during an incident, so that erased
+	// exactly the evidence the forensics columns above exist to preserve —
+	// revoke_reason, rotated_at, indeterminate_at, pre_expiry_401_at,
+	// last_exchange_* — plus the snapshot history the sibling-comparison
+	// technique needs (an account's token lifetime is only interpretable
+	// against the ones minted alongside it).
+	//
+	// It has now cost two post-mortems. On 2026-08-21 ac2@nati and ac3@nati
+	// were quarantined 2m01s apart, deleted 4h20m later, and the incident was
+	// only reconstructable because identity's pod logs happened not to have
+	// rotated yet. That is not a control.
+	//
+	// Soft delete keeps the row and every column on it while removing the
+	// account from the pool: GORM excludes deleted rows from Find/First
+	// automatically, so lease, sweep, placement and pool-health all stop
+	// seeing it with no change at their call sites. A re-add resurrects the
+	// tombstone in place — see the deleted_at entry in AdminClaudeTokenAdd's
+	// update set, without which the ON DUPLICATE KEY UPDATE would write the
+	// new credential onto a row that stays invisible.
+	DeletedAt gorm.DeletedAt `gorm:"column:deleted_at;index" json:"-"`
 }
 
 func (ClaudeQuotaToken) TableName() string { return "claude_quota_tokens" }

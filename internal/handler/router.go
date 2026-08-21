@@ -519,6 +519,12 @@ func Register(r *gin.Engine) {
 			// the cooldown applies across every proxy replica, not just the pod
 			// that saw the failure.
 			internal.POST("/claude-account/bench", InternalClaudeAccountBench)
+			// Serving-path mid-life 401 — the proxy was refused on a token it
+			// had just leased, which means the family was invalidated by
+			// something other than our own rotation. Records the at-risk
+			// signal while the account is STILL SERVING; the snapshot probe
+			// discovers this minutes later, and only sometimes.
+			internal.POST("/claude-account/mid-life-401", InternalClaudeAccountMidLife401)
 			// Field-box fingerprint adoption — each proxy replica reports the
 			// client version triples it saw, and reads back ONE aggregated
 			// pool. Central because the replicas must present an identical

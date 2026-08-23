@@ -63,6 +63,7 @@ func SessionBearerHandler(c *gin.Context) {
 	//     (parity with the CLI: anyone with a lum.id PAT can run
 	//     `flowmesh ssh`). Cost control lives in the billing layer,
 	//     not here.
+	//   ?audience=lqt → read-only LQT surfaces, no scopes; see the case below.
 	requestedAud := strings.ToLower(strings.TrimSpace(c.Query("audience")))
 	if requestedAud == "" {
 		requestedAud = "runmesh"
@@ -104,8 +105,29 @@ func SessionBearerHandler(c *gin.Context) {
 			"flowmesh:tasks:read",
 			"flowmesh:results:read",
 		}
+	case "lqt":
+		// LQT read surfaces (lum.id/lqt/inspect/*, served by its own ingress
+		// straight to lqt-inspect — it never passes through the landing nginx,
+		// so it is NOT covered by the $lqt_auth service-PAT injection and is
+		// scoped to whoever's bearer actually arrives).
+		//
+		// lqt-auth already accepts exactly this: it verifies a JWKS-signed JWT
+		// requiring aud="lqt" / iss="https://lum.id" (lqt-auth DEFAULT_AUD,
+		// DEFAULT_ISS) before falling back to PAT introspect. The two halves
+		// were built to meet and were never connected — without this case a
+		// browser had no way to reach a tenant-scoped LQT read except by the
+		// user pasting a raw PAT into the page, which is precisely what
+		// session-bearer exists to avoid.
+		//
+		// No scopes: /lqt/inspect/* authorizes on the tenant the token asserts
+		// (self_tenant is injected server-side from `sub` and cannot be spoofed
+		// by the caller), not on a scope string. Deliberately NOT granting
+		// `lqt:strategy` here — deploying a strategy is a write, it is a
+		// capability tag a user mints on a PAT deliberately, and a 10-minute
+		// bearer minted from a session cookie is the wrong instrument for it.
+		audience = "lqt"
 	default:
-		fail(c, http.StatusBadRequest, 1001, "audience must be 'runmesh' or 'flowmesh'")
+		fail(c, http.StatusBadRequest, 1001, "audience must be 'runmesh', 'flowmesh' or 'lqt'")
 		return
 	}
 

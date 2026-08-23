@@ -1656,6 +1656,8 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		Email         string
 		FiveTokens    int
 		SevenTokens   int
+		ClaudeFive    int
+		ClaudeSeven   int
 		RawInput      int
 		RawOutput     int
 		RawCacheRead  int
@@ -1669,11 +1671,18 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	// dashboard would show a user comfortably inside their cap while the proxy
 	// 429s them — the same class of bug as the 5h/4h window skew.
 	wsql := common.ClaudeWeightedTokensSQL("ue.")
+	// Claude-only weighted draw: the same expression gated to claude-* models.
+	// The 4h/7d bars reflect POOLED CLAUDE ONLY (the gate's enforcePoolQuota
+	// exempts deepseek/on-prem from the cap), so the dashboard must not show
+	// OpenRouter/on-prem drawing against the Claude budget.
+	claudeOnly := `CASE WHEN ue.model LIKE 'claude-%' THEN 1 ELSE 0 END`
 	err := common.DB.Raw(fmt.Sprintf(`
 		SELECT ue.user_sub                                                              AS user_sub,
 		       COALESCE(u.email, ue.user_sub)                                           AS email,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s ELSE 0 END), 0) AS five_tokens,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s ELSE 0 END), 0) AS seven_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_five_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_seven_tokens,
 		       -- RAW totals alongside the weighted ones, so the quota number can be
 		       -- reconciled against Anthropic's own record instead of taken on trust.
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.input_tokens ELSE 0 END), 0)         AS raw_input,
@@ -1690,7 +1699,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       FROM   claude_pool_windows) w ON w.user_sub = ue.user_sub
 		LEFT JOIN users u ON u.id = ue.user_sub
 		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= LEAST(w.five_eff, w.seven_eff)
-		GROUP  BY ue.user_sub, u.email`, wsql),
+		GROUP  BY ue.user_sub, u.email`, wsql, claudeOnly),
 		int(common.ClaudePoolShortWindow().Seconds()), now, far, now, far).Scan(&rows).Error
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query usage: "+err.Error())
@@ -1759,12 +1768,25 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		SevenDay      int                   `json:"seven_day_tokens"`
 		FiveHourPct   float64               `json:"five_hour_pct"`
 		SevenDayPct   float64               `json:"seven_day_pct"`
+		// Claude-only weighted draw (subset of FiveHour/SevenDay) + pct — the bars
+		// reflect POOLED CLAUDE ONLY (the gate's enforcePoolQuota exempts
+		// deepseek/on-prem from the cap), so the dashboard must not show
+		// OpenRouter/on-prem drawing against the Claude budget. Full-window
+		// numbers stay in five_hour_tokens/seven_day_tokens.
+		ClaudeFive     int                   `json:"claude_five_hour_tokens"`
+		ClaudeSeven    int                   `json:"claude_seven_day_tokens"`
+		ClaudeFivePct  float64               `json:"claude_five_hour_pct"`
+		ClaudeSevenPct float64               `json:"claude_seven_day_pct"`
 		CostCents7d   int                   `json:"cost_cents_7d"`
 		Requests      int                   `json:"requests_7d"`
 		LastTs        time.Time             `json:"last_ts"`
 		FiveHourReset string                `json:"five_hour_reset,omitempty"`
 		SevenDayReset string                `json:"seven_day_reset,omitempty"`
 		Models        map[string]modelUsage `json:"models"`
+		// Provider-grouped 7d subtotals: "claude" | "openrouter" | "onprem" →
+		// {tokens_7d, cost_cents_7d}. Lets the dashboard show per-user provider
+		// splits without the reader mentally summing model chips.
+		Providers map[string]modelUsage `json:"providers"`
 		// RAW 7d totals exactly as Anthropic reported them. five_hour_tokens and
 		// seven_day_tokens above are the WEIGHTED quota unit (cache reads at a
 		// tenth, model by price ratio), which is deliberately not a token count —
@@ -1780,11 +1802,13 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	for _, r := range rows {
 		u, ok := byUser[r.UserSub]
 		if !ok {
-			u = &userUsage{Email: r.Email, Models: map[string]modelUsage{}}
+			u = &userUsage{Email: r.Email, Models: map[string]modelUsage{}, Providers: map[string]modelUsage{}}
 			byUser[r.UserSub] = u
 		}
 		u.FiveHour = r.FiveTokens
 		u.SevenDay = r.SevenTokens
+		u.ClaudeFive = r.ClaudeFive
+		u.ClaudeSeven = r.ClaudeSeven
 		u.RawInput, u.RawOutput = r.RawInput, r.RawOutput
 		u.RawCacheRead, u.RawCacheWrite = r.RawCacheRead, r.RawCacheWrite
 		u.RawTotal = r.RawInput + r.RawOutput + r.RawCacheRead + r.RawCacheWrite
@@ -1813,7 +1837,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 			u.SevenDayReset = resetAt.UTC().Format(time.RFC3339)
 		}
 	}
-	// Attach per-model breakdown.
+	// Attach per-model breakdown + aggregate into provider subtotals.
 	for _, mr := range modelRows {
 		u, ok := byUser[mr.UserSub]
 		if !ok {
@@ -1823,14 +1847,20 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		m.Tokens += mr.Tokens
 		m.CostCents += mr.CostCents
 		u.Models[mr.Model] = m
+		// Provider grouping — same classification the chips use.
+		p := u.Providers[string(common.ClassifyProvider(mr.Model))]
+		p.Tokens += mr.Tokens
+		p.CostCents += mr.CostCents
+		u.Providers[string(common.ClassifyProvider(mr.Model))] = p
 	}
 	// Merge PAT holders who haven't charged tokens yet.
 	for _, ph := range patHolders {
 		if _, ok := byUser[ph.UserSub]; !ok {
 			byUser[ph.UserSub] = &userUsage{
-				Email:  ph.Email,
-				LastTs: ph.LastUsedAt,
-				Models: map[string]modelUsage{},
+				Email:     ph.Email,
+				LastTs:    ph.LastUsedAt,
+				Models:    map[string]modelUsage{},
+				Providers: map[string]modelUsage{},
 			}
 		}
 	}
@@ -1838,6 +1868,10 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	for _, u := range byUser {
 		u.FiveHourPct = float64(u.FiveHour) / float64(cap5) * 100
 		u.SevenDayPct = float64(u.SevenDay) / float64(cap7) * 100
+		// Claude-only pcts power the bars so OpenRouter/on-prem don't draw
+		// against the Claude budget on-screen. Divide by the same caps.
+		u.ClaudeFivePct = float64(u.ClaudeFive) / float64(cap5) * 100
+		u.ClaudeSevenPct = float64(u.ClaudeSeven) / float64(cap7) * 100
 		users = append(users, *u)
 	}
 	// Highest 5h pressure first.

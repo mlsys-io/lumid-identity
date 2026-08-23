@@ -215,20 +215,19 @@ type ChargeRes struct {
 	SevenDayReset string `json:"seven_day_reset,omitempty"`
 }
 
-// poolCapApplies reports whether a model's usage counts against the Anthropic
-// account-pool caps.
+// poolCapApplies reports whether a model's usage counts against the per-user
+// pool 5h/7d windows.
 //
-// An EMPTY model means claude-proxy's pre-request gate (a dry-run carrying no
-// model and zero tokens) — it must be gated. Treating "" as non-Anthropic is
-// what silently disabled quota enforcement entirely; see quota_gate_test.go.
-func poolCapApplies(model string) bool {
-	// Case-INSENSITIVE to match claude-proxy's isAnthropicNativeModel
-	// (which lowercases). A capital-C "Claude-…" routed to the pool but, when
-	// this was case-sensitive, skipped the per-request cap — a one-request
-	// overshoot. Kept hyphen-free so it stays a SUPERSET of what routes to the
-	// pool (gate at least everything the proxy treats as Anthropic).
-	return model == "" || strings.HasPrefix(strings.ToLower(model), "claude")
-}
+// Every named model — Claude or not — draws on the SAME shared window. Non-Anthropic
+// models (deepseek-v4-flash, kimi-k3, z-ai/glm-5.2) were previously excluded so their
+// usage never counted and could never deny; that metering gap is closed (the cost-model
+// difference is handled by the weight, not by skipping the window).
+//
+// "" is claude-proxy's PRE-REQUEST dry-run gate (no model, zero tokens). It MUST remain
+// gated: treating "" as non-Anthropic is the regression that silently disabled ALL pool
+// quota enforcement (see quota_gate_test.go). Only claude-proxy's gate sends ""; a real
+// charge always carries a model.
+func poolCapApplies(model string) bool { return true }
 
 // Model weighting for the pool quota.
 //
@@ -267,10 +266,17 @@ const (
 	// effect was to under-charge Sonnet work 3x and Haiku ~3.8x relative to
 	// Opus, overstating how much cheaper they are and skewing the incentive
 	// further toward them than the real price gap justifies.
-	claudeWeightOpus    = 1.0
-	claudeWeightSonnet  = 0.6
-	claudeWeightHaiku   = 0.2
-	claudeWeightDefault = claudeWeightSonnet // conservative, matches modelCostCents' default
+	claudeWeightOpus   = 1.0
+	claudeWeightSonnet = 0.6
+	claudeWeightHaiku  = 0.2
+
+	// Non-Anthropic models (deepseek-v4-flash, kimi-k3, z-ai/glm-5.2) now draw on the
+	// SAME per-user window as Claude, so they need a price-ratio weight of their own.
+	// Ratio to Opus: DeepSeek ~$0.27/$1.10, GLM ~$0.14/$0.14 per MTok vs Opus $5/$25
+	// → true ratio ≈ 0.05. 0.1 keeps a 2x margin so no single non-Claude model silently
+	// drains a week's budget, but stays BELOW the Haiku floor (0.2) so the free
+	// self-hosted model isn't over-counted. Env-tunable; the value is a policy call.
+	claudeWeightNonClaude = 0.1
 
 	// Cached input is charged at a fraction of fresh input, so the quota weights
 	// it the same way it weights models — by price ratio. A cache READ is a tenth
@@ -342,7 +348,7 @@ func ClaudeModelWeightSQL(col string) string {
 	  WHEN LOWER(%[1]s) LIKE 'claude-sonnet%%' THEN %[3]v
 	  WHEN LOWER(%[1]s) LIKE 'claude-haiku%%'  THEN %[4]v
 	  ELSE %[5]v
-	END`, col, claudeWeightOpus, claudeWeightSonnet, claudeWeightHaiku, claudeWeightDefault)
+	END`, col, claudeWeightOpus, claudeWeightSonnet, claudeWeightHaiku, claudeWeightNonClaude)
 }
 
 // ClaudeModelWeight is the Go-side twin of ClaudeModelWeightSQL, for weighting
@@ -357,9 +363,57 @@ func ClaudeModelWeight(model string) float64 {
 	case strings.HasPrefix(m, "claude-haiku"):
 		return claudeWeightHaiku
 	default:
-		return claudeWeightDefault
+		// Any other model — an unknown Claude variant OR a non-Anthropic model
+		// (deepseek-v4-flash, kimi-k3, z-ai/glm-5.2) — is counted at the cheap
+		// non-Claude weight. Non-Claude models now share the window, so they must
+		// not fall through to the Sonnet-rate default.
+		return claudeWeightNonClaude
 	}
 }
+
+// LlmProvider classifies a model id by its serving route, so the dashboard can
+// distinguish pooled Claude (subscription, 4h/7d-constrained) from OpenRouter
+// (metered pay-per-use) from on-prem (self-hosted GB10, free at the margin).
+// Mirrors claude-proxy's isSelfHostedModel/isDeepseekFamily semantics; keep the
+// two in step (the frontend modelRoute() duplicates this — see claude-quota.tsx).
+type LlmProvider string
+
+const (
+	ProviderClaude    LlmProvider = "claude"
+	ProviderOpenRouter LlmProvider = "openrouter"
+	ProviderOnPrem     LlmProvider = "onprem"
+)
+
+// ClassifyProvider maps a model id to its serving provider.
+//
+// Rules (matched to the gate's own classification):
+//   - claude-*            → pooled Claude (draws the Anthropic subscription)
+//   - deepseek-v4-flash   → on-prem (self-hosted GB10 pair, free at the margin)
+//   - everything else     → OpenRouter (metered pay-per-use: kimi-*, z-ai/*,
+//     deepseek/deepseek-*, any unlisted id)
+func ClassifyProvider(model string) LlmProvider {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if i := strings.IndexByte(m, '['); i >= 0 {
+		m = m[:i] // strip Claude Code's [N] context-length marker
+	}
+	if strings.HasPrefix(m, "claude-") {
+		return ProviderClaude
+	}
+	if m == "deepseek-v4-flash" {
+		return ProviderOnPrem
+	}
+	return ProviderOpenRouter
+}
+
+// claudePoolUnlimitedSentinel is the "uncapped" cap for admins/super_admins: a
+// weighted-token budget so large it can never bind (~2.1B units).
+//
+// Deliberately NOT 0 ("0 = unlimited"). 0 would break three things at once:
+// envIntPos rejects non-positive values when reading env caps, the percentage
+// math divides by the cap (divide-by-zero), and `used > 0` would hard-deny
+// immediately. A huge positive sentinel keeps every downstream arithmetic valid
+// (admin pct computes to ~0) and lets the same gate handle all roles uniformly.
+const claudePoolUnlimitedSentinel = math.MaxInt32
 
 // ClaudePoolLimits reads the env-tunable per-user pool caps.
 // LUMID_QUOTA_CLAUDE_5H_TOKENS keeps its name for continuity with any existing
@@ -384,14 +438,19 @@ func ClaudePoolLimits() (short, sevenD int) {
 // as it throttles a student. So the budget is tiered by role instead.
 //
 // LUMID_QUOTA_CLAUDE_USER_{5H,7D}_TOKENS set the cap for role="user"; admins and
-// super_admins keep ClaudePoolLimits(). Both DEFAULT to the global values, so
-// this function changes nothing until an operator sets them — the policy is
-// config, not a silent behaviour change shipped in a binary.
+// super_admins are UNCAPPED (claudePoolUnlimitedSentinel) so operators doing the
+// heaviest work are never throttled by the same budget that protects the shared
+// pool from a large non-admin cohort.
+//
+// The user cap DEFAULTS to the global values, so this function changes nothing
+// until an operator sets LUMID_QUOTA_CLAUDE_USER_* — setting them is the policy,
+// and is MANDATORY for enforcement (see the deploy manifest) — while the admin
+// uncapping is unconditional.
 func ClaudePoolLimitsForRole(role string) (short, sevenD int) {
-	gShort, gSeven := ClaudePoolLimits()
 	if role == "admin" || role == "super_admin" {
-		return gShort, gSeven
+		return claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel
 	}
+	gShort, gSeven := ClaudePoolLimits()
 	return envIntPos("LUMID_QUOTA_CLAUDE_USER_5H_TOKENS", gShort),
 		envIntPos("LUMID_QUOTA_CLAUDE_USER_7D_TOKENS", gSeven)
 }
@@ -555,13 +614,13 @@ func formatPoolReset(t time.Time) string {
 // handler with no risk of starting anyone's clock; only ClaudePoolCommit
 // opens or rolls an anchor.
 //
-// The model filter MIRRORS poolCapApplies: only usage that actually consumes
-// the Anthropic account pool counts toward the windows. Without it,
-// external-API models (kimi-k3, glm, …) — which bill to our own provider keys
-// and are exempt from the cap check — still inflated the window and burned
-// the user's Claude quota. They have no prompt caching, so a single agentic
-// turn re-sends the whole context (observed 75k–296k uncached input tokens
-// per request), which exhausted a 1.5M/5h cap in a handful of calls.
+// Every claude_proxy row — Claude or not — counts toward the shared window.
+// Non-Anthropic models (deepseek-v4-flash, kimi-k3, z-ai/glm-5.2) draw on the
+// SAME per-user 5h/7d window as Claude; their cost difference is handled by the
+// model weight (claudeWeightNonClaude), not by excluding them. This closure is
+// what makes the shared-window design work end-to-end: the gate (poolCapApplies),
+// this SUM, and the admin table all agree, so a dashboard never disagrees with
+// the gate about how much a user has drawn.
 func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStatus, error) {
 	var status ClaudePoolStatus
 	var win models.ClaudePoolWindow
@@ -607,8 +666,7 @@ func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStat
 		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS five_tokens,
 		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS seven_tokens
 		FROM   usage_events
-		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?
-		       AND (model IS NULL OR model = '' OR LOWER(model) LIKE 'claude%%')`, w),
+		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?`, w),
 		fiveBound, sevenBound, userSub, scanBound).Scan(&row).Error; err != nil {
 		return status, err
 	}
@@ -658,19 +716,15 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		// Fixed 5h/7d windows (not midnight-daily) — mirrors the Anthropic
 		// account quota shape the pool itself is subject to.
 		//
-		// Non-Anthropic models (kimi-k3, z-ai/glm-5.2, etc.) don't consume the
-		// Anthropic token pool — skip the cap check and just record the event.
+		// Every named model — Claude or non-Claude — runs this cap check against the
+		// SAME shared 5h/7d window. Non-Anthropic models (deepseek-v4-flash,
+		// kimi-k3, z-ai/glm-5.2) used to bypass here entirely (an explicit
+		// `if !poolCapApplies(req.Model) { break }`), so a user could draw
+		// unlimited LLM usage at /lum.id/code. poolCapApplies is now constant-true
+		// precisely so no named model skips this gate; the historical `""` dry-run
+		// bug (see quota_gate_test.go) is preserved by the fact that the "" gate
+		// request runs THIS same path, not a bypass.
 		//
-		// `req.Model != ""` is load-bearing. claude-proxy's PRE-REQUEST gate is a
-		// dry-run with no model and zero tokens (gateUser →
-		// chargeUser(sub,"","",0,0,true)), and an empty string is not
-		// "claude"-prefixed — so this bypass silently swallowed the gate and
-		// EVERY user was served regardless of quota. The cap was effectively
-		// unenforced from the commit that introduced the bypass until this fix;
-		// only a named non-Anthropic model may skip.
-		if !poolCapApplies(req.Model) {
-			break
-		}
 		// Role-tiered: a student on the shared pool and an operator doing the
 		// heaviest work on it should not get the same budget. Defaults to the
 		// global caps unless LUMID_QUOTA_CLAUDE_USER_* is set.
@@ -767,8 +821,10 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	//
 	// Recording an overspend is also what makes the NEXT dry-run gate deny: the
 	// stored total finally exceeds the cap. res.Allowed stays false either way.
+	// poolCapApplies is constant-true, so it is omitted (a claude_proxy overspend
+	// is recorded for any model, Claude or non-Claude).
 	overspend := deny != "" && !req.DryRun && req.Kind == "claude_proxy" &&
-		poolCapApplies(req.Model) && (req.InputTokens > 0 || req.OutputTokens > 0)
+		(req.InputTokens > 0 || req.OutputTokens > 0)
 
 	if !res.Allowed {
 		// Report current state, not the would-be after-state.
@@ -804,7 +860,7 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		return ChargeRes{}, err
 	}
 
-	if req.Kind == "claude_proxy" && poolCapApplies(req.Model) {
+	if req.Kind == "claude_proxy" {
 		if cerr := ClaudePoolCommit(db, req.UserSub, now); cerr != nil {
 			return ChargeRes{}, cerr
 		}

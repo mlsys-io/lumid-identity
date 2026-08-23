@@ -30,24 +30,37 @@ func clearRoleTierEnv(t *testing.T) {
 	}
 }
 
-// The change must be INERT until an operator opts in. Shipping a binary that
-// silently retiers everyone's quota is how a deploy becomes indistinguishable
-// from an outage for whoever was over the new line.
+// For ORDINARY users the change must be INERT until an operator opts in. Shipping
+// a binary that silently retiers everyone's quota is how a deploy becomes
+// indistinguishable from an outage for whoever was over the new line. Admins are
+// different: they are unconditionally UNCAPPED (sentinel), never bound by a
+// user-tier cap. Their usage is still COUNTED (event + anchor) — the caps are
+// what they're exempt from, not the accounting.
 func TestRoleTierDefaultsToGlobalForEveryone(t *testing.T) {
 	clearRoleTierEnv(t)
 	os.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "35000000")
 	os.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "450000000")
 
-	for _, role := range []string{"user", "admin", "super_admin", "", "nonsense"} {
+	// Ordinary users default to the global cap (opt-in via LUMID_QUOTA_CLAUDE_USER_*).
+	for _, role := range []string{"user", "", "nonsense"} {
 		short, seven := ClaudePoolLimitsForRole(role)
 		if short != 35000000 || seven != 450000000 {
 			t.Errorf("role %q with no user-tier env set got (%d, %d), want the global (35000000, 450000000) — "+
-				"the tier must be opt-in", role, short, seven)
+				"the user tier must be opt-in", role, short, seven)
+		}
+	}
+	// Admins are UNCAPPED regardless of env — never throttled by the shared budget.
+	for _, role := range []string{"admin", "super_admin"} {
+		short, seven := ClaudePoolLimitsForRole(role)
+		if short != claudePoolUnlimitedSentinel || seven != claudePoolUnlimitedSentinel {
+			t.Errorf("role %q got (%d, %d), want the unlimited sentinel (%d, %d)",
+				role, short, seven, claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel)
 		}
 	}
 }
 
-// Once set, the user tier applies to role="user" and NOT to operators.
+// Once set, the user tier applies to role="user" and NOT to operators (who stay
+// uncapped).
 func TestUserTierAppliesOnlyToOrdinaryUsers(t *testing.T) {
 	clearRoleTierEnv(t)
 	os.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "35000000")
@@ -63,8 +76,8 @@ func TestUserTierAppliesOnlyToOrdinaryUsers(t *testing.T) {
 	}{
 		{"user", 2000000, 40000000, "a student gets the cohort budget"},
 		{"", 2000000, 40000000, "an unset role is NOT privileged — default to the tighter tier"},
-		{"admin", 35000000, 450000000, "an operator keeps the full budget"},
-		{"super_admin", 35000000, 450000000, "super_admin keeps the full budget"},
+		{"admin", claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel, "an operator is uncapped, not merely larger"},
+		{"super_admin", claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel, "super_admin is uncapped"},
 	}
 	for _, c := range cases {
 		t.Run(c.description, func(t *testing.T) {

@@ -28,10 +28,15 @@ func TestClaudeModelWeight(t *testing.T) {
 		// to the cheap default and undercharge the most expensive model.
 		{"Claude-Opus-5", claudeWeightOpus},
 		{"CLAUDE-SONNET-5", claudeWeightSonnet},
-		// Unknown / empty bill at the conservative default rather than free.
-		{"", claudeWeightDefault},
-		{"kimi-k3", claudeWeightDefault},
-		{"some-future-model", claudeWeightDefault},
+		// Non-Anthropic models and unknown/empty bill at the cheap non-Claude
+		// weight rather than the Sonnet default. These models now share the window
+		// with Claude, so over-weighting them (as Sonnet) would burn a user's
+		// budget on the free self-hosted model.
+		{"", claudeWeightNonClaude},
+		{"kimi-k3", claudeWeightNonClaude},
+		{"deepseek-v4-flash", claudeWeightNonClaude},
+		{"z-ai/glm-5.2", claudeWeightNonClaude},
+		{"some-future-model", claudeWeightNonClaude},
 	}
 	for _, c := range cases {
 		if got := ClaudeModelWeight(c.model); got != c.want {
@@ -69,7 +74,7 @@ func TestOpusIsTheNormalisationPoint(t *testing.T) {
 func TestClaudeModelWeightSQLMatchesGo(t *testing.T) {
 	sql := ClaudeModelWeightSQL("model")
 
-	for _, want := range []float64{claudeWeightOpus, claudeWeightSonnet, claudeWeightHaiku, claudeWeightDefault} {
+	for _, want := range []float64{claudeWeightOpus, claudeWeightSonnet, claudeWeightHaiku, claudeWeightNonClaude} {
 		if !strings.Contains(sql, fmt.Sprintf("%v", want)) {
 			t.Errorf("SQL expression is missing weight %v — Go and SQL have drifted:\n%s", want, sql)
 		}
@@ -130,8 +135,10 @@ func TestClaudeWeightedTokens(t *testing.T) {
 		// Malformed input must clamp, never yield a negative 5-minute term.
 		{"1h exceeds total clamps", "claude-opus-5", 0, 0, 0, 100, 500, 200},
 		{"haiku is a fifth of opus", "claude-haiku-4-5", 0, 0, 100000, 0, 0, 2000}, // 100000*0.1*0.2
-		// Unknown model bills at the conservative default, never free.
-		{"unknown model", "some-future-model", 1000, 0, 0, 0, 0, 600},
+		// Unknown / non-Claude model bills at the cheap non-Claude weight, never
+		// free. 1000 * 0.1 = 100.
+		{"unknown model", "some-future-model", 1000, 0, 0, 0, 0, 100},
+		{"deepseek", "deepseek-v4-flash", 1000, 0, 0, 0, 0, 100},
 	}
 	for _, c := range cases {
 		got := ClaudeWeightedTokens(c.model, c.in, c.out, c.cRead, c.cWrite, c.cWrite1h)

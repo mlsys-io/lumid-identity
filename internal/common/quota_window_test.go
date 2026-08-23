@@ -15,6 +15,7 @@ package common
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -124,8 +125,11 @@ func TestClaudePoolWindow_OpensOnFirstCharge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usage after two charges: %v", err)
 	}
-	if status.FiveHourUsed != 1800 { // 1000+500+200+100
-		t.Fatalf("five_hour_used=%d want 1800", status.FiveHourUsed)
+	// The window counts WEIGHTED units, not raw tokens: both charges are sonnet
+	// (×0.6). (1500 + 300) × 0.6 = 1080.
+	if want := int(math.Round(float64(1500+300) * claudeWeightSonnet)); status.FiveHourUsed != want {
+		t.Fatalf("five_hour_used=%d want %d (weighted units, not raw tokens)",
+			status.FiveHourUsed, want)
 	}
 }
 
@@ -172,8 +176,9 @@ func TestClaudePoolWindow_BackdatedRoll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usage after roll: %v", err)
 	}
-	if status.FiveHourUsed != 777 {
-		t.Fatalf("five_hour_used after roll=%d want 777 (old 5000 must not count)", status.FiveHourUsed)
+	// Weighted sonnet (×0.6): 777 × 0.6 = 466.
+	if want := int(math.Round(float64(777) * claudeWeightSonnet)); status.FiveHourUsed != want {
+		t.Fatalf("five_hour_used after roll=%d want %d (old 5000 must not count)", status.FiveHourUsed, want)
 	}
 	var win models.ClaudePoolWindow
 	db.Where("user_sub = ?", sub).First(&win)
@@ -384,8 +389,121 @@ func TestClaudePoolWindow_ConcurrentRollConvergence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usage after convergence: %v", err)
 	}
-	if status.FiveHourUsed != n*100 {
+	// Weighted sonnet (×0.6): n×100 raw × 0.6 = 480.
+	if want := int(math.Round(float64(n) * 100 * claudeWeightSonnet)); status.FiveHourUsed != want {
 		t.Fatalf("five_hour_used=%d want %d (all concurrent charges must count under the converged anchor)",
-			status.FiveHourUsed, n*100)
+			status.FiveHourUsed, want)
+	}
+}
+
+// A non-Anthropic model (deepseek-v4-flash) must count toward the SAME shared
+// 5h/7d window as Claude, open the window anchor like Claude, and be able to
+// deny a subsequent Claude request once the shared cap is crossed. This is the
+// metering-gap closure: previously deepseek bypassed entirely (unmetered, never
+// gated). Cost is handled by the weight, not exclusion — weighted tokens of a
+// deepseek charge count against the same caps a Claude charge counts against.
+func TestClaudePoolWindow_NonClaudeCounts(t *testing.T) {
+	t.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "1000") // tight share cap for fast test
+	t.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "10000")
+	db := connectTestDB(t)
+	sub := claudePoolTestSub("nonclaude")
+	t.Cleanup(func() { cleanupSub(t, db, sub) })
+
+	// One deepseek turn: 1000 fresh input. Weighted at claudeWeightNonClaude (0.1)
+	// → 100 weighted units.
+	res, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "deepseek-v4-flash",
+		InputTokens: 1000, OutputTokens: 200,
+	})
+	if err != nil || !res.Allowed {
+		t.Fatalf("deepseek charge: err=%v allowed=%v", err, res.Allowed)
+	}
+	if res.FiveHourReset == "" {
+		t.Fatalf("deepseek charge should open the shared window anchor, got empty reset")
+	}
+
+	// The deepseek charge counted into the shared window at its weight.
+	status, err := ClaudePoolUsage(db, sub, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("usage after deepseek: %v", err)
+	}
+	if want := int(math.Round(float64(1200) * claudeWeightNonClaude)); status.FiveHourUsed != want {
+		t.Fatalf("five_hour_used=%d want %d (deepseek weighted into the shared window)",
+			status.FiveHourUsed, want)
+	}
+
+	// A second deepseek charge pushes the SHARED cap past 1000 weighted units →
+	// a subsequent CLAUDE request must now be denied. Cross-model same-window.
+	if _, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "deepseek-v4-flash",
+		InputTokens: 9000, OutputTokens: 0, // +900 weighted → total ~1020
+	}); err != nil {
+		t.Fatalf("second deepseek charge: %v", err)
+	}
+	gate, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "", DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	if gate.Allowed {
+		t.Fatalf("a Claude model must be denied once the SHARED window (exhausted by deepseek) is over the cap")
+	}
+}
+
+// An admin/super_admin has NO quota cap (claudePoolUnlimitedSentinel) but their
+// usage must STILL be counted: the event is recorded and the window anchor rolls,
+// so /me/claude-usage and the admin table show it. "No quota" applies to the cap
+// check, not to the accounting.
+func TestClaudePoolWindow_AdminStillCounts(t *testing.T) {
+	t.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "1") // absurdly tiny — only binds for non-admins
+	t.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "10")
+	db := connectTestDB(t)
+	sub := claudePoolTestSub("admin-count")
+	t.Cleanup(func() { cleanupSub(t, db, sub) })
+
+	// The role lookup reads users.id (the sub). A synthetic sub has no users row
+	// and would fail OPEN to the tiny global caps — proving nothing about admins.
+	// connectTestDB only migrates UsageEvent + ClaudePoolWindow, so ensure the
+	// minimal users table exists, insert a real admin row, and clear any stale
+	// role-cache entry so the role actually resolves to admin.
+	db.Exec(`CREATE TABLE IF NOT EXISTS users (id VARCHAR(36) PRIMARY KEY,
+		email VARCHAR(255), role VARCHAR(32) DEFAULT 'user')`)
+	db.Exec(`INSERT INTO users (id, email, role) VALUES (?, ?, 'admin')
+		ON DUPLICATE KEY UPDATE role = 'admin'`, sub, sub+"@test")
+	t.Cleanup(func() { db.Exec(`DELETE FROM users WHERE id = ?`, sub) })
+	roleCacheMu.Lock()
+	delete(roleCache, sub)
+	roleCacheMu.Unlock()
+
+	// The sentinel is what frees admins from the cap.
+	if short, seven := ClaudePoolLimitsForRole("admin"); short != claudePoolUnlimitedSentinel || seven != claudePoolUnlimitedSentinel {
+		t.Fatalf("admin caps = (%d,%d), want sentinel (%d,%d)",
+			short, seven, claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel)
+	}
+
+	// An admin's deepseek charge is allowed (uncapped) and still recorded.
+	res, err := CheckAndCharge(db, ChargeReq{
+		UserSub: sub, Kind: "claude_proxy", Model: "deepseek-v4-flash",
+		InputTokens: 1_000_000, OutputTokens: 0, // huge, but uncapped
+	})
+	if err != nil || !res.Allowed {
+		t.Fatalf("admin deepseek charge: err=%v allowed=%v deny=%q", err, res.Allowed, res.DenyReason)
+	}
+	var evCnt int64
+	db.Model(&models.UsageEvent{}).Where("user_sub = ?", sub).Count(&evCnt)
+	if evCnt != 1 {
+		t.Fatalf("admin charge recorded %d usage_events rows, want 1 (must still count)", evCnt)
+	}
+	var win models.ClaudePoolWindow
+	if err := db.Where("user_sub = ?", sub).First(&win).Error; err != nil {
+		t.Fatalf("admin charge should still roll the window anchor: %v", err)
+	}
+	status, err := ClaudePoolUsage(db, sub, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("admin usage: %v", err)
+	}
+	if status.FiveHourUsed <= 0 {
+		t.Fatalf("admin usage must be counted, got %d", status.FiveHourUsed)
 	}
 }

@@ -2098,7 +2098,7 @@ You have tools to:
   - record the user's feedback on runs (what worked, what to change)
   - query recent run results
   - search the web (web_search), fetch one URL (web_fetch), or run deep research (deep_research)
-  - look up financial data by symbol (query_findata)
+  - analyze FinData financial data: discover schemas/tables with data_catalog, then run ad-hoc read-only SQL with data_query (e.g. 'SELECT * FROM market.ohlcv LIMIT 5'); query_findata gives quick per-symbol lookups
   - remember things about the user long-term (remember_about_me) — call this whenever the user shares a preference, fact about themselves, or a working style hint that should persist
   - generate an image from a prompt (generate_image) or synthesize speech from text (text_to_speech) — call these when the user asks you to draw/render a picture or read something aloud; the result appears inline in their artifact panel
 
@@ -2762,7 +2762,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "query_findata",
-			"description": "Look up financial data for a stock/ETF symbol via the kv.run:5000 warehouse. Faster + cheaper than web_search for price + corporate-action queries. Kinds: quote (current price + volume), news (recent headlines), earnings (calendar + results), peers (similar tickers), filings (SEC filings), ohlc (30-day daily bars).",
+			"description": "Quick per-symbol financial lookup (quote/news/earnings/peers/filings/ohlc) against the findata warehouse. Compat shim for the retired kv.run:5000 tool. For ad-hoc analytical SQL or schema discovery, prefer data_catalog + data_query instead.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -2771,6 +2771,30 @@ func buildToolDefs() []map[string]any {
 					"limit":  map[string]any{"type": "integer", "description": "Optional row cap (for news/earnings/filings). Default 10, max 50."},
 				},
 				"required": []string{"kind", "symbol"},
+			},
+		},
+		{
+			"name":        "data_catalog",
+			"description": "Discover the FinData warehouse schema. With no schema, lists all schemas (fundamentals, market, estimates, news, macro, …). With a schema, lists that schema's tables. Use this first to learn what tables/columns exist before writing a data_query. App is 'findata' by default.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":    map[string]any{"type": "string", "description": "Data app (default 'findata')."},
+					"schema": map[string]any{"type": "string", "description": "Optional schema name to list its tables, e.g. 'market'."},
+				},
+			},
+		},
+		{
+			"name":        "data_query",
+			"description": "Run an ad-hoc read-only SELECT against the FinData warehouse and return the rows. Use for analytical queries (aggregations, joins, filtering) that the canned query_findata lookups can't express. Discover schemas/tables first with data_catalog. A LIMIT is appended if absent (default 200, max 1000). App is 'findata' by default.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"sql":   map[string]any{"type": "string", "description": "A single SELECT statement, e.g. 'SELECT * FROM market.ohlcv LIMIT 5'."},
+					"app":   map[string]any{"type": "string", "description": "Data app (default 'findata')."},
+					"limit": map[string]any{"type": "integer", "description": "Optional row cap. Default 200, max 1000."},
+				},
+				"required": []string{"sql"},
 			},
 		},
 		{
@@ -3948,6 +3972,20 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			limit = int(v)
 		}
 		return toolQueryFindata(kind, symbol, limit)
+
+	case "data_catalog":
+		app, _ := args["app"].(string)
+		schema, _ := args["schema"].(string)
+		return toolDataCatalog(app, schema)
+
+	case "data_query":
+		sql, _ := args["sql"].(string)
+		app, _ := args["app"].(string)
+		limit := 0
+		if v, ok := args["limit"].(float64); ok {
+			limit = int(v)
+		}
+		return toolDataQuery(sql, app, limit)
 
 	case "remember_about_me":
 		note, _ := args["note"].(string)

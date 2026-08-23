@@ -46,6 +46,8 @@ var subAgentDefaultTools = map[string]bool{
 	"web_fetch":            true,
 	"deep_research":        true,
 	"query_findata":        true,
+	"data_catalog":         true,
+	"data_query":           true,
 	"query_my_knowledge":   true,
 	"code_run":             true,
 	"list_apps":            true,

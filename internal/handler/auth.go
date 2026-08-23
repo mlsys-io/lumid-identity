@@ -234,9 +234,14 @@ type sendCodeReq struct {
 }
 
 // POST /api/v1/send-verification-code — generates a 6-digit OTP,
-// stores it in Redis for 10 min, "sends" it. Real SMTP wiring is
-// Phase 2's job; for now we log the code so ops can read it off the
-// container output during testing.
+// stores it in Redis for 10 min, and emails it.
+//
+// SMTP is wired in production (the EMAIL_* keys on identity-env), so this
+// really does deliver: signup is self-serve and needs no operator. Only
+// when EMAIL_SMTP_HOST is empty — i.e. dev — does the helper fall back to
+// printing the code on stdout. This comment previously said the opposite
+// ("Phase 2's job; for now we log the code"), which is how the onboarding
+// docs came to describe registration as operator-gated.
 //
 // Rate-limited: one code per email per 60s.
 func SendVerificationCodeHandler(c *gin.Context) {

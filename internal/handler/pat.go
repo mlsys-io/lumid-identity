@@ -188,7 +188,13 @@ func PATMintHandler(c *gin.Context) {
 		return
 	}
 	if !callerHasLumidWrite(c) {
-		fail(c, http.StatusForbidden, 1005, "PAT scope insufficient: lumid:write required to mint tokens")
+		// Name the actual remedy. The old text ("lumid:write required") read as
+		// a capability a role=user cannot self-grant, sending people to ask an
+		// operator for a scope they do not need — callerHasLumidWrite exempts
+		// browser sessions entirely, so minting in the UI always works. The
+		// guard is only "a PAT may not mint a wider PAT".
+		fail(c, http.StatusForbidden, 1005,
+			"a PAT cannot mint another PAT — mint it at lum.id/dashboard/tokens while logged in, or use a PAT with lumid:write")
 		return
 	}
 	var req patMintReq

@@ -79,6 +79,9 @@ var destructiveTools = map[string]bool{
 	"multi_edit":  true,
 	"app_push":    true,
 	"app_install": true,
+	// LQT mailbox strategy submission is a WRITE (deploys a strategy via the
+	// strategy.deploy topic) — approval-gated like the other mutating tools.
+	"lqt_mailbox_submit": true,
 	// Phase 4 (app -> agent) canonical names. The old app_* names stay above
 	// as aliases so in-flight clients/prompts keep working; both route to the
 	// same LumidOS bridge handler (see agentToolAlias + dispatchTool).
@@ -2066,6 +2069,9 @@ func buildToolDefsForRole(role string) []map[string]any {
 	// — the model never sees it for any lesser role; dispatch re-checks too.
 	if role == "super_admin" {
 		defs = append(defs, operatorToolDefs()...)
+		// LQT mailbox strategy submission is a WRITE — super_admin-only, same
+		// posture as the operator tools (dispatch re-checks role + approval).
+		defs = append(defs, lqtToolDefs()...)
 	}
 	return defs
 }
@@ -2795,6 +2801,18 @@ func buildToolDefs() []map[string]any {
 					"limit": map[string]any{"type": "integer", "description": "Optional row cap. Default 200, max 1000."},
 				},
 				"required": []string{"sql"},
+			},
+		},
+		{
+			"name":        "lqt_mailbox_read",
+			"description": "Read data from the LQT prediction-market mailbox (venues, strategies, results, telemetry). Read-only. Pick one endpoint: venue_health_nyc|venue_health_chi|venue_health_dublin (venue health), stats (strategy/result/telemetry counts), strategies (list), results (list), cycles_nyc (runtime cycles), signals_venue_mid (venue mid-price signals). Use limit for the list endpoints.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"endpoint": map[string]any{"type": "string", "enum": []string{"venue_health_nyc", "venue_health_chi", "venue_health_dublin", "stats", "strategies", "results", "cycles_nyc", "signals_venue_mid"}, "description": "Which LQT mailbox surface to read."},
+					"limit":    map[string]any{"type": "integer", "description": "Optional row cap for list endpoints (strategies/results/cycles_nyc/signals_venue_mid). Default 100, max 1000."},
+				},
+				"required": []string{"endpoint"},
 			},
 		},
 		{
@@ -3987,6 +4005,14 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		}
 		return toolDataQuery(sql, app, limit)
 
+	case "lqt_mailbox_read":
+		endpoint, _ := args["endpoint"].(string)
+		limit := 0
+		if v, ok := args["limit"].(float64); ok {
+			limit = int(v)
+		}
+		return toolLqtMailboxRead(endpoint, limit)
+
 	case "remember_about_me":
 		note, _ := args["note"].(string)
 		return toolRememberAboutMe(userID, note, args["tags"])
@@ -4131,6 +4157,11 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		dimension, _ := args["dimension"].(string)
 		dryRun, _ := args["dry_run"].(bool)
 		return toolOperatorRemediate(c, userID, role, dimension, dryRun)
+	case "lqt_mailbox_submit":
+		name, _ := args["name"].(string)
+		version, _ := args["version"].(string)
+		strategy, _ := args["strategy"].(string)
+		return toolLqtMailboxSubmit(c, userID, role, name, version, strategy)
 	case "account_list_pat":
 		return toolAccountListPat(userID)
 	case "account_revoke_pat":

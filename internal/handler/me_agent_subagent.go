@@ -48,6 +48,7 @@ var subAgentDefaultTools = map[string]bool{
 	"query_findata":        true,
 	"data_catalog":         true,
 	"data_query":           true,
+	"lqt_mailbox_read":     true,
 	"query_my_knowledge":   true,
 	"code_run":             true,
 	"list_apps":            true,

@@ -1,14 +1,19 @@
 package handler
 
-// GET /api/v1/admin/openrouter-balance — OpenRouter account credit/limit for
-// the /code dashboard.
+// GET /api/v1/admin/openrouter-balance — OpenRouter account credit for the
+// /code dashboard.
 //
 // The dashboard's per-model chips + provider subtotals distinguish pooled
 // Claude from OpenRouter from on-prem, but the OpenRouter side is metered
 // pay-per-use — so the operator needs to see how much credit is left on the
 // OpenRouter account. This endpoint reads the same key lumid-llm uses
 // (LUMID_LLM_OPENROUTER_KEY, injected into identity-env) and asks OpenRouter
-// for the key's usage/limit.
+// for the account's total credit + usage.
+//
+// We use GET /api/v1/credits, NOT /api/v1/auth/key: the latter reports
+// per-key usage with `limit: null` for unlimited (pay-as-you-go) keys, so it
+// cannot express a credit balance. /credits returns the account-level
+// `total_credits` / `total_usage` in USD — the number the operator wants.
 //
 // SECURITY: the key never leaves the server. The client only ever sees the
 // normalized balance, never the raw credential. Degrades gracefully to
@@ -28,7 +33,7 @@ import (
 )
 
 const (
-	openRouterBalanceURL     = "https://openrouter.ai/api/v1/auth/key"
+	openRouterCreditsURL     = "https://openrouter.ai/api/v1/credits"
 	openRouterBalanceTTL     = 5 * time.Minute
 	openRouterBalanceTimeout = 10 * time.Second
 )
@@ -46,27 +51,21 @@ type openRouterBalanceCached struct {
 }
 
 // openRouterBalancePayload is the normalized response handed to the client.
+// BalanceUsd = total_credits - total_usage (the spendable remainder).
 type openRouterBalancePayload struct {
-	Available  bool    `json:"available"`
-	BalanceUsd float64 `json:"balance_usd"`
-	LimitUsd   float64 `json:"limit_usd"`
-	UsageUsd   float64 `json:"usage_usd"`
-	Currency   string  `json:"currency"`
-	IsFreeTier bool    `json:"is_free_tier"`
-	Label      string  `json:"label,omitempty"`
-	Error      string  `json:"error,omitempty"`
+	Available    bool    `json:"available"`
+	BalanceUsd   float64 `json:"balance_usd"`
+	TotalCredits float64 `json:"total_credits"`
+	UsageUsd     float64 `json:"usage_usd"`
+	Error        string  `json:"error,omitempty"`
 }
 
-// openRouterAuthKeyResp is the subset of OpenRouter's /auth/key response we
-// care about. Amounts arrive in MILLIcents (1/1000 of a cent) per OpenRouter's
-// API; we normalize to dollars.
-type openRouterAuthKeyResp struct {
+// openRouterCreditsResp is the subset of OpenRouter's /credits response we
+// care about. Values are in USD.
+type openRouterCreditsResp struct {
 	Data struct {
-		Label      string  `json:"label"`
-		Usage      float64 `json:"usage"`
-		Limit      float64 `json:"limit"`
-		IsFreeTier bool    `json:"is_free_tier"`
-		Currency   string  `json:"currency"`
+		TotalCredits float64 `json:"total_credits"`
+		TotalUsage   float64 `json:"total_usage"`
 	} `json:"data"`
 	Error *struct {
 		Message string `json:"message"`
@@ -94,7 +93,7 @@ func AdminOpenRouterBalance(c *gin.Context) {
 		return
 	}
 
-	req, err := http.NewRequest(http.MethodGet, openRouterBalanceURL, nil)
+	req, err := http.NewRequest(http.MethodGet, openRouterCreditsURL, nil)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "openrouter balance: "+err.Error())
 		return
@@ -123,7 +122,7 @@ func AdminOpenRouterBalance(c *gin.Context) {
 		return
 	}
 
-	var ar openRouterAuthKeyResp
+	var ar openRouterCreditsResp
 	if err := json.Unmarshal(raw, &ar); err != nil {
 		payload := openRouterBalancePayload{Available: false, Error: "malformed openrouter response"}
 		openRouterBalanceMu.Lock()
@@ -141,16 +140,13 @@ func AdminOpenRouterBalance(c *gin.Context) {
 		return
 	}
 
-	// OpenRouter reports usage/limit in MILLIcents (1/1000 cent). Normalize to
-	// dollars. A free-tier key has no limit (0) — show usage only.
+	// /credits returns total_credits / total_usage in USD. Balance is the
+	// spendable remainder.
 	payload := openRouterBalancePayload{
-		Available:  true,
-		BalanceUsd: (ar.Data.Limit - ar.Data.Usage) / 1000,
-		LimitUsd:   ar.Data.Limit / 1000,
-		UsageUsd:   ar.Data.Usage / 1000,
-		Currency:   ar.Data.Currency,
-		IsFreeTier: ar.Data.IsFreeTier,
-		Label:      ar.Data.Label,
+		Available:    true,
+		BalanceUsd:   ar.Data.TotalCredits - ar.Data.TotalUsage,
+		TotalCredits: ar.Data.TotalCredits,
+		UsageUsd:     ar.Data.TotalUsage,
 	}
 	openRouterBalanceMu.Lock()
 	openRouterBalanceCache = &openRouterBalanceCached{at: time.Now(), data: payload}

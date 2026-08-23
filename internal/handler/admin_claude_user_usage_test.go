@@ -144,13 +144,18 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 		t.Fatalf("status %d: %s", w.Code, w.Body.String())
 	}
 
+	type modelRow struct {
+		Tokens         int `json:"tokens_7d"`
+		WeightedTokens int `json:"weighted_tokens_7d"`
+	}
 	type userRow struct {
-		Email         string  `json:"email"`
-		FiveHour      int     `json:"five_hour_tokens"`
-		SevenDay      int     `json:"seven_day_tokens"`
-		FiveHourReset string  `json:"five_hour_reset"`
-		SevenDayReset string  `json:"seven_day_reset"`
-		FiveHourPct   float64 `json:"five_hour_pct"`
+		Email         string              `json:"email"`
+		FiveHour      int                 `json:"five_hour_tokens"`
+		SevenDay      int                 `json:"seven_day_tokens"`
+		FiveHourReset string              `json:"five_hour_reset"`
+		SevenDayReset string              `json:"seven_day_reset"`
+		FiveHourPct   float64             `json:"five_hour_pct"`
+		Models        map[string]modelRow `json:"models"`
 	}
 	var out struct {
 		Data struct {
@@ -166,16 +171,48 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 		byEmail[u.Email] = u
 	}
 
-	// liveSub: five=700+300=1000 (only the -30min event), seven=400+100+700+300=1500.
+	// liveSub. These columns are WEIGHTED quota units, not raw tokens: the
+	// seeded model is claude-sonnet-5, weight 0.6 (ClaudeModelWeight).
+	//
+	// They used to be asserted as raw 1000/1500. That was correct when written
+	// and went stale the moment per-model weighting landed -- and nothing
+	// caught it, because this whole test skips unless TEST_MYSQL_DSN is set, so
+	// it had been silently failing rather than guarding. If these numbers ever
+	// come back RAW again, the dashboard has lost its weighting and the caps
+	// are being enforced against the wrong unit.
+	//   five  = (700+300)*0.6                 = 600  (only the -30min event)
+	//   seven = (400+100)*0.6 + (700+300)*0.6 = 900  (both events)
 	live, ok := byEmail[liveSub+"@example.com"]
 	if !ok {
 		t.Fatalf("live user missing from results: %+v", out.Data.Users)
 	}
-	if live.FiveHour != 1000 {
-		t.Fatalf("live user five_hour_tokens=%d want 1000", live.FiveHour)
+	if live.FiveHour != 600 {
+		t.Fatalf("live user five_hour_tokens=%d want 600 (weighted: (700+300)*0.6)", live.FiveHour)
 	}
-	if live.SevenDay != 1500 {
-		t.Fatalf("live user seven_day_tokens=%d want 1500", live.SevenDay)
+	if live.SevenDay != 900 {
+		t.Fatalf("live user seven_day_tokens=%d want 900 (weighted: (500+1000)*0.6)", live.SevenDay)
+	}
+
+	// The per-model breakdown must report RAW tokens and WEIGHTED units as
+	// SEPARATE fields, on a basis identical for every model. tokens_7d was
+	// input+output only, which put a cache-heavy Claude row and a cache-free
+	// deepseek row on different footings in one table; it now includes the
+	// cache columns, so a Claude row and a non-Claude row are comparable.
+	//   raw      = 500 + 1000 = 1500 (no cache tokens seeded)
+	//   weighted = 1500 * 0.6 =  900
+	sonnet, ok := live.Models["claude-sonnet-5"]
+	if !ok {
+		t.Fatalf("live user missing per-model row for claude-sonnet-5: %+v", live.Models)
+	}
+	if sonnet.Tokens != 1500 {
+		t.Fatalf("per-model tokens_7d=%d want 1500 raw (in+out+cache, model-neutral)", sonnet.Tokens)
+	}
+	if sonnet.WeightedTokens != 900 {
+		t.Fatalf("per-model weighted_tokens_7d=%d want 900 (1500*0.6)", sonnet.WeightedTokens)
+	}
+	if sonnet.WeightedTokens != live.SevenDay {
+		t.Fatalf("per-model weighted units must sum to the user's 7d total: model=%d user=%d",
+			sonnet.WeightedTokens, live.SevenDay)
 	}
 	if live.FiveHourReset == "" || live.SevenDayReset == "" {
 		t.Fatalf("live user should have both resets populated, got five=%q seven=%q", live.FiveHourReset, live.SevenDayReset)

@@ -1709,22 +1709,36 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	// Per-model breakdown, anchor-bounded to the 7d window (same seven_eff
 	// shape as above, recomputed inline since this is a separate query).
 	modelRows := []struct {
-		UserSub   string
-		Model     string
-		Tokens    int
-		CostCents int
+		UserSub        string
+		Model          string
+		Tokens         int
+		WeightedTokens int
+		CostCents      int
 	}{}
-	common.DB.Raw(`
+	common.DB.Raw(fmt.Sprintf(`
 		SELECT ue.user_sub                                        AS user_sub,
 		       COALESCE(ue.model, '')                             AS model,
-		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens,
+		       -- RAW tokens, on the SAME basis for every model.
+		       --
+		       -- This used to be input+output only, which silently put Claude and
+		       -- non-Claude rows on DIFFERENT footings in the same table: a Claude
+		       -- Code turn is 90-95%% cache-read (see the proxy's meteredInput), so
+		       -- omitting the cache columns showed Claude at a twentieth of its real
+		       -- volume, while deepseek/kimi -- which do no prompt caching and carry
+		       -- their whole prompt in input_tokens -- showed at ~100%%. Ranking one
+		       -- against the other was therefore meaningless.
+		       COALESCE(SUM(ue.input_tokens + ue.output_tokens
+		                    + ue.cache_read_tokens + ue.cache_creation_tokens), 0) AS tokens,
+		       -- Weighted quota units, the same expression the gate and the
+		       -- top-level columns use, so per-model rows sum to the user total.
+		       COALESCE(SUM(%[1]s), 0)                AS weighted_tokens,
 		       COALESCE(SUM(ue.cost_cents), 0)                    AS cost_cents
 		FROM   usage_events ue
 		JOIN  (SELECT user_sub,
 		              CASE WHEN seven_day_anchor + INTERVAL 7 DAY > ? THEN seven_day_anchor ELSE ? END AS seven_eff
 		       FROM   claude_pool_windows) w ON w.user_sub = ue.user_sub
 		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= w.seven_eff
-		GROUP  BY ue.user_sub, ue.model`,
+		GROUP  BY ue.user_sub, ue.model`, wsql),
 		now, far).Scan(&modelRows)
 
 	// Also find users who hold a claude:proxy (or wildcard) PAT used recently
@@ -1759,8 +1773,14 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	common.DB.Find(&anchorRows)
 
 	type modelUsage struct {
-		Tokens    int `json:"tokens_7d"`
-		CostCents int `json:"cost_cents_7d"`
+		// Tokens is RAW tokens (input+output+cache), identical in meaning for
+		// every model. WeightedTokens is the price-ratio quota unit that only
+		// gates the Claude pool. Surfacing both is what keeps a Claude row and a
+		// deepseek row comparable instead of accidentally an order of magnitude
+		// apart -- see the query above.
+		Tokens         int `json:"tokens_7d"`
+		WeightedTokens int `json:"weighted_tokens_7d"`
+		CostCents      int `json:"cost_cents_7d"`
 	}
 	type userUsage struct {
 		Email       string  `json:"email"`
@@ -1853,11 +1873,13 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		}
 		m := u.Models[mr.Model]
 		m.Tokens += mr.Tokens
+		m.WeightedTokens += mr.WeightedTokens
 		m.CostCents += mr.CostCents
 		u.Models[mr.Model] = m
 		// Provider grouping — same classification the chips use.
 		p := u.Providers[string(common.ClassifyProvider(mr.Model))]
 		p.Tokens += mr.Tokens
+		p.WeightedTokens += mr.WeightedTokens
 		p.CostCents += mr.CostCents
 		u.Providers[string(common.ClassifyProvider(mr.Model))] = p
 	}

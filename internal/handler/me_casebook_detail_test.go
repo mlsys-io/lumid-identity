@@ -31,13 +31,13 @@ func writeCase(t *testing.T, dir, name string, body map[string]any) {
 
 func fullCase() map[string]any {
 	return map[string]any{
-		"case_id":    "019",
-		"version":    "v10",
-		"difficulty": "Hard",
-		"industry":   "Optics",
-		"topic":      "Profitability",
-		"case_type":  "interviewer_driven",
-		"source":     map[string]any{"title": "BetaOptics", "year": 2021},
+		"case_id":        "019",
+		"version":        "v10",
+		"difficulty":     "Hard",
+		"industry":       "Optics",
+		"topic":          "Profitability",
+		"case_type":      "interviewer_driven",
+		"source":         map[string]any{"title": "BetaOptics", "year": 2021},
 		"opening_prompt": "Our client is BetaOptics…",
 		"structure_1_client_basic_context": map[string]any{
 			"company": "BetaOptics", "ask": "Why are margins falling?",

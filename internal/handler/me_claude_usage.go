@@ -7,6 +7,7 @@ package handler
 // selected.
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -55,25 +56,43 @@ func MeClaudeUsage(c *gin.Context) {
 
 	// Per-model breakdown, same anchor-bounded 7d window.
 	modelRows := []struct {
-		Model     string
-		Tokens    int
-		CostCents int
+		Model          string
+		Tokens         int
+		WeightedTokens int
+		CostCents      int
 	}{}
-	common.DB.Raw(`
+	common.DB.Raw(fmt.Sprintf(`
 		SELECT COALESCE(ue.model, '')                             AS model,
-		       COALESCE(SUM(ue.input_tokens + ue.output_tokens), 0) AS tokens,
+		       -- RAW tokens, the SAME basis for every model. Omitting the cache
+		       -- columns (as this did) puts Claude and non-Claude on different
+		       -- footings in one breakdown: a Claude Code turn is 90-95%%
+		       -- cache-read, so Claude showed at ~1/20th of real volume while
+		       -- deepseek/kimi -- no prompt caching, whole prompt in
+		       -- input_tokens -- showed at ~100%%. Mirrors AdminClaudeUserUsage.
+		       COALESCE(SUM(ue.input_tokens + ue.output_tokens
+		                    + ue.cache_read_tokens + ue.cache_creation_tokens), 0) AS tokens,
+		       -- Weighted quota units: what the cap is actually enforced against.
+		       COALESCE(SUM(%[1]s), 0)                            AS weighted_tokens,
 		       COALESCE(SUM(ue.cost_cents), 0)                    AS cost_cents
 		FROM   usage_events ue
 		WHERE  ue.kind = 'claude_proxy' AND ue.user_sub = ? AND ue.ts >= ?
-		GROUP  BY ue.model`,
+		GROUP  BY ue.model`, common.ClaudeWeightedTokensSQL("ue.")),
 		userID, sevenDayBound).Scan(&modelRows)
 	type modelUsage struct {
-		Tokens    int `json:"tokens_7d"`
-		CostCents int `json:"cost_cents_7d"`
+		// Raw tokens (model-neutral) and price-weighted quota units, named
+		// separately -- they differ ~10x on Claude traffic and one number
+		// labelled "tokens" cannot honestly be both.
+		Tokens         int `json:"tokens_7d"`
+		WeightedTokens int `json:"weighted_tokens_7d"`
+		CostCents      int `json:"cost_cents_7d"`
 	}
 	models := map[string]modelUsage{}
 	for _, m := range modelRows {
-		models[m.Model] = modelUsage{Tokens: m.Tokens, CostCents: m.CostCents}
+		models[m.Model] = modelUsage{
+			Tokens:         m.Tokens,
+			WeightedTokens: m.WeightedTokens,
+			CostCents:      m.CostCents,
+		}
 	}
 
 	// Per-USER caps, not the global. Enforcement resolves the caller's role tier

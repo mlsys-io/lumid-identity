@@ -61,10 +61,11 @@ var artifactIDRe = regexp.MustCompile(`^art-[a-f0-9]{16}$`)
 //	vega     a Vega-Lite spec                             the richer default for new charts
 //	candles  {data:[{time,open,high,low,close,volume?}]}   OHLC on a financial time scale
 //	table    [rows] | {columns,rows}                       sortable/filterable result grid
+//	tradingview  a TradingView official embed URL          rendered as a sandboxed iframe
 //
 // image / audio / pdf are deliberately absent: those are data: URLs written by
 // the media tools through persistMediaArtifact, which carries a larger ceiling.
-var artifactKinds = []string{"markdown", "code", "json", "text", "chart", "vega", "candles", "table"}
+var artifactKinds = []string{"markdown", "code", "json", "text", "chart", "vega", "candles", "table", "tradingview"}
 
 // normalizeArtifactKind lower-cases and defaults the kind, reporting whether it
 // is renderable. Empty means "markdown" — the historical default.

@@ -447,20 +447,39 @@ func ClaudePoolLimits() (short, sevenD int) {
 // throttles the operators doing the heaviest legitimate work by exactly as much
 // as it throttles a student. So the budget is tiered by role instead.
 //
-// LUMID_QUOTA_CLAUDE_USER_{5H,7D}_TOKENS set the cap for role="user"; admins and
-// super_admins are UNCAPPED (claudePoolUnlimitedSentinel) so operators doing the
-// heaviest work are never throttled by the same budget that protects the shared
-// pool from a large non-admin cohort.
+// Three tiers, tightest-first when in doubt:
 //
-// The user cap DEFAULTS to the global values, so this function changes nothing
+//	role=user (and anything unrecognised) → LUMID_QUOTA_CLAUDE_USER_{5H,7D}_TOKENS
+//	role=admin                            → the GLOBAL cap (LUMID_QUOTA_CLAUDE_{5H,7D}_TOKENS)
+//	role=super_admin                      → uncapped (claudePoolUnlimitedSentinel)
+//
+// ADMINS WERE UNCAPPED UNTIL 2026-08-24 and are now on the global tier. The
+// original reasoning — operators doing the heaviest work should never be
+// throttled by the budget that protects the pool from a cohort — assumed the
+// pool had headroom to give them. It does not: three of the four pooled
+// accounts were revoked on 2026-08-21, leaving ONE, and ~25% of all Claude
+// requests were being denied. Measured the same day, the two largest consumers
+// were both admins at ~820M weighted units each over 7 days, drawing against a
+// budget that did not exist. An exemption is only defensible while the resource
+// is not scarce.
+//
+// super_admin stays exempt DELIBERATELY, as an escape hatch: if a cap turns out
+// to be mis-sized, at least one account can still work while it is retuned.
+// That is also why the sentinel and ClaudePoolIsUnlimited stay — they are now a
+// one-role concern rather than dead code.
+//
+// The user cap DEFAULTS to the global values, so the user tier changes nothing
 // until an operator sets LUMID_QUOTA_CLAUDE_USER_* — setting them is the policy,
-// and is MANDATORY for enforcement (see the deploy manifest) — while the admin
-// uncapping is unconditional.
+// and is MANDATORY for enforcement (see the deploy manifest). The admin tier
+// needs no new env: it is the global cap, which is already set everywhere.
 func ClaudePoolLimitsForRole(role string) (short, sevenD int) {
-	if role == "admin" || role == "super_admin" {
+	if role == "super_admin" {
 		return claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel
 	}
 	gShort, gSeven := ClaudePoolLimits()
+	if role == "admin" {
+		return gShort, gSeven
+	}
 	return envIntPos("LUMID_QUOTA_CLAUDE_USER_5H_TOKENS", gShort),
 		envIntPos("LUMID_QUOTA_CLAUDE_USER_7D_TOKENS", gSeven)
 }

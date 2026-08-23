@@ -477,7 +477,7 @@ func TestClaudePoolWindow_AdminStillCounts(t *testing.T) {
 	roleCacheMu.Unlock()
 
 	// The sentinel is what frees admins from the cap.
-	if short, seven := ClaudePoolLimitsForRole("admin"); short != claudePoolUnlimitedSentinel || seven != claudePoolUnlimitedSentinel {
+	if short, seven := ClaudePoolLimitsForRole("super_admin"); short != claudePoolUnlimitedSentinel || seven != claudePoolUnlimitedSentinel {
 		t.Fatalf("admin caps = (%d,%d), want sentinel (%d,%d)",
 			short, seven, claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel)
 	}

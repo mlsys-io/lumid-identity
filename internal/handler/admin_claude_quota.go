@@ -1763,11 +1763,11 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		CostCents int `json:"cost_cents_7d"`
 	}
 	type userUsage struct {
-		Email         string                `json:"email"`
-		FiveHour      int                   `json:"five_hour_tokens"`
-		SevenDay      int                   `json:"seven_day_tokens"`
-		FiveHourPct   float64               `json:"five_hour_pct"`
-		SevenDayPct   float64               `json:"seven_day_pct"`
+		Email       string  `json:"email"`
+		FiveHour    int     `json:"five_hour_tokens"`
+		SevenDay    int     `json:"seven_day_tokens"`
+		FiveHourPct float64 `json:"five_hour_pct"`
+		SevenDayPct float64 `json:"seven_day_pct"`
 		// Claude-only weighted draw (subset of FiveHour/SevenDay) + pct — the bars
 		// reflect POOLED CLAUDE ONLY (the gate's enforcePoolQuota exempts
 		// deepseek/on-prem from the cap), so the dashboard must not show
@@ -1777,12 +1777,12 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		ClaudeSeven    int                   `json:"claude_seven_day_tokens"`
 		ClaudeFivePct  float64               `json:"claude_five_hour_pct"`
 		ClaudeSevenPct float64               `json:"claude_seven_day_pct"`
-		CostCents7d   int                   `json:"cost_cents_7d"`
-		Requests      int                   `json:"requests_7d"`
-		LastTs        time.Time             `json:"last_ts"`
-		FiveHourReset string                `json:"five_hour_reset,omitempty"`
-		SevenDayReset string                `json:"seven_day_reset,omitempty"`
-		Models        map[string]modelUsage `json:"models"`
+		CostCents7d    int                   `json:"cost_cents_7d"`
+		Requests       int                   `json:"requests_7d"`
+		LastTs         time.Time             `json:"last_ts"`
+		FiveHourReset  string                `json:"five_hour_reset,omitempty"`
+		SevenDayReset  string                `json:"seven_day_reset,omitempty"`
+		Models         map[string]modelUsage `json:"models"`
 		// Provider-grouped 7d subtotals: "claude" | "openrouter" | "onprem" →
 		// {tokens_7d, cost_cents_7d}. Lets the dashboard show per-user provider
 		// splits without the reader mentally summing model chips.

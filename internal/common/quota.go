@@ -379,7 +379,7 @@ func ClaudeModelWeight(model string) float64 {
 type LlmProvider string
 
 const (
-	ProviderClaude    LlmProvider = "claude"
+	ProviderClaude     LlmProvider = "claude"
 	ProviderOpenRouter LlmProvider = "openrouter"
 	ProviderOnPrem     LlmProvider = "onprem"
 )

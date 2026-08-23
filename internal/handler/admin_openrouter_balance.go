@@ -28,8 +28,8 @@ import (
 )
 
 const (
-	openRouterBalanceURL = "https://openrouter.ai/api/v1/auth/key"
-	openRouterBalanceTTL = 5 * time.Minute
+	openRouterBalanceURL     = "https://openrouter.ai/api/v1/auth/key"
+	openRouterBalanceTTL     = 5 * time.Minute
 	openRouterBalanceTimeout = 10 * time.Second
 )
 

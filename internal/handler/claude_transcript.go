@@ -290,16 +290,29 @@ func countToolUse(response json.RawMessage) int {
 			Type string `json:"type"`
 		} `json:"content"`
 	}
-	if json.Unmarshal(response, &r) != nil {
+	if json.Unmarshal(response, &r) == nil && len(r.Content) > 0 {
+		n := 0
+		for _, b := range r.Content {
+			if b.Type == "tool_use" {
+				n++
+			}
+		}
+		return n
+	}
+	// STREAMING turns are not objects. claude-proxy stores raw SSE bytes as a
+	// JSON *string* (postTranscript: "SSE responses are raw event-stream bytes
+	// -- not valid JSON -- so encode them as a JSON string"), so the unmarshal
+	// above always failed and every streaming turn recorded tool_use_count=0.
+	// Since Claude Code streams effectively everything, the column was 0 for
+	// entire sessions: 75- and 85-turn sessions of heavy tool use both read 0.
+	//
+	// In the SSE form each tool call appears as one content_block_start whose
+	// content_block type is tool_use; count those.
+	var sse string
+	if json.Unmarshal(response, &sse) != nil {
 		return 0
 	}
-	n := 0
-	for _, b := range r.Content {
-		if b.Type == "tool_use" {
-			n++
-		}
-	}
-	return n
+	return strings.Count(sse, `"type":"tool_use"`)
 }
 
 // ── read paths ──────────────────────────────────────────────────────────────

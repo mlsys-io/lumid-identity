@@ -76,7 +76,13 @@ func MeClaudeUsage(c *gin.Context) {
 		models[m.Model] = modelUsage{Tokens: m.Tokens, CostCents: m.CostCents}
 	}
 
-	cap5, cap7 := common.ClaudePoolLimits()
+	// Per-USER caps, not the global. Enforcement resolves the caller's role tier
+	// (ClaudePoolLimitsForUser on the charge path), so reading the global here
+	// would show a user a cap that is not the one they are actually held to:
+	// admins are uncapped, and role `user` reads LUMID_QUOTA_CLAUDE_USER_*.
+	// Showing someone else's number is worse than showing none.
+	cap5, cap7 := common.ClaudePoolLimitsForUser(common.DB, userID)
+	unlimited := common.ClaudePoolIsUnlimited(cap5)
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
@@ -91,6 +97,9 @@ func MeClaudeUsage(c *gin.Context) {
 			"models":           models,
 			"cap_5h":           cap5,
 			"cap_7d":           cap7,
+			// True for admin/super_admin, who are uncapped. The caps above are
+			// then a sentinel, not a budget — render "—", not 2.1B.
+			"cap_unlimited": unlimited,
 			// Env-tunable and no longer 5h — see shortWindowLabel. Any surface
 			// showing this quota must render it instead of a hardcoded "5h".
 			"short_window_label": shortWindowLabel(),

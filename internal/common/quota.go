@@ -415,6 +415,16 @@ func ClassifyProvider(model string) LlmProvider {
 // (admin pct computes to ~0) and lets the same gate handle all roles uniformly.
 const claudePoolUnlimitedSentinel = math.MaxInt32
 
+// ClaudePoolIsUnlimited reports whether a cap returned by ClaudePoolLimitsForUser
+// / ClaudePoolLimitsForRole is the admin uncapped sentinel rather than a real
+// budget.
+//
+// Display surfaces need this: the sentinel keeps the arithmetic valid (pct
+// computes to ~0), but rendering "2147483647 tokens, 0%" tells an operator
+// nothing and looks like a bug. Enforcement must NOT branch on it — the whole
+// point of a huge positive sentinel is that one code path handles every role.
+func ClaudePoolIsUnlimited(cap int) bool { return cap >= claudePoolUnlimitedSentinel }
+
 // ClaudePoolLimits reads the env-tunable per-user pool caps.
 // LUMID_QUOTA_CLAUDE_5H_TOKENS keeps its name for continuity with any existing
 // deployment env; it now sets the SHORT-window budget whatever that window's

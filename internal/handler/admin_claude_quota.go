@@ -1797,6 +1797,14 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		RawCacheRead  int `json:"raw_cache_read_tokens_7d"`
 		RawCacheWrite int `json:"raw_cache_creation_tokens_7d"`
 		RawTotal      int `json:"raw_total_tokens_7d"`
+		// THIS user's tier, which is what their pct above is computed against.
+		// The top-level five_hour_tokens/seven_day_tokens are the default tier
+		// and no longer describe every row: admins are uncapped and role `user`
+		// carries LUMID_QUOTA_CLAUDE_USER_*. Render these per row, or the
+		// dashboard silently attributes one tier's percentage to another.
+		Cap5h        int  `json:"cap_5h"`
+		Cap7d        int  `json:"cap_7d"`
+		CapUnlimited bool `json:"cap_unlimited"`
 	}
 	byUser := map[string]*userUsage{}
 	for _, r := range rows {
@@ -1865,13 +1873,23 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		}
 	}
 	users := make([]userUsage, 0, len(byUser))
-	for _, u := range byUser {
-		u.FiveHourPct = float64(u.FiveHour) / float64(cap5) * 100
-		u.SevenDayPct = float64(u.SevenDay) / float64(cap7) * 100
+	for sub, u := range byUser {
+		// Divide each user by THEIR OWN tier, not by the global. Caps are
+		// role-tiered (admins uncapped, role `user` on LUMID_QUOTA_CLAUDE_USER_*),
+		// so a single divisor mis-states everyone whose tier is not the default —
+		// and this dashboard is what an operator reads to decide whether the pool
+		// is under pressure. The role lookup is memoised (roleCache), so this is
+		// a map hit per user, not a query per user.
+		uCap5, uCap7 := common.ClaudePoolLimitsForUser(common.DB, sub)
+		u.Cap5h = uCap5
+		u.Cap7d = uCap7
+		u.CapUnlimited = common.ClaudePoolIsUnlimited(uCap5)
+		u.FiveHourPct = float64(u.FiveHour) / float64(uCap5) * 100
+		u.SevenDayPct = float64(u.SevenDay) / float64(uCap7) * 100
 		// Claude-only pcts power the bars so OpenRouter/on-prem don't draw
 		// against the Claude budget on-screen. Divide by the same caps.
-		u.ClaudeFivePct = float64(u.ClaudeFive) / float64(cap5) * 100
-		u.ClaudeSevenPct = float64(u.ClaudeSeven) / float64(cap7) * 100
+		u.ClaudeFivePct = float64(u.ClaudeFive) / float64(uCap5) * 100
+		u.ClaudeSevenPct = float64(u.ClaudeSeven) / float64(uCap7) * 100
 		users = append(users, *u)
 	}
 	// Highest 5h pressure first.

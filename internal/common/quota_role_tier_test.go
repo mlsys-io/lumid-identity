@@ -154,3 +154,54 @@ func TestRoleCacheEntriesExpire(t *testing.T) {
 	delete(roleCache, "expiry-probe")
 	roleCacheMu.Unlock()
 }
+
+// Display surfaces must be able to tell "uncapped" from "a very large budget".
+//
+// The sentinel is deliberately a huge positive number so enforcement needs no
+// special case, but that same property makes it unreadable on screen: /me/claude-usage
+// and the /code dashboard would render an admin as "0% of 2147483647" — which looks
+// like a bug and hides the fact that the row has no budget at all. Enforcement must
+// keep treating it as an ordinary number; only rendering branches on this.
+func TestClaudePoolIsUnlimitedDistinguishesTheSentinel(t *testing.T) {
+	clearRoleTierEnv(t)
+	os.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "35000000")
+	os.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "450000000")
+
+	for _, role := range []string{"admin", "super_admin"} {
+		short, seven := ClaudePoolLimitsForRole(role)
+		if !ClaudePoolIsUnlimited(short) || !ClaudePoolIsUnlimited(seven) {
+			t.Errorf("role %q: caps (%d, %d) must report as unlimited", role, short, seven)
+		}
+	}
+
+	// A real budget — however generous — must NOT report as unlimited, or an
+	// operator loses the one signal that says "this row is exempt".
+	for _, role := range []string{"user", ""} {
+		short, seven := ClaudePoolLimitsForRole(role)
+		if ClaudePoolIsUnlimited(short) || ClaudePoolIsUnlimited(seven) {
+			t.Errorf("role %q: real caps (%d, %d) must not report as unlimited", role, short, seven)
+		}
+	}
+}
+
+// The cohort budget is what an operator actually sets on the manifest; pin that
+// the tier applies to role `user` and leaves admins exempt, so arming it cannot
+// silently throttle the operators.
+func TestCohortBudgetBindsUsersAndNotAdmins(t *testing.T) {
+	clearRoleTierEnv(t)
+	os.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "35000000")
+	os.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "450000000")
+	os.Setenv("LUMID_QUOTA_CLAUDE_USER_5H_TOKENS", "2000000")
+	os.Setenv("LUMID_QUOTA_CLAUDE_USER_7D_TOKENS", "20000000")
+
+	short, seven := ClaudePoolLimitsForRole("user")
+	if short != 2000000 || seven != 20000000 {
+		t.Errorf("role user got (%d, %d), want the cohort tier (2000000, 20000000)", short, seven)
+	}
+	aShort, aSeven := ClaudePoolLimitsForRole("admin")
+	if !ClaudePoolIsUnlimited(aShort) || !ClaudePoolIsUnlimited(aSeven) {
+		t.Errorf("admin got (%d, %d), want uncapped — arming the cohort budget must not "+
+			"throttle operators, which is the exact inversion this tiering exists to prevent",
+			aShort, aSeven)
+	}
+}

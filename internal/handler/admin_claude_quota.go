@@ -1681,8 +1681,8 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       COALESCE(u.email, ue.user_sub)                                           AS email,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s ELSE 0 END), 0) AS five_tokens,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s ELSE 0 END), 0) AS seven_tokens,
-		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_five_tokens,
-		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_seven_tokens,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_five,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_seven,
 		       -- RAW totals alongside the weighted ones, so the quota number can be
 		       -- reconciled against Anthropic's own record instead of taken on trust.
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.input_tokens ELSE 0 END), 0)         AS raw_input,

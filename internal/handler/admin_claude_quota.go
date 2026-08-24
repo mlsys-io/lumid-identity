@@ -763,6 +763,29 @@ type quotaResult struct {
 	DrainReason   string     `json:"drain_reason,omitempty"`
 }
 
+// applyAccountState copies the OPERATOR-VISIBLE state of a pooled account onto
+// the wire result: pause and bench.
+//
+// Extracted so it can be tested without a DB. Both of these are fields that were
+// declared on quotaResult and then not assigned — the drain pair shipped that
+// way, and the symptom was maddening rather than obvious: the write worked every
+// time, but the dashboard could not see it, so the button never flipped and a
+// second press hit the idempotent no-op, which logs nothing. It looked like the
+// control did nothing. A declared-but-unpopulated wire field fails silently in
+// exactly this shape, so it gets a test.
+func applyAccountState(res *quotaResult, row models.ClaudeQuotaToken, now time.Time) {
+	// Unconditional: a drain has no expiry. It clears only on resume.
+	res.DrainingSince = row.DrainingSince
+	res.DrainReason = row.DrainReason
+	// Report a standing bench alongside whatever the quota headers say — the two
+	// are independent, and a benched account otherwise looks green.
+	if row.BenchUntil != nil && now.Before(*row.BenchUntil) {
+		res.BenchedUntil = row.BenchUntil
+		res.BenchReason = row.BenchReason
+		res.BenchDead = row.BenchDead
+	}
+}
+
 func fillFromSnap(res *quotaResult, snap *models.ClaudeQuotaSnapshot) {
 	res.Ts = snap.Ts
 	res.FiveHourPct = snap.FiveHourPct
@@ -793,13 +816,7 @@ func AdminClaudeQuota(c *gin.Context) {
 		go func(i int, row models.ClaudeQuotaToken) {
 			defer wg.Done()
 			res := quotaResult{Email: row.Email, Label: row.Label}
-			// Report a standing bench alongside whatever the quota headers say —
-			// the two are independent, and a benched account looks green.
-			if row.BenchUntil != nil && time.Now().Before(*row.BenchUntil) {
-				res.BenchedUntil = row.BenchUntil
-				res.BenchReason = row.BenchReason
-				res.BenchDead = row.BenchDead
-			}
+			applyAccountState(&res, row, time.Now())
 
 			var snap models.ClaudeQuotaSnapshot
 			snapErr := common.DB.

@@ -256,7 +256,7 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 
 	// The live user's 7d window is only 3 DAYS old, so its column cannot be read
 	// as "seven days of usage" without knowing that. The age makes it legible.
-	if live.SevenAgeSec < int((71 * time.Hour).Seconds()) || live.SevenAgeSec > int((73 * time.Hour).Seconds()) {
+	if live.SevenAgeSec < int((71*time.Hour).Seconds()) || live.SevenAgeSec > int((73*time.Hour).Seconds()) {
 		t.Fatalf("live user seven_window_age_seconds=%d, want ~72h — a UI cannot "+
 			"label the window honestly without it", live.SevenAgeSec)
 	}

@@ -1867,13 +1867,13 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		Trailing7dReqs     int `json:"trailing_7d_requests"`
 		// Age of each window in seconds, so a UI can say "7d (18h in)" rather
 		// than presenting an 18-hour figure as if it covered seven days.
-		FiveWindowAgeSec int `json:"five_window_age_seconds"`
+		FiveWindowAgeSec  int `json:"five_window_age_seconds"`
 		SevenWindowAgeSec int `json:"seven_window_age_seconds"`
-		RawInput      int `json:"raw_input_tokens_7d"`
-		RawOutput     int `json:"raw_output_tokens_7d"`
-		RawCacheRead  int `json:"raw_cache_read_tokens_7d"`
-		RawCacheWrite int `json:"raw_cache_creation_tokens_7d"`
-		RawTotal      int `json:"raw_total_tokens_7d"`
+		RawInput          int `json:"raw_input_tokens_7d"`
+		RawOutput         int `json:"raw_output_tokens_7d"`
+		RawCacheRead      int `json:"raw_cache_read_tokens_7d"`
+		RawCacheWrite     int `json:"raw_cache_creation_tokens_7d"`
+		RawTotal          int `json:"raw_total_tokens_7d"`
 		// THIS user's tier, which is what their pct above is computed against.
 		// The top-level five_hour_tokens/seven_day_tokens are the default tier
 		// and no longer describe every row: admins are uncapped and role `user`

@@ -2016,12 +2016,43 @@ func AdminClaudeUserUsage(c *gin.Context) {
 			users[j], users[j-1] = users[j-1], users[j]
 		}
 	}
+	// ON-PREM SAVINGS — what the GB10-served share WOULD have cost if bought.
+	//
+	// Nothing new is measured here. usage_events.cost_cents already prices
+	// non-Anthropic models at their metered rate rather than at zero (see
+	// claude-proxy modelCostCents: "priced at the METERED rate the model would
+	// cost if bought"), and ClassifyProvider already separates the locally
+	// served id `deepseek-v4-flash` from the overflow id
+	// `deepseek/deepseek-v4-flash-0731`. So the onprem bucket's cost IS the
+	// counterfactual, and the openrouter bucket's cost is real spend. This just
+	// names them, because an unlabelled "onprem: $X" reads as money SPENT — the
+	// exact opposite of what it means.
+	//
+	// CAVEAT worth keeping in view: deepseek reports its whole prompt in
+	// input_tokens (it does no cache accounting through this path), so the
+	// counterfactual charges every token at full input price. A real OpenRouter
+	// buyer would get prefix-cache reads at 1/5. Our own hit rate is ~97%, so if
+	// that carried over, true avoided spend is materially LOWER than this figure
+	// — treat it as an upper bound, which is why the field says so.
+	var onPremSavingsCents, openRouterSpendCents int
+	for _, u := range users {
+		onPremSavingsCents += u.Providers[string(common.ProviderOnPrem)].CostCents
+		openRouterSpendCents += u.Providers[string(common.ProviderOpenRouter)].CostCents
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
 			"users":            users,
 			"five_hour_tokens": cap5,
 			"seven_day_tokens": cap7,
+			// Upper bound: no prefix-cache credit. See the comment above.
+			"onprem_savings_cents_7d_max": onPremSavingsCents,
+			// Same tokens valued with cache reads at 1/5 of input, the discount a
+			// real buyer would get on this workload. The truth sits between.
+			"onprem_savings_cents_7d_min": onPremSavingsCents / 5,
+			// What the overflow actually cost, for the comparison that matters:
+			// savings are only impressive next to what we still pay.
+			"openrouter_spend_cents_7d": openRouterSpendCents,
 			// The short window is env-tunable (LUMID_QUOTA_CLAUDE_SHORT_WINDOW)
 			// and is no longer 5h, so the UI must render this rather than a
 			// hardcoded "5h" — otherwise the dashboard silently lies the next

@@ -1654,6 +1654,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	rows := []struct {
 		UserSub       string
 		Email         string
+		Role          string
 		FiveTokens    int
 		SevenTokens   int
 		ClaudeFive    int
@@ -1691,6 +1692,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	err := common.DB.Raw(fmt.Sprintf(`
 		SELECT ue.user_sub                                                              AS user_sub,
 		       COALESCE(u.email, ue.user_sub)                                           AS email,
+		       COALESCE(u.role, '')                                                     AS role,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s ELSE 0 END), 0) AS five_tokens,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s ELSE 0 END), 0) AS seven_tokens,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_five,
@@ -1802,10 +1804,11 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	var patHolders []struct {
 		UserSub    string
 		Email      string
+		Role       string
 		LastUsedAt time.Time
 	}
 	common.DB.Raw(`
-		SELECT t.user_id AS user_sub, u.email,
+		SELECT t.user_id AS user_sub, u.email, COALESCE(u.role,'') AS role,
 		       MAX(t.last_used_at) AS last_used_at
 		FROM   tokens t
 		JOIN   users u ON u.id = t.user_id
@@ -1816,7 +1819,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       OR t.scopes LIKE 'claude:proxy %'
 		       OR t.scopes LIKE '% claude:proxy'
 		       OR t.scopes LIKE '% claude:proxy %')
-		GROUP  BY t.user_id, u.email`,
+		GROUP  BY t.user_id, u.email, u.role`,
 		now.Add(-7*24*time.Hour)).Scan(&patHolders)
 
 	cap5, cap7 := common.ClaudePoolLimits()
@@ -1839,7 +1842,13 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		CostCents      int `json:"cost_cents_7d"`
 	}
 	type userUsage struct {
-		Email       string  `json:"email"`
+		Email string `json:"email"`
+		// The user's role. Display surfaces need it because the Claude-pool
+		// chrome — 4h/7d bars, reset clocks, window-reset buttons — is
+		// meaningless for role `user`: aliasClaudeForRole rewrites their
+		// sonnet/haiku to the in-house deepseek, so they never draw on the
+		// pool at all and their bars are permanently empty.
+		Role        string  `json:"role"`
 		FiveHour    int     `json:"five_hour_tokens"`
 		SevenDay    int     `json:"seven_day_tokens"`
 		FiveHourPct float64 `json:"five_hour_pct"`
@@ -1905,7 +1914,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 	for _, r := range rows {
 		u, ok := byUser[r.UserSub]
 		if !ok {
-			u = &userUsage{Email: r.Email, Models: map[string]modelUsage{}, Providers: map[string]modelUsage{}}
+			u = &userUsage{Email: r.Email, Role: r.Role, Models: map[string]modelUsage{}, Providers: map[string]modelUsage{}}
 			byUser[r.UserSub] = u
 		}
 		u.FiveHour = r.FiveTokens
@@ -1974,6 +1983,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		if _, ok := byUser[ph.UserSub]; !ok {
 			byUser[ph.UserSub] = &userUsage{
 				Email:     ph.Email,
+				Role:      ph.Role,
 				LastTs:    ph.LastUsedAt,
 				Models:    map[string]modelUsage{},
 				Providers: map[string]modelUsage{},

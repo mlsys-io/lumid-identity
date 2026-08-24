@@ -55,11 +55,11 @@ func TestRoleTierDefaultsToGlobalForEveryone(t *testing.T) {
 		t.Errorf("role admin got (%d, %d), want the global (35000000, 450000000) — "+
 			"admins are capped at the global tier, not exempt", short, seven)
 	}
-	// super_admin remains the ONE exemption, kept as an escape hatch.
-	if short, seven := ClaudePoolLimitsForRole("super_admin"); short != claudePoolUnlimitedSentinel || seven != claudePoolUnlimitedSentinel {
-		t.Errorf("role super_admin got (%d, %d), want the unlimited sentinel (%d, %d) — "+
-			"the escape hatch must survive, or a mis-sized cap locks out every operator",
-			short, seven, claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel)
+	// NOBODY is exempt: super_admin is on the same global tier as admin.
+	if short, seven := ClaudePoolLimitsForRole("super_admin"); short != 35000000 || seven != 450000000 {
+		t.Errorf("role super_admin got (%d, %d), want the global tier — the exemption "+
+			"covered the single largest consumer, bounding everyone except the account "+
+			"that mattered most", short, seven)
 	}
 }
 
@@ -81,7 +81,7 @@ func TestUserTierAppliesOnlyToOrdinaryUsers(t *testing.T) {
 		{"user", 2000000, 40000000, "a student gets the cohort budget"},
 		{"", 2000000, 40000000, "an unset role is NOT privileged — default to the tighter tier"},
 		{"admin", 35000000, 450000000, "an admin gets the global tier — larger than a user, not unlimited"},
-		{"super_admin", claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel, "super_admin is the one remaining exemption (escape hatch)"},
+		{"super_admin", 35000000, 450000000, "super_admin is capped too — no role is exempt"},
 	}
 	for _, c := range cases {
 		t.Run(c.description, func(t *testing.T) {
@@ -171,16 +171,11 @@ func TestClaudePoolIsUnlimitedDistinguishesTheSentinel(t *testing.T) {
 	os.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "35000000")
 	os.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "450000000")
 
-	// super_admin is the only exempt role since 2026-08-24.
-	if short, seven := ClaudePoolLimitsForRole("super_admin"); !ClaudePoolIsUnlimited(short) || !ClaudePoolIsUnlimited(seven) {
-		t.Errorf("super_admin caps (%d, %d) must report as unlimited", short, seven)
-	}
-
 	// A real budget — however generous — must NOT report as unlimited, or an
 	// operator loses the one signal that says "this row is exempt". `admin` is
 	// in this set now: its global-tier cap is large, and a large number is
 	// exactly what must not be mistaken for no number at all.
-	for _, role := range []string{"admin", "user", ""} {
+	for _, role := range []string{"admin", "super_admin", "user", ""} {
 		short, seven := ClaudePoolLimitsForRole(role)
 		if ClaudePoolIsUnlimited(short) || ClaudePoolIsUnlimited(seven) {
 			t.Errorf("role %q: real caps (%d, %d) must not report as unlimited", role, short, seven)
@@ -219,7 +214,8 @@ func TestCohortBudgetKeepsTheTierOrdering(t *testing.T) {
 	if ClaudePoolIsUnlimited(aShort) || ClaudePoolIsUnlimited(aSeven) {
 		t.Errorf("admin caps (%d, %d) report as unlimited — the admin tier is not being enforced", aShort, aSeven)
 	}
-	if sShort, sSeven := ClaudePoolLimitsForRole("super_admin"); !ClaudePoolIsUnlimited(sShort) || !ClaudePoolIsUnlimited(sSeven) {
-		t.Errorf("super_admin got (%d, %d), want the escape-hatch exemption", sShort, sSeven)
+	if sShort, sSeven := ClaudePoolLimitsForRole("super_admin"); sShort != aShort || sSeven != aSeven {
+		t.Errorf("super_admin (%d, %d) must match admin (%d, %d) — no role is exempt",
+			sShort, sSeven, aShort, aSeven)
 	}
 }

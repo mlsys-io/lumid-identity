@@ -451,13 +451,18 @@ func TestClaudePoolWindow_NonClaudeCounts(t *testing.T) {
 	}
 }
 
-// An admin/super_admin has NO quota cap (claudePoolUnlimitedSentinel) but their
-// usage must STILL be counted: the event is recorded and the window anchor rolls,
-// so /me/claude-usage and the admin table show it. "No quota" applies to the cap
-// check, not to the accounting.
+// An admin's usage must be COUNTED, not merely gated: the event is recorded and
+// the window anchor rolls, so /me/claude-usage and the admin table show it.
+//
+// This used to assert admins were EXEMPT (claudePoolUnlimitedSentinel) and set
+// absurdly tiny global caps to prove the exemption bound nobody. Since
+// 2026-08-24 no role is exempt — admin and super_admin sit on the global tier —
+// so the caps here are set generously instead: the point was never the
+// exemption, it was that accounting happens independently of the cap check.
 func TestClaudePoolWindow_AdminStillCounts(t *testing.T) {
-	t.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "1") // absurdly tiny — only binds for non-admins
-	t.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "10")
+	// Generous: this test is about RECORDING, so the charge must be allowed.
+	t.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "70000000")
+	t.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "900000000")
 	db := connectTestDB(t)
 	sub := claudePoolTestSub("admin-count")
 	t.Cleanup(func() { cleanupSub(t, db, sub) })
@@ -476,13 +481,20 @@ func TestClaudePoolWindow_AdminStillCounts(t *testing.T) {
 	delete(roleCache, sub)
 	roleCacheMu.Unlock()
 
-	// The sentinel is what frees admins from the cap.
-	if short, seven := ClaudePoolLimitsForRole("super_admin"); short != claudePoolUnlimitedSentinel || seven != claudePoolUnlimitedSentinel {
-		t.Fatalf("admin caps = (%d,%d), want sentinel (%d,%d)",
-			short, seven, claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel)
+	// Both operator roles resolve to the global tier — a real budget, not a
+	// sentinel. If either ever reports unlimited again, the tier has silently
+	// stopped being enforced for the platform's heaviest accounts.
+	for _, role := range []string{"admin", "super_admin"} {
+		short, seven := ClaudePoolLimitsForRole(role)
+		if short != 70000000 || seven != 900000000 {
+			t.Fatalf("role %s caps = (%d,%d), want the global tier (70000000,900000000)", role, short, seven)
+		}
+		if ClaudePoolIsUnlimited(short) {
+			t.Fatalf("role %s reports unlimited — no role is exempt", role)
+		}
 	}
 
-	// An admin's deepseek charge is allowed (uncapped) and still recorded.
+	// An admin's deepseek charge is allowed (within tier) and still recorded.
 	res, err := CheckAndCharge(db, ChargeReq{
 		UserSub: sub, Kind: "claude_proxy", Model: "deepseek-v4-flash",
 		InputTokens: 1_000_000, OutputTokens: 0, // huge, but uncapped

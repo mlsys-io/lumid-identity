@@ -450,8 +450,14 @@ func ClaudePoolLimits() (short, sevenD int) {
 // Three tiers, tightest-first when in doubt:
 //
 //	role=user (and anything unrecognised) → LUMID_QUOTA_CLAUDE_USER_{5H,7D}_TOKENS
-//	role=admin                            → the GLOBAL cap (LUMID_QUOTA_CLAUDE_{5H,7D}_TOKENS)
-//	role=super_admin                      → uncapped (claudePoolUnlimitedSentinel)
+//	role=admin, role=super_admin          → the GLOBAL cap (LUMID_QUOTA_CLAUDE_{5H,7D}_TOKENS)
+//
+// NOBODY IS EXEMPT as of 2026-08-24. super_admin kept the sentinel for one day
+// as an escape hatch against a mis-sized cap; it was removed once the tier had
+// been observed in production, because the exemption covered the single
+// largest consumer on the platform and so bounded everyone except the account
+// that mattered most. The recovery path if a cap does misfire is the
+// per-user window reset on /code (RequireSuperAdmin), not an uncapped role.
 //
 // ADMINS WERE UNCAPPED UNTIL 2026-08-24 and are now on the global tier. The
 // original reasoning — operators doing the heaviest work should never be
@@ -463,21 +469,18 @@ func ClaudePoolLimits() (short, sevenD int) {
 // budget that did not exist. An exemption is only defensible while the resource
 // is not scarce.
 //
-// super_admin stays exempt DELIBERATELY, as an escape hatch: if a cap turns out
-// to be mis-sized, at least one account can still work while it is retuned.
-// That is also why the sentinel and ClaudePoolIsUnlimited stay — they are now a
-// one-role concern rather than dead code.
+// The sentinel and ClaudePoolIsUnlimited are retained deliberately even though
+// no role returns them now: an operator can still set a tier to an enormous
+// value, and the display surfaces must keep being able to tell "no budget"
+// from "a very large one" rather than rendering a fraction of a sentinel.
 //
 // The user cap DEFAULTS to the global values, so the user tier changes nothing
 // until an operator sets LUMID_QUOTA_CLAUDE_USER_* — setting them is the policy,
 // and is MANDATORY for enforcement (see the deploy manifest). The admin tier
 // needs no new env: it is the global cap, which is already set everywhere.
 func ClaudePoolLimitsForRole(role string) (short, sevenD int) {
-	if role == "super_admin" {
-		return claudePoolUnlimitedSentinel, claudePoolUnlimitedSentinel
-	}
 	gShort, gSeven := ClaudePoolLimits()
-	if role == "admin" {
+	if role == "admin" || role == "super_admin" {
 		return gShort, gSeven
 	}
 	return envIntPos("LUMID_QUOTA_CLAUDE_USER_5H_TOKENS", gShort),

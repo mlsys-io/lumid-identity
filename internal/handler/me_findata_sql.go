@@ -322,14 +322,36 @@ func MeFindataSQLRevoke(c *gin.Context) {
 	}
 	var stmt string
 	if err := conn.QueryRow(ctx, `SELECT format('ALTER ROLE %I NOLOGIN', $1::text)`,
-		acct.RoleName).Scan(&stmt); err == nil {
-		_, _ = conn.Exec(ctx, stmt)
+		acct.RoleName).Scan(&stmt); err != nil {
+		fail(c, http.StatusBadGateway, 1502, "warehouse: "+err.Error())
+		return
 	}
+	if _, err := conn.Exec(ctx, stmt); err != nil {
+		fail(c, http.StatusBadGateway, 1502, "warehouse: "+err.Error())
+		return
+	}
+
+	// Terminating live backends goes through a SECURITY DEFINER wrapper, not
+	// pg_terminate_backend directly. sql_provisioner holds the cohort roles
+	// WITHOUT their privileges (INHERIT FALSE — the thing keeping it out of the
+	// warehouse data), so it also lacks "privileges of the role whose process is
+	// being terminated" and a direct call fails with permission denied. The
+	// blunt alternative, GRANT pg_signal_backend, would let it kill ANY
+	// non-superuser backend including findata-app's; the wrapper bounds it to
+	// `sql_*` seats.
+	//
+	// The error is NOT swallowed. An earlier revision ignored it, which meant a
+	// revoke whose termination failed still reported success with
+	// sessions_terminated: 0 — indistinguishable from "there was nothing to
+	// kill" while the session kept running. That is the precise failure this
+	// endpoint exists to prevent, so it must be loud.
 	var killed int
-	_ = conn.QueryRow(ctx, `
-		SELECT count(*) FROM (
-			SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1
-		) t`, acct.RoleName).Scan(&killed)
+	if err := conn.QueryRow(ctx,
+		`SELECT pgbouncer_auth.terminate_user_backends($1)`, acct.RoleName).Scan(&killed); err != nil {
+		fail(c, http.StatusBadGateway, 1502,
+			"credential revoked, but live sessions could NOT be terminated: "+err.Error())
+		return
+	}
 
 	common.DB.Model(&acct).Updates(map[string]interface{}{"credential_expires_at": nil})
 	writeAudit(c, u.ID, u.ID, "me:findata-sql:revoke",

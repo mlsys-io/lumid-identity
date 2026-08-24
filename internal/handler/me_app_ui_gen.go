@@ -179,10 +179,16 @@ Widget types:
   - { type: chart, source: <src>, path: <dotpath to array>, kind: line|bar, x: <key>, y: <key> }
   - { type: table, source: <src>, path: <dotpath to array>, columns: [ { key: <k>, label: "..." } ] }
   - { type: list, source: <src>, path: <dotpath to array>, title_key: <k>, subtitle_key: <k> }
-  - { type: action, label: "Run now", action: run_loop, app: <app>, loop: <loop> }
+  - { type: action, label: "Run now", intent: run_loop, app: <app>, loop: <loop> }
   - { type: form, action: <ALLOWLISTED action key>, submit_label: "...", field_columns: 1|2|3,
       fields: [ { key, label, type: text|number|select|textarea, options: [..], default, placeholder, required, group: "<group heading>", full_width: true } ],
       cost_estimate: { gpu_field, cpu_field, ttl_field, gpu_rate, cpu_rate } }
+  - { type: form, loop: <loop>, submit_label: "...", fields: [ ...same as above... ] }
+      Runs one of THIS app's loops with the field values as arguments. Prefer it
+      whenever a verb needs input: an action key reaches only the few
+      allowlisted keys, and type:action collects nothing (it is a bare button,
+      and its args are sent verbatim — a "{placeholder}" there is transmitted
+      literally). app: is inferred from the page; set it only cross-app.
 
 Allowed data sources (reads) — use ONLY these:
   me://today | me://drafts | me://workflows | me://loops/health | me://apps | me://gpu-rentals

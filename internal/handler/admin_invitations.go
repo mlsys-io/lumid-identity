@@ -116,11 +116,20 @@ type mintInviteReq struct {
 	MaxUses int    `json:"max_uses"` // per code; default 1 (0 = unlimited)
 	Note    string `json:"note"`
 	TTLDays int    `json:"ttl_days"` // 0 = no expiry
+	// Space-separated scopes granted on redemption, e.g. "lumid:write".
+	// One code with max_uses=20 therefore onboards a whole cohort to an
+	// entitlement none of them could self-grant, without an operator ever
+	// touching an individual account or holding anyone's credential.
+	Scopes string `json:"scopes"`
 }
 
 type inviteRow struct {
-	Code          string     `json:"code"`
-	Note          string     `json:"note,omitempty"`
+	Code string `json:"code"`
+	Note string `json:"note,omitempty"`
+	// Surfaced so an operator listing codes can see WHICH grants each one
+	// carries. Once a code confers entitlement rather than mere signup, "what
+	// does this code do" stops being answerable from the note field.
+	Scopes        string     `json:"scopes,omitempty"`
 	MaxUses       int        `json:"max_uses"`
 	UsesRemaining int        `json:"uses_remaining"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
@@ -146,6 +155,25 @@ func AdminInviteMint(c *gin.Context) {
 	if req.MaxUses == 0 {
 		req.MaxUses = 1
 	}
+	// Validate scopes HERE, at mint, not at redemption. A bad scope discovered
+	// during redeem is discovered by the wrong person: the user has already
+	// spent a seat and can do nothing about it, while the operator who made the
+	// mistake never sees the error.
+	for _, s := range strings.Fields(req.Scopes) {
+		svc, _ := parseScope(s)
+		if svc == "" {
+			fail(c, http.StatusBadRequest, 1001,
+				"invalid scope '"+s+"' — expected <service>:<read|write|admin>")
+			return
+		}
+		if svc == "*" {
+			// An invitation carrying a wildcard is indistinguishable from
+			// handing out admin, and it would do so to every holder of the code.
+			fail(c, http.StatusBadRequest, 1001, "wildcard scope is never allowed in an invitation")
+			return
+		}
+	}
+
 	var expAt *time.Time
 	if req.TTLDays > 0 {
 		t := time.Now().AddDate(0, 0, req.TTLDays)
@@ -163,6 +191,7 @@ func AdminInviteMint(c *gin.Context) {
 			Code:          raw,
 			CreatedByID:   adminID,
 			Note:          req.Note,
+			Scopes:        strings.Join(strings.Fields(req.Scopes), " "),
 			MaxUses:       req.MaxUses,
 			UsesRemaining: req.MaxUses,
 			ExpiresAt:     expAt,
@@ -172,7 +201,7 @@ func AdminInviteMint(c *gin.Context) {
 			return
 		}
 		codes = append(codes, inviteRow{
-			Code: row.Code, Note: row.Note,
+			Code: row.Code, Note: row.Note, Scopes: row.Scopes,
 			MaxUses: row.MaxUses, UsesRemaining: row.UsesRemaining,
 			ExpiresAt: row.ExpiresAt, CreatedAt: row.CreatedAt,
 		})
@@ -202,7 +231,7 @@ func AdminInviteList(c *gin.Context) {
 	out := make([]inviteRow, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, inviteRow{
-			Code: r.Code, Note: r.Note,
+			Code: r.Code, Note: r.Note, Scopes: r.Scopes,
 			MaxUses: r.MaxUses, UsesRemaining: r.UsesRemaining,
 			ExpiresAt: r.ExpiresAt, RevokedAt: r.RevokedAt,
 			LastUsedAt: r.LastUsedAt, CreatedAt: r.CreatedAt,

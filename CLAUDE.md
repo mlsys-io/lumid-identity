@@ -1,38 +1,38 @@
 # CLAUDE.md — lumid-identity
 
-This file provides guidance to Claude Code (claude.ai/code) when working in this repository.
-
 **`lumid-identity` is the sole token authority for the entire Lumid ecosystem.** Go + Gin + GORM,
 port **9900**. Every other service — QuantArena, Runmesh, FlowMesh, Lumilake, xpcloud, LQT,
-claude-proxy, chatbox — is a bearer-auth *consumer* of this service. If you are adding
-authentication anywhere in the stack, you are almost certainly adding a consumer, not a new
-authority.
+claude-proxy, chatbox — is a bearer-auth *consumer*. If you are adding authentication anywhere in
+the stack, you are almost certainly adding a consumer, not a new authority.
+
+Stack-wide auth architecture, role matrix and Runmesh SSO bridge: root `/proj/CLAUDE.md` §4.
 
 > **Where this runs (checked 2026-08-09).** Deployment `lumid-identity` (**2 replicas**, deliberate
-> — WebSocket sessions need cross-node reach) in ns `lumid` on cluster `lumid-prod2`, **service**
-> tier. Argo CD app `lumid-identity` from `/proj/deploy_infra/k8s-lift/lumid-identity/`. Live image
-> was **`v0.5.59`** (checked 2026-08-15). It is reachable only through the `lumid-landing` nginx, which proxies
+> — WebSocket sessions need cross-node reach), ns `lumid`, **service** tier; Argo app
+> `lumid-identity` from `/proj/deploy_infra/k8s-lift/lumid-identity/`. Live image was **`v0.5.59`**
+> (checked 2026-08-15). Reachable only through the `lumid-landing` nginx, which proxies
 > `https://lum.id/api/v1/*`, `/oauth/*` and `/.well-known/*` to `lumid-identity:9900`.
-> Database: the shared in-cluster `mysql-trading` (schema `lumid_identity`).
+> Database: the shared in-cluster MySQL, schema `lumid_identity`. (That instance was named
+> `mysql-trading` when this note was written; it is **`mysql-identity`** since 2026-08-17/19 —
+> the PVC is still `mysql-trading-2g`. See root `/proj/CLAUDE.md` §3.)
 >
 > **`VERSION` in this repo reads `0.3.0` and is not the release source** — releases are git tags
 > (`v0.3.96`, …) which drive the image tag. Don't trust the file.
 
 ## Release / deploy
 
-Tag-driven, and **self-deploying**. Cut a `vX.Y.Z` tag → CI builds
-`ghcr.io/mlsys-io/lumid-identity:vX.Y.Z` → **Argo CD Image Updater** (semver strategy, allow-tags
+Tag-driven and **self-deploying**: cut a `vX.Y.Z` tag → CI builds
+`ghcr.io/mlsys-io/lumid-identity:vX.Y.Z` → **Argo CD Image Updater** (semver, allow-tags
 `^v\d+\.\d+\.\d+$`) writes the resolved tag back to
 `deploy_infra@migration/uks:k8s-lift/lumid-identity/.argocd-source-lumid-identity.yaml` and Argo
-rolls it. No manual pin step. Rollback = cut a higher tag from the good commit (Image Updater only
-moves *forward* on semver; reverting the write-back alone will be re-applied).
+rolls it. No manual pin step. Rollback = cut a **higher** tag from the good commit (Image Updater
+only moves forward on semver; reverting the write-back alone will be re-applied).
 
-The `digest:` in `kustomization.yaml` is the **adoption seed**, not the live pin — the
-`.argocd-source-*` override wins. Its comment block still names v0.3.8x and is stale; read the
-`.argocd-source-*` file for what is actually deployed. Checking the highest git tag is also NOT a
-way to learn what is live.
-**Never `kubectl set image`** — `selfHeal: true` reverts it within minutes.
-Protocol: `/proj/deploy_infra/k8s-lift/CD-PROTOCOL.md`.
+- The `digest:` in `kustomization.yaml` is the **adoption seed, not the live pin** — the
+  `.argocd-source-*` override wins. Its comment block still names v0.3.8x and is stale.
+- Reading the highest git tag is also NOT a way to learn what is live — read `.argocd-source-*`.
+- **Never `kubectl set image`** — `selfHeal: true` reverts it. Protocol:
+  `/proj/deploy_infra/k8s-lift/CD-PROTOCOL.md`.
 
 ```bash
 export KUBECONFIG=~/.kube/lumid-prod2.yaml
@@ -44,7 +44,7 @@ kubectl -n lumid rollout status deploy/lumid-identity
 
 ```
 cmd/identity/main.go       entry point
-internal/handler/          ~123 files. The surface is large; group by prefix:
+internal/handler/          ~168 files. The surface is large; group by prefix:
   auth.go                  login / register / send-code / logout / session cookie
   password_reset.go        forgot + reset
   user.go                  GET/PUT /user, session-bearer
@@ -76,12 +76,9 @@ docs/unified-auth.md       the shared `lumid_auth` hook-library spec for consume
 - **One authority.** Never add a second issuer. A new service authenticates by calling
   `/oauth/introspect` or verifying against `/.well-known/jwks.json`, never by minting its own
   tokens.
-- **Three token shapes, all accepted forever:**
-  | Prefix | Validation |
-  |---|---|
-  | `lm_pat_live_*` | SHA-256 hash lookup — the canonical PAT |
-  | `rm_pat_live_*` | same table; legacy QuantArena format, kept so no user is broken |
-  | JWT (3 dot-segments) | RS256 against the JWKS |
+- **Three token shapes, all accepted forever:** `lm_pat_live_*` (SHA-256 hash lookup — the
+  canonical PAT), `rm_pat_live_*` (same table; legacy QuantArena format, kept so no user is
+  broken), and JWT (3 dot-segments, RS256 against the JWKS).
 - **`computeAccess(user, service)` precedence, in this order:** `status=suspended` → `none`;
   role `admin|super_admin` → `admin` everywhere; an explicit `user_access_grants` row → its level;
   otherwise `read` plus PAT-scope upgrades. Role trumps grants; status trumps role.
@@ -135,6 +132,3 @@ go run ./cmd/identity -c configs/identity.yaml    # :9900
 go build ./... && go test ./...
 ```
 End-user auth journeys live in `/proj/lumid_e2e/` (Playwright, real Gmail via ImapFlow).
-
-Broader context — the full auth architecture diagram, the Runmesh SSO bridge, and the role matrix
-— is in the root `/proj/CLAUDE.md` §4.

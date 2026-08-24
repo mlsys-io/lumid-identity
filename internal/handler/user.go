@@ -464,6 +464,54 @@ func RedeemInvitationCodeHandler(c *gin.Context) {
 		return
 	}
 
+	// Apply the code's scopes as durable access grants.
+	//
+	// These ride the SAME transaction as the uses_remaining decrement above,
+	// and that is the whole reason this block sits here rather than after the
+	// commit. A code that consumed a seat but failed to apply its grants leaves
+	// the user believing they were onboarded and the operator believing the
+	// seat was spent — with nothing to distinguish that from a code that simply
+	// granted nothing, and no way for the user to redeem it again.
+	//
+	// This is what lets an operator hand out an entitlement a user cannot
+	// self-grant (`lumid:write`) without any credential passing through the
+	// operator's hands: they issue a claim, the user redeems it, and then mints
+	// their own PAT through the ordinary flow. Nothing about PAT minting
+	// changes — canGrant simply starts passing, because the grant row exists.
+	for _, raw := range strings.Fields(inv.Scopes) {
+		svc, lvl := parseScope(raw)
+		if svc == "" || svc == "*" {
+			// Validated at mint time. A malformed value that reached the DB
+			// anyway must not fail somebody's redeem — skip it rather than
+			// punish the user for an operator's typo.
+			continue
+		}
+		var existing models.UserAccessGrant
+		err := tx.Where("user_id = ? AND service = ?", u.ID, svc).First(&existing).Error
+		if err == nil {
+			// Redeeming a second code must not collide on the uk_user_svc
+			// unique index — and must never DOWNGRADE an existing grant. A
+			// read-level invitation landing on someone who already has write
+			// would otherwise quietly take access away.
+			if levelRank(lvl) > levelRank(existing.Level) {
+				if e := tx.Model(&existing).Updates(map[string]any{
+					"level": lvl, "granted_by": "invite:" + code,
+				}).Error; e != nil {
+					tx.Rollback()
+					fail(c, http.StatusInternalServerError, 1500, "apply grant: "+e.Error())
+					return
+				}
+			}
+		} else if e := tx.Create(&models.UserAccessGrant{
+			ID: uuid.NewString(), UserID: u.ID, Service: svc,
+			Level: lvl, GrantedBy: "invite:" + code,
+		}).Error; e != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 1500, "apply grant: "+e.Error())
+			return
+		}
+	}
+
 	if err := tx.Commit().Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "commit: "+err.Error())
 		return

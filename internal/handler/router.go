@@ -247,6 +247,12 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/experiments", MeAppExperiments)
 			me.GET("/apps/:app/experiments/:id", MeAppExperiment)
 			me.GET("/apps/:app/experiments/:id/case/:caseId", MeAppExperimentCase)
+			// FinData SQL — self-service warehouse credentials. The role is an
+			// entitlement provisioned by an operator; minting is what makes it
+			// usable, and the password is shown exactly once.
+			me.GET("/findata-sql", MeFindataSQL)
+			me.POST("/findata-sql/credential", MeFindataSQLMint)
+			me.DELETE("/findata-sql/credential", MeFindataSQLRevoke)
 			me.GET("/intents/:id", MeIntentGet)
 			// Permanently dismiss a failed/optimistic install card by app name.
 			me.DELETE("/install-intents/:name", MeInstallIntentDelete)

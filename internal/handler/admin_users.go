@@ -356,7 +356,13 @@ func AdminUsersRevokeSessions(c *gin.Context) {
 // The shape is deliberately flat so the UI can render a grid without
 // per-service knowledge.
 
-var accessServices = []string{"lumid", "qa", "runmesh", "lumilake", "flowmesh", "xpcloud"}
+// `findata` gates a Postgres login on the 1.7 TB warehouse behind sql.lum.id.
+// It is GRANTED, never defaulted: MeFindataSQL deliberately reads the explicit
+// user_access_grants row rather than calling computeAccess, because
+// computeAccess falls back to `best := "read"` for every active user — which
+// would entitle the whole user base to a warehouse seat the moment this string
+// was added here.
+var accessServices = []string{"lumid", "qa", "runmesh", "lumilake", "flowmesh", "xpcloud", "findata"}
 
 type accessRow struct {
 	Service string `json:"service"` // lumid | qa | runmesh | lumilake | flowmesh | xpcloud

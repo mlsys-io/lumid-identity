@@ -148,7 +148,7 @@ func InternalClaudePoolHealth(c *gin.Context) {
 	}
 
 	now := time.Now()
-	var refreshable, exhausted, benched, quarantined int
+	var refreshable, exhausted, benched, quarantined, draining int
 	quarantinedList := make([]quarantinedAccount, 0, len(rows))
 	atRiskList := make([]atRiskAccount, 0, len(rows))
 
@@ -177,6 +177,9 @@ func InternalClaudePoolHealth(c *gin.Context) {
 			}
 			if row.BenchUntil != nil && now.Before(*row.BenchUntil) {
 				benched++
+			}
+			if row.DrainingSince != nil {
+				draining++
 			}
 			// Only for accounts that are still alive — a quarantined one is
 			// already the loudest thing in this payload, and listing it twice
@@ -207,7 +210,13 @@ func InternalClaudePoolHealth(c *gin.Context) {
 		}
 	}
 
-	servable := refreshable - exhausted
+	// Paused accounts are refreshable and un-exhausted, so without this a pool
+	// drained down to one account still reports healthy:true — and opsagent's
+	// P0 trusts this field verbatim. That is the exact alerting gap the
+	// 2026-08-19 servable/refreshable split was added to close, re-opened by a
+	// different cause. An operator pause is still a reason the pool cannot fail
+	// over, so it must count against the floor.
+	servable := refreshable - exhausted - draining
 	if servable < 0 { // defensive only; refreshable/exhausted share the same population
 		servable = 0
 	}
@@ -228,6 +237,11 @@ func InternalClaudePoolHealth(c *gin.Context) {
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
 			"total":                len(rows),
+			// Reported separately from `benched`: a bench is Anthropic refusing
+			// us and clears itself, a pause is deliberate and clears only when a
+			// human resumes it. An operator seeing the floor breached needs to
+			// know which, because only one of them is their own doing.
+			"draining":             draining,
 			"refreshable":          refreshable,
 			"exhausted":            exhausted,
 			"servable":             servable,

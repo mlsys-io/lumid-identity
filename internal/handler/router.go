@@ -575,6 +575,9 @@ func Register(r *gin.Engine) {
 			// Reset the per-user SHORT-window quota clock. super_admin, not admin:
 			// it hands capacity back to users, which is a budget decision.
 			superAdmin.POST("/claude-pool/reset-window", AdminClaudePoolResetWindow)
+			// Pause/resume a pooled account (graceful drain). super_admin for the
+			// same reason as reset-window: it moves capacity between people.
+			superAdmin.POST("/claude-account/drain", AdminClaudeAccountDrain)
 		}
 
 		// admin + super_admin — Claude Code quota dashboard (/quota page) and

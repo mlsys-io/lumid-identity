@@ -753,6 +753,14 @@ type quotaResult struct {
 	BenchedUntil *time.Time `json:"benched_until,omitempty"`
 	BenchReason  string     `json:"bench_reason,omitempty"`
 	BenchDead    bool       `json:"bench_dead,omitempty"`
+	// Operator pause (graceful drain). Reported separately from the bench
+	// because they read the same on a dashboard and mean opposite things: a
+	// bench is Anthropic refusing us and clears itself, a drain is a human
+	// deliberately winding the account down and clears only when they say so.
+	// A paused account is still SERVING its existing users, so rendering it as
+	// simply "down" would be wrong too.
+	DrainingSince *time.Time `json:"draining_since,omitempty"`
+	DrainReason   string     `json:"drain_reason,omitempty"`
 }
 
 func fillFromSnap(res *quotaResult, snap *models.ClaudeQuotaSnapshot) {
@@ -1116,6 +1124,114 @@ func hrwScore(userSub, email string) float64 {
 // Benches are still extend-only for EXTENDING (seconds>0), so a short probe
 // bench from one replica can never shorten a longer one already set by the
 // other — that part is unchanged.
+// AdminClaudeAccountDrain pauses or resumes a pooled account from lum.id/code.
+//
+// POST /api/v1/admin/claude-account/drain  {email, draining, reason}
+//
+// A PAUSE IS NOT A BENCH, and the difference is the whole feature. A bench is a
+// timed cooldown claude-proxy reports after Anthropic refuses a credential; it
+// expires on its own and, because the proxy REHOMEs a session whose home is
+// benched beyond sessionPinMaxWait, it moves live conversations onto a sibling
+// subscription. That is the 2026-08-16 ac7 shape.
+//
+// A drain instead:
+//   - removes the account from placement TARGETS, so nobody is newly homed;
+//   - keeps lease-time serving whoever is already homed or session-pinned there,
+//     so conversations finish where they started;
+//   - never expires — only a human resumes it.
+//
+// Users leave as they go idle, on the normal placement cadence. That drift is
+// the "safe transfer": no deadline, no forced move, no split sessions.
+//
+// super_admin (not admin) to match claude-pool/reset-window: pausing an account
+// takes capacity away from other people, which is a budget decision.
+func AdminClaudeAccountDrain(c *gin.Context) {
+	var body struct {
+		Email    string `json:"email"`
+		Draining *bool  `json:"draining"`
+		Reason   string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(body.Email))
+	if email == "" {
+		fail(c, http.StatusBadRequest, 1400, "email required")
+		return
+	}
+	// Pointer so "absent" is a client bug rather than silently meaning resume —
+	// a mis-serialised field must not un-pause an account.
+	if body.Draining == nil {
+		fail(c, http.StatusBadRequest, 1400, "draining (true|false) required")
+		return
+	}
+
+	var row models.ClaudeQuotaToken
+	if err := common.DB.Where("email = ?", email).First(&row).Error; err != nil {
+		fail(c, http.StatusNotFound, 1404, "no such pooled account")
+		return
+	}
+
+	was := row.DrainingSince
+	if !*body.Draining {
+		if err := common.DB.Model(&row).Updates(map[string]interface{}{
+			"draining_since": nil, "drain_reason": "",
+		}).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "persist resume: "+err.Error())
+			return
+		}
+		log.Printf("claude-pool: %s RESUMED by operator (was paused since %v) — it becomes a placement target on the next tick",
+			email, was)
+		ok(c, "ok", gin.H{"email": email, "draining": false, "was_draining_since": was})
+		return
+	}
+
+	// Refuse to pause the last one standing. Pausing every account does not
+	// drain the pool, it takes lum.id/claude down: placement would have no
+	// target, and excludeDraining's backstop would ignore the drain anyway, so
+	// the operator would get an outage AND a control that silently did nothing.
+	var alive int64
+	if err := common.DB.Model(&models.ClaudeQuotaToken{}).
+		Where("revoked_at IS NULL AND draining_since IS NULL AND email <> ?", email).
+		Count(&alive).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "count servable: "+err.Error())
+		return
+	}
+	if alive == 0 {
+		fail(c, http.StatusConflict, 1409,
+			"refusing to pause the last un-paused account — that is an outage, not a drain. Add or resume another account first.")
+		return
+	}
+
+	if row.DrainingSince != nil {
+		// Idempotent: keep the original timestamp so "paused 40m ago" stays
+		// true and a double-click cannot restart the clock.
+		ok(c, "ok", gin.H{"email": email, "draining": true, "since": row.DrainingSince, "unchanged": true})
+		return
+	}
+	reason := strings.TrimSpace(body.Reason)
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	now := time.Now()
+	if err := common.DB.Model(&row).Updates(map[string]interface{}{
+		"draining_since": now, "drain_reason": reason,
+	}).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "persist drain: "+err.Error())
+		return
+	}
+	log.Printf("claude-pool: %s PAUSED by operator (%s) — no new placements; users already homed there keep being served until they go idle",
+		email, reason)
+	// Run placement NOW rather than waiting up to assignmentTTL (10m, and
+	// per-process so worse with replicas). The first wave of already-idle users
+	// should move while the operator is still looking at the page — a pause that
+	// appears to do nothing for ten minutes reads as broken. GET_LOCK-serialised,
+	// so forcing it is safe.
+	EnsureAssignments(true)
+	ok(c, "ok", gin.H{"email": email, "draining": true, "since": now, "reason": reason})
+}
+
 func InternalClaudeAccountBench(c *gin.Context) {
 	var body struct {
 		Email   string `json:"email"`
@@ -1327,7 +1443,9 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	// quarantined pool masquerade as a busy one on 2026-08-13 — every user was
 	// told to retry in 5 minutes, for a day, against a pool that could never
 	// recover on its own.
-	var nExcluded, nQuarantined, nBenched, nExhausted int
+	var nExcluded, nQuarantined, nBenched, nExhausted, nDraining int
+	// Paused accounts skipped this pass, kept for the availability fallback below.
+	var drainFallback []models.ClaudeQuotaToken
 
 	var cands []cand
 	for _, row := range rows {
@@ -1346,6 +1464,36 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// instead of only the pod that saw the failure.
 		if row.BenchUntil != nil && time.Now().Before(*row.BenchUntil) {
 			nBenched++
+			continue
+		}
+		// OPERATOR-PAUSED (draining). Closed to newcomers, still open to whoever
+		// is already here.
+		//
+		// The exception is the entire point. Refusing a user their own home for
+		// >= sessionPinMaxWait makes claude-proxy fire PIN RELEASED and rebind
+		// the session to a sibling — subscription B picking up turn N of a
+		// conversation it never saw, with no prompt-cache history. That is the
+		// suspension signal a pause is supposed to remove, so a pause that
+		// caused it would be strictly worse than doing nothing. Placement moves
+		// these users off as they go idle; the drain finishes on its own.
+		// `prefer` and ONLY `prefer` — not the user's assigned home.
+		//
+		// `prefer` is the live session's account: claude-proxy sends it for any
+		// session it holds a binding for, and identity fills it from
+		// ClaudeSessionBinding above when the proxy cannot (sibling replica, or
+		// after a rollout). So it is exactly the set of conversations already in
+		// flight, which is exactly what a graceful pause protects.
+		//
+		// Honouring the ASSIGNED HOME instead would defeat the drain and then
+		// entrench it. A user homed here who opens a BRAND-NEW conversation has
+		// no binding and no pin — nothing is in flight, so nothing needs
+		// protecting — yet the account would take the new session anyway. Worse,
+		// that traffic keeps them inside activeUsers(30m), so placementWrites
+		// keeps deferring their move, so their home never changes, so the next
+		// new session lands here too. The drain would never finish.
+		if row.DrainingSince != nil && row.Email != prefer {
+			nDraining++
+			drainFallback = append(drainFallback, row)
 			continue
 		}
 		var snap models.ClaudeQuotaSnapshot
@@ -1369,6 +1517,31 @@ func InternalClaudeTokenLease(c *gin.Context) {
 			continue
 		}
 		cands = append(cands, cand{row, sp})
+	}
+
+	// AVAILABILITY BACKSTOP: a pause must never be able to cause an outage.
+	//
+	// The admin endpoint refuses to pause the last un-paused account, but that
+	// only checks the pool as it stands at the moment of the click. Pause one of
+	// three, then have the other two quarantine overnight, and this loop yields
+	// zero candidates while a perfectly good credential sits in drainFallback —
+	// a hard 503 for everyone, caused by a control whose whole purpose was to be
+	// safe. Same doctrine as servableAccounts' never-return-empty fallback:
+	// serving from a paused account is a degraded state, refusing everyone is an
+	// incident. Loud, because the operator needs to know their pause is not
+	// being honoured.
+	if len(cands) == 0 && len(drainFallback) > 0 {
+		log.Printf("claude-lease: every usable account is PAUSED (%d) — serving a paused account rather than refusing; resume one or add capacity",
+			len(drainFallback))
+		for _, row := range drainFallback {
+			var snap models.ClaudeQuotaSnapshot
+			var sp *models.ClaudeQuotaSnapshot
+			if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil {
+				sp = &snap
+			}
+			cands = append(cands, cand{row, sp})
+		}
+		nDraining = 0
 	}
 
 	// Order (ascending key, lowest picked first): "use it or lose it", driven by
@@ -1592,8 +1765,8 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	// ("quarantined=0"), so a consumer matching on a bare word would classify a
 	// perfectly ordinary dry pool as a quarantined one. Match the token, not the
 	// vocabulary.
-	breakdown := fmt.Sprintf("total=%d quarantined=%d benched=%d exhausted=%d excluded=%d",
-		len(rows), nQuarantined, nBenched, nExhausted, nExcluded)
+	breakdown := fmt.Sprintf("total=%d quarantined=%d benched=%d exhausted=%d excluded=%d draining=%d",
+		len(rows), nQuarantined, nBenched, nExhausted, nExcluded, nDraining)
 	if nQuarantined > 0 && nBenched == 0 && nExhausted == 0 {
 		// Deliberately does NOT contain "available quota": claude-proxy's legacy
 		// path keys off that phrase, and this state must not reach users as a

@@ -57,6 +57,26 @@ type ClaudeQuotaToken struct {
 	// threshold. It is not self-clearing on a stray success — recovery is a
 	// deliberate operator re-add, matching the alert text the proxy emits.
 	BenchDead bool `gorm:"column:bench_dead;not null;default:false" json:"bench_dead,omitempty"`
+	// ── Operator drain ────────────────────────────────────────────────────────
+	//
+	// DrainingSince marks an account an operator has PAUSED from lum.id/code. It
+	// is a graceful drain, deliberately not a bench:
+	//
+	//   - Placement stops using it as a TARGET, so nobody is newly homed here.
+	//   - Lease-time keeps serving users already homed or session-pinned here,
+	//     so conversations in flight finish on the subscription that started
+	//     them. Refusing them instead would make claude-proxy hit
+	//     sessionPinMaxWait and fire PIN RELEASED, splitting the session across
+	//     subscriptions — the exact suspension signal a pause exists to avoid.
+	//   - Users drift off as they go idle, on the normal placement cadence. That
+	//     drift IS the safe transfer; there is no deadline and no forced move.
+	//
+	// A timestamp rather than a bool so the dashboard can say how long a drain
+	// has been running, and so an abandoned one is visible rather than silent.
+	// Unlike BenchUntil this NEVER expires on its own — a pause that quietly
+	// resumed itself would be worse than no pause at all.
+	DrainingSince *time.Time `gorm:"column:draining_since"        json:"draining_since,omitempty"`
+	DrainReason   string     `gorm:"column:drain_reason;size:512" json:"drain_reason,omitempty"`
 	// ── Refresh-exchange forensics ────────────────────────────────────────────
 	//
 	// Added 2026-08-14. When all four pooled accounts were quarantined on

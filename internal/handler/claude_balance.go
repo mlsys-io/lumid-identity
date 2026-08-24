@@ -262,6 +262,58 @@ func servableAccounts(accounts []string, q map[string]accountQuota) []string {
 	return out
 }
 
+// drainingAccounts reports which of `accounts` an operator has PAUSED.
+//
+// Separate query rather than threading the rows down from assignableAccounts:
+// that function returns emails only, and widening its contract to carry drain
+// state would put a display concern into the one place that decides pool
+// membership.
+func drainingAccounts(accounts []string) map[string]bool {
+	out := make(map[string]bool, len(accounts))
+	if len(accounts) == 0 {
+		return out
+	}
+	var rows []models.ClaudeQuotaToken
+	if err := common.DB.Where("email IN ? AND draining_since IS NOT NULL", accounts).
+		Find(&rows).Error; err != nil {
+		// Fail OPEN: on a query error nothing is treated as draining, so
+		// placement behaves exactly as it did before this feature. The opposite
+		// default would let a transient DB blip empty the target list and strand
+		// the whole pool.
+		log.Printf("claude-pool: draining lookup failed, treating no account as paused: %v", err)
+		return out
+	}
+	for _, r := range rows {
+		out[r.Email] = true
+	}
+	return out
+}
+
+// excludeDraining removes paused accounts from the placement TARGET list.
+//
+// Mirrors servableAccounts' "never return empty" contract, and for the same
+// reason: an empty target list places nobody, which is an outage rather than a
+// pause. The admin endpoint refuses to pause the last servable account, so this
+// is a backstop for a pool that became fully paused some other way (every other
+// account exhausted or quarantined while one was already draining).
+func excludeDraining(canServe []string, draining map[string]bool) []string {
+	if len(draining) == 0 {
+		return canServe
+	}
+	out := make([]string, 0, len(canServe))
+	for _, a := range canServe {
+		if !draining[a] {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		log.Printf("claude-pool: every servable account is paused — ignoring the drain for placement, "+
+			"since placing nobody is an outage, not a pause (accounts=%d)", len(canServe))
+		return canServe
+	}
+	return out
+}
+
 // accountLabels caches account -> field-box Label purely so the placement log
 // can print it. Without it, "account ytb has 5 users" and "field box chicago
 // has no traffic" are two facts with no way to connect them — you cannot tell
@@ -420,6 +472,13 @@ type placementInputs struct {
 	load           map[string]int64
 	valid          map[string]bool // account still in the pool at all
 	servable       map[string]bool // account can currently take traffic
+	// draining — operator has PAUSED this account. Distinct from !servable on
+	// purpose: a draining account CAN still take traffic (lease-time keeps
+	// serving whoever is already homed on it), it just must not receive anyone
+	// new. Conflating the two would send its active users down the evacuation
+	// arm below and teleport live conversations, which is what a pause exists
+	// to prevent.
+	draining       map[string]bool
 	active         map[string]bool // user made a pooled request very recently
 	rebalance      bool
 	sharingTooWide bool
@@ -461,6 +520,32 @@ func placementWrites(in placementInputs) ([]models.ClaudeUserAssignment, int) {
 			reason = "initial"
 		case !in.valid[have]:
 			reason = "account-gone"
+		// Both drain arms require in.servable[have]. A paused account that is ALSO
+		// exhausted cannot serve anyone, so deferring there would strand the user
+		// rather than protect them — the protection only makes sense while the
+		// origin still works. Falling through lets the evacuation arms below move
+		// them and, correctly, call it "exhausted": that is the more urgent fact
+		// and the one with a different remedy.
+		case in.draining[have] && in.servable[have] && in.active[sub]:
+			// Operator paused this account and the user is mid-conversation.
+			// Their origin STILL WORKS — lease-time keeps serving whoever is
+			// already pinned here — so there is nothing to protect them from
+			// and everything to lose by moving them. Deliberately not gated on
+			// `rebalance`: a drain must progress on its own without switching
+			// off hysteresis for the rest of the pool.
+			//
+			// (If activeUsers' query fails it returns an empty set by design,
+			// so a DB hiccup degrades to moving everyone at once. Documented
+			// at :499 — noted here because this is the one arm where that
+			// degradation costs a split session rather than an egress change.)
+			deferred++
+			continue
+		case in.draining[have] && in.servable[have] && have != want:
+			// Idle on a paused account: this is the drain doing its work. `want`
+			// can never name a draining account (they are not placement
+			// targets), so the guard is structural — kept explicit so the
+			// all-paused fallback cannot produce a self-move.
+			reason = "drain"
 		case in.rebalance && have != want && in.servable[have] && in.active[sub]:
 			// Mid-session, and their current origin still works — leave them.
 			deferred++
@@ -719,12 +804,38 @@ func EnsureAssignments(force bool) error {
 		// stays the full list for reporting and for skew, so an exhausted
 		// account still shows in the log — it just stops receiving people.
 		quotas := accountQuotas(accounts)
-		targets := servableAccounts(accounts, quotas)
+		// TWO DIFFERENT QUESTIONS, DELIBERATELY TWO SETS.
+		//
+		//   canServe — "could this account carry traffic right now?"  Used to
+		//              decide whether a mid-session user must be evacuated.
+		//   targets  — "may someone be newly homed here?"  canServe minus the
+		//              accounts an operator has paused.
+		//
+		// These were one set. Folding a paused account out of canServe as well
+		// would send its ACTIVE users down placementWrites' evacuation arm and
+		// move them mid-conversation — handing subscription B turn N of a
+		// session it never saw, which is the 2026-08-16 ac7 failure and the
+		// precise thing a pause is meant to avoid. A paused account keeps
+		// serving whoever is already on it and simply stops accepting newcomers.
+		canServe := servableAccounts(accounts, quotas)
+		draining := drainingAccounts(accounts)
+		targets := excludeDraining(canServe, draining)
 		maxPer := effectiveUserCap(len(loads), len(targets), configured)
 
 		ideal := computeAssignment(loads, targets, maxPer)
 		logPlacement(loads, accounts, ideal, configured, quotas)
-		curSkew := skew(loads, targets, cur)
+		// Skew must ignore users still sitting on a paused account. skew() sums
+		// into tot[assign[u]] for EVERY user, and Go creates the map entry even
+		// for an account absent from `targets` — so a heavy user deferred on a
+		// draining account would inflate `hi`, push curSkew past the factor and
+		// flip the global rebalance the comment below is careful not to flip.
+		curForSkew := make(map[string]string, len(cur))
+		for sub, acct := range cur {
+			if !draining[acct] {
+				curForSkew[sub] = acct
+			}
+		}
+		curSkew := skew(loads, targets, curForSkew)
 		sharingTooWide := overCap(cur, valid, maxPer)
 
 		// Users sitting on an exhausted account are ALREADY displaced: the valve
@@ -732,8 +843,11 @@ func EnsureAssignments(force bool) error {
 		// unstable today. Moving them is not new churn — it is placement catching
 		// up to what lease-time is doing anyway, and it restores a stable box.
 		stranded := 0
-		servable := make(map[string]bool, len(targets))
-		for _, a := range targets {
+		// Built from canServe, NOT targets — see the comment above. A paused
+		// account must read servable here so its active users are deferred
+		// rather than evacuated, and so they are not counted as stranded.
+		servable := make(map[string]bool, len(canServe))
+		for _, a := range canServe {
 			servable[a] = true
 		}
 		for _, acct := range cur {
@@ -741,6 +855,15 @@ func EnsureAssignments(force bool) error {
 				stranded++
 			}
 		}
+		// NOTE a drain deliberately does NOT appear here. `rebalance` is a
+		// POOL-GLOBAL switch: turning it on disables skew hysteresis for every
+		// user, so on each tick any unrelated idle person whose greedy-LPT
+		// `ideal` drifted (loads are a rolling 7d window, so it drifts
+		// constantly) gets re-homed and their public egress box changes. An
+		// exhausted account can get away with that because it self-clears in
+		// hours; a pause has no deadline, so it would churn the whole pool for
+		// as long as the operator left it on. placementWrites handles drainees
+		// directly instead, which touches only them.
 		rebalance := curSkew > rebalanceSkewFactor || sharingTooWide || stranded > 0
 
 		load := make(map[string]int64, len(loads))
@@ -749,7 +872,7 @@ func EnsureAssignments(force bool) error {
 		}
 		writes, deferred := placementWrites(placementInputs{
 			ideal: ideal, cur: cur, load: load,
-			valid: valid, servable: servable,
+			valid: valid, servable: servable, draining: draining,
 			active:         activeUsers(activeSessionWindow),
 			rebalance:      rebalance,
 			sharingTooWide: sharingTooWide,

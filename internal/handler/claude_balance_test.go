@@ -256,6 +256,7 @@ func basePlacement() placementInputs {
 		load:           map[string]int64{"u1": 100},
 		valid:          map[string]bool{"a": true, "b": true},
 		servable:       map[string]bool{"a": true, "b": true},
+		draining:       map[string]bool{},
 		active:         map[string]bool{},
 		rebalance:      true,
 		sharingTooWide: true,
@@ -362,5 +363,94 @@ func TestSettledUsersDoNotChurnWhileAMoveIsDeferred(t *testing.T) {
 				t.Fatalf("tick %d: settled user churned to %s", tick, w.Account)
 			}
 		}
+	}
+}
+
+// --- operator pause (graceful drain) ----------------------------------------
+
+// THE ANTI-TELEPORT INVARIANT. A paused account is still SERVING the people
+// already on it (lease-time honours their session pin), so a mid-conversation
+// user must be left exactly where they are. Moving them would hand subscription
+// B turn N of a session it never saw — the 2026-08-16 ac7 shape, and the precise
+// thing a pause exists to avoid.
+//
+// Note rebalance:false. The drain must work without the pool-global switch,
+// because turning that on for an open-ended pause would churn every unrelated
+// user's egress box on every tick.
+func TestDrainingAccountDefersItsActiveUser(t *testing.T) {
+	in := basePlacement()
+	in.rebalance = false
+	in.sharingTooWide = false
+	in.draining = map[string]bool{"a": true}
+	in.active = map[string]bool{"u1": true}
+	writes, deferred := placementWrites(in)
+	if len(writes) != 0 {
+		t.Fatalf("moved a mid-session user off a PAUSED account — this splits the session across subscriptions: %+v", writes)
+	}
+	if deferred != 1 {
+		t.Fatalf("deferred = %d, want 1", deferred)
+	}
+}
+
+// The other half: an idle user must actually leave, or the drain never
+// completes. Also without the global rebalance.
+func TestDrainingAccountMovesItsIdleUser(t *testing.T) {
+	in := basePlacement()
+	in.rebalance = false
+	in.sharingTooWide = false
+	in.draining = map[string]bool{"a": true}
+	writes, deferred := placementWrites(in)
+	if len(writes) != 1 || writes[0].Account != "b" {
+		t.Fatalf("idle user did not drain off the paused account: %+v", writes)
+	}
+	if deferred != 0 {
+		t.Fatalf("deferred = %d, want 0", deferred)
+	}
+	if writes[0].Reason != "drain" {
+		t.Fatalf("reason = %q, want drain — an operator pause and a quota evacuation need different remedies", writes[0].Reason)
+	}
+}
+
+// A drain must not be mistaken for an evacuation. "exhausted" means the account
+// cannot serve and lease-time is already sending these users elsewhere; a paused
+// account can and does still serve them. Conflating the two is what would make
+// the active case above evacuate instead of defer.
+func TestDrainIsNotReportedAsExhausted(t *testing.T) {
+	in := basePlacement()
+	in.rebalance = false
+	in.sharingTooWide = false
+	in.draining = map[string]bool{"a": true}
+	writes, _ := placementWrites(in)
+	if len(writes) != 1 || writes[0].Reason == "exhausted" {
+		t.Fatalf("drain reported as an evacuation: %+v", writes)
+	}
+}
+
+// A genuinely exhausted account overrides the pause: the user cannot be served
+// there at all, so leaving them is stranding rather than protecting.
+func TestExhaustedBeatsDrainingForAnActiveUser(t *testing.T) {
+	in := basePlacement()
+	in.draining = map[string]bool{"a": true}
+	in.servable = map[string]bool{"a": false, "b": true}
+	in.active = map[string]bool{"u1": true}
+	writes, _ := placementWrites(in)
+	if len(writes) != 1 {
+		t.Fatalf("active user stranded on an exhausted+paused account: %+v", writes)
+	}
+}
+
+// Pausing every account is an outage, not a drain. excludeDraining must hand
+// back the original list rather than place nobody — mirroring servableAccounts'
+// never-return-empty doctrine.
+func TestExcludeDrainingNeverEmptiesTheTargetList(t *testing.T) {
+	all := []string{"a", "b"}
+	if got := excludeDraining(all, map[string]bool{"a": true, "b": true}); len(got) != 2 {
+		t.Fatalf("all-paused emptied the target list (%v) — that places nobody", got)
+	}
+	if got := excludeDraining(all, map[string]bool{"a": true}); len(got) != 1 || got[0] != "b" {
+		t.Fatalf("excludeDraining = %v, want [b]", got)
+	}
+	if got := excludeDraining(all, map[string]bool{}); len(got) != 2 {
+		t.Fatalf("no drain should be a passthrough, got %v", got)
 	}
 }

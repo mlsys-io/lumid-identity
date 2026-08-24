@@ -14,6 +14,7 @@ var AllTables = []interface{}{
 	&Session{},
 	&SigningKey{},
 	&InvitationCode{},
+	&InvitationRedemption{},
 	&PasswordReset{},
 	&SSHKey{},
 	&UserAccessGrant{},

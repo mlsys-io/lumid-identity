@@ -387,13 +387,15 @@ func RedeemInvitationCodeHandler(c *gin.Context) {
 		fail(c, http.StatusForbidden, 1006, "account suspended")
 		return
 	}
-	if u.InvitationCodeUsed != "" {
-		// Idempotent: a user who already redeemed should not be punished
-		// for retrying (e.g. dialog reopened, race with another tab).
-		// 409 with a clear message lets the UI close the dialog and
-		// move on without another DB write.
+	// Has this user already redeemed THIS code? That is the only replay we must
+	// refuse. Enforcement is the uk_user_code unique index below — this SELECT
+	// is a fast path and a nice error message, not the guarantee: two
+	// concurrent redeems both pass here and one loses at the insert.
+	var priorSame models.InvitationRedemption
+	if err := tx.Where("user_id = ? AND code = ?", u.ID, code).
+		First(&priorSame).Error; err == nil {
 		tx.Rollback()
-		fail(c, http.StatusConflict, 1009, "invitation code already redeemed")
+		fail(c, http.StatusConflict, 1009, "you have already redeemed this code")
 		return
 	}
 
@@ -417,6 +419,23 @@ func RedeemInvitationCodeHandler(c *gin.Context) {
 	if inv.MaxUses != 0 && inv.UsesRemaining <= 0 {
 		tx.Rollback()
 		fail(c, http.StatusBadRequest, 1007, "invitation code exhausted")
+		return
+	}
+
+	// A user who has already onboarded may redeem a code that GRANTS ACCESS,
+	// but not a second plain signup code. Those are different objects that
+	// happen to share a table: a signup code answers "may this person join",
+	// which is asked once; a scoped code answers "may this person have X",
+	// which is asked whenever X changes.
+	//
+	// Conflating them is what broke this: every one of the twenty cohort
+	// accounts already had invitation_code_used set from signup, so a scoped
+	// code minted for them was refused before it could grant anything — the
+	// feature worked only for brand-new accounts, which is precisely the group
+	// that did not need it.
+	if u.InvitationCodeUsed != "" && strings.TrimSpace(inv.Scopes) == "" {
+		tx.Rollback()
+		fail(c, http.StatusConflict, 1009, "invitation code already redeemed")
 		return
 	}
 
@@ -456,11 +475,35 @@ func RedeemInvitationCodeHandler(c *gin.Context) {
 		}
 	}
 
-	if err := tx.Model(&u).
-		Update("invitation_code_used", code).Error; err != nil {
+	// Only the FIRST redemption sets invitation_code_used. That column means
+	// "the code this account joined with", and a later access grant must not
+	// rewrite the signup record — QuantArena's middleware reads it, and the
+	// provenance of who invited whom would be lost.
+	if u.InvitationCodeUsed == "" {
+		if err := tx.Model(&u).
+			Update("invitation_code_used", code).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 1500,
+				"set user invitation_code: "+err.Error())
+			return
+		}
+	}
+
+	// The per-(user, code) record. Its unique index — not the SELECT at the top
+	// — is what actually stops a replay: without it one user could drain a
+	// 20-seat code alone, because uses_remaining decrements per redeem, not per
+	// person. A duplicate key here is a concurrent double-submit, which is a
+	// 409, not a 500.
+	if err := tx.Create(&models.InvitationRedemption{
+		ID: uuid.NewString(), UserID: u.ID, Code: code,
+		Scopes: strings.TrimSpace(inv.Scopes),
+	}).Error; err != nil {
 		tx.Rollback()
-		fail(c, http.StatusInternalServerError, 1500,
-			"set user invitation_code: "+err.Error())
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+			fail(c, http.StatusConflict, 1009, "you have already redeemed this code")
+			return
+		}
+		fail(c, http.StatusInternalServerError, 1500, "record redemption: "+err.Error())
 		return
 	}
 

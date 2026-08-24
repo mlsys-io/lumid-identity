@@ -1143,8 +1143,11 @@ func hrwScore(userSub, email string) float64 {
 // Users leave as they go idle, on the normal placement cadence. That drift is
 // the "safe transfer": no deadline, no forced move, no split sessions.
 //
-// super_admin (not admin) to match claude-pool/reset-window: pausing an account
-// takes capacity away from other people, which is a budget decision.
+// ADMIN, not super_admin — the same level as deleting an account, which an admin
+// can already do. Gating a reversible pause more tightly than an irreversible
+// delete is incoherent, and in practice it just hid the control from the people
+// who run the pool. Contrast claude-pool/reset-window, which is super_admin
+// because it hands out budget; this only stops an account taking new work.
 func AdminClaudeAccountDrain(c *gin.Context) {
 	var body struct {
 		Email    string `json:"email"`

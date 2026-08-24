@@ -575,9 +575,6 @@ func Register(r *gin.Engine) {
 			// Reset the per-user SHORT-window quota clock. super_admin, not admin:
 			// it hands capacity back to users, which is a budget decision.
 			superAdmin.POST("/claude-pool/reset-window", AdminClaudePoolResetWindow)
-			// Pause/resume a pooled account (graceful drain). super_admin for the
-			// same reason as reset-window: it moves capacity between people.
-			superAdmin.POST("/claude-account/drain", AdminClaudeAccountDrain)
 		}
 
 		// admin + super_admin — Claude Code quota dashboard (/quota page) and
@@ -590,6 +587,14 @@ func Register(r *gin.Engine) {
 			adminQuota.GET("/claude-account-users", AdminClaudeAccountUsers)
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
+			// Pause/resume a pooled account (graceful drain). ADMIN, not
+			// super_admin, and deliberately the same level as the DELETE above:
+			// an admin can already remove an account from the pool outright, so
+			// putting a REVERSIBLE pause behind a higher bar made the safe
+			// control harder to reach than the destructive one. It is also not
+			// the reset-window case — that HANDS OUT budget, which is why that
+			// one is super_admin; this only stops an account taking new work.
+			adminQuota.POST("/claude-account/drain", AdminClaudeAccountDrain)
 			// Label-only update — move an account between field boxes without
 			// re-adding it (which would mean re-running `claude auth login`).
 			adminQuota.PATCH("/claude-token/:email", AdminClaudeTokenLabel)

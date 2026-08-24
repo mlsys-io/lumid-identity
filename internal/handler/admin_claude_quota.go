@@ -1664,12 +1664,22 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		RawCacheWrite int
 		CostCents     int
 		Reqs          int
-		LastTs        time.Time
+		// True rolling windows, anchor-independent. See the query comment.
+		Trailing4hRaw      int
+		Trailing7dRaw      int
+		Trailing4hWeighted int
+		Trailing7dWeighted int
+		Trailing7dReqs     int
+		LastTs             time.Time
 	}{}
 	// Model-weighted, using the SAME shared expression the gate uses. If this
 	// table and ClaudePoolUsage disagreed about how much someone has drawn, the
 	// dashboard would show a user comfortably inside their cap while the proxy
 	// 429s them — the same class of bug as the 5h/4h window skew.
+	// Trailing bounds for the anchor-independent totals.
+	trail4h := now.Add(-common.ClaudePoolShortWindow())
+	trail7d := now.Add(-7 * 24 * time.Hour)
+
 	wsql := common.ClaudeWeightedTokensSQL("ue.")
 	// Claude-only weighted draw: the same expression gated to claude-* models.
 	// The 4h/7d bars reflect POOLED CLAUDE ONLY (the gate's enforcePoolQuota
@@ -1691,6 +1701,24 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.cache_creation_tokens ELSE 0 END), 0) AS raw_cache_write,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.cost_cents ELSE 0 END), 0)                      AS cost_cents,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN 1 ELSE 0 END), 0)                                  AS reqs,
+		       -- TRAILING totals: a true rolling 4h / 7d, independent of the anchor.
+		       --
+		       -- Everything above is WINDOW-scoped, which is right for the cap and
+		       -- wrong for the question "how much has this person used". The window
+		       -- opens on first charge and rolls only once fully elapsed, so a
+		       -- continuously-active user's "7d" figure can cover as little as an
+		       -- hour: measured 2026-08-24, admin@lum.id's 7d anchor was 18h old and
+		       -- the column read 1.8B tokens against 6.6B actually used in seven
+		       -- days -- understated 3.7x. Worse, an EXPIRED window contributes
+		       -- nothing at all, so two users who had burned ~1.7B tokens between
+		       -- them rendered as 0/0, i.e. indistinguishable from idle.
+		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN ue.input_tokens + ue.output_tokens
+		                        + ue.cache_read_tokens + ue.cache_creation_tokens ELSE 0 END), 0) AS trailing4h_raw,
+		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN ue.input_tokens + ue.output_tokens
+		                        + ue.cache_read_tokens + ue.cache_creation_tokens ELSE 0 END), 0) AS trailing7d_raw,
+		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN %[1]s ELSE 0 END), 0) AS trailing4h_weighted,
+		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN %[1]s ELSE 0 END), 0) AS trailing7d_weighted,
+		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN 1 ELSE 0 END), 0)     AS trailing7d_reqs,
 		       MAX(ue.ts)                                                               AS last_ts
 		FROM   usage_events ue
 		JOIN  (SELECT user_sub,
@@ -1698,9 +1726,23 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		              CASE WHEN seven_day_anchor + INTERVAL 7 DAY > ? THEN seven_day_anchor ELSE ? END AS seven_eff
 		       FROM   claude_pool_windows) w ON w.user_sub = ue.user_sub
 		LEFT JOIN users u ON u.id = ue.user_sub
-		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= LEAST(w.five_eff, w.seven_eff)
+		-- LEAST must include the trailing bound too: the anchor can be far more
+		-- recent than 7 days ago, and without this the trailing sums above would
+		-- silently see only the rows the WINDOW already admitted -- reproducing
+		-- the very understatement they exist to correct.
+		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= LEAST(w.five_eff, w.seven_eff, ?)
 		GROUP  BY ue.user_sub, u.email`, wsql, claudeOnly),
-		int(common.ClaudePoolShortWindow().Seconds()), now, far, now, far).Scan(&rows).Error
+		// ORDER IS BY POSITION IN THE SQL TEXT, not by logical grouping. The five
+		// trailing placeholders sit in the SELECT list, which precedes the JOIN
+		// subquery, so they bind FIRST. Appending them after the window args (the
+		// obvious-looking thing) silently shifts every parameter by five and the
+		// query still runs — it just returns wrong numbers. Caught by
+		// TestAdminClaudeUserUsage_FixedWindowJoin, which saw an expired window
+		// report 599 tokens instead of 0.
+		trail4h, trail7d, trail4h, trail7d, trail7d, // SELECT: trailing sums
+		int(common.ClaudePoolShortWindow().Seconds()), now, far, now, far, // JOIN: window anchors
+		trail7d). // WHERE: widened lower bound
+		Scan(&rows).Error
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query usage: "+err.Error())
 		return
@@ -1812,6 +1854,21 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		// tenth, model by price ratio), which is deliberately not a token count —
 		// these are here so the two can be reconciled against Anthropic's record
 		// rather than the quota number being taken on trust.
+		// TRAILING totals — a true rolling 4h/7d, independent of the anchor.
+		// The window-scoped figures above answer "how much of the cap is spent";
+		// these answer "how much has this person used", which is what a reader
+		// assumes a column labelled 7d means. They diverge sharply: a
+		// continuously-active user's window can be hours old, and an EXPIRED
+		// window contributes zero, rendering a heavy user as idle.
+		Trailing4hTokens   int `json:"trailing_4h_tokens"`
+		Trailing7dTokens   int `json:"trailing_7d_tokens"`
+		Trailing4hWeighted int `json:"trailing_4h_weighted"`
+		Trailing7dWeighted int `json:"trailing_7d_weighted"`
+		Trailing7dReqs     int `json:"trailing_7d_requests"`
+		// Age of each window in seconds, so a UI can say "7d (18h in)" rather
+		// than presenting an 18-hour figure as if it covered seven days.
+		FiveWindowAgeSec int `json:"five_window_age_seconds"`
+		SevenWindowAgeSec int `json:"seven_window_age_seconds"`
 		RawInput      int `json:"raw_input_tokens_7d"`
 		RawOutput     int `json:"raw_output_tokens_7d"`
 		RawCacheRead  int `json:"raw_cache_read_tokens_7d"`
@@ -1840,6 +1897,11 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		u.RawInput, u.RawOutput = r.RawInput, r.RawOutput
 		u.RawCacheRead, u.RawCacheWrite = r.RawCacheRead, r.RawCacheWrite
 		u.RawTotal = r.RawInput + r.RawOutput + r.RawCacheRead + r.RawCacheWrite
+		u.Trailing4hTokens = r.Trailing4hRaw
+		u.Trailing7dTokens = r.Trailing7dRaw
+		u.Trailing4hWeighted = r.Trailing4hWeighted
+		u.Trailing7dWeighted = r.Trailing7dWeighted
+		u.Trailing7dReqs = r.Trailing7dReqs
 		u.CostCents7d = r.CostCents
 		u.Requests = r.Reqs
 		u.LastTs = r.LastTs
@@ -1860,9 +1922,13 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		// roll already used the configured length.
 		if live, resetAt := common.ClaudeWindowLive(win.FiveHourAnchor, common.ClaudePoolShortWindow(), now); live {
 			u.FiveHourReset = resetAt.UTC().Format(time.RFC3339)
+			// How far INTO the window we are. Without this a reader cannot tell a
+			// figure covering seven days from one covering seven minutes.
+			u.FiveWindowAgeSec = int(now.Sub(win.FiveHourAnchor).Seconds())
 		}
 		if live, resetAt := common.ClaudeWindowLive(win.SevenDayAnchor, 7*24*time.Hour, now); live {
 			u.SevenDayReset = resetAt.UTC().Format(time.RFC3339)
+			u.SevenWindowAgeSec = int(now.Sub(win.SevenDayAnchor).Seconds())
 		}
 	}
 	// Attach per-model breakdown + aggregate into provider subtotals.

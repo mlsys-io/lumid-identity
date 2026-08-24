@@ -155,6 +155,9 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 		FiveHourReset string              `json:"five_hour_reset"`
 		SevenDayReset string              `json:"seven_day_reset"`
 		FiveHourPct   float64             `json:"five_hour_pct"`
+		Trailing4h    int                 `json:"trailing_4h_tokens"`
+		Trailing7d    int                 `json:"trailing_7d_tokens"`
+		SevenAgeSec   int                 `json:"seven_window_age_seconds"`
 		Models        map[string]modelRow `json:"models"`
 	}
 	var out struct {
@@ -232,6 +235,30 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 	}
 	if expired.FiveHourReset != "" || expired.SevenDayReset != "" {
 		t.Fatalf("expired user should have blank resets (idle), got five=%q seven=%q", expired.FiveHourReset, expired.SevenDayReset)
+	}
+
+	// TRAILING totals must be anchor-INDEPENDENT. This is the fix for the
+	// dashboard reading "0" for a user who had burned a billion tokens: their
+	// window had expired, so every window-scoped column contributed nothing.
+	//
+	// expiredSub's only event is 999 input tokens at -49h — outside both expired
+	// windows, but well inside a true rolling 7d. Window columns stay 0; the
+	// trailing column must show it. If this ever reads 0 again, the dashboard has
+	// gone back to being unable to distinguish a heavy user from an idle one.
+	if expired.Trailing7d != 999 {
+		t.Fatalf("expired user trailing_7d_tokens=%d want 999 raw — trailing totals "+
+			"must not be bounded by the (expired) anchor", expired.Trailing7d)
+	}
+	// ...and the 4h trailing window genuinely excludes it (the event is 49h old).
+	if expired.Trailing4h != 0 {
+		t.Fatalf("expired user trailing_4h_tokens=%d want 0 (event is 49h old)", expired.Trailing4h)
+	}
+
+	// The live user's 7d window is only 3 DAYS old, so its column cannot be read
+	// as "seven days of usage" without knowing that. The age makes it legible.
+	if live.SevenAgeSec < int((71 * time.Hour).Seconds()) || live.SevenAgeSec > int((73 * time.Hour).Seconds()) {
+		t.Fatalf("live user seven_window_age_seconds=%d, want ~72h — a UI cannot "+
+			"label the window honestly without it", live.SevenAgeSec)
 	}
 
 	// precutoverSub: no anchor row at all → excluded entirely, not a zeroed row.

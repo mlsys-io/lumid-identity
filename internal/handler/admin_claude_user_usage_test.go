@@ -103,6 +103,17 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 	if err := db.Create(&liveEvents).Error; err != nil {
 		t.Fatalf("seed live events: %v", err)
 	}
+	// A NON-pool turn. deepseek runs on our own GB10 and enforcePoolQuota exempts
+	// it, so it must NOT count toward a table headed "per-user POOL usage" — but
+	// it must still appear in the all-models total. On prod this mattered: 26% of
+	// one user's headline was non-pool traffic (1.7B of 6.5B tokens).
+	nonPool := models.UsageEvent{
+		UserSub: liveSub, Ts: now.Add(-20 * time.Minute), Kind: "claude_proxy",
+		Model: "deepseek-v4-flash", InputTokens: 5000, OutputTokens: 1000,
+	}
+	if err := db.Create(&nonPool).Error; err != nil {
+		t.Fatalf("seed non-pool event: %v", err)
+	}
 
 	// --- expiredSub: both windows fully expired (never rolled forward —
 	// simulates a user who hasn't made a claude_proxy call since expiry).
@@ -149,16 +160,17 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 		WeightedTokens int `json:"weighted_tokens_7d"`
 	}
 	type userRow struct {
-		Email         string              `json:"email"`
-		FiveHour      int                 `json:"five_hour_tokens"`
-		SevenDay      int                 `json:"seven_day_tokens"`
-		FiveHourReset string              `json:"five_hour_reset"`
-		SevenDayReset string              `json:"seven_day_reset"`
-		FiveHourPct   float64             `json:"five_hour_pct"`
-		Trailing4h    int                 `json:"trailing_4h_tokens"`
-		Trailing7d    int                 `json:"trailing_7d_tokens"`
-		SevenAgeSec   int                 `json:"seven_window_age_seconds"`
-		Models        map[string]modelRow `json:"models"`
+		Email            string              `json:"email"`
+		FiveHour         int                 `json:"five_hour_tokens"`
+		SevenDay         int                 `json:"seven_day_tokens"`
+		FiveHourReset    string              `json:"five_hour_reset"`
+		SevenDayReset    string              `json:"seven_day_reset"`
+		FiveHourPct      float64             `json:"five_hour_pct"`
+		Trailing4h       int                 `json:"trailing_4h_tokens"`
+		Trailing7dClaude int                 `json:"trailing_7d_claude_tokens"`
+		Trailing7d       int                 `json:"trailing_7d_tokens"`
+		SevenAgeSec      int                 `json:"seven_window_age_seconds"`
+		Models           map[string]modelRow `json:"models"`
 	}
 	var out struct {
 		Data struct {
@@ -189,11 +201,16 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 	if !ok {
 		t.Fatalf("live user missing from results: %+v", out.Data.Users)
 	}
-	if live.FiveHour != 600 {
-		t.Fatalf("live user five_hour_tokens=%d want 600 (weighted: (700+300)*0.6)", live.FiveHour)
+	// These columns are ALL-MODELS weighted, so the seeded deepseek turn counts
+	// too — at the non-Claude weight of 0.1, which is the point: it draws on the
+	// window but not on the Claude budget the BARS show.
+	//   five  = (700+300)*0.6 + (5000+1000)*0.1 = 600 + 600 = 1200
+	//   seven = (500+1000)*0.6 + 600            = 900 + 600 = 1500
+	if live.FiveHour != 1200 {
+		t.Fatalf("live user five_hour_tokens=%d want 1200 (claude 600 + deepseek 600)", live.FiveHour)
 	}
-	if live.SevenDay != 900 {
-		t.Fatalf("live user seven_day_tokens=%d want 900 (weighted: (500+1000)*0.6)", live.SevenDay)
+	if live.SevenDay != 1500 {
+		t.Fatalf("live user seven_day_tokens=%d want 1500 (claude 900 + deepseek 600)", live.SevenDay)
 	}
 
 	// The per-model breakdown must report RAW tokens and WEIGHTED units as
@@ -213,9 +230,15 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 	if sonnet.WeightedTokens != 900 {
 		t.Fatalf("per-model weighted_tokens_7d=%d want 900 (1500*0.6)", sonnet.WeightedTokens)
 	}
-	if sonnet.WeightedTokens != live.SevenDay {
-		t.Fatalf("per-model weighted units must sum to the user's 7d total: model=%d user=%d",
-			sonnet.WeightedTokens, live.SevenDay)
+	// Per-model weighted units must SUM to the user's window total across every
+	// model — not equal any single one, now that a non-pool model is present.
+	sumWeighted := 0
+	for _, m := range live.Models {
+		sumWeighted += m.WeightedTokens
+	}
+	if sumWeighted != live.SevenDay {
+		t.Fatalf("per-model weighted units must sum to the user's 7d total: sum=%d user=%d",
+			sumWeighted, live.SevenDay)
 	}
 	if live.FiveHourReset == "" || live.SevenDayReset == "" {
 		t.Fatalf("live user should have both resets populated, got five=%q seven=%q", live.FiveHourReset, live.SevenDayReset)
@@ -235,6 +258,18 @@ func TestAdminClaudeUserUsage_FixedWindowJoin(t *testing.T) {
 	}
 	if expired.FiveHourReset != "" || expired.SevenDayReset != "" {
 		t.Fatalf("expired user should have blank resets (idle), got five=%q seven=%q", expired.FiveHourReset, expired.SevenDayReset)
+	}
+
+	// POOL-ONLY vs ALL-MODELS. The row is titled "pool usage", so the headline
+	// must exclude the exempt on-prem traffic; the all-models figure keeps it.
+	//   raw all models = 500+1000 (claude) + 6000 (deepseek) = 7500
+	//   raw pool only  = 500+1000                            = 1500
+	if live.Trailing7d != 7500 {
+		t.Fatalf("trailing_7d_tokens=%d want 7500 (all models, incl. non-pool)", live.Trailing7d)
+	}
+	if live.Trailing7dClaude != 1500 {
+		t.Fatalf("trailing_7d_claude_tokens=%d want 1500 — non-pool traffic must not "+
+			"inflate a POOL usage figure", live.Trailing7dClaude)
 	}
 
 	// TRAILING totals must be anchor-INDEPENDENT. This is the fix for the

@@ -1665,12 +1665,14 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		CostCents     int
 		Reqs          int
 		// True rolling windows, anchor-independent. See the query comment.
-		Trailing4hRaw      int
-		Trailing7dRaw      int
-		Trailing4hWeighted int
-		Trailing7dWeighted int
-		Trailing7dReqs     int
-		LastTs             time.Time
+		Trailing4hRaw       int
+		Trailing7dRaw       int
+		Trailing4hWeighted  int
+		Trailing7dWeighted  int
+		Trailing7dReqs      int
+		Trailing4hClaudeRaw int
+		Trailing7dClaudeRaw int
+		LastTs              time.Time
 	}{}
 	// Model-weighted, using the SAME shared expression the gate uses. If this
 	// table and ClaudePoolUsage disagreed about how much someone has drawn, the
@@ -1719,6 +1721,17 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN %[1]s ELSE 0 END), 0) AS trailing4h_weighted,
 		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN %[1]s ELSE 0 END), 0) AS trailing7d_weighted,
 		       COALESCE(SUM(CASE WHEN ue.ts >= ? THEN 1 ELSE 0 END), 0)     AS trailing7d_reqs,
+		       -- POOL-ONLY trailing totals. This table is "per-user POOL usage", and
+		       -- the pool is the Anthropic accounts: enforcePoolQuota exempts
+		       -- deepseek/on-prem, so counting it here overstates what the shared
+		       -- resource actually bore. Measured 2026-08-24, suzhengy's headline
+		       -- was 26%% non-pool traffic (1.7B of 6.5B tokens).
+		       COALESCE(SUM(CASE WHEN ue.ts >= ? AND ue.model LIKE 'claude-%%'
+		                    THEN ue.input_tokens + ue.output_tokens
+		                       + ue.cache_read_tokens + ue.cache_creation_tokens ELSE 0 END), 0) AS trailing4h_claude_raw,
+		       COALESCE(SUM(CASE WHEN ue.ts >= ? AND ue.model LIKE 'claude-%%'
+		                    THEN ue.input_tokens + ue.output_tokens
+		                       + ue.cache_read_tokens + ue.cache_creation_tokens ELSE 0 END), 0) AS trailing7d_claude_raw,
 		       MAX(ue.ts)                                                               AS last_ts
 		FROM   usage_events ue
 		JOIN  (SELECT user_sub,
@@ -1739,7 +1752,8 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		// query still runs — it just returns wrong numbers. Caught by
 		// TestAdminClaudeUserUsage_FixedWindowJoin, which saw an expired window
 		// report 599 tokens instead of 0.
-		trail4h, trail7d, trail4h, trail7d, trail7d, // SELECT: trailing sums
+		trail4h, trail7d, trail4h, trail7d, trail7d, // SELECT: trailing sums (raw 4h/7d, weighted 4h/7d, reqs)
+		trail4h, trail7d, // SELECT: pool-only trailing sums
 		int(common.ClaudePoolShortWindow().Seconds()), now, far, now, far, // JOIN: window anchors
 		trail7d). // WHERE: widened lower bound
 		Scan(&rows).Error
@@ -1865,6 +1879,10 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		Trailing4hWeighted int `json:"trailing_4h_weighted"`
 		Trailing7dWeighted int `json:"trailing_7d_weighted"`
 		Trailing7dReqs     int `json:"trailing_7d_requests"`
+		// Pool-only (claude-*) trailing raw tokens — what the SHARED pool actually
+		// bore. The fields above include deepseek/on-prem, which the cap exempts.
+		Trailing4hClaudeTokens int `json:"trailing_4h_claude_tokens"`
+		Trailing7dClaudeTokens int `json:"trailing_7d_claude_tokens"`
 		// Age of each window in seconds, so a UI can say "7d (18h in)" rather
 		// than presenting an 18-hour figure as if it covered seven days.
 		FiveWindowAgeSec  int `json:"five_window_age_seconds"`
@@ -1902,6 +1920,8 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		u.Trailing4hWeighted = r.Trailing4hWeighted
 		u.Trailing7dWeighted = r.Trailing7dWeighted
 		u.Trailing7dReqs = r.Trailing7dReqs
+		u.Trailing4hClaudeTokens = r.Trailing4hClaudeRaw
+		u.Trailing7dClaudeTokens = r.Trailing7dClaudeRaw
 		u.CostCents7d = r.CostCents
 		u.Requests = r.Reqs
 		u.LastTs = r.LastTs

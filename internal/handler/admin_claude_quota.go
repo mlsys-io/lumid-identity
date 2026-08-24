@@ -1511,10 +1511,16 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// that traffic keeps them inside activeUsers(30m), so placementWrites
 		// keeps deferring their move, so their home never changes, so the next
 		// new session lands here too. The drain would never finish.
-		if row.DrainingSince != nil && row.Email != prefer {
-			nDraining++
-			drainFallback = append(drainFallback, row)
-			continue
+		if row.DrainingSince != nil {
+			// The pin exception is TIME-BOXED — see drainPinGrace. Unbounded, it
+			// makes the pause cosmetic: the binding refreshes on every serve, so
+			// an actively-worked session holds a paused account open forever.
+			pinned := row.Email == prefer && time.Since(*row.DrainingSince) < drainPinGrace
+			if !pinned {
+				nDraining++
+				drainFallback = append(drainFallback, row)
+				continue
+			}
 		}
 		var snap models.ClaudeQuotaSnapshot
 		var sp *models.ClaudeQuotaSnapshot
@@ -2688,6 +2694,40 @@ func refreshAllSnapshots() {
 // an account outright (see InternalClaudeTokenLease). Named so the probe-
 // suppression rule below cannot drift away from the rule it is reasoning about.
 const leaseExhaustPct = 98.0
+
+// drainPinGrace bounds how long a PAUSED account keeps honouring an existing
+// session pin.
+//
+// Without a bound the pause never takes effect. claude-proxy keys stickiness on
+// x-claude-code-session-id, refreshes the binding on every serve, and keeps it
+// across lease renewals by design ("what keeps a long session on one
+// subscription"). A Claude Code session does not end while someone is working,
+// so "let conversations finish" is unbounded: measured 2026-08-25, ac5 was
+// paused with 0 users still ASSIGNED to it and was still taking 100% of traffic
+// (144/144 requests, all via relay=nyc) because every one of them arrived with
+// prefer=ac5.
+//
+// So the exception is time-boxed instead. Inside the window a live conversation
+// is protected exactly as before; past it the account is refused even to its
+// own preferrer, claude-proxy accrues sessionPinMaxWait (2 min of 429s with
+// Retry-After) and then releases the pin and rebinds to a sibling — its normal
+// "home never became servable" path, the same one an exhausted home uses.
+//
+// The cost is therefore bounded and predictable: at most one split per session
+// still running when the window closes, plus a ~2 min tail. That is the trade
+// an operator asked for: a pause that is guaranteed to take effect beats one
+// that never splits a session but also never does anything.
+//
+// 30m matches activeSessionWindow, so it lines up with the definition of
+// "active" that placement already uses.
+var drainPinGrace = func() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("LUMID_CLAUDE_DRAIN_PIN_GRACE")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return 30 * time.Minute
+}()
 
 // exhaustedSnapshotStillTrue reports whether a snapshot showing an exhausted
 // window can still be believed past quotaCacheTTL.

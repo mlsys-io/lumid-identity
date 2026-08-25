@@ -2209,9 +2209,36 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		u.ClaudeSevenPct = float64(u.ClaudeSeven) / float64(uCap7) * 100
 		users = append(users, *u)
 	}
-	// Highest 5h pressure first.
+	// BUSIEST FIRST — by what they actually used, not by how full their window is.
+	//
+	// This sorted on FiveHourPct, which is WINDOW-SCOPED: ClaudePoolUsage returns
+	// 0 outright when neither anchor is live. So the heaviest user on the
+	// platform sank to the BOTTOM of the table the moment their window lapsed,
+	// ranked below someone who had just started, and the person you most wanted
+	// to see was the hardest to find. Same root cause as the 0% bar reading as
+	// idle — the window answers "how much of the cap is spent", never "how busy
+	// is this person".
+	//
+	// Rank on the TRAILING pooled-Claude figure instead: a true rolling 4h, then
+	// 7d as the tiebreak for users quiet in the last few hours but heavy across
+	// the week, then pct so the ordering stays total and deterministic across
+	// replicas. Pool-only (claude-*) on purpose — this table is per-user POOL
+	// usage, and ranking by deepseek volume would put the cheapest traffic on
+	// top of a page about a scarce shared subscription.
+	busier := func(a, b *userUsage) bool {
+		if a.Trailing4hClaudeTokens != b.Trailing4hClaudeTokens {
+			return a.Trailing4hClaudeTokens > b.Trailing4hClaudeTokens
+		}
+		if a.Trailing7dClaudeTokens != b.Trailing7dClaudeTokens {
+			return a.Trailing7dClaudeTokens > b.Trailing7dClaudeTokens
+		}
+		if a.FiveHourPct != b.FiveHourPct {
+			return a.FiveHourPct > b.FiveHourPct
+		}
+		return a.Email < b.Email
+	}
 	for i := 1; i < len(users); i++ {
-		for j := i; j > 0 && users[j].FiveHourPct > users[j-1].FiveHourPct; j-- {
+		for j := i; j > 0 && busier(&users[j], &users[j-1]); j-- {
 			users[j], users[j-1] = users[j-1], users[j]
 		}
 	}

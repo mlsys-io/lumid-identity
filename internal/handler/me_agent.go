@@ -1118,20 +1118,46 @@ func groundedDrillIn(ctx map[string]any) bool {
 // to the default (Claude) on empty or unrecognized model strings so
 // clients that don't pass `model` keep working.
 func resolveProvider(modelID, role string) llmProvider {
+	p, _ := resolveProviderWhy(modelID, role)
+	return p
+}
+
+// resolveProviderWhy is resolveProvider plus the REASON the request was not
+// honoured verbatim — "" when it was.
+//
+// The silent fallback below is deliberate for a role miss and was a trap for
+// everything else. A typo'd or renamed id used to return 200 carrying a
+// DIFFERENT model, with nothing in the response saying so: the caller sees a
+// perfectly good answer from a model they did not ask for. That cost real
+// debugging time — two spill tests reported clean 200s while never reaching
+// the sandbox at all, because "claude-code" is not an id ("claude-code-sonnet"
+// is) and the mismatch was invisible.
+//
+// The two cases are genuinely different and are now treated differently:
+//
+//   - UNKNOWN id — nothing in the catalog matches. Almost always a typo or a
+//     stale client. Returning someone else's model is never what was wanted,
+//     so the caller is told.
+//   - ROLE too low — the id is real, the caller may not have it. Falling back
+//     keeps the panel working when a user's role changes under a saved
+//     selection, which is the original intent and is kept. Still reported, so
+//     "why am I getting gemma4" has an answer.
+func resolveProviderWhy(modelID, role string) (llmProvider, string) {
 	if modelID != "" {
 		for _, p := range llmProviders {
 			if p.id == modelID {
 				if providerAllowed(role, p) {
-					return p
+					return p, ""
 				}
-				// Requested a provider above the caller's role → fall back
-				// to their default (gemma4) rather than 403, so the panel
-				// degrades gracefully if a stale id is sent.
-				return defaultProviderFor(role)
+				return defaultProviderFor(role), fmt.Sprintf(
+					"model %q requires role %q; you are %q — used %s instead",
+					modelID, p.minRole, role, defaultProviderFor(role).id)
 			}
 		}
+		return defaultProviderFor(role), fmt.Sprintf(
+			"unknown model %q — used %s instead", modelID, defaultProviderFor(role).id)
 	}
-	return defaultProviderFor(role)
+	return defaultProviderFor(role), ""
 }
 
 type chatMessage struct {
@@ -1409,7 +1435,12 @@ func MeAgentChat(c *gin.Context) {
 	}
 
 	role := currentUserRole(c)
-	provider := resolveProvider(body.Model, role)
+	provider, providerNote := resolveProviderWhy(body.Model, role)
+	// Never let a downgrade be silent. A 200 carrying a model the caller
+	// did not ask for is indistinguishable from success.
+	if providerNote != "" {
+		log.Printf("me_agent: provider downgrade: %s", providerNote)
+	}
 	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context, body.Mode)
 	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
 	apiKey, err := provider.keyFn()

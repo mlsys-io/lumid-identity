@@ -122,7 +122,12 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	role := currentUserRole(c)
-	provider := resolveProvider(body.Model, role)
+	provider, providerNote := resolveProviderWhy(body.Model, role)
+	// Never let a downgrade be silent. A 200 carrying a model the caller
+	// did not ask for is indistinguishable from success.
+	if providerNote != "" {
+		log.Printf("me_agent: provider downgrade: %s", providerNote)
+	}
 	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context, body.Mode)
 	apiKey, err := provider.keyFn()
 	if err != nil {

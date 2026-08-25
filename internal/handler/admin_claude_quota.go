@@ -244,6 +244,38 @@ func markIndeterminate(row *models.ClaudeQuotaToken, caller string, started time
 		"our stored refresh token could already be superseded", row.Email, caller, truncStr(reason, 200))
 }
 
+// hasForensicState reports whether row carries anything a re-add's upsert
+// would clear (see claudeTokenReAddColumns) that is worth preserving — an
+// already-clean/healthy account being re-added (e.g. a routine credential
+// rotation) should not write a noise row.
+func hasForensicState(row *models.ClaudeQuotaToken) bool {
+	return row.RevokedAt != nil || row.RevokeReason != "" || row.BenchDead || row.BenchUntil != nil
+}
+
+// snapshotHistory records a forensic copy of row's current state into
+// claude_quota_token_history before something is about to overwrite it —
+// either the quarantine write itself (event="quarantined") or an operator's
+// re-add clearing a prior quarantine/bench (event="re_added"). Best-effort:
+// this must never block the write it is protecting, so failures are logged
+// and swallowed, same treatment reportMidLife401 already gets.
+func snapshotHistory(row *models.ClaudeQuotaToken, event string) {
+	h := models.ClaudeQuotaTokenHistory{
+		Email: row.Email, Event: event, Label: row.Label,
+		RevokedAt: row.RevokedAt, RevokeReason: row.RevokeReason,
+		IndeterminateAt: row.IndeterminateAt, IndeterminateReason: row.IndeterminateReason,
+		PreExpiry401At: row.PreExpiry401At, PreExpiry401Reason: row.PreExpiry401Reason,
+		RotatedAt:      row.RotatedAt,
+		LastExchangeAt: row.LastExchangeAt, LastExchangeOutcome: row.LastExchangeOutcome,
+		LastExchangeMs: row.LastExchangeMs,
+		BenchUntil:     row.BenchUntil, BenchReason: row.BenchReason, BenchDead: row.BenchDead,
+		DrainingSince: row.DrainingSince, DrainReason: row.DrainReason,
+	}
+	if err := common.DB.Create(&h).Error; err != nil {
+		log.Printf("claude-quota-history: %s: failed to record %s snapshot: %v (forensics for this event are lost)",
+			row.Email, event, err)
+	}
+}
+
 func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, error) {
 	// Re-read: another refresher (this pod or the other replica) may have
 	// rotated while we waited on the locks. singleflight collapses concurrent
@@ -419,6 +451,11 @@ func refreshTokenLocked(row *models.ClaudeQuotaToken, caller string) (string, er
 			})
 			row.RevokedAt = &now
 			row.RevokeReason = reason
+			// Capture the verdict now, while it is true — AdminClaudeTokenAdd's
+			// re-add (the operator's own recovery step) clears revoked_at/
+			// revoke_reason to restore service, and would otherwise be the last
+			// thing to ever see this text.
+			snapshotHistory(row, "quarantined")
 			recordExchange(row, caller, "invalid_grant", started, reason)
 			log.Printf("claude-refresh: %s: QUARANTINED caller=%s — %s; re-add with a fresh `claude auth login` required",
 				row.Email, caller, reason)
@@ -978,6 +1015,19 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	// "label" is only included in the update set when this request actually
 	// supplied one — an unrelated re-add (e.g. refresh-token rotation) with no
 	// label field must not silently wipe an existing field-box tag.
+	// Safety-net capture: the quarantine branch in refreshTokenLocked already
+	// snapshots at the moment revoked_at/revoke_reason are SET, but this
+	// upsert is the moment they (and bench state) are CLEARED — the last
+	// chance to preserve anything set by a path other than that branch. Only
+	// worth a row when there is something to lose; a re-add of an already
+	// clean/healthy account (e.g. a routine credential rotation) writes none.
+	var existing models.ClaudeQuotaToken
+	if err := common.DB.Unscoped().Where("email = ?", email).First(&existing).Error; err == nil {
+		if hasForensicState(&existing) {
+			snapshotHistory(&existing, "re_added")
+		}
+	}
+
 	updateCols := claudeTokenReAddColumns(label != "")
 	if err := common.DB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
@@ -1026,6 +1076,32 @@ func AdminClaudeTokenDelete(c *gin.Context) {
 	// revocation from an ordinary expiry when the next account dies.
 	log.Printf("claude-pool: %s removed from the pool (tombstoned — row and snapshots retained for forensics)", email)
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
+}
+
+// AdminClaudeTokenHistory returns the forensic snapshots recorded for a
+// pooled account — one row per quarantine and per re-add that cleared one.
+//
+// GET /api/v1/admin/claude-token/:email/history  (RequireAdmin)
+//
+// This is the read side of snapshotHistory: before it existed, the verdict
+// in claude_quota_tokens.revoke_reason (LOST-RESPONSE SUSPECTED /
+// REVOKED-UPSTREAM / SECOND-HOLDER OR UPSTREAM REVOCATION) only survived
+// until the next re-add, which is also an operator's own recovery step —
+// so diagnosing a quarantine after the fact meant racing the fix. This
+// endpoint is what makes that unnecessary going forward.
+func AdminClaudeTokenHistory(c *gin.Context) {
+	email := strings.TrimSpace(strings.ToLower(c.Param("email")))
+	if email == "" {
+		fail(c, http.StatusBadRequest, 1400, "email required")
+		return
+	}
+	var rows []models.ClaudeQuotaTokenHistory
+	if err := common.DB.Where("email = ?", email).
+		Order("recorded_at DESC").Limit(50).Find(&rows).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "query history: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"email": email, "history": rows}})
 }
 
 // AdminClaudeTokenLabel updates ONLY a pooled account's field-box Label.

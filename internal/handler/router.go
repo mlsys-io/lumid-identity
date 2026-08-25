@@ -587,6 +587,9 @@ func Register(r *gin.Engine) {
 			adminQuota.GET("/claude-account-users", AdminClaudeAccountUsers)
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
+			// Forensic snapshots taken at quarantine and at each re-add that
+			// clears one — survives the re-add that would otherwise erase them.
+			adminQuota.GET("/claude-token/:email/history", AdminClaudeTokenHistory)
 			// Pause/resume a pooled account (graceful drain). ADMIN, not
 			// super_admin, and deliberately the same level as the DELETE above:
 			// an admin can already remove an account from the pool outright, so

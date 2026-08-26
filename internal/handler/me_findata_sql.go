@@ -13,9 +13,9 @@ package handler
 //     one usable. So an entitled-but-never-minted user gets `FATAL: no such
 //     user`, and provisioning a hundred roles distributes nothing.
 //
-//   * THE PASSWORD IS SHOWN ONCE. Same contract as a PAT. It is not stored
-//     anywhere on this side — see the note on encryption below, which is a
-//     deliberate departure from google_grants.
+//   * THE PASSWORD IS SHOWN ONCE, AND ALSO STORED ENCRYPTED. Shown once because
+//     that is the PAT contract users already know; stored because the
+//     session/sandbox has to be able to replay it. See the note below.
 //
 //   * IT MUST BE WRITTEN IN TWO PLACES, TOGETHER. pgbouncer authenticates the
 //     client against pgbouncer_auth.credentials AND re-authenticates upstream
@@ -30,19 +30,39 @@ package handler
 //     It cannot read a single warehouse row. That is what makes it acceptable
 //     for the token authority to talk to the warehouse at all.
 //
-// ON NOT ENCRYPTING THE PASSWORD AT REST HERE
-// google_grants and app_secrets store their secrets with common.EncryptGrant
-// because they must be REPLAYED later (a refresh token is useless if you cannot
-// read it back). A SQL password never needs replaying: the user has it, and if
-// they lose it they mint another. Storing it — encrypted or not — would add a
-// second place to steal it from and buy nothing. So it is generated, written to
-// Postgres, returned once, and dropped.
+// ON STORING THE PASSWORD ENCRYPTED AT REST (REVERSED 2026-08-26)
+// This file used to argue the opposite, and the argument was sound on its own
+// premise: google_grants and app_secrets encrypt because they must be REPLAYED,
+// whereas "a SQL password never needs replaying: the user has it, and if they
+// lose it they mint another".
+//
+// That premise no longer holds. A user working in the UI, in chat, or through
+// the CLI never handles the password at all — the session/sandbox opens the
+// connection on their behalf, so something other than the user must be able to
+// replay it. Once a secret is replayable, this repo's convention is
+// common.EncryptGrant, the same call app_secrets uses, and the fetch path
+// mirrors InternalAppSecretsFetch — the existing "pure-UI credential path".
+//
+// The cost the old comment named is real: this is a second place to steal it
+// from. Three things bound it, and they should stay true.
+//   1. It is NEVER returned on a user-authenticated route. MeFindataSQL reports
+//      status only. Only the bridge-authed internal endpoint decrypts, so a
+//      stolen user PAT cannot read a standing warehouse password.
+//   2. The credential it protects is read-only, expires in 7 days, and is
+//      capped at 4 connections — the blast radius is a bounded read.
+//   3. Revoke clears the ciphertext, so "revoked" means gone here too, not just
+//      refused at the proxy.
+//
+// The password is STILL returned once at mint. That is not redundant: someone
+// connecting from their own DBeaver needs it in hand, and that path has no
+// sandbox to fetch on their behalf.
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -263,23 +283,38 @@ func MeFindataSQLMint(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
-	common.DB.Model(&acct).Updates(map[string]interface{}{
+	// Store it encrypted so the user's session/sandbox can replay it later. The
+	// warehouse write above is what actually grants access, so a failure here
+	// must NOT fail the mint: the user still has the password in the response,
+	// and the worst case is that the sandbox path needs another mint. Losing a
+	// working credential over a bookkeeping error would be the worse trade.
+	updates := map[string]interface{}{
 		"credential_expires_at": expires,
-		"last_minted_at":        now,
-	})
+		"last_minted_at":        time.Now().UTC(),
+	}
+	if enc, err := common.EncryptGrant(pw); err == nil {
+		updates["password_encrypted"] = enc
+	} else {
+		log.Printf("findata-sql: mint stored no replayable credential for %s: %v", acct.RoleName, err)
+	}
+	common.DB.Model(&acct).Updates(updates)
 	writeAudit(c, u.ID, u.ID, "me:findata-sql:mint", "role="+acct.RoleName)
 
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
-		"role":       acct.RoleName,
-		"password":   pw, // shown once, never retrievable again
+		"role": acct.RoleName,
+		// Shown once. It is also stored encrypted for the session/sandbox to
+		// replay, but that copy is never readable on a user-authenticated route,
+		// so from the browser's point of view this is still the only sighting.
+		"password":   pw,
 		"expires_at": expires.Format(time.RFC3339),
 		"dsn": fmt.Sprintf(
 			"postgresql://%s@sql.lum.id:5432/findata?sslmode=verify-full&sslrootcert=sql-ca.pem",
 			acct.RoleName),
-		"note": "Copy this now — it is not stored and cannot be shown again. " +
-			"Fetch the CA from https://lum.id/findata/sql-ca.pem and use " +
-			"sslmode=verify-full; `require` encrypts but verifies nothing.",
+		"note": "Copy this now — it will not be shown again. You only need it to " +
+			"connect from your own database client; in Studio and in chat the " +
+			"query runs as you, with no password to handle. If you do connect " +
+			"directly, use sslmode=verify-full — `require` encrypts but verifies " +
+			"nothing.",
 	}})
 }
 
@@ -353,7 +388,14 @@ func MeFindataSQLRevoke(c *gin.Context) {
 		return
 	}
 
-	common.DB.Model(&acct).Updates(map[string]interface{}{"credential_expires_at": nil})
+	// Clear the replayable copy too. Without this, "revoked" would be true at
+	// the warehouse and false here: the sandbox would keep fetching a password
+	// that no longer authenticates, turning a clean revocation into a login
+	// failure nobody can explain. Revoked must mean gone in both places.
+	common.DB.Model(&acct).Updates(map[string]interface{}{
+		"credential_expires_at": nil,
+		"password_encrypted":    "",
+	})
 	writeAudit(c, u.ID, u.ID, "me:findata-sql:revoke",
 		fmt.Sprintf("role=%s sessions_terminated=%d", acct.RoleName, killed))
 
@@ -385,3 +427,63 @@ func findataSQLPassword() (string, error) {
 
 // findataSQLNewAccountID is used by the provisioning backfill.
 func findataSQLNewAccountID() string { return uuid.NewString() }
+
+// InternalFindataSQLFetch — POST /api/v1/internal/findata-sql/fetch
+//
+// Hands the user's warehouse credential to a runtime acting on their behalf:
+// the chatbox sandbox, or any surface that opens the connection for them. Same
+// shape and same gate as InternalAppSecretsFetch — the established "pure-UI
+// credential path" — so there is one pattern here, not two.
+//
+// BRIDGE-AUTHED, DELIBERATELY. This is the only route that decrypts the stored
+// password, and X-Bridge-Secret is held by services, never by a browser or a
+// user's PAT. Putting it on /me/ would mean any leaked user token could read a
+// standing warehouse password, which is exactly the risk the old
+// never-store design was avoiding. Keep it off the user surface.
+//
+// Returns 404 rather than an empty credential when there is nothing to replay,
+// so a caller can tell "this user has no seat" from "this user has a seat and
+// the password is blank" — the second would be a bug worth surfacing.
+func InternalFindataSQLFetch(c *gin.Context) {
+	var body struct {
+		UserSub string `json:"user_sub" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+
+	var acct models.FindataSQLAccount
+	if err := common.DB.Where("user_id = ?", body.UserSub).First(&acct).Error; err != nil {
+		fail(c, http.StatusNotFound, 1004, "no warehouse role for this user")
+		return
+	}
+	if acct.PasswordEncrypted == "" {
+		fail(c, http.StatusNotFound, 1004, "no credential minted for this user")
+		return
+	}
+	// Expiry is checked HERE as well as at the proxy. The proxy is authoritative
+	// and would refuse it anyway, but handing out a password we already know is
+	// dead produces a connection failure at the far end of the sandbox, which is
+	// a much worse place to diagnose it from.
+	if acct.CredentialExpiresAt == nil || !acct.CredentialExpiresAt.After(time.Now()) {
+		fail(c, http.StatusGone, 1010, "credential expired — the user must mint again")
+		return
+	}
+	pw, err := common.DecryptGrant(acct.PasswordEncrypted)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "decrypt: "+err.Error())
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+		"role":       acct.RoleName,
+		"password":   pw,
+		"host":       "sql.lum.id",
+		"port":       5432,
+		"database":   "findata",
+		"sslmode":    "verify-full",
+		"ca_url":     "https://lum.id/findata/sql-ca.pem",
+		"expires_at": acct.CredentialExpiresAt.UTC().Format(time.RFC3339),
+	}})
+}

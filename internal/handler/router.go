@@ -519,6 +519,12 @@ func Register(r *gin.Engine) {
 			// Decrypted per-(user,app) secrets for the scheduler to inject
 			// into the cycle env (pure-UI credential path).
 			internal.POST("/app-secrets/fetch", InternalAppSecretsFetch)
+			// The same pure-UI credential path for the FinData warehouse: the
+			// sandbox opens the SQL connection on the user's behalf, so it
+			// needs their minted password. Bridge-authed for the reason the
+			// handler documents — this is the ONLY route that decrypts it, and
+			// it must never be reachable with a user's own token.
+			internal.POST("/findata-sql/fetch", InternalFindataSQLFetch)
 			// Cross-node run store — the cycle self-reports each run's metrics
 			// here so the Studio trajectory/experiments surfaces (which can't
 			// read the scheduler PVC) can reconstruct run history. App-agnostic.

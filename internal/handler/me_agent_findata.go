@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -137,10 +138,7 @@ func toolDataQuery(sql, app string, limit int) (map[string]any, bool) {
 	if limit <= 0 || limit > 1000 {
 		limit = dataQueryLimit
 	}
-	// Append LIMIT if the caller didn't specify one — mirrors data.py:184.
-	if !hasLimitClause(sql) {
-		sql = fmt.Sprintf("%s LIMIT %d", strings.TrimRight(sql, ";"), limit)
-	}
+	sql = applyLimit(sql, limit)
 
 	payload, _ := json.Marshal(map[string]any{
 		"sql":           sql,
@@ -202,11 +200,45 @@ func parseJSONL(data []byte) []any {
 	return rows
 }
 
-var limitRe = regexp.MustCompile(`(?i)\blimit\s+\d+`)
+// limitTailRe matches a bounding LIMIT at the END of the statement — the only
+// position that actually bounds the result set.
+//
+// The previous expression was unanchored (`\blimit\s+\d+`) and that was the
+// bug: a LIMIT anywhere made the guard believe the query was already bounded,
+// so `SELECT * FROM (SELECT x FROM t LIMIT 5) s` and `SELECT 'limit 5' AS s`
+// both ran the OUTER query with no bound at all. It also missed `LIMIT ALL`
+// (no `\d+`), which then had `LIMIT 200` appended onto it and failed as a
+// syntax error. Measured, both, against prod — see e2e spec 23.
+//
+// `offset` is part of the alternation because `LIMIT 5 OFFSET 10` is bounded
+// and must not be appended to; anchoring alone would have regressed it.
+var limitTailRe = regexp.MustCompile(`(?is)\blimit\s+(\d+|all)(\s+offset\s+\d+)?\s*$`)
 
-// hasLimitClause reports whether the SQL already carries a LIMIT clause.
-func hasLimitClause(sql string) bool {
-	return limitRe.MatchString(sql)
+// trailingLineCommentRe finds a `-- …` comment running to the end of the
+// statement. It is stripped for DETECTION only, never from what we execute, so
+// a false positive costs an extra LIMIT and never corrupts the user's SQL.
+var trailingLineCommentRe = regexp.MustCompile(`(?m)--[^\n]*$`)
+
+// applyLimit returns sql guaranteed to be bounded by at most `limit` rows.
+//
+// Three outcomes:
+//   - already ends in LIMIT <n> [OFFSET m] → returned unchanged
+//   - ends in LIMIT ALL → ALL is REPLACED by the cap. Appending would be a
+//     syntax error, and leaving it alone would honour an explicit request for
+//     an unbounded scan of the warehouse.
+//   - anything else → LIMIT is appended on its OWN LINE, so a query ending in
+//     a `--` comment does not swallow it.
+func applyLimit(sql string, limit int) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(sql), "; \t\n\r")
+	probe := strings.TrimRight(trailingLineCommentRe.ReplaceAllString(trimmed, ""), " \t\n\r")
+
+	if m := limitTailRe.FindStringSubmatchIndex(probe); m != nil {
+		if strings.EqualFold(probe[m[2]:m[3]], "all") {
+			return probe[:m[2]] + strconv.Itoa(limit) + probe[m[3]:]
+		}
+		return trimmed // already bounded
+	}
+	return fmt.Sprintf("%s\nLIMIT %d", trimmed, limit)
 }
 
 // toolQueryFindata — compat shim for the retired kv.run:5000 tool. Maps the

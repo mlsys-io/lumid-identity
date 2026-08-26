@@ -211,3 +211,99 @@ func MeStrategies(c *gin.Context) {
 	}
 	ok(c, "ok", data)
 }
+
+// MeStrategyDetail — GET /api/v1/me/strategies/:id
+//
+// One strategy WITH its body (bytecode_hex / spec_json), for callers that must
+// act on the strategy itself — submitting a backtest, which needs
+// dsl/program_hex rather than a name.
+//
+// # WHY THIS EXISTS RATHER THAN READING THE MAILBOX FEED
+//
+// /xpio/strategies carries the same payload and is far easier to reach, but it
+// is backed by `xpio.strategies`, which has NO tenant column — the bundle's own
+// backtest verb documents it as "cross-tenant readable by construction" and
+// warns that "strategy_id is NOT globally unique across tenants". Resolving a
+// body from there would let one researcher backtest another's strategy, keyed
+// on an id that does not distinguish them.
+//
+// So the body is served here, from core.tenant_strategies, under the same
+// predicate as the list: tenant_id = the caller's own id. The :id is a filter
+// WITHIN that scope, never a lookup key across it — an id belonging to someone
+// else returns not-found, not their strategy.
+func MeStrategyDetail(c *gin.Context) {
+	userID, okAuth := currentUserID(c)
+	if !okAuth {
+		fail(c, http.StatusUnauthorized, 1003, "auth required")
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		fail(c, http.StatusBadRequest, 1400, "strategy id required")
+		return
+	}
+	if strategiesDSN() == "" {
+		fail(c, http.StatusServiceUnavailable, 1503, "strategy registry not configured")
+		return
+	}
+	tenant, err := uuid.Parse(strings.TrimSpace(userID))
+	if err != nil {
+		// Cannot own an LQT strategy at all — indistinguishable from not found,
+		// and saying so leaks nothing about whether the id exists elsewhere.
+		fail(c, http.StatusNotFound, 1404, "strategy not found")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), strategiesOpTimeout)
+	defer cancel()
+	conn, err := strategiesConnect(ctx)
+	if err != nil {
+		fail(c, http.StatusServiceUnavailable, 1503, "strategy registry unreachable")
+		return
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	// Both predicates bound, tenant first. There is no request field that can
+	// widen the tenant term: it comes from the authenticated session.
+	const q = `
+		SELECT strategy_id, name, kind, model, version, status,
+		       coalesce(bytecode_hex, ''), coalesce(spec_json::text, ''),
+		       coalesce(program_hash, '')
+		  FROM core.tenant_strategies
+		 WHERE tenant_id = $1 AND strategy_id = $2`
+
+	var (
+		strategyID, name, kind, status  string
+		model, version                  *string
+		bytecodeHex, specJSON, progHash string
+	)
+	err = conn.QueryRow(ctx, q, tenant, id).Scan(
+		&strategyID, &name, &kind, &model, &version, &status,
+		&bytecodeHex, &specJSON, &progHash)
+	if err != nil {
+		// No row for THIS tenant. Deliberately the same answer whether the id
+		// is unknown or belongs to another tenant — distinguishing them would
+		// turn this into an existence oracle over other people's strategies.
+		fail(c, http.StatusNotFound, 1404, "strategy not found")
+		return
+	}
+
+	data := gin.H{
+		"strategy_id":  strategyID,
+		"name":         name,
+		"kind":         kind,
+		"model":        model,
+		"version":      version,
+		"status":       status,
+		"program_hash": progHash,
+	}
+	// The body, in the shape the backtest API and the mailbox both accept:
+	// program_hex preferred, dsl as the compile-server-side path.
+	if bytecodeHex != "" {
+		data["program_hex"] = bytecodeHex
+	}
+	if specJSON != "" {
+		data["spec_json"] = specJSON
+	}
+	ok(c, "ok", data)
+}

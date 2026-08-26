@@ -255,6 +255,9 @@ func Register(r *gin.Engine) {
 			// (lqt-auth parses the sub as the tenant), so the predicate is
 			// the session's own id and no request field reaches it.
 			me.GET("/strategies", MeStrategies)
+			// One strategy WITH its body, same tenant predicate. The :id filters
+			// WITHIN the caller's scope — another tenant's id returns not-found.
+			me.GET("/strategies/:id", MeStrategyDetail)
 			me.GET("/findata-sql", MeFindataSQL)
 			me.POST("/findata-sql/credential", MeFindataSQLMint)
 			me.DELETE("/findata-sql/credential", MeFindataSQLRevoke)

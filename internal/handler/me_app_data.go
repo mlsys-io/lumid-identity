@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -83,5 +84,56 @@ func MeAppData(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": filterAppData(c, res)})
+}
+
+// filterAppData narrows a tool's result by any extra query params.
+//
+// A surface could not scope an app-data table at all: the source forwards only
+// app= and tool=, so `me://app-data?...&strategy_id=X` was silently dropped and
+// the table showed everything under a heading claiming otherwise — a scope a
+// reader believes and the data does not honour.
+//
+// Applied AFTER the tool runs, deliberately. Post-filtering can only REMOVE
+// rows the caller was already entitled to see, so it cannot widen access
+// however the params are crafted, and it needs no change to the tool
+// signatures (and so no chance of one tool mishandling a filter). The cost is
+// that the tool still does its full work; these results are small.
+//
+// A param naming a field no row has matches NOTHING rather than being ignored.
+// Ignoring it is how a filtered-looking table quietly shows every row.
+func filterAppData(c *gin.Context, res map[string]any) map[string]any {
+	filters := map[string]string{}
+	for k, v := range c.Request.URL.Query() {
+		if k == "tool" || k == "app" || len(v) == 0 || v[0] == "" {
+			continue
+		}
+		filters[k] = v[0]
+	}
+	if len(filters) == 0 || res == nil {
+		return res
+	}
+	out := make(map[string]any, len(res))
+	for key, val := range res {
+		rows, isRows := val.([]map[string]any)
+		if !isRows {
+			out[key] = val
+			continue
+		}
+		kept := make([]map[string]any, 0, len(rows))
+		for _, r := range rows {
+			match := true
+			for fk, fv := range filters {
+				if fmt.Sprintf("%v", r[fk]) != fv {
+					match = false
+					break
+				}
+			}
+			if match {
+				kept = append(kept, r)
+			}
+		}
+		out[key] = kept
+	}
+	return out
 }

@@ -711,17 +711,18 @@ var llmProviders = []llmProvider{
 		// GET lum.id/llm/v1/models. Reasoning model (emits thinking deltas,
 		// handled by the SSE parser). The old kv.run:5000 endpoint is dead.
 		//
-		// The id stays "kvrun-gemma4" ON PURPOSE even though Gemma-4 is retired:
-		// it is persisted in personas' preferred_model and referenced by the UI
-		// and e2e tests, so renaming it would orphan saved selections. Only the
-		// upstream model moves (Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash as the
-		// GB10 pair was repurposed). 256K context.
+		// The id was "kvrun-gemma4" long after Gemma-4 was retired, because it is
+		// persisted in personas' preferred_model and referenced by the UI and e2e
+		// suites — renaming it would have orphaned every saved selection. It is
+		// now the honest id; `kvrun-gemma4` lives on in modelIDAliases, so saved
+		// selections and the UI/e2e references still resolve here. Upstream moved
+		// Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash. 256K context.
 		//
 		// KEEP upstreamModel IN SYNC WITH THE GATEWAY. A retired id does NOT fail
 		// loudly: LUMID_LLM_BACKENDS is an allowlist but unknown ids fall through
 		// to the OpenRouter catch-all, so a stale value here silently bills
 		// OpenRouter and can return an empty completion instead of erroring.
-		id:                  "kvrun-gemma4",
+		id:                  "deepseek-v4-flash",
 		displayName:         "DeepSeek-V4-Flash (Lumid GPU)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
 		upstreamModel:       "deepseek-v4-flash",
@@ -1142,17 +1143,52 @@ func resolveProvider(modelID, role string) llmProvider {
 //     keeps the panel working when a user's role changes under a saved
 //     selection, which is the original intent and is kept. Still reported, so
 //     "why am I getting gemma4" has an answer.
+//
+// modelIDAliases maps a retired model id to its current one.
+//
+// A model id is PERSISTED — personas store it in preferred_model, saved chats
+// carry it, e2e suites pin it — so renaming one strands every saved selection
+// on an id that no longer resolves and silently substitutes the default for the
+// model the user picked. That is why `kvrun-gemma4` still names a provider
+// whose upstream has been deepseek-v4-flash for some time.
+//
+// Resolving aliases makes a rename survivable instead of breaking: both ids
+// reach the same provider, so an id can be migrated at leisure rather than in
+// one coordinated change across three repos. Add the entry here FIRST, ship it,
+// then change the id.
+var modelIDAliases = map[string]string{
+	// Gemma-4 was retired long ago; the id outlived it because personas persist
+	// it. Upstream moved Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash.
+	"kvrun-gemma4": "deepseek-v4-flash",
+}
+
+// providerByID finds a provider by exact id, then by alias. Exact first, so an
+// alias can never shadow a live id.
+func providerByID(modelID string) (llmProvider, bool) {
+	for _, p := range llmProviders {
+		if p.id == modelID {
+			return p, true
+		}
+	}
+	if to, ok := modelIDAliases[modelID]; ok {
+		for _, p := range llmProviders {
+			if p.id == to {
+				return p, true
+			}
+		}
+	}
+	return llmProvider{}, false
+}
+
 func resolveProviderWhy(modelID, role string) (llmProvider, string) {
 	if modelID != "" {
-		for _, p := range llmProviders {
-			if p.id == modelID {
-				if providerAllowed(role, p) {
-					return p, ""
-				}
-				return defaultProviderFor(role), fmt.Sprintf(
-					"model %q requires role %q; you are %q — used %s instead",
-					modelID, p.minRole, role, defaultProviderFor(role).id)
+		if p, found := providerByID(modelID); found {
+			if providerAllowed(role, p) {
+				return p, ""
 			}
+			return defaultProviderFor(role), fmt.Sprintf(
+				"model %q requires role %q; you are %q — used %s instead",
+				modelID, p.minRole, role, defaultProviderFor(role).id)
 		}
 		return defaultProviderFor(role), fmt.Sprintf(
 			"unknown model %q — used %s instead", modelID, defaultProviderFor(role).id)

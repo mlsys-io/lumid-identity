@@ -125,9 +125,9 @@ func TestFirstToolCapableProvider(t *testing.T) {
 		role   string
 		wantID string
 	}{
-		{"user", "kvrun-gemma4"},
-		{"admin", "kvrun-gemma4"},
-		{"super_admin", "kvrun-gemma4"},
+		{"user", "deepseek-v4-flash"},
+		{"admin", "deepseek-v4-flash"},
+		{"super_admin", "deepseek-v4-flash"},
 	}
 	for _, c := range cases {
 		t.Run(c.role, func(t *testing.T) {
@@ -153,7 +153,7 @@ func TestProviderAllowed(t *testing.T) {
 	var gemma, sonnet, opus, fable llmProvider
 	for _, p := range llmProviders {
 		switch p.id {
-		case "kvrun-gemma4":
+		case "deepseek-v4-flash":
 			gemma = p
 		case "claude-code-sonnet":
 			sonnet = p
@@ -164,7 +164,7 @@ func TestProviderAllowed(t *testing.T) {
 		}
 	}
 	if gemma.id == "" || sonnet.id == "" || opus.id == "" || fable.id == "" {
-		t.Fatalf("expected gemma4 + claude-code-{sonnet,opus,fable} in llmProviders")
+		t.Fatalf("expected deepseek-v4-flash + claude-code-{sonnet,opus,fable} in llmProviders")
 	}
 
 	cases := []struct {
@@ -191,5 +191,37 @@ func TestProviderAllowed(t *testing.T) {
 				t.Errorf("providerAllowed(%q, %q) = %v, want %v", c.role, c.p.id, got, c.want)
 			}
 		})
+	}
+}
+
+// A retired id must keep resolving. Personas persist preferred_model, so an id
+// that stops resolving silently swaps the user's chosen model for the default —
+// the failure this alias table exists to prevent.
+func TestModelIDAliasResolves(t *testing.T) {
+	for old, want := range modelIDAliases {
+		p, found := providerByID(old)
+		if !found {
+			t.Fatalf("alias %q did not resolve", old)
+		}
+		if p.id != want {
+			t.Fatalf("alias %q -> %q, want %q", old, p.id, want)
+		}
+	}
+}
+
+// An alias must never shadow a live id: exact match wins.
+func TestLiveIDNotShadowedByAlias(t *testing.T) {
+	for _, lp := range llmProviders {
+		p, found := providerByID(lp.id)
+		if !found || p.id != lp.id {
+			t.Fatalf("live id %q resolved to %q (found=%v)", lp.id, p.id, found)
+		}
+	}
+}
+
+// An unknown id must stay unknown rather than being coerced to a target.
+func TestUnknownIDStaysUnknown(t *testing.T) {
+	if _, found := providerByID("no-such-model-xyz"); found {
+		t.Fatal("unknown id resolved to a provider")
 	}
 }

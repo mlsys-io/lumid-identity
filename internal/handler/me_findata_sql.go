@@ -98,6 +98,11 @@ const (
 // never reaches the warehouse.
 var findataSQLRoleRe = regexp.MustCompile(`^sql_[a-z0-9_]{1,58}$`)
 
+// The capability tag that marks a PAT as intended for warehouse work. Minting
+// with it shadow-issues the credential; presenting it is what allows reading
+// the stored one back. Registered in admin_users.go::capabilityScopes.
+const findataSQLScope = "findata:sql"
+
 func findataSQLDSN() string { return strings.TrimSpace(os.Getenv("FINDATA_PROVISIONER_DSN")) }
 
 // findataSQLConnect dials the warehouse per operation rather than holding a
@@ -537,4 +542,101 @@ func findataSQLShadowMint(ctx context.Context, u models.User) string {
 		return ""
 	}
 	return acct.RoleName
+}
+
+// callerPATHasScope reports whether THIS request authenticated with a PAT
+// carrying `want`.
+//
+// The PAT requirement is the point, not incidental. currentUserID accepts a
+// session JWT as readily as a PAT, so a plain /me/ route is reachable with the
+// lm_session cookie — and an XSS on lum.id carries that cookie. Requiring a
+// token that begins lm_pat_/rm_pat_ AND names the scope means the browser
+// session cannot read a standing warehouse password no matter what runs in it.
+// Session JWTs carry no scopes, so they fail this by construction rather than
+// by a check someone could later relax.
+func callerPATHasScope(c *gin.Context, want string) bool {
+	tok := bearerToken(c)
+	if !strings.HasPrefix(tok, "lm_pat_") && !strings.HasPrefix(tok, "rm_pat_") {
+		return false
+	}
+	row, ok := lookupPAT(tok)
+	if !ok {
+		return false
+	}
+	for _, s := range strings.Fields(row.Scopes) {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// MeFindataSQLReveal — GET /api/v1/me/findata-sql/credential
+//
+// Returns the caller's OWN stored warehouse password, for a PAT that was minted
+// for warehouse work. This is the read half of "mint once, look it up later":
+// the credential is already stored so the sandbox can replay it, and a user
+// holding the right token should not have to rotate their password just to see
+// it again.
+//
+// WHY THIS IS NOT A GENERAL /me/ READ. Three gates, and each closes a different
+// hole:
+//
+//  1. PAT-only, scope-bearing (callerPATHasScope). Keeps the browser session —
+//     and therefore any XSS on lum.id — out entirely.
+//  2. The same entitlement gate as minting. A grant can be revoked after a PAT
+//     is issued; entitlement is re-checked here, not inherited from mint time.
+//  3. Expiry. Handing out a password already known to be dead produces a
+//     failure at the far end of someone's SQL client.
+//
+// A stolen scoped PAT can read this — but the same token can already MINT a
+// credential, so the capability was never the difference. The difference is
+// that minting is NOISY (it rotates the password and breaks the real user's
+// live sessions) while reading is silent. That is exactly why this is gated on
+// a scope a general-purpose token does not carry.
+func MeFindataSQLReveal(c *gin.Context) {
+	u, ok := findataSQLLoadUser(c)
+	if !ok {
+		return
+	}
+	if !callerPATHasScope(c, findataSQLScope) {
+		fail(c, http.StatusForbidden, 1005,
+			"this needs a personal access token scoped `"+findataSQLScope+"` — "+
+				"a browser session cannot read a stored warehouse password")
+		return
+	}
+	if !findataSQLEntitled(u) {
+		fail(c, http.StatusForbidden, 1005, "no findata grant")
+		return
+	}
+	var acct models.FindataSQLAccount
+	if err := common.DB.Where("user_id = ?", u.ID).First(&acct).Error; err != nil {
+		fail(c, http.StatusNotFound, 1004, "no warehouse role for this account")
+		return
+	}
+	if acct.PasswordEncrypted == "" {
+		fail(c, http.StatusNotFound, 1004, "no credential minted yet")
+		return
+	}
+	if acct.CredentialExpiresAt == nil || !acct.CredentialExpiresAt.After(time.Now()) {
+		fail(c, http.StatusGone, 1010, "credential expired — mint again")
+		return
+	}
+	pw, err := common.DecryptGrant(acct.PasswordEncrypted)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "decrypt: "+err.Error())
+		return
+	}
+	writeAudit(c, u.ID, u.ID, "me:findata-sql:reveal", "role="+acct.RoleName)
+
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+		"role":       acct.RoleName,
+		"password":   pw,
+		"host":       "sql.lum.id",
+		"port":       5432,
+		"database":   "findata",
+		"sslmode":    "verify-full",
+		"ca_url":     "https://lum.id/findata/sql-ca.pem",
+		"expires_at": acct.CredentialExpiresAt.UTC().Format(time.RFC3339),
+	}})
 }

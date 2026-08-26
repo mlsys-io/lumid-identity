@@ -268,7 +268,7 @@ func PATMintHandler(c *gin.Context) {
 	// able to fail it. An un-entitled user simply gets a tag that does nothing.
 	var sqlRole string
 	for _, sc := range req.Scopes {
-		if sc == "findata:sql" {
+		if sc == findataSQLScope {
 			sqlRole = findataSQLShadowMint(c.Request.Context(), u)
 			break
 		}

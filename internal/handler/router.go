@@ -261,6 +261,10 @@ func Register(r *gin.Engine) {
 			me.GET("/findata-sql", MeFindataSQL)
 			me.POST("/findata-sql/credential", MeFindataSQLMint)
 			me.DELETE("/findata-sql/credential", MeFindataSQLRevoke)
+			// Read the stored credential back. PAT-with-scope only — a browser
+			// session must never be able to read a standing warehouse password,
+			// which is what keeps an XSS on lum.id out of the warehouse.
+			me.GET("/findata-sql/credential", MeFindataSQLReveal)
 			me.GET("/intents/:id", MeIntentGet)
 			// Permanently dismiss a failed/optimistic install card by app name.
 			me.DELETE("/install-intents/:name", MeInstallIntentDelete)

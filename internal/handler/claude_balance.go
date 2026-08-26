@@ -467,11 +467,11 @@ func computeAssignment(loads []userLoad, accounts []string, maxPer int) map[stri
 // into a struct so the decision itself stays a pure function that a test can
 // drive without a database.
 type placementInputs struct {
-	ideal          map[string]string // where each user should be
-	cur            map[string]string // where each user is now
-	load           map[string]int64
-	valid          map[string]bool // account still in the pool at all
-	servable       map[string]bool // account can currently take traffic
+	ideal    map[string]string // where each user should be
+	cur      map[string]string // where each user is now
+	load     map[string]int64
+	valid    map[string]bool // account still in the pool at all
+	servable map[string]bool // account can currently take traffic
 	// draining — operator has PAUSED this account. Distinct from !servable on
 	// purpose: a draining account CAN still take traffic (lease-time keeps
 	// serving whoever is already homed on it), it just must not receive anyone

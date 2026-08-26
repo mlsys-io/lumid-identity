@@ -236,7 +236,7 @@ func InternalClaudePoolHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"total":                len(rows),
+			"total": len(rows),
 			// Reported separately from `benched`: a bench is Anthropic refusing
 			// us and clears itself, a pause is deliberate and clears only when a
 			// human resumes it. An operator seeing the floor breached needs to

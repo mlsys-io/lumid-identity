@@ -169,6 +169,10 @@ func InternalMeIntentsClaim(c *gin.Context) {
 			if rows[i].Bearer != "" {
 				p["bearer"] = rows[i].Bearer
 			}
+			// An lqt-mailbox deploy needs an `lqt:strategy`-SCOPED PAT, which the
+			// login JWT in `bearer` is not — see lqt_strategy_pat.go. Merged here,
+			// never persisted, exactly like `bearer`.
+			attachLQTStrategyPAT(rows[i].Action, rows[i].UserSub, p)
 			claimed = append(claimed, claimedIntent{
 				IntentID: rows[i].ID,
 				Action:   rows[i].Action,

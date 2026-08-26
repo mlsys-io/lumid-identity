@@ -26,6 +26,12 @@ type MeChat struct {
 	Model        string `gorm:"column:model;size:128"      json:"model,omitempty"`
 	Mode         string `gorm:"column:mode;size:32"        json:"mode,omitempty"`
 	App          string `gorm:"column:app;size:128;index"  json:"app,omitempty"`
+	// One strategy inside that app, so a user's threads about different
+	// strategies stay separable. Without the COLUMN the handler's field was
+	// dropped on the way to MySQL: the API accepted strategy_id, echoed
+	// nothing back, and the per-strategy Sessions table — which fails closed
+	// on an unmatched id — rendered empty forever with no error anywhere.
+	StrategyID string `gorm:"column:strategy_id;size:128" json:"strategy_id,omitempty"`
 	// Claude CLI session id backing this thread, so --resume continuity
 	// survives a reload (and, now, a different replica).
 	ClaudeSessionID string `gorm:"column:claude_session_id;size:128" json:"claude_session_id,omitempty"`

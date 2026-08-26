@@ -50,6 +50,7 @@ func toRow(userSub string, r *chatRecord) (*models.MeChat, error) {
 		ID: r.ID, UserSub: userSub,
 		Title: r.Title, TitleSummary: r.TitleSummary,
 		Model: r.Model, Mode: r.Mode, App: r.App,
+		StrategyID:      r.StrategyID,
 		ClaudeSessionID: r.ClaudeSessionID,
 		MsgCount:        len(r.Messages),
 		Messages:        string(blob),
@@ -62,6 +63,7 @@ func fromRow(m *models.MeChat) *chatRecord {
 	r := &chatRecord{
 		ID: m.ID, Title: m.Title, TitleSummary: m.TitleSummary,
 		Model: m.Model, Mode: m.Mode, App: m.App,
+		StrategyID:      m.StrategyID,
 		ClaudeSessionID: m.ClaudeSessionID,
 		CreatedAt:       m.CreatedAt.UTC().Format(chatTimeFmt),
 		UpdatedAt:       m.UpdatedAt.UTC().Format(chatTimeFmt),

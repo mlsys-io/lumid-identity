@@ -48,7 +48,7 @@ package handler
 //   1. It is NEVER returned on a user-authenticated route. MeFindataSQL reports
 //      status only. Only the bridge-authed internal endpoint decrypts, so a
 //      stolen user PAT cannot read a standing warehouse password.
-//   2. The credential it protects is read-only, expires in 30 days, and is
+//   2. The credential it protects is read-only, expires in 90 days, and is
 //      capped at 4 connections — the blast radius is a bounded read.
 //   3. Revoke clears the ciphertext, so "revoked" means gone here too, not just
 //      refused at the proxy.
@@ -79,27 +79,28 @@ import (
 )
 
 const (
-	// 30 days (was 7). The original reasoning is unchanged and is what argues
-	// for the longer value: GUI clients (DBeaver, pgAdmin, Metabase) store a
-	// password in a connection profile, so a short TTL is not "more secure", it
-	// is unusable — people route around it, typically by writing the password
-	// somewhere worse than we were storing it.
+	// 90 days (was 7, briefly 30). The reasoning has been the same each time and
+	// it points one way: a TTL short enough to be friction is not "more secure",
+	// because GUI clients (DBeaver, pgAdmin, Metabase) store the password in a
+	// connection profile and people route around expiry by keeping it somewhere
+	// worse than we were storing it. Every shortening buys a little theoretical
+	// containment and spends real behaviour.
 	//
-	// A week turned out to be short enough to be that kind of friction: a
-	// researcher who connects twice a month would find a dead credential on
-	// most visits, and the fix they reach for is not "mint again", it is
-	// "keep the password somewhere I control".
+	// What still holds at 90 days is the property that actually matters: the
+	// credential expires WITHOUT anyone having to notice it leaked. That is the
+	// whole job of a TTL here, and it is unchanged.
 	//
-	// A month still auto-expires, which is the property that matters — a leaked
-	// credential dies on its own without anyone noticing it leaked. Everything
-	// else bounding the blast radius is unchanged: read-only, 4-connection cap,
-	// and revocation is immediate and independent of expiry.
+	// What bounds the damage is not the number. It is that the role is read-only,
+	// capped at 4 connections, scoped to one warehouse, and revocable
+	// immediately and independently of expiry — revoke clears the stored
+	// ciphertext and terminates live backends. A longer window widens the tail on
+	// a leak nobody caught; it does not widen what a leaked credential can do.
 	//
-	// This is the ONLY place the number lives. `ttl_days` in the status
-	// response is computed from it and the UI renders that, so changing it here
-	// changes what users are told. Prose that hardcodes a number elsewhere is a
-	// bug waiting to drift.
-	findataSQLCredTTL = 30 * 24 * time.Hour
+	// This is the ONLY place the number lives. `ttl_days` in the status response
+	// is computed from it and the UI renders that, so changing it here changes
+	// what users are told. Prose hardcoding a number elsewhere is drift waiting
+	// to happen.
+	findataSQLCredTTL = 90 * 24 * time.Hour
 
 	// The provisioner is only ever running four short statements. A generous
 	// bound still fails fast if the tailnet hop to the warehouse is down.

@@ -242,6 +242,23 @@ func InternalAppSecretsFetch(c *gin.Context) {
 			out[rows[i].Key] = v
 		}
 	}
+	// An lqt-mailbox DEPLOY needs an `lqt:strategy`-scoped PAT, which no user
+	// can be expected to paste into a credential form — and which the picker
+	// cannot synthesise, because it only has the caller's login JWT. Mint one
+	// here, per fetch, so it rides the SAME env-injection the config_schema
+	// creds use (the picker writes these AFTER LUMID_PAT, so it wins).
+	//
+	// Injected only for the app that deploys, and only when the user has not
+	// set the key themselves — a hand-set LQT_STRATEGY_PAT stays authoritative.
+	// See lqt_strategy_pat.go for why a scoped PAT (not the login JWT, not an
+	// aud=lqt session-bearer) is the only credential the consumer accepts.
+	if body.App == lqtStrategyApp {
+		if _, userSet := out["LQT_STRATEGY_PAT"]; !userSet {
+			if tok := mintLQTStrategyPAT(body.UserSub); tok != "" {
+				out["LQT_STRATEGY_PAT"] = tok
+			}
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{"secrets": out},

@@ -63,6 +63,16 @@ type chatRecord struct {
 	// session picker can group/switch by app and re-open the right workspace.
 	// Empty = a general (non-app) chat from the home.
 	App string `json:"app,omitempty"`
+	// StrategyID grounds this thread on ONE strategy inside that app, so a
+	// user's threads about different strategies stay separable. Set from the
+	// surface's per-row "Discuss" (ActionDef.ask_select emits a
+	// StudioSelection{kind:"strategy",id,label}).
+	//
+	// Without this the per-strategy Sessions table cannot filter: the renderer
+	// deliberately returns NOTHING for an unsupported strategy_id rather than
+	// showing every thread for the app, because attributing another
+	// strategy's conversation to this one is worse than an empty table.
+	StrategyID string `json:"strategy_id,omitempty"`
 }
 
 func chatsDir(userID string) string {
@@ -121,20 +131,22 @@ func MeChatsList(c *gin.Context) {
 		return
 	}
 	type listRow struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Model     string `json:"model,omitempty"`
-		Mode      string `json:"mode,omitempty"`
-		App       string `json:"app,omitempty"`
-		MsgCount  int    `json:"msg_count"`
-		CreatedAt string `json:"created_at"`
-		UpdatedAt string `json:"updated_at"`
+		ID         string `json:"id"`
+		Title      string `json:"title"`
+		Model      string `json:"model,omitempty"`
+		Mode       string `json:"mode,omitempty"`
+		App        string `json:"app,omitempty"`
+		StrategyID string `json:"strategy_id,omitempty"`
+		MsgCount   int    `json:"msg_count"`
+		CreatedAt  string `json:"created_at"`
+		UpdatedAt  string `json:"updated_at"`
 	}
 	rows := make([]listRow, 0, len(recs))
 	for _, r := range recs {
 		rows = append(rows, listRow{
 			ID: r.ID, Title: r.Title, Model: r.Model, Mode: r.Mode, App: r.App,
-			MsgCount: len(r.Messages), CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+			StrategyID: r.StrategyID,
+			MsgCount:   len(r.Messages), CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}
 	// Newest-updated first. chatStoreList already orders by updated_at, but any
@@ -185,6 +197,7 @@ func MeChatSave(c *gin.Context) {
 		Mode            string           `json:"mode"`
 		ClaudeSessionID string           `json:"claude_session_id"`
 		App             string           `json:"app"`
+		StrategyID      string           `json:"strategy_id"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -230,6 +243,11 @@ func MeChatSave(c *gin.Context) {
 	}
 	// App grounding — set on create; on update keep the existing value unless a
 	// non-empty app is sent (a thread shouldn't silently lose its app binding).
+	// Same guard as App: a later save that omits the field must not silently
+	// unground a thread that was opened from a strategy row.
+	if body.StrategyID != "" {
+		rec.StrategyID = body.StrategyID
+	}
 	if body.App != "" {
 		rec.App = body.App
 	}

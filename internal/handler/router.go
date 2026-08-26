@@ -250,6 +250,11 @@ func Register(r *gin.Engine) {
 			// FinData SQL — self-service warehouse credentials. The role is an
 			// entitlement provisioned by an operator; minting is what makes it
 			// usable, and the password is shown exactly once.
+			// LQT strategy registry — the read behind the strategy workspace.
+			// Scoped to the caller: an LQT tenant IS a lum.id user id
+			// (lqt-auth parses the sub as the tenant), so the predicate is
+			// the session's own id and no request field reaches it.
+			me.GET("/strategies", MeStrategies)
 			me.GET("/findata-sql", MeFindataSQL)
 			me.POST("/findata-sql/credential", MeFindataSQLMint)
 			me.DELETE("/findata-sql/credential", MeFindataSQLRevoke)

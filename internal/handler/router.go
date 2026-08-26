@@ -258,6 +258,11 @@ func Register(r *gin.Engine) {
 			// One strategy WITH its body, same tenant predicate. The :id filters
 			// WITHIN the caller's scope — another tenant's id returns not-found.
 			me.GET("/strategies/:id", MeStrategyDetail)
+			// SQL console backend. Same code path chat's data_query uses, so the
+			// two cannot drift. NOT routed via /dataapp-proxy/findata/, which
+			// overwrites Authorization with a shared service PAT and would erase
+			// who ran the query.
+			me.POST("/data-query", MeDataQuery)
 			me.GET("/findata-sql", MeFindataSQL)
 			me.POST("/findata-sql/credential", MeFindataSQLMint)
 			me.DELETE("/findata-sql/credential", MeFindataSQLRevoke)

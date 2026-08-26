@@ -29,6 +29,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -296,4 +298,63 @@ func excerpt(b []byte) string {
 		return s[:480] + "…"
 	}
 	return s
+}
+
+// MeDataQuery — POST /api/v1/me/data-query
+//
+// The SQL console's backend. Deliberately a thin wrapper over toolDataQuery,
+// which is the SAME code path chat uses, so the console and the assistant
+// cannot drift into answering the same question differently.
+//
+// WHY NOT /dataapp-proxy/findata/retrieve, which the browser can already reach:
+// that nginx block OVERWRITES Authorization with a shared read-scoped service
+// PAT ($findata_auth). Every user's query would arrive as one service account,
+// which is fine for a catalog browse and wrong for a console — it erases who
+// ran what. Routing through identity keeps the caller's own session on the
+// request and gets the audit row below.
+//
+// ATTRIBUTION, STATED HONESTLY: this is user-authenticated at identity and
+// service-credentialed at findata, exactly like chat. The audit trail is
+// identity's, not the warehouse's. The only path with warehouse-level
+// per-user attribution is the sql_<name> role over the Postgres wire — which
+// is why that seat still exists and is not replaced by this.
+//
+// No extra entitlement gate: data_query is read-only and available to every
+// role today via chat, and putting a stricter gate on the same capability
+// purely because it has a UI would be theatre.
+func MeDataQuery(c *gin.Context) {
+	u, ok := findataSQLLoadUser(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		SQL   string `json:"sql" binding:"required"`
+		App   string `json:"app"`
+		Limit int    `json:"limit"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.SQL) == "" {
+		fail(c, http.StatusBadRequest, 1400, "sql required")
+		return
+	}
+
+	out, ok2 := toolDataQuery(req.SQL, req.App, req.Limit)
+	if !ok2 {
+		// Pass the underlying message through rather than flattening it. A
+		// console's whole value is that a bad query tells you WHY, and the
+		// warehouse's own error ("relation does not exist", a syntax caret) is
+		// more useful than anything this layer could restate.
+		msg, _ := out["error"].(string)
+		if msg == "" {
+			msg = "query failed"
+		}
+		fail(c, http.StatusBadRequest, 1400, msg)
+		return
+	}
+
+	writeAudit(c, u.ID, u.ID, "me:data-query", excerpt([]byte(strings.TrimSpace(req.SQL))))
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": out})
 }

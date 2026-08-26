@@ -605,6 +605,14 @@ var capabilityScopes = map[string]bool{
 	// and does NOT imply admin or real-trade — real-trade is gated separately on
 	// the LQT side (super_admin). Not a wildcard; scoped to strategy.deploy only.
 	"lqt:strategy": true,
+	// FinData warehouse SQL — marks a PAT as intended for warehouse work, and
+	// makes minting it ALSO issue the user's Postgres credential (see
+	// findataSQLShadowMint). Deliberately a capability tag, not a service scope:
+	// it confers no platform access here, and entitlement is still decided by
+	// the explicit findata grant plus a provisioned role. A user without those
+	// gets a tag that does nothing, which is correct — the tag is intent, the
+	// grant is permission.
+	"findata:sql": true,
 	// Claude account-pool proxy — authorizes ONLY the lum.id/claude reverse
 	// proxy (claude-proxy consumer). A PAT carrying this tag can route Claude
 	// Code requests through the pooled org accounts; it confers no platform

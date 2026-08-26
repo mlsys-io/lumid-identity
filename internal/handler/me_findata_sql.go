@@ -61,6 +61,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -215,89 +216,18 @@ func MeFindataSQLMint(c *gin.Context) {
 		return
 	}
 
-	pw, err := findataSQLPassword()
+	pw, expires, err := findataSQLIssue(c.Request.Context(), u.ID, acct.RoleName, &acct)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "rng")
-		return
-	}
-	expires := time.Now().UTC().Add(findataSQLCredTTL)
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), findataSQLOpTimeout)
-	defer cancel()
-	conn, err := findataSQLConnect(ctx)
-	if err != nil {
-		if findataSQLDSN() == "" {
+		switch {
+		case errors.Is(err, errFindataSQLUnconfigured):
 			fail(c, http.StatusServiceUnavailable, 1503, "findata sql provisioning not configured")
-			return
+		case errors.Is(err, errFindataSQLRNG):
+			fail(c, http.StatusInternalServerError, 1500, "rng")
+		default:
+			fail(c, http.StatusBadGateway, 1502, err.Error())
 		}
-		fail(c, http.StatusBadGateway, 1502, "warehouse unreachable: "+err.Error())
 		return
 	}
-	defer conn.Close(context.Background())
-
-	// ONE transaction. The role password and the credential row must move
-	// together: if only the row lands, pgbouncer authenticates the client and
-	// then fails upstream; if only the role lands, the client cannot get in at
-	// all. Either half alone is a broken login that looks like a network fault.
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		fail(c, http.StatusBadGateway, 1502, "warehouse: "+err.Error())
-		return
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-
-	// DDL takes no placeholders for identifiers or passwords, hence quote_ident
-	// / quote_literal via format(). The role name is regex-checked above and the
-	// password is generated here, so neither is attacker-controlled; this is the
-	// belt to that braces.
-	var stmt string
-	if err := tx.QueryRow(ctx,
-		`SELECT format('ALTER ROLE %I LOGIN PASSWORD %L VALID UNTIL %L',
-		               $1::text, $2::text, $3::timestamptz)`,
-		acct.RoleName, pw, expires).Scan(&stmt); err != nil {
-		fail(c, http.StatusBadGateway, 1502, "warehouse: "+err.Error())
-		return
-	}
-	if _, err := tx.Exec(ctx, stmt); err != nil {
-		fail(c, http.StatusBadGateway, 1502, "warehouse: "+err.Error())
-		return
-	}
-
-	// The credential pgbouncer's auth_query resolves. Plaintext by design — a
-	// SCRAM verifier cannot be used to log INTO a server, only to verify a
-	// client, so a verifier here breaks the upstream leg. See the README.
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO pgbouncer_auth.credentials (username, password, expires_at, lumid_sub)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (username) DO UPDATE
-		   SET password = EXCLUDED.password,
-		       expires_at = EXCLUDED.expires_at,
-		       lumid_sub  = EXCLUDED.lumid_sub,
-		       revoked_at = NULL`,
-		acct.RoleName, pw, expires, u.ID); err != nil {
-		fail(c, http.StatusBadGateway, 1502, "warehouse: "+err.Error())
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		fail(c, http.StatusBadGateway, 1502, "warehouse commit: "+err.Error())
-		return
-	}
-
-	// Store it encrypted so the user's session/sandbox can replay it later. The
-	// warehouse write above is what actually grants access, so a failure here
-	// must NOT fail the mint: the user still has the password in the response,
-	// and the worst case is that the sandbox path needs another mint. Losing a
-	// working credential over a bookkeeping error would be the worse trade.
-	updates := map[string]interface{}{
-		"credential_expires_at": expires,
-		"last_minted_at":        time.Now().UTC(),
-	}
-	if enc, err := common.EncryptGrant(pw); err == nil {
-		updates["password_encrypted"] = enc
-	} else {
-		log.Printf("findata-sql: mint stored no replayable credential for %s: %v", acct.RoleName, err)
-	}
-	common.DB.Model(&acct).Updates(updates)
 	writeAudit(c, u.ID, u.ID, "me:findata-sql:mint", "role="+acct.RoleName)
 
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
@@ -486,4 +416,125 @@ func InternalFindataSQLFetch(c *gin.Context) {
 		"ca_url":     "https://lum.id/findata/sql-ca.pem",
 		"expires_at": acct.CredentialExpiresAt.UTC().Format(time.RFC3339),
 	}})
+}
+
+var (
+	errFindataSQLUnconfigured = errors.New("findata sql provisioning not configured")
+	errFindataSQLRNG          = errors.New("rng")
+)
+
+// findataSQLIssue mints (or rotates) a warehouse password for one role.
+//
+// Extracted from MeFindataSQLMint so the PAT path can shadow-mint the same
+// credential. Every invariant the handler documented lives here now, because
+// this is the only place that writes them:
+//
+//   - BOTH WRITES IN ONE TRANSACTION. pgbouncer authenticates the client
+//     against pgbouncer_auth.credentials AND re-authenticates upstream to
+//     Postgres as that same role. If only one lands, the client authenticates
+//     and then every upstream connection fails — a broken login that presents
+//     as a network fault.
+//   - The role name is regex-checked by the CALLER before it gets here; it is
+//     interpolated into DDL, where there is no placeholder for an identifier.
+//   - The encrypted copy is best-effort. The warehouse write is what grants
+//     access, so failing the whole mint over a bookkeeping error would trade a
+//     working credential for a tidy database.
+//
+// acct may be nil when the caller has no row loaded; the local mirror is then
+// skipped rather than guessed at.
+func findataSQLIssue(ctx context.Context, userID, roleName string, acct *models.FindataSQLAccount) (string, time.Time, error) {
+	pw, err := findataSQLPassword()
+	if err != nil {
+		return "", time.Time{}, errFindataSQLRNG
+	}
+	expires := time.Now().UTC().Add(findataSQLCredTTL)
+
+	opCtx, cancel := context.WithTimeout(ctx, findataSQLOpTimeout)
+	defer cancel()
+	conn, err := findataSQLConnect(opCtx)
+	if err != nil {
+		if findataSQLDSN() == "" {
+			return "", time.Time{}, errFindataSQLUnconfigured
+		}
+		return "", time.Time{}, fmt.Errorf("warehouse unreachable: %w", err)
+	}
+	defer conn.Close(context.Background())
+
+	tx, err := conn.Begin(opCtx)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("warehouse: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var stmt string
+	if err := tx.QueryRow(opCtx,
+		`SELECT format('ALTER ROLE %I LOGIN PASSWORD %L VALID UNTIL %L',
+		               $1::text, $2::text, $3::timestamptz)`,
+		roleName, pw, expires).Scan(&stmt); err != nil {
+		return "", time.Time{}, fmt.Errorf("warehouse: %w", err)
+	}
+	if _, err := tx.Exec(opCtx, stmt); err != nil {
+		return "", time.Time{}, fmt.Errorf("warehouse: %w", err)
+	}
+	if _, err := tx.Exec(opCtx, `
+		INSERT INTO pgbouncer_auth.credentials (username, password, expires_at, lumid_sub)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (username) DO UPDATE
+		   SET password = EXCLUDED.password,
+		       expires_at = EXCLUDED.expires_at,
+		       lumid_sub  = EXCLUDED.lumid_sub,
+		       revoked_at = NULL`,
+		roleName, pw, expires, userID); err != nil {
+		return "", time.Time{}, fmt.Errorf("warehouse: %w", err)
+	}
+	if err := tx.Commit(opCtx); err != nil {
+		return "", time.Time{}, fmt.Errorf("warehouse commit: %w", err)
+	}
+
+	if acct != nil {
+		updates := map[string]interface{}{
+			"credential_expires_at": expires,
+			"last_minted_at":        time.Now().UTC(),
+		}
+		if enc, encErr := common.EncryptGrant(pw); encErr == nil {
+			updates["password_encrypted"] = enc
+		} else {
+			log.Printf("findata-sql: no replayable credential stored for %s: %v", roleName, encErr)
+		}
+		common.DB.Model(acct).Updates(updates)
+	}
+	return pw, expires, nil
+}
+
+// findataSQLShadowMint issues a warehouse credential as a SIDE EFFECT of
+// minting a PAT that carries the findata:sql capability tag.
+//
+// WHY THE TAG IS NOT THE PRIVILEGE. findata:sql is a capability scope, so
+// canGrant lets any active user ask for it — capability tags confer no
+// platform access by design. The tag therefore expresses INTENT ("this token
+// is for warehouse work"), and entitlement is still decided by the same gate
+// as the self-service path: an explicit findata grant plus a provisioned role.
+// A user without those gets a PAT with a tag that does nothing, which is the
+// correct outcome and not an error worth failing their mint over.
+//
+// Returns the role name when a credential was issued, "" when it was skipped.
+// Never returns an error to the caller: a PAT mint must not fail because a
+// side effect did.
+func findataSQLShadowMint(ctx context.Context, u models.User) string {
+	if !findataSQLEntitled(u) {
+		return ""
+	}
+	var acct models.FindataSQLAccount
+	if err := common.DB.Where("user_id = ?", u.ID).First(&acct).Error; err != nil {
+		return ""
+	}
+	if !findataSQLRoleRe.MatchString(acct.RoleName) {
+		log.Printf("findata-sql: shadow mint skipped, malformed role %q", acct.RoleName)
+		return ""
+	}
+	if _, _, err := findataSQLIssue(ctx, u.ID, acct.RoleName, &acct); err != nil {
+		log.Printf("findata-sql: shadow mint failed for %s: %v", acct.RoleName, err)
+		return ""
+	}
+	return acct.RoleName
 }

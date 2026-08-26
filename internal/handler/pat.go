@@ -60,6 +60,10 @@ type patMintResp struct {
 	Name      string     `json:"name"`
 	Scopes    []string   `json:"scopes"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// Set when a findata:sql-tagged mint also issued the warehouse
+	// credential. Empty means it was skipped (not entitled, or no role
+	// provisioned) — the PAT itself is unaffected either way.
+	FindataSQLRole string `json:"findata_sql_role,omitempty"`
 }
 
 // JSON shape matches the lumid_auth_ui PATInfo TS interface verbatim.
@@ -257,10 +261,25 @@ func PATMintHandler(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, err.Error())
 		return
 	}
-	ok_(c, "minted", patMintResp{
+	// Shadow-mint the warehouse credential when the token is tagged for it, so
+	// a user asking for warehouse access performs ONE action rather than two.
+	// Deliberately after the PAT is persisted and deliberately non-fatal: the
+	// PAT is the thing the caller asked for, and a side effect must never be
+	// able to fail it. An un-entitled user simply gets a tag that does nothing.
+	var sqlRole string
+	for _, sc := range req.Scopes {
+		if sc == "findata:sql" {
+			sqlRole = findataSQLShadowMint(c.Request.Context(), u)
+			break
+		}
+	}
+
+	resp := patMintResp{
 		ID: row.ID, Token: cleartext, Prefix: patCleartextPrefix,
 		Name: row.Name, Scopes: req.Scopes, ExpiresAt: expAt,
-	})
+	}
+	resp.FindataSQLRole = sqlRole
+	ok_(c, "minted", resp)
 }
 
 // mintPATForUser is the entropy→hash→persist core of PAT creation, shared

@@ -32,11 +32,32 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 			if r.Metrics != "" {
 				_ = json.Unmarshal([]byte(r.Metrics), &m)
 			}
-			out = append(out, map[string]any{
+			row := map[string]any{
 				"loop": r.Loop, "run_ts": r.RunTs, "ok": r.Ok,
 				"model": r.Model, "source": r.Source,
 				"duration_s": r.DurationS, "metrics": m,
-			})
+			}
+			// Promote the run's SOURCE strategy to the top level.
+			//
+			// filterAppData matches top-level fields only, and deliberately
+			// fails closed on a field no row has. So a surface filtering by
+			// `source_strategy_id` — which is exactly what lqt-mailbox's
+			// "Backtests for this strategy" widget does
+			// (me://app-data?…&loop=backtest&source_strategy_id={strategy_id})
+			// — matched NOTHING, permanently, and the section read empty for
+			// every strategy. The id was present all along, but only buried in
+			// `metrics.command_engine.source_strategy_id`.
+			//
+			// Do NOT read `command_engine.strategy_id` here: on a backtest row
+			// that is the CLAIM's own id (`bt-<uuid>`), not the strategy the
+			// backtest came from. Promoting it would make the filter match the
+			// wrong thing, which is worse than matching nothing.
+			if ce, ok := m["command_engine"].(map[string]any); ok {
+				if v, ok := ce["source_strategy_id"].(string); ok && v != "" {
+					row["source_strategy_id"] = v
+				}
+			}
+			out = append(out, row)
 		}
 		return map[string]any{"app": app, "runs": out, "count": len(out)}, true
 	},

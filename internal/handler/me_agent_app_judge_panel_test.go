@@ -204,14 +204,16 @@ func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
 	// longer why it is excluded, and leaving that reason here would have rotted
 	// into a false statement.
 	//
-	// It stays excluded for the OTHER half of the original reason, which is still
-	// true: its ladder is CPU -> OpenRouter with NO tier-0, so any request that
-	// arrives while the 8 CPU slots are busy is billed, and it is pool-ENFORCED
-	// rather than pool-exempt in claude-proxy. Note this guard governs the
-	// sandbox lane only — GLM IS offered as a normal Studio chat chip (see
-	// llmProviders), which is a different lane with its own dailyBudgetTokens cap.
-	// Add it here if GLM is ever made pool-exempt.
-	permitted := map[string]bool{"deepseek-v4-flash": true}
+	// GLM was then made pool-EXEMPT the same day, which was the condition this
+	// guard named for admitting it — so it is permitted here now, on the same
+	// footing as deepseek: both are served from hardware we own and neither is
+	// refused when a user's Claude window is exhausted.
+	//
+	// What that does NOT mean: pool-exempt is about REFUSAL, not accounting.
+	// identity still counts both models against the window at
+	// claudeWeightNonClaude (poolCapApplies is unconditional and ClaudePoolUsage
+	// has no model filter), so admitting GLM here does not hide its spend.
+	permitted := map[string]bool{"deepseek-v4-flash": true, "glm-5.3-flash": true}
 	for _, p := range llmProviders {
 		rest, ok := strings.CutPrefix(p.upstreamModel, "lumid-llm/")
 		if !ok {

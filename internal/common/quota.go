@@ -402,22 +402,27 @@ func ClassifyProvider(model string) LlmProvider {
 	if m == "deepseek-v4-flash" {
 		return ProviderOnPrem
 	}
-	// glm-5.3-flash needs no arm here TODAY, and that is worth stating so nobody
-	// "fixes" it: claude-proxy's billedModel() prefers the id the upstream
-	// REPORTED, and the OpenRouter path reports "z-ai/glm-5.3-flash", which the
-	// catch-all below already classifies correctly. Verified against prod
-	// 2026-08-27 — the recorded usage_events rows carry the z-ai/ spelling.
+	// THAT DAY ARRIVED 2026-08-27 and all three edits moved together, as the
+	// note this replaces required. glm-5.3-flash now has a real on-prem backend
+	// (glm-5.3-flash=http://100.117.154.126:4005 in LUMID_LLM_BACKENDS — our own
+	// s0 CPU, NUMA node1, 8 slots x 1M ctx), so the bare id IS reachable and is
+	// classified on-prem here, and claude-proxy's glmProfile.poolEnforced went
+	// false. Edit 2 of that list needed nothing: claude-quota.tsx no longer
+	// carries its own modelRoute() -- it renders the `providers` breakdown the
+	// API returns, so THIS function is now the single classifier and the
+	// frontend cannot drift from it. (One stale comment there still says
+	// "mirror modelRoute"; the code below it reads u.providers.)
 	//
-	// The bare "glm-5.3-flash" only becomes reachable when an on-prem backend
-	// starts echoing it (the s0 CPU path). THREE edits must move together that
-	// day, or the dashboard and the spend limiter disagree:
-	//
-	//   1. an `m == "glm-5.3-flash" -> ProviderOnPrem` arm here;
-	//   2. modelRoute() in lumid_ui/src/pages/studio/claude-quota.tsx, which
-	//      duplicates this classification for the frontend;
-	//   3. modelProfile.poolEnforced -> false in claude-proxy's oaicompat.go,
-	//      since the pool exemption means "free at the margin" and only becomes
-	//      true once we are actually serving it ourselves.
+	// BOTH spellings must stay classified, and they land in different arms on
+	// purpose. claude-proxy's billedModel() prefers the id the upstream
+	// REPORTED, so a turn served by the CPU backend records the bare
+	// "glm-5.3-flash" (on-prem, below) while one that overflowed to OpenRouter
+	// records "z-ai/glm-5.3-flash" and falls to the catch-all as OpenRouter.
+	// That split is not a bug -- it is the dashboard correctly showing which
+	// side of the ladder actually served the turn.
+	if m == "glm-5.3-flash" {
+		return ProviderOnPrem
+	}
 	return ProviderOpenRouter
 }
 

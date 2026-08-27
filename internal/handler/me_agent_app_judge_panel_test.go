@@ -192,16 +192,26 @@ func TestProviderUpstreamModelsAreRoutable(t *testing.T) {
 // if the policy had allowed it. Two independent failures behind one chip that
 // looked fine in the picker.
 func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
-	const permitted = "deepseek-v4-flash" // mirrors SELF_HOSTED_MODELS in claude-proxy
+	// claude-proxy's SELF_HOSTED_MODELS now names TWO models
+	// (deepseek-v4-flash,glm-5.3-flash), but this guard is deliberately NARROWER
+	// than "whatever claude-proxy forwards". Its question is "may this chip be
+	// offered to every ordinary user in the sandbox lane?", and glm-5.3-flash is
+	// OpenRouter-served: real money per token, pool-enforced rather than
+	// pool-exempt. A chip pointing at it would put a metered model in front of
+	// every user of the in-house lane, which is the opposite of what this lane is
+	// for. So GLM is excluded ON PURPOSE, not by omission — add it here only if
+	// it ever gains a real on-prem backend in lumid-llm's LUMID_LLM_BACKENDS.
+	permitted := map[string]bool{"deepseek-v4-flash": true}
 	for _, p := range llmProviders {
 		rest, ok := strings.CutPrefix(p.upstreamModel, "lumid-llm/")
 		if !ok {
 			continue
 		}
-		if rest != permitted {
+		if !permitted[rest] {
 			t.Errorf("provider %q routes in-house at %q, but claude-proxy forwards only %q "+
-				"among non-Anthropic models — every call through it is refused for all roles",
-				p.id, rest, permitted)
+				"among non-Anthropic models in this lane — every call through it is "+
+				"refused for all roles",
+				p.id, rest, "deepseek-v4-flash")
 		}
 	}
 }

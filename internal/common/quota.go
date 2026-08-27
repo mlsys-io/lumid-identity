@@ -402,6 +402,22 @@ func ClassifyProvider(model string) LlmProvider {
 	if m == "deepseek-v4-flash" {
 		return ProviderOnPrem
 	}
+	// glm-5.3-flash needs no arm here TODAY, and that is worth stating so nobody
+	// "fixes" it: claude-proxy's billedModel() prefers the id the upstream
+	// REPORTED, and the OpenRouter path reports "z-ai/glm-5.3-flash", which the
+	// catch-all below already classifies correctly. Verified against prod
+	// 2026-08-27 — the recorded usage_events rows carry the z-ai/ spelling.
+	//
+	// The bare "glm-5.3-flash" only becomes reachable when an on-prem backend
+	// starts echoing it (the s0 CPU path). THREE edits must move together that
+	// day, or the dashboard and the spend limiter disagree:
+	//
+	//   1. an `m == "glm-5.3-flash" -> ProviderOnPrem` arm here;
+	//   2. modelRoute() in lumid_ui/src/pages/studio/claude-quota.tsx, which
+	//      duplicates this classification for the frontend;
+	//   3. modelProfile.poolEnforced -> false in claude-proxy's oaicompat.go,
+	//      since the pool exemption means "free at the margin" and only becomes
+	//      true once we are actually serving it ourselves.
 	return ProviderOpenRouter
 }
 

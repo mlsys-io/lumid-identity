@@ -185,10 +185,10 @@ func adminLoopsFromCache(c *gin.Context) bool {
 // are best-effort — missing files don't 500.
 
 type loopRow struct {
-	App                 string  `json:"app"`
-	Loop                string  `json:"loop"`
-	Schedule            string  `json:"schedule"`
-	DeclaredIn          string  `json:"declared_in"`
+	App        string `json:"app"`
+	Loop       string `json:"loop"`
+	Schedule   string `json:"schedule"`
+	DeclaredIn string `json:"declared_in"`
 	// TenantSub — the user_sub this loop belongs to; empty for
 	// operator-shared apps. Published by the scheduler so /me/loops/health
 	// can scope rows to the caller instead of returning every tenant's

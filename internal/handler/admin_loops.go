@@ -115,7 +115,7 @@ func adminLoopsFromCache(c *gin.Context) bool {
 	}
 
 	now := time.Now().Unix()
-	rows := doc.Loops
+	rows := scopeLoopRows(c, doc.Loops)
 	for i := range rows {
 		rows[i].Status = loopStatusFor(rows[i].Schedule, rows[i].LastRunTS, rows[i].ConsecutiveFailures, now)
 	}
@@ -130,6 +130,16 @@ func adminLoopsFromCache(c *gin.Context) bool {
 		summary[r.Status]++
 	}
 	apps := doc.Apps
+	if _, scoped := c.Get(loopsTenantScopeKey); scoped {
+		keep := loopRowApps(rows)
+		narrowed := make([]appGitStatus, 0, len(keep))
+		for _, a := range apps {
+			if _, want := keep[a.App]; want {
+				narrowed = append(narrowed, a)
+			}
+		}
+		apps = narrowed
+	}
 	sort.Slice(apps, func(i, j int) bool { return apps[i].App < apps[j].App })
 
 	// The daemon is "running" only if its last publish is recent; a stale doc
@@ -179,6 +189,12 @@ type loopRow struct {
 	Loop                string  `json:"loop"`
 	Schedule            string  `json:"schedule"`
 	DeclaredIn          string  `json:"declared_in"`
+	// TenantSub — the user_sub this loop belongs to; empty for
+	// operator-shared apps. Published by the scheduler so /me/loops/health
+	// can scope rows to the caller instead of returning every tenant's
+	// inventory (the P0 "single-tenant" shortcut, which expired the moment
+	// real users were onboarded).
+	TenantSub           string  `json:"tenant_sub,omitempty"`
 	LastRunTS           float64 `json:"last_run_ts"`
 	LastOk              *bool   `json:"last_ok,omitempty"`
 	ConsecutiveFailures int     `json:"consecutive_failures"`
@@ -1238,6 +1254,44 @@ func xpcloudBaseURL() string {
 	return "http://host.docker.internal:8900"
 }
 
+// loopsTenantScopeKey — set by MeLoopsHealth for non-admin callers. When
+// present, AdminLoops returns ONLY loops belonging to that user_sub.
+const loopsTenantScopeKey = "loops_tenant_scope"
+
+// scopeLoopRows filters rows to the caller's tenant when a scope is set.
+// Returns the rows unchanged for admins (no scope key) so the /admin/loops
+// tile keeps its fleet-wide view.
+func scopeLoopRows(c *gin.Context, rows []loopRow) []loopRow {
+	v, exists := c.Get(loopsTenantScopeKey)
+	if !exists {
+		return rows
+	}
+	sub, _ := v.(string)
+	if sub == "" {
+		// Fail CLOSED: a scope was requested but is unusable. Returning
+		// everything here is exactly the bug this function exists to fix.
+		return []loopRow{}
+	}
+	out := make([]loopRow, 0, len(rows))
+	for _, r := range rows {
+		if r.TenantSub == sub {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// loopRowApps returns the distinct app names present in rows — used to
+// narrow the apps[] block so it cannot leak app names the caller's own
+// filtered loops don't reference.
+func loopRowApps(rows []loopRow) map[string]struct{} {
+	seen := map[string]struct{}{}
+	for _, r := range rows {
+		seen[r.App] = struct{}{}
+	}
+	return seen
+}
+
 func AdminLoops(c *gin.Context) {
 	// Preferred source: the scheduler-published Redis doc (the daemon runs on
 	// its own pod with the real ~/.xp fs). Falls through to identity's local
@@ -1328,6 +1382,8 @@ func AdminLoops(c *gin.Context) {
 		return rows[i].Loop < rows[j].Loop
 	})
 
+	rows = scopeLoopRows(c, rows)
+
 	// Summary counts for the tile heading
 	summary := map[string]int{"ok": 0, "never": 0, "failing": 0, "stale": 0, "manual": 0}
 	for _, r := range rows {
@@ -1343,10 +1399,17 @@ func AdminLoops(c *gin.Context) {
 	// loop. The dashboard pivots loops by app, so this is the natural
 	// shape for "git status per repo".
 	seenApps := map[string]struct{}{}
+	_, appsScoped := c.Get(loopsTenantScopeKey)
+	keepApps := loopRowApps(rows)
 	apps_status := make([]appGitStatus, 0, len(apps))
 	for _, app := range apps {
 		if _, dup := seenApps[app.App]; dup {
 			continue
+		}
+		if appsScoped {
+			if _, want := keepApps[app.App]; !want {
+				continue
+			}
 		}
 		seenApps[app.App] = struct{}{}
 		apps_status = append(apps_status, loadAppGitStatus(home, app.App))

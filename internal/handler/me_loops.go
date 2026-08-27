@@ -325,13 +325,32 @@ func MeLoopStop(c *gin.Context) {
 // P2: filters to the calling user's tenant root once per-tenant
 // volumes land.
 func MeLoopsHealth(c *gin.Context) {
-	if _, authed := currentUserID(c); !authed {
+	uid, authed := currentUserID(c)
+	if !authed {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
-	// Delegate — same handler the admin tile calls. Filtering by
-	// tenant lands in P2; in P0 every user sees the operator host's
-	// loops (acceptable since single-tenant during dogfood).
+	// TENANT SCOPING. This used to delegate to AdminLoops wholesale, on the
+	// stated premise that "the operator host is single-tenant during
+	// dogfood". That premise expired when real users were onboarded: every
+	// authenticated role-`user` caller was served the FLEET's loop inventory
+	// — app names, schedules, run health and descriptions for every tenant
+	// plus the operator's own apps.
+	//
+	// Admins keep the fleet-wide view (the /admin/loops tile depends on it);
+	// everyone else is scoped to loops carrying their own tenant_sub. The
+	// scope is applied inside AdminLoops so BOTH of its response paths (the
+	// scheduler's Redis doc and the local filesystem walk) are covered — a
+	// filter on only one of them would leak through the other.
+	role := ""
+	if tok := bearerToken(c); tok != "" {
+		if _, r, resolved := resolveRole(tok); resolved {
+			role = r
+		}
+	}
+	if !isAdminRole(role) {
+		c.Set(loopsTenantScopeKey, uid)
+	}
 	AdminLoops(c)
 }
 

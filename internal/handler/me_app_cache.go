@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,6 +138,29 @@ func materialiseTenantApp(userSub, app string) string {
 	// author until now, which is why owner-only testing never saw it.
 	owner := repoOwnerFor(userSub, app)
 	paths := repoTree(owner, userSub, app, "")
+	if len(paths) == 0 {
+		// RESCUE for a bare-slug install. repoOwnerFor recovers the author from
+		// the install intent's "<owner>/<name>" slug; an install recorded as the
+		// bare "<name>" carries no owner, so it falls back to the CALLER's sub,
+		// whose repo does not exist, and every surface 404s "app not found" for
+		// an app /me/apps reports ready.
+		//
+		// Bare slugs are not an edge case: /onboarding/domain installs
+		// auto-quant / personal-agent / mbb-ai by bare name, the apps page's
+		// retryInstall passes a bare name, and the chat's install_app tool takes
+		// whatever slug the model produced. The scheduler resolves shorthand on
+		// its own side, so those paths look fine wherever the PVC is readable —
+		// but identity mounts only signing-keys, so THIS fallback is the only
+		// path a cloud identity pod has, and it was the one that could not.
+		//
+		// Placed here rather than inside repoOwnerFor on purpose: it runs only
+		// where the existing code has already failed outright, so no currently
+		// working resolution changes behaviour.
+		if alt := resolvePublishedOwner(userSub, app); alt != "" && alt != owner {
+			owner = alt
+			paths = repoTree(owner, userSub, app, "")
+		}
+	}
 	if len(paths) == 0 {
 		return ""
 	}
@@ -506,4 +530,96 @@ func repoOwnerFor(userSub, app string) string {
 		}
 	}
 	return userSub
+}
+
+// firstPartyOwner — the canonical publisher for shorthand app names. Mirrors
+// sdk/ops/apps.py::_FIRST_PARTY_OWNER, including the env override, so the Go
+// and Python resolvers cannot drift into disagreeing about what "auto-quant"
+// means.
+func firstPartyOwner() string {
+	if v := os.Getenv("LUMID_FIRST_PARTY_OWNER"); v != "" {
+		return v
+	}
+	return "70f192ce-97f3-5d9e-4324-8a557ea72900"
+}
+
+// resolvedOwnerCache memoises bare-name -> owner. The tenant bundle cache in
+// front of this already collapses a turn's many tool calls into one miss, so
+// this only guards against repeated misses across turns.
+var resolvedOwnerCache sync.Map // app -> string
+
+// resolvePublishedOwner finds who publishes `app` when the install recorded no
+// owner. Same two rungs, in the same order, as
+// sdk/ops/apps.py::_resolve_install_slug:
+//
+//  1. a direct hit under the first-party owner, then
+//  2. a search for a UNIQUE public repo whose name matches exactly.
+//
+// Ambiguity returns "" rather than a guess. Two owners really do publish an
+// app named "mbb-ai", and silently picking one would hand the user someone
+// else's bundle — a wrong bundle is worse than the 404 this rescues, because
+// it looks like it worked.
+func resolvePublishedOwner(userSub, app string) string {
+	if app == "" || strings.ContainsAny(app, "/\\") || strings.Contains(app, "..") {
+		return ""
+	}
+	if v, ok := resolvedOwnerCache.Load(app); ok {
+		return v.(string)
+	}
+	bearer, err := xpcloudUserJWT(userSub)
+	if err != nil {
+		return ""
+	}
+	base := xpcloudBaseURL()
+
+	owner := ""
+	// 1. First-party direct hit.
+	if code, _, err := xpcloudJSON(http.MethodGet, base+"/api/v1/repos/"+firstPartyOwner()+"/"+app, bearer, nil); err == nil && code == http.StatusOK {
+		owner = firstPartyOwner()
+	}
+	// 2. Unique public exact-name match.
+	if owner == "" {
+		code, body, err := xpcloudJSON(http.MethodGet, base+"/api/v1/repos?q="+url.QueryEscape(app), bearer, nil)
+		if err == nil && code == http.StatusOK {
+			repos, _ := body["repos"].([]any)
+			owner = uniquePublicOwner(repos, app)
+		}
+	}
+	resolvedOwnerCache.Store(app, owner)
+	return owner
+}
+
+// uniquePublicOwner returns the owner_sub of the ONE public repo named exactly
+// `app`, or "" when there are none or several.
+//
+// Split out from resolvePublishedOwner so the selection rule is testable
+// without a network or a DB: the rule is the whole risk here. A search for
+// "mbb-ai" really does return two public repos under different owners, and the
+// difference between returning "" and returning either one of them is the
+// difference between a visible 404 and silently serving a stranger's bundle.
+func uniquePublicOwner(repos []any, app string) string {
+	match := ""
+	n := 0
+	for _, r := range repos {
+		rec, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := rec["name"].(string); name != app {
+			continue
+		}
+		if vis, _ := rec["visibility"].(string); vis != "public" {
+			continue
+		}
+		sub, _ := rec["owner_sub"].(string)
+		if sub == "" {
+			continue
+		}
+		n++
+		match = sub
+	}
+	if n == 1 {
+		return match
+	}
+	return ""
 }

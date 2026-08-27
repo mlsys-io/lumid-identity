@@ -2,6 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"lumid_identity/internal/common"
@@ -83,6 +86,60 @@ func mintLQTStrategyPAT(userSub string) string {
 	return tok
 }
 
+// lqtStrategyPATCacheKey is where the minted deploy PAT is cached, encrypted,
+// in the SAME per-user app_secrets store that delivers it. The leading "__"
+// marks it as machine-managed; a user-set LQT_STRATEGY_PAT still wins.
+const lqtStrategyPATCacheKey = "__lqt_strategy_pat_cache"
+
+// Re-mint once the cached token is within this of expiry, so a cycle never
+// receives a credential that dies mid-run.
+const lqtStrategyPATRenewBefore = 20 * time.Minute
+
+// lqtStrategyPATCached returns a live deploy PAT for userSub, minting a new one
+// ONLY when there is no usable cached token.
+//
+// WHY THIS EXISTS. The first version minted on every call. `InternalAppSecretsFetch`
+// runs per cycle per user, so with lqt-mailbox installed for a cohort that is a
+// fresh credential every cycle: measured 2026-08-27, **451 minted, 103 in 30
+// minutes, 432 live at once** — 13 per student and rising linearly with users.
+// Each is a real credential that can deploy a strategy, so that is credential
+// sprawl, not just table growth.
+//
+// A PAT's cleartext is argon2id-hashed and unrecoverable, which is why the naive
+// fix ("look up the user's existing one") is impossible — so cache it the way
+// the FinData SQL password is cached: AES-256-GCM via common.EncryptGrant,
+// stored as "<expiry_epoch>:<token>" so the expiry travels with it and no
+// introspect round-trip is needed on the hot path.
+func lqtStrategyPATCached(userSub string) string {
+	var row models.AppSecret
+	if err := common.DB.Where("user_sub = ? AND app_slug = ? AND `key` = ?",
+		userSub, lqtStrategyApp, lqtStrategyPATCacheKey).First(&row).Error; err == nil {
+		if v, err := common.DecryptGrant(row.ValueEncrypted); err == nil {
+			if exp, tok, ok := strings.Cut(v, ":"); ok && tok != "" {
+				if unix, err := strconv.ParseInt(exp, 10, 64); err == nil {
+					if time.Until(time.Unix(unix, 0)) > lqtStrategyPATRenewBefore {
+						return tok
+					}
+				}
+			}
+		}
+	}
+	tok := mintLQTStrategyPAT(userSub)
+	if tok == "" {
+		return ""
+	}
+	enc, err := common.EncryptGrant(fmt.Sprintf("%d:%s", time.Now().Add(lqtStrategyPATTTL).Unix(), tok))
+	if err == nil {
+		// Best-effort: a failed cache write costs an extra mint next cycle, it
+		// must never cost the caller its credential.
+		_ = common.DB.Save(&models.AppSecret{
+			UserSub: userSub, AppSlug: lqtStrategyApp,
+			Key: lqtStrategyPATCacheKey, ValueEncrypted: enc,
+		}).Error
+	}
+	return tok
+}
+
 // attachLQTStrategyPAT adds `lqt_strategy_pat` to a claimed intent's payload
 // when the intent is an lqt-mailbox run_loop. The picker exports it as
 // LQT_STRATEGY_PAT, which `_scoped_pat()` prefers over LUMID_PAT.
@@ -93,7 +150,7 @@ func attachLQTStrategyPAT(action, userSub string, p map[string]any) {
 	if p == nil || !lqtIntentNeedsStrategyPAT(action, p) {
 		return
 	}
-	if tok := mintLQTStrategyPAT(userSub); tok != "" {
+	if tok := lqtStrategyPATCached(userSub); tok != "" {
 		p["lqt_strategy_pat"] = tok
 	}
 }

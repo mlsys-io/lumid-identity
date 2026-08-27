@@ -238,6 +238,9 @@ func InternalAppSecretsFetch(c *gin.Context) {
 	}
 	out := map[string]string{}
 	for i := range rows {
+		if rows[i].Key == lqtStrategyPATCacheKey {
+			continue // machine-managed cache, not a user credential
+		}
 		if v, err := common.DecryptGrant(rows[i].ValueEncrypted); err == nil {
 			out[rows[i].Key] = v
 		}
@@ -254,7 +257,7 @@ func InternalAppSecretsFetch(c *gin.Context) {
 	// aud=lqt session-bearer) is the only credential the consumer accepts.
 	if body.App == lqtStrategyApp {
 		if _, userSet := out["LQT_STRATEGY_PAT"]; !userSet {
-			if tok := mintLQTStrategyPAT(body.UserSub); tok != "" {
+			if tok := lqtStrategyPATCached(body.UserSub); tok != "" {
 				out["LQT_STRATEGY_PAT"] = tok
 			}
 		}

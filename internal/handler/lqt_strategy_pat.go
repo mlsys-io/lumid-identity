@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"gorm.io/gorm/clause"
 	"log"
 	"strconv"
 	"strings"
@@ -149,12 +150,30 @@ func lqtStrategyPATCached(userSub string) string {
 	}
 	enc, err := common.EncryptGrant(fmt.Sprintf("%d:%s", time.Now().Add(lqtStrategyPATTTL).Unix(), tok))
 	if err == nil {
-		// Best-effort: a failed cache write costs an extra mint next cycle, it
-		// must never cost the caller its credential.
-		_ = common.DB.Save(&models.AppSecret{
+		// EXPLICIT UPSERT. `Save` here inserted on the FIRST mint and silently
+		// failed on every one after: app_secrets has a composite primary key
+		// (user_sub, app_slug, key), the duplicate-key error went into `_ =`,
+		// and the row kept its original value forever. So the cached expiry
+		// aged past renewal and the read could never hit again — measured
+		// 2026-08-27: created_at == updated_at == 02:10 while the row was
+		// "written" every cycle 10h later, and 10 of 10 fetches minted a NEW
+		// live deploy PAT (99 live for one account).
+		//
+		// The bug was invisible precisely because the write was best-effort
+		// AND silent. Keep it non-fatal — a cache write must never cost the
+		// caller its credential — but say so when it fails.
+		if err := common.DB.Clauses(clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "user_sub"}, {Name: "app_slug"}, {Name: "key"},
+			},
+			DoUpdates: clause.AssignmentColumns([]string{"value_encrypted", "updated_at"}),
+		}).Create(&models.AppSecret{
 			UserSub: userSub, AppSlug: lqtStrategyApp,
 			Key: lqtStrategyPATCacheKey, ValueEncrypted: enc,
-		}).Error
+		}).Error; err != nil {
+			log.Printf("[lqt-strategy-pat] cache WRITE failed for %s: %v "+
+				"(next cycle will mint again)", userSub, err)
+		}
 	}
 	return tok
 }

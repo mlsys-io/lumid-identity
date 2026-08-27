@@ -735,6 +735,39 @@ var llmProviders = []llmProvider{
 		maxOutputTokens:     16384,  // 262K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
+	{
+		// glm-5.3-flash — GLM-5.3-Flash (Zhipu, MIT), 321B total / 18B active MoE,
+		// 1M context. Served by lumid-llm, which routes it to our own s0 CPU
+		// backend (NUMA node1, 8 slots x 1M ctx) and overflows to OpenRouter only
+		// when that backend is at its roof.
+		//
+		// dailyBudgetTokens is FINITE even though the primary backend is our own
+		// hardware, and that is deliberate: the ladder is CPU -> OpenRouter with
+		// no tier-0, so every request that arrives while the 8 CPU slots are busy
+		// is BILLED. -1 here would be an uncapped spend path for every user at
+		// exactly the moment the model is most popular — the same trap the qwen
+		// block below documents, reached by a different route. Matched to the qwen
+		// entries rather than invented.
+		//
+		// supportsVision is false although GLM-5.3-Flash IS natively multimodal:
+		// claude-proxy still drops image blocks (text-only scope) and llama.cpp is
+		// text-only for this architecture. A false negative just hides the image
+		// affordance; a false positive breaks the turn.
+		//
+		// KEEP upstreamModel IN SYNC WITH THE GATEWAY — see the deepseek note above.
+		id:                  "glm-5.3-flash",
+		displayName:         "GLM-5.3-Flash (Lumid CPU)",
+		endpoint:            lumidLLMBase() + "/v1/messages",
+		upstreamModel:       "glm-5.3-flash",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+		supportsVision:      false,   // text-only through this path; see above
+		minRole:             "user",  // everyone
+		maxOutputTokens:     16384,   // 1M ctx; reasoning model, give answers room
+		dailyBudgetTokens:   200_000, // finite: OpenRouter overflow is billed
+	},
 	// The two qwen entries below moved from ON-PREM to OPENROUTER, and the id
 	// form moved with them. lumid-llm resolves a bare id only via
 	// LUMID_LLM_BACKENDS (what luyao1 served); everything in

@@ -195,12 +195,22 @@ func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
 	// claude-proxy's SELF_HOSTED_MODELS now names TWO models
 	// (deepseek-v4-flash,glm-5.3-flash), but this guard is deliberately NARROWER
 	// than "whatever claude-proxy forwards". Its question is "may this chip be
-	// offered to every ordinary user in the sandbox lane?", and glm-5.3-flash is
-	// OpenRouter-served: real money per token, pool-enforced rather than
-	// pool-exempt. A chip pointing at it would put a metered model in front of
-	// every user of the in-house lane, which is the opposite of what this lane is
-	// for. So GLM is excluded ON PURPOSE, not by omission — add it here only if
-	// it ever gains a real on-prem backend in lumid-llm's LUMID_LLM_BACKENDS.
+	// offered to every ordinary user in the SANDBOX lane?"
+	//
+	// UPDATED 2026-08-27: the trigger this comment used to name HAS fired —
+	// glm-5.3-flash now has a real on-prem backend
+	// (glm-5.3-flash=http://100.117.154.126:4005 in LUMID_LLM_BACKENDS, our own
+	// s0 CPU on NUMA node1). So "OpenRouter-served, real money per token" is no
+	// longer why it is excluded, and leaving that reason here would have rotted
+	// into a false statement.
+	//
+	// It stays excluded for the OTHER half of the original reason, which is still
+	// true: its ladder is CPU -> OpenRouter with NO tier-0, so any request that
+	// arrives while the 8 CPU slots are busy is billed, and it is pool-ENFORCED
+	// rather than pool-exempt in claude-proxy. Note this guard governs the
+	// sandbox lane only — GLM IS offered as a normal Studio chat chip (see
+	// llmProviders), which is a different lane with its own dailyBudgetTokens cap.
+	// Add it here if GLM is ever made pool-exempt.
 	permitted := map[string]bool{"deepseek-v4-flash": true}
 	for _, p := range llmProviders {
 		rest, ok := strings.CutPrefix(p.upstreamModel, "lumid-llm/")

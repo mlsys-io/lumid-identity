@@ -405,9 +405,10 @@ func ClassifyProvider(model string) LlmProvider {
 	// THAT DAY ARRIVED 2026-08-27 and all three edits moved together, as the
 	// note this replaces required. glm-5.3-flash now has a real on-prem backend
 	// (glm-5.3-flash=http://100.117.154.126:4005 in LUMID_LLM_BACKENDS — our own
-	// s0 CPU, NUMA node1, 8 slots x 1M ctx), so the bare id IS reachable and is
-	// classified on-prem here, and claude-proxy's glmProfile.poolEnforced went
-	// false. Edit 2 of that list needed nothing: claude-quota.tsx no longer
+	// s0 CPU, NUMA node1, 8 slots x 1M ctx) and claude-proxy's
+	// glmProfile.poolEnforced went false. The on-prem id is glm-5.3-flash-CPU,
+	// not the bare id -- see below. Edit 2 of that list needed nothing:
+	// claude-quota.tsx no longer
 	// carries its own modelRoute() -- it renders the `providers` breakdown the
 	// API returns, so THIS function is now the single classifier and the
 	// frontend cannot drift from it. (One stale comment there still says
@@ -420,7 +421,13 @@ func ClassifyProvider(model string) LlmProvider {
 	// records "z-ai/glm-5.3-flash" and falls to the catch-all as OpenRouter.
 	// That split is not a bug -- it is the dashboard correctly showing which
 	// side of the ladder actually served the turn.
-	if m == "glm-5.3-flash" {
+	// glm-5.3-flash-cpu is the direct-dial id for the s0 CPU instance, mirroring
+	// deepseek-v4-flash-cpu. The BARE glm-5.3-flash is OpenRouter-served and
+	// falls to the catch-all below -- deliberately, and this was corrected the
+	// same day it was introduced: CPU-first for the bare id made Studio chat
+	// appear dead, because CPU prefill is ~65 tok/s against a ~19k-token tool
+	// catalog per turn. Decode was fine (12.9 tok/s); prefill was not.
+	if m == "glm-5.3-flash-cpu" {
 		return ProviderOnPrem
 	}
 	return ProviderOpenRouter

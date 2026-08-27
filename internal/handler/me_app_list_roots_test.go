@@ -41,3 +41,50 @@ func TestAppListRootsCacheIsPerUser(t *testing.T) {
 		t.Errorf("cache root for sub-aaa is wrong: %q", a[2])
 	}
 }
+
+// installedAppNames drives materialisation, so its newest-intent-wins decision
+// is what keeps a list endpoint from resurrecting an uninstalled app or hiding
+// a live one. Same rule as cardsFromIntents; tested here without a DB by
+// exercising the decision on ordered rows.
+func TestInstalledAppNamesDecision(t *testing.T) {
+	// Mirrors the loop in installedAppNames: rows are newest-first.
+	decide := func(rows []struct {
+		name, action, status string
+	}) []string {
+		seen := map[string]bool{}
+		var out []string
+		for _, r := range rows {
+			if r.name == "" || seen[r.name] {
+				continue
+			}
+			seen[r.name] = true
+			if r.action == "uninstall" && r.status != "failed" {
+				continue
+			}
+			out = append(out, r.name)
+		}
+		return out
+	}
+	type row = struct{ name, action, status string }
+
+	got := decide([]row{{"a", "install", "done"}})
+	if len(got) != 1 || got[0] != "a" {
+		t.Errorf("plain install should be listed, got %v", got)
+	}
+	// Newest is an uninstall — the older install must not resurrect it.
+	got = decide([]row{{"a", "uninstall", "done"}, {"a", "install", "done"}})
+	if len(got) != 0 {
+		t.Errorf("uninstalled app must not be listed, got %v", got)
+	}
+	// A FAILED uninstall means the app is still there; hiding it would strand
+	// the user with no way to retry.
+	got = decide([]row{{"a", "uninstall", "failed"}, {"a", "install", "done"}})
+	if len(got) != 1 || got[0] != "a" {
+		t.Errorf("failed uninstall should keep the app listed, got %v", got)
+	}
+	// Reinstalled after an uninstall: newest wins again.
+	got = decide([]row{{"a", "install", "done"}, {"a", "uninstall", "done"}})
+	if len(got) != 1 || got[0] != "a" {
+		t.Errorf("reinstall should win over the older uninstall, got %v", got)
+	}
+}

@@ -109,6 +109,9 @@ func MeSkills(c *gin.Context) {
 	// 1. Walk the caller's apps (tenant first, then operator-shared) and
 	//    invert skill_imports[] → used_by. Tenant shadowing matches the
 	//    rest of /me/*: a tenant app wins over a same-named shared one.
+	// Make the per-pod cache match what the user has installed, so this answers
+	// the same on either replica.
+	ensureTenantAppsMaterialised(userID)
 	usages := map[string]*skillUsage{} // repo → usage
 	seenApps := map[string]bool{}
 	for _, root := range appListRoots(userID) {

@@ -26,6 +26,7 @@ func toolListApps(userID string) map[string]any {
 		Tenant  bool   `json:"tenant"`
 		HasMfst bool   `json:"has_manifest"`
 	}
+	ensureTenantAppsMaterialised(userID)
 	out := []appCard{}
 	seen := map[string]bool{}
 	walk := func(root string, isTenant bool) {

@@ -358,6 +358,9 @@ func MeExperiments(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
+	// Make the per-pod cache match what the user has installed, so this answers
+	// the same on either replica.
+	ensureTenantAppsMaterialised(userID)
 	all := []gin.H{}
 	seen := map[string]bool{}
 	for _, root := range appListRoots(userID) {

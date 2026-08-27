@@ -648,3 +648,59 @@ func appListRoots(userSub string) []string {
 		filepath.Join(tenantCacheRoot(), userSub),
 	}
 }
+
+// installedAppNames returns the apps the DATABASE says this user has, newest
+// intent wins, with a non-failed uninstall suppressing an older install.
+//
+// Same decision as cardsFromIntents, which is why /me/apps reports an app on
+// every replica while the filesystem scans do not: the intent ledger is shared,
+// the materialised cache is per-pod local.
+func installedAppNames(userSub string) []string {
+	if common.DB == nil || userSub == "" {
+		return nil
+	}
+	var rows []models.MeAppIntent
+	if err := common.DB.
+		Where("user_sub = ? AND action IN ?", userSub, []string{"install", "uninstall"}).
+		Order("created_at desc").
+		Limit(400).
+		Find(&rows).Error; err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for i := range rows {
+		var payload map[string]any
+		if rows[i].Payload != "" {
+			_ = json.Unmarshal([]byte(rows[i].Payload), &payload)
+		}
+		name := intentAppName(payload)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		if rows[i].Action == "uninstall" && rows[i].Status != "failed" {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// ensureTenantAppsMaterialised makes the per-pod cache reflect what the user
+// actually has installed, before a list endpoint walks it.
+//
+// Without this, adding the cache as a read root only half-worked: the cache is
+// populated lazily by resolveAppDir, so a freshly-rolled pod has an empty one
+// and the same request answers differently depending on which replica serves
+// it. Measured after the read-root change alone: /me/skills returned 1 from the
+// pod that had materialised the app and 0 from its sibling, on identical input.
+//
+// Best-effort and idempotent. materialiseTenantApp is a no-op within its 5
+// minute TTL and single-flights per (sub, app), so the common case is a stat
+// per installed app, not a fetch.
+func ensureTenantAppsMaterialised(userSub string) {
+	for _, name := range installedAppNames(userSub) {
+		_ = materialiseTenantApp(userSub, name)
+	}
+}

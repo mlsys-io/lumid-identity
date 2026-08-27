@@ -61,6 +61,14 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 		}
 		return map[string]any{"app": app, "runs": out, "count": len(out)}, true
 	},
+	// The caller's own scorecard — the same rows app_report gives the chat, so a
+	// results page and the agent cannot quote different numbers at the same
+	// person. Qualifies on every count the allowlist asks for: no argument but
+	// the app, reads only what the judge already recorded, and appRunsFor scopes
+	// it to user_sub so a surface cannot widen it.
+	"report": func(userID, app string) (map[string]any, bool) {
+		return toolAppReport(userID, app)
+	},
 }
 
 // MeAppData — GET /me/apps/:app/data?tool=<name>

@@ -735,37 +735,77 @@ var llmProviders = []llmProvider{
 		maxOutputTokens:     16384,  // 262K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
+	// The two qwen entries below moved from ON-PREM to OPENROUTER, and the id
+	// form moved with them. lumid-llm resolves a bare id only via
+	// LUMID_LLM_BACKENDS (what luyao1 served); everything in
+	// LUMID_LLM_OPENROUTER_MODEL_MAP is "qwen/"-prefixed. So the bare ids these
+	// entries used to carry now 503 with "unknown model ... unrecognised ids are
+	// never forwarded to OpenRouter" — measured in-cluster 2026-08-27 against
+	// lumid-llm:8088, where `qwen3.6-35b-a3b` fails and `qwen/qwen3.6-35b-a3b`
+	// returns 200. The MODELS are alive; only the naming moved.
+	//
+	// Two consequences the old comments got wrong, and they are the reason this
+	// block is annotated rather than just re-prefixed:
+	//   - they are no longer "free local GPU" — every call is BILLED through
+	//     OpenRouter, so dailyBudgetTokens must be finite. -1 (no cap) on a
+	//     minRole:"user" billed model is an uncapped spend path for every user,
+	//     and this field is the only per-user backstop (effectiveDailyBudget).
+	//   - supportsVision was true because of the mmproj build on luyao1. That
+	//     box no longer serves these. Vision on the OpenRouter route is
+	//     UNVERIFIED, so claim false: a false negative only hides the image
+	//     affordance, a false positive breaks the turn.
 	{
-		// qwen3.6-35b-a3b — MoE (35B/A3B), vision-capable, 262K context.
-		// Served by lumid-llm (luyao1 GPU1, llama.cpp). Strong general model.
+		// qwen3.6-35b-a3b — MoE (35B/A3B), 262K context. Strong general model.
 		id:                  "lumid-qwen3-35b",
-		displayName:         "Qwen3.6-35B-A3B (Lumid GPU)",
+		displayName:         "Qwen3.6-35B-A3B",
 		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "qwen3.6-35b-a3b",
+		upstreamModel:       "qwen/qwen3.6-35b-a3b",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,   // mmproj vision on luyao1 GPU1
-		minRole:             "user", // everyone — free local GPU
-		maxOutputTokens:     16384,  // 262K ctx
-		dailyBudgetTokens:   -1,
+		supportsVision:      false,   // unverified on the OpenRouter route
+		minRole:             "user",  // everyone — but now billed, hence the cap
+		maxOutputTokens:     16384,   // 262K ctx
+		dailyBudgetTokens:   200_000, // finite: billed upstream
 	},
 	{
-		// qwen3.6-27b — dense 27B, vision-capable, 32K context.
-		// Served by lumid-llm (luyao1 GPU0, llama.cpp).
+		// qwen3.6-27b — dense 27B, 32K context.
 		id:                  "lumid-qwen3-27b",
-		displayName:         "Qwen3.6-27B (Lumid GPU)",
+		displayName:         "Qwen3.6-27B",
 		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "qwen3.6-27b",
+		upstreamModel:       "qwen/qwen3.6-27b",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,   // both luyao1 models are vision-capable
-		minRole:             "user", // everyone — free local GPU
-		maxOutputTokens:     8192,   // 32K ctx — smaller output budget
-		dailyBudgetTokens:   -1,
+		supportsVision:      false,   // unverified on the OpenRouter route
+		minRole:             "user",  // everyone — but now billed, hence the cap
+		maxOutputTokens:     8192,    // 32K ctx — smaller output budget
+		dailyBudgetTokens:   200_000, // finite: billed upstream
+	},
+	{
+		// qwen3.8-27b — the INDEPENDENT judge seat for app scoring panels.
+		//
+		// Exists as its own entry rather than reusing a chat chip because the
+		// judge must not be the same model as the analyst: for role `user`,
+		// claude-proxy's aliasClaudeForRole rewrites claude-sonnet/haiku to
+		// deepseek-v4-flash, which is also this table's default provider — so a
+		// deepseek judge scoring a deepseek answer is self-assessment, and the
+		// score is the product here. Paired with deepseek-v4-flash as seat 1 by
+		// mbb-consultant's judge_panel (median of 2, panel_min_agreement 2).
+		id:                  "lumid-qwen38-27b",
+		displayName:         "Qwen3.8-27B",
+		endpoint:            lumidLLMBase() + "/v1/messages",
+		upstreamModel:       "qwen/qwen3.8-27b",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+		supportsVision:      false,
+		minRole:             "user",  // scoring runs on behalf of ordinary users
+		maxOutputTokens:     8192,    // matches skills/llm.py's gateway floor
+		dailyBudgetTokens:   200_000, // finite: billed upstream
 	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a
@@ -838,16 +878,33 @@ var llmProviders = []llmProvider{
 		dailyBudgetTokens: -1,
 	},
 	{
-		// Claude Code HARNESS on our own GPU — the sandbox routes the CLI at
-		// the lumid-llm gateway ("lumid-llm/<model>" prefix) instead of the
-		// pool. Full agentic loop (Bash/Edit/Todo in the user's workspace),
-		// zero Anthropic quota, free at the margin. qwen3.6-35b is the only
-		// in-house model with workable multi-turn tool calling; gemma-class
-		// models struggle in agentic loops, so no gemma entry.
+		// Claude Code HARNESS on our own GPU — the "lumid-llm/<model>" prefix
+		// tells claude-sandbox to run the full agentic loop (Bash/Edit/Todo in
+		// the user's workspace) against an in-house model instead of the pool.
+		// Zero Anthropic quota, free at the margin.
+		//
+		// The id says qwen35 and the model is deepseek-v4-flash. The id is kept
+		// because it is PERSISTED (personas, saved chats) — same reason
+		// kvrun-gemma4 outlived Gemma-4 — and the upstream is deepseek because
+		// qwen could not work here, twice over:
+		//
+		//   1. claude-sandbox strips the prefix and sends the BARE model to
+		//      claude-proxy (selectBackend: "BOTH go through claude-proxy"),
+		//      where denyExternalModelForRole permits exactly one non-Anthropic
+		//      model — whatever SELF_HOSTED_MODELS names, which is
+		//      deepseek-v4-flash. A qwen id was refused for EVERY role,
+		//      admins included, by deliberate policy: an external bill must not
+		//      be runnable on a model we do not host.
+		//   2. `qwen3.6-35b-a3b` stopped resolving at lumid-llm anyway when
+		//      those models moved to OpenRouter and gained a `qwen/` prefix.
+		//
+		// So this chip was offered to every ordinary user (minRole "user") and
+		// could never answer. deepseek-v4-flash is the in-house model this lane
+		// was reaching for, and it is the one claude-proxy allows.
 		id:                "claude-code-qwen35",
-		displayName:       "Qwen3.6-35B (Code · Lumid GPU)",
+		displayName:       "DeepSeek-V4-Flash (Code · Lumid GPU)",
 		endpoint:          "",
-		upstreamModel:     "lumid-llm/qwen3.6-35b-a3b",
+		upstreamModel:     "lumid-llm/deepseek-v4-flash",
 		authHeader:        "",
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
@@ -2432,8 +2489,22 @@ func buildToolDefs() []map[string]any {
 					"answer":   map[string]any{"type": "string", "description": "the answer being scored, verbatim"},
 					"question": map[string]any{"type": "string", "description": "the question it answered"},
 					"case_id":  map[string]any{"type": "string", "description": "the labelled case; omit for an open answer (score will be reported as ungrounded)"},
+					"subject":  map[string]any{"type": "string", "enum": []string{"ai", "human"}, "description": "who WROTE the answer being scored: \"human\" when the user is the candidate (the app is interviewing them), \"ai\" when the app answered. Defaults to \"ai\". Get this right — the scorecard averages the two separately, and mislabelling mixes the user's score into the model's."},
 				},
 				"required": []string{"app", "answer"},
+			},
+		},
+		{
+			// Imperative for the same reason app_answer and app_judge are. The
+			// app's own page tells the user to type "scorecard"; before this tool
+			// existed the agent met that word with a table assembled from the
+			// transcript, which reads exactly like a benchmark and is not one.
+			"name":        "app_report",
+			"description": "REQUIRED whenever the user asks for their scorecard, their running total, how they are doing so far, or a summary of their scores while an app is in context. Returns THIS user's own scored turns and their averages, read back from what the judge actually recorded. Do NOT assemble a scorecard from the conversation and do NOT average the numbers yourself — casebook and open scores are reported separately on purpose, and combining them produces a number that means nothing.",
+			"input_schema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"app": map[string]any{"type": "string"}},
+				"required":   []string{"app"},
 			},
 		},
 		{
@@ -3750,9 +3821,14 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		answer, _ := args["answer"].(string)
 		question, _ := args["question"].(string)
 		caseID, _ := args["case_id"].(string)
+		subject, _ := args["subject"].(string)
 		// The mode decides whether MISSED keypoints come back: the interviewer
 		// owns the case and may see them; the candidate must not.
-		return toolAppJudge(c.Request.Context(), userID, role, app, caseID, question, answer, c.GetString(ctxModeKey))
+		return toolAppJudge(c.Request.Context(), userID, role, app, caseID, question, answer, c.GetString(ctxModeKey), subject)
+
+	case "app_report":
+		app, _ := args["app"].(string)
+		return toolAppReport(userID, app)
 
 	case "app_config_get":
 		app, _ := args["app"].(string)

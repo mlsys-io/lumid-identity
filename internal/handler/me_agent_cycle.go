@@ -88,6 +88,39 @@ func chatCycleMetrics(toolCalls []toolCallResult) map[string]any {
 		if v, ok := res["score"].(float64); ok {
 			m["score"] = v
 		}
+		// The judge already resolves which QUESTION it scored (total_scope — the
+		// matched question id, or "case") and the per-axis breakdown. Both were
+		// computed and thrown away, which is why the Results surface could only
+		// offer a blank per-axis column and said so in its own prose. A scorecard
+		// needs a row label and the axes; these are them.
+		if v, ok := res["total_scope"].(string); ok && v != "" {
+			m["q_id"] = v
+		}
+		if v, ok := res["axes"]; ok && v != nil {
+			m["axes"] = v
+		}
+		// Panel shape travels with the score or it cannot be read honestly later:
+		// a number from one surviving seat is a different object from one two
+		// seats agreed on, and only the turn that produced it knows which.
+		// Accept both shapes: the tool sets an int in-process, but anything that
+		// round-trips this map through JSON hands back a float64, and a type
+		// assertion that only knows one of them drops the field silently.
+		switch v := res["panel_n"].(type) {
+		case int:
+			m["panel_n"] = v
+		case float64:
+			m["panel_n"] = int(v)
+		}
+		if v, ok := res["independent"].(bool); ok {
+			m["independent"] = v
+		}
+		// Who ANSWERED. Interviewer mode scores the human; benchmark mode scores
+		// the analyst. Averaging the two together is exactly the corruption
+		// commands/_session.py::summary's single_subject logic exists to prevent,
+		// and without this field the chat path has no way to tell them apart.
+		if v, ok := res["subject"].(string); ok && v != "" {
+			m["subject"] = v
+		}
 	}
 	if len(tools) > 0 {
 		m["tools"] = strings.Join(tools, ",")

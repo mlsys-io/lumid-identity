@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // toolAppJudge SCORES an answer against a case's real ground truth.
@@ -23,9 +25,15 @@ import (
 // is returned only when the person reading is the INTERVIEWER (they own the
 // case); in coach mode the reader is the candidate, for whom the missed
 // keypoints ARE the answer.
-func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer, mode string) (map[string]any, bool) {
+func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer, mode, subject string) (map[string]any, bool) {
 	if app == "" || answer == "" {
 		return map[string]any{"error": "app and answer are required"}, false
+	}
+	// Anything that is not an explicit "human" is the app's own answer. Coerced
+	// rather than trusted, so a malformed value cannot invent a third category
+	// the scorecard does not know how to average. Mirrors commands/judge.py.
+	if subject != "human" {
+		subject = "ai"
 	}
 	appDir := resolveAppDir(userID, app)
 	if appDir == "" {
@@ -36,7 +44,7 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 	// this whole distinction exists to prevent.
 	if caseID == "" {
 		return map[string]any{
-			"app": app, "grounded": false, "mode": "open",
+			"app": app, "grounded": false, "mode": "open", "subject": subject,
 			"caveat": "No case selected, so there is no ground truth to score against. " +
 				"Pick a labelled case for a backed score.",
 		}, true
@@ -61,78 +69,195 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		"Use only axes the question actually exercises; omit the others. " +
 		"`missed` holds SHORT LABELS of uncovered keypoints — never their content."
 
-	// One retry, with the format restated bluntly. Measured: the same model
-	// returned clean counts on one call and unparsable prose on the next, so a
-	// single attempt made scoring randomly unavailable. Bounded at two — a judge
-	// that cannot produce a number twice should refuse, not be argued with.
-	var parsed map[string]any
-	var text string
-	var err error
-	for attempt := 0; attempt < 2 && parsed == nil; attempt++ {
+	// Score every seat on the panel declared by the app.
+	//
+	// A seat that cannot produce a usable number is DROPPED, never counted as a
+	// zero. That rule is the whole reason this survives what it used to die of:
+	// the pinned judge model 503'd on every call for eleven days, and because
+	// one dead seat was the entire panel, every scored turn returned an error.
+	// A zero would have been worse still — it would have halved a correct
+	// answer's score silently. Same discipline as commands/judge.py::_score_one.
+	seats, minAgree := judgePanelFor(appDir)
+	out := map[string]any{
+		"app": app, "case_id": caseID, "grounded": true,
+		"mode": "casebook", "subject": subject,
+	}
+
+	// `total` is a property of the RUBRIC, not of any seat, so it is fixed once
+	// here. That is what makes two seats — and two runs — comparable at all.
+	fixedTotal := 0
+	if len(keypoints) > 0 {
+		fixedTotal = len(keypoints)
+		out["total_scope"] = scope
+	}
+
+	type seatScore struct {
+		model   string
+		parsed  map[string]any
+		covered int
+		total   int
+	}
+	var scored []seatScore
+	var dropped []string
+	for _, seat := range seats {
+		id := resolveJudgeSeat(seat)
+		if id == "" {
+			// Do NOT fall through to the caller's role default here: that is how
+			// a panel silently collapses into the analyst model grading its own
+			// answer while still reporting a full panel.
+			dropped = append(dropped, seat+" (no such model)")
+			continue
+		}
+		parsed := judgeSeatScore(c, role, id, sys, user)
+		if parsed == nil {
+			dropped = append(dropped, seat+" (no parsable score)")
+			continue
+		}
+		// Coerce before use. Told to return an integer count, the model returned
+		// `covered` as a LIST of the keypoints it matched — accepted by the
+		// parser (the key was present) and then unusable, so the turn reported a
+		// score of nothing. Count a list, take a number, refuse anything else.
+		covered, total, okCounts := judgeTotals(parsed)
+		if fixedTotal > 0 {
+			total = fixedTotal
+			okCounts = okCov(parsed)
+			if covered > total {
+				covered = total
+			}
+		}
+		if !okCounts {
+			dropped = append(dropped, seat+" (no usable covered/total)")
+			continue
+		}
+		scored = append(scored, seatScore{model: id, parsed: parsed, covered: covered, total: total})
+	}
+
+	if len(scored) == 0 {
+		// Refuse rather than pass raw judge text through: unparsed judge output
+		// reaching the user is exactly how the answer key escapes.
+		return map[string]any{
+			"app": app, "case_id": caseID, "grounded": true, "mode": "casebook",
+			"error":        "judge returned no parsable score",
+			"panel_tried":  seats,
+			"panel_failed": dropped,
+		}, false
+	}
+
+	covereds := make([]int, len(scored))
+	for i, s := range scored {
+		covereds[i] = s.covered
+	}
+	covered := medianInt(covereds)
+	total := scored[0].total
+
+	// The representative seat is the live seat nearest the median — its axes and
+	// missed labels are the ones reported, so those stay internally consistent
+	// with the headline count instead of being spliced from different seats.
+	rep := scored[0]
+	for _, s := range scored {
+		if abs(s.covered-covered) < abs(rep.covered-covered) {
+			rep = s
+		}
+	}
+
+	out["covered"] = covered
+	out["total"] = total
+	out["score"] = float64(covered) / float64(total)
+	if v, present := rep.parsed["axes"]; present {
+		out["axes"] = v
+	}
+
+	// Report the panel's shape, not just its verdict. A score from one surviving
+	// seat is a different object from a score two seats agreed on, and the app's
+	// existing honesty contract (grounded / caveat / total_scope) says the
+	// difference gets a label rather than silence.
+	models := make([]string, len(scored))
+	for i, s := range scored {
+		models[i] = s.model
+	}
+	out["judge_models"] = models
+	out["panel_n"] = len(scored)
+	if len(dropped) > 0 {
+		out["panel_failed"] = dropped
+	}
+	if total > 0 && len(covereds) > 1 {
+		lo, hi := covereds[0], covereds[0]
+		for _, v := range covereds {
+			if v < lo {
+				lo = v
+			}
+			if v > hi {
+				hi = v
+			}
+		}
+		out["spread_pp"] = float64(hi-lo) / float64(total) * 100
+	}
+	if len(scored) < minAgree {
+		out["low_confidence"] = true
+		out["caveat"] = "scored by " + strconv.Itoa(len(scored)) + " of " +
+			strconv.Itoa(minAgree) + " required panel seats — treat as indicative"
+	}
+	// Whether the score is independent of the model that wrote the answer. For
+	// role `user`, claude-proxy aliases claude-sonnet/haiku to deepseek-v4-flash,
+	// which is also the default analyst — so a deepseek-only panel is the model
+	// marking its own work, and the agent has to say so.
+	analyst := httpProviderFor(role).id
+	independent := false
+	for _, s := range scored {
+		if s.model != analyst {
+			independent = true
+		}
+	}
+	out["independent"] = independent
+
+	// The candidate must not be handed the answer key by another name.
+	if mode != modeCoach {
+		if v, present := rep.parsed["missed"]; present {
+			out["missed"] = v
+		}
+	}
+	return out, true
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// judgeSeatScore runs ONE panel seat, with one retry, and returns nil when it
+// cannot produce a parsable score.
+//
+// One retry, with the format restated bluntly. Measured: the same model
+// returned clean counts on one call and unparsable prose on the next, so a
+// single attempt made scoring randomly unavailable. Bounded at two — a judge
+// that cannot produce a number twice should refuse, not be argued with.
+//
+// Returning nil rather than an error is deliberate: at panel level a seat
+// failing is a degradation, not a turn-ending fault, and the caller decides
+// whether enough seats survived.
+func judgeSeatScore(c context.Context, role, modelID, sys, user string) map[string]any {
+	for attempt := 0; attempt < 2; attempt++ {
 		u := user
 		if attempt > 0 {
 			u = user + "\n\nYour previous reply could not be parsed. Output the JSON " +
 				"object ONLY — no prose, no code fence, no explanation. `covered` and " +
 				"`total` must be plain integers."
 		}
-		// Pinned to a stronger scorer than the chat default. resolveProvider
-		// still re-checks the caller's role, so an over-tier pin degrades to the
-		// role default rather than escalating.
-		text, err = answerWithAppVoiceModel(c, role, judgeModelID, sys, u)
+		// resolveProvider re-checks the caller's role, so an over-tier seat
+		// degrades to the role default rather than escalating.
+		text, err := answerWithAppVoiceModel(c, role, modelID, sys, u)
 		if err != nil {
-			return map[string]any{"error": "judge call failed: " + err.Error()}, false
+			return nil
 		}
-		parsed = parseJudgeJSON(text)
-		if parsed != nil {
-			if _, _, ok := judgeTotals(parsed); !ok {
-				parsed = nil // parsed, but not into usable counts — retry once
+		if parsed := parseJudgeJSON(text); parsed != nil {
+			if _, _, ok := judgeTotals(parsed); ok {
+				return parsed
 			}
 		}
 	}
-
-	out := map[string]any{"app": app, "case_id": caseID, "grounded": true, "mode": "casebook"}
-	if parsed == nil {
-		// Refuse rather than pass the raw model text through: unparsed judge
-		// output reaching the user is exactly how the answer key escapes.
-		return map[string]any{
-			"app": app, "case_id": caseID, "grounded": true, "mode": "casebook",
-			"error": "judge returned no parsable score",
-		}, false
-	}
-	// Coerce before use. Told to return an integer count, the model returned
-	// `covered` as a LIST of the keypoints it matched — accepted by the parser
-	// (the key was present) and then unusable, so the turn reported a score of
-	// nothing. Count a list, take a number, refuse anything else.
-	covered, total, okCounts := judgeTotals(parsed)
-	// Our count wins when we have one: it is derived from the rubric, so it is
-	// the same on every run, which is what makes two scores comparable at all.
-	if len(keypoints) > 0 {
-		total = len(keypoints)
-		out["total_scope"] = scope
-		okCounts = okCov(parsed)
-		if covered > total {
-			covered = total
-		}
-	}
-	if !okCounts {
-		return map[string]any{
-			"app": app, "case_id": caseID, "grounded": true, "mode": "casebook",
-			"error": "judge returned no usable covered/total count",
-		}, false
-	}
-	out["covered"] = covered
-	out["total"] = total
-	out["score"] = float64(covered) / float64(total)
-	if v, present := parsed["axes"]; present {
-		out["axes"] = v
-	}
-	// The candidate must not be handed the answer key by another name.
-	if mode != modeCoach {
-		if v, present := parsed["missed"]; present {
-			out["missed"] = v
-		}
-	}
-	return out, true
+	return nil
 }
 
 // judgeTotals extracts covered AND total, deriving total when the model omits
@@ -182,7 +307,84 @@ func judgeCount(v any) (int, bool) {
 // judgeModelID — the scorer. Kept separate from the chat model on purpose: the
 // user picks a model for CONVERSATION, and letting that choice decide how
 // answers are scored makes a benchmark that moves with a dropdown.
-const judgeModelID = "lumid-qwen3-35b"
+const judgeModelID = "lumid-qwen38-27b"
+
+// judgePanelFor reads the scoring panel out of the app's own spec, falling back
+// to the const above.
+//
+// Which model scores used to be a Go constant, which meant a dead judge could
+// only be fixed by cutting an identity release — and it stayed dead for eleven
+// days because nothing upstream of the model call fails when the model 503s.
+// Reading it from the bundle makes the next swap an `app_push`.
+//
+// Accepts either a provider id (`lumid-qwen38-27b`) or the upstream model name
+// (`qwen/qwen3.8-27b`), because the spec is written by app authors who think in
+// model names, not in this table's ids.
+func judgePanelFor(appDir string) (seats []string, minAgree int) {
+	minAgree = 1
+	specPath, ok := ResolveSpecPath(appDir)
+	if !ok {
+		return []string{judgeModelID}, minAgree
+	}
+	raw, err := os.ReadFile(specPath)
+	if err != nil {
+		return []string{judgeModelID}, minAgree
+	}
+	var doc struct {
+		Config struct {
+			JudgeModel        string   `yaml:"judge_model"`
+			JudgePanel        []string `yaml:"judge_panel"`
+			PanelMinAgreement int      `yaml:"panel_min_agreement"`
+		} `yaml:"config"`
+	}
+	if yaml.Unmarshal(raw, &doc) != nil {
+		return []string{judgeModelID}, minAgree
+	}
+	for _, s := range doc.Config.JudgePanel {
+		if s = strings.TrimSpace(s); s != "" {
+			seats = append(seats, s)
+		}
+	}
+	if len(seats) == 0 && strings.TrimSpace(doc.Config.JudgeModel) != "" {
+		seats = []string{strings.TrimSpace(doc.Config.JudgeModel)}
+	}
+	if len(seats) == 0 {
+		seats = []string{judgeModelID}
+	}
+	if doc.Config.PanelMinAgreement > 0 {
+		minAgree = doc.Config.PanelMinAgreement
+	}
+	return seats, minAgree
+}
+
+// resolveJudgeSeat maps a spec-declared seat to a provider id this table knows.
+// Returns "" when the seat names nothing servable, so the caller can drop it
+// rather than route it at the caller's role default — which is how a panel
+// silently collapses into the analyst grading itself.
+func resolveJudgeSeat(seat string) string {
+	if _, ok := providerByID(seat); ok {
+		return seat
+	}
+	for _, p := range llmProviders {
+		if p.upstreamModel == seat {
+			return p.id
+		}
+	}
+	return ""
+}
+
+// medianInt returns the median of a non-empty set of keypoint counts. Even
+// counts round the midpoint DOWN: between two seats that disagree, the app's
+// own discipline is to claim the smaller number.
+func medianInt(xs []int) int {
+	s := append([]int(nil), xs...)
+	sort.Ints(s)
+	n := len(s)
+	if n%2 == 1 {
+		return s[n/2]
+	}
+	return (s[n/2-1] + s[n/2]) / 2
+}
 
 // judgePromptFor loads the app's own judge prompt, falling back to a neutral
 // rubric instruction. Apps carry per-axis prompts (judge_score_framework.md,

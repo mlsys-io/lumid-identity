@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,34 +34,142 @@ import (
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 
+	"lumid_identity/internal/common"
 	"lumid_identity/models"
 )
 
 const openModeCaveat = "indicative only — no ground truth for this question"
 
-// skillCardsFor picks the app skill-card prompts that fit a question. Mirrors
-// the app's own router; falls back to whatever cards exist so an app with a
-// different naming scheme still gets its voice applied.
-func skillCardsFor(promptsDir, question string) []string {
+// skillCardNamesFor routes a question to skill cards.
+//
+// ADDITIVE, not first-match-wins. It used to be a switch, which meant a question
+// could only ever be one kind of question: "what other factors should they weigh
+// before setting this price?" matched the `risk` arm and stopped, so the pricing
+// cards never loaded. The Python router on the same prompt set
+// (commands/answer.py::pick_skills) has always been additive, and the two
+// disagreeing is not a style difference — it is the same app giving a different
+// answer depending on which process ran it.
+//
+// The last two branches restore cards that NO branch here ever named:
+// analyst_skill_revenue_brainstorm.md and analyst_skill_value_to_customer.md
+// shipped in the bundle, were allowlisted in knownSkillCards (so a correction
+// could name a card the router could never select), and were loaded by nothing.
+// The triggers are the ones documented in each card's own header.
+func skillCardNamesFor(question string) []string {
 	q := strings.ToLower(question)
 	want := []string{"communication"}
-	switch {
-	case strings.Contains(q, "npv"), strings.Contains(q, "payback"), strings.Contains(q, "irr"):
+	has := func(ws ...string) bool {
+		for _, w := range ws {
+			if strings.Contains(q, w) {
+				return true
+			}
+		}
+		return false
+	}
+	if has("npv", "discount", "payback", "irr") {
 		want = append(want, "npv", "profitability")
-	case strings.Contains(q, "how many"), strings.Contains(q, "market size"), strings.Contains(q, "estimate"):
+	}
+	if has("how many", "market size", "estimate the", "estimate") {
 		want = append(want, "market_sizing")
-	case strings.Contains(q, "option"), strings.Contains(q, "which of"):
+	}
+	if has("option", "alternative", "which of") {
 		want = append(want, "options")
-	case strings.Contains(q, "risk"), strings.Contains(q, "factors"):
+	}
+	if has("risk", "factors") {
 		want = append(want, "risk_mece", "stakeholder_eval")
-	default:
+	}
+	// GENERATING revenue (adjacent products, new streams), as distinct from
+	// profitability, which defends revenue that already exists. Written for
+	// Case_007 Q3, where the router returned only [communication].
+	if has("grow revenue", "increase revenue", "new revenue", "adjacent", "additional revenue") {
+		want = append(want, "revenue_brainstorm")
+	}
+	// The layer AFTER a price or a recommendation — reason from the customer's
+	// side rather than reaching for generic risk. Written for the Case_001 Q4 /
+	// Case_013 Q4 pattern that risk_mece was misrouting.
+	if has("based on this price", "what other factors", "other considerations",
+		"what else should", "willingness to pay") {
+		want = append(want, "value_to_customer")
+	}
+	if len(want) == 1 {
 		want = append(want, "issue_tree", "hypothesis_first")
 	}
-	var out []string
+	seen := map[string]bool{}
+	out := want[:0]
 	for _, w := range want {
-		p := filepath.Join(promptsDir, "analyst_skill_"+w+".md")
-		if b, err := os.ReadFile(p); err == nil && len(b) > 0 {
-			out = append(out, string(b))
+		if !seen[w] {
+			seen[w] = true
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func skillCardsFor(promptsDir, question string) []string {
+	return skillCardsWithCorrections("", "", promptsDir, question)
+}
+
+// skillCardsWithCorrections loads the routed cards and appends the corrections
+// this user has APPROVED for them.
+//
+// Without this the correction loop is closed everywhere except where it counts.
+// The picker applies an approved card edit to the tenant bundle on the xpio PVC
+// (me_intent_picker.py::_process_ingest_draft), but identity does not mount that
+// PVC — resolveAppDir falls through to materialiseTenantApp, a cache of the
+// PUBLISHED bundle. So the edit was written, and the chat that was supposed to
+// be shaped by it read a copy that never contained it. Review said "approved",
+// the answers never changed, and nothing anywhere reported a failure.
+//
+// Reading the approved drafts directly closes it in the reader: it applies the
+// moment the user approves rather than whenever a cache expires, it needs no
+// PVC, and it is per-user by construction because drafts are keyed on user_sub.
+// The picker's write stays — that is the durable copy that lands in the user's
+// own bundle.
+func skillCardsWithCorrections(userID, app, promptsDir, question string) []string {
+	corrections := approvedCardCorrections(userID, app)
+	var out []string
+	for _, name := range skillCardNamesFor(question) {
+		p := filepath.Join(promptsDir, "analyst_skill_"+name+".md")
+		b, err := os.ReadFile(p)
+		if err != nil || len(b) == 0 {
+			continue
+		}
+		card := string(b)
+		if add := corrections[name]; len(add) > 0 {
+			// Same heading and bullet shape the picker writes, so a card the
+			// picker has already edited and one corrected only here read
+			// identically to the model.
+			card = strings.TrimRight(card, "\n") + "\n\n## Learned corrections\n"
+			for _, a := range add {
+				card += "\n- (approved from Review) " + a + "\n"
+			}
+		}
+		out = append(out, card)
+	}
+	return out
+}
+
+// approvedCardCorrections maps skill-card name → this user's approved correction
+// bodies for it. Empty for an anonymous/unknown caller, which is what keeps the
+// plain skillCardsFor path (and its test) free of DB access.
+func approvedCardCorrections(userID, app string) map[string][]string {
+	if userID == "" || app == "" || common.DB == nil {
+		return nil
+	}
+	rows, err := draftStoreList(userID, app, "approved")
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	out := map[string][]string{}
+	for _, d := range rows {
+		// skillFromDraftBody re-checks knownSkillCards, so a draft body cannot
+		// name a card outside the allowlist however it was written.
+		card := skillFromDraftBody(d.Body)
+		if card == "" {
+			continue
+		}
+		if body := strings.TrimSpace(d.Body); body != "" {
+			out[card] = append(out[card], body)
 		}
 	}
 	return out
@@ -281,7 +390,7 @@ func toolAppAnswer(c context.Context, userID, role, app, question, caseID string
 	}
 
 	parts := []string{string(sys)}
-	parts = append(parts, skillCardsFor(promptsDir, question)...)
+	parts = append(parts, skillCardsWithCorrections(userID, app, promptsDir, question)...)
 	system := strings.Join(parts, "\n\n---\n\n")
 
 	user := question
@@ -356,7 +465,12 @@ func answerWithAppVoiceModel(ctx context.Context, role, modelID, system, user st
 		// the whole budget before the JSON appeared — which surfaced as
 		// "judge returned no parsable score" on some runs and not others, with
 		// no other difference between them.
-		"max_tokens": 6000,
+		//
+		// 8192 matches the floor the Python side already applies to the same
+		// gateway (skills/llm.py's LUMID_GATEWAY_MIN_TOKENS): every model behind
+		// it is a reasoning model, so the two paths should not disagree about
+		// how much room a thinking preamble needs.
+		"max_tokens": 8192,
 		"system":     system,
 		"messages": []map[string]any{
 			{"role": "user", "content": user},
@@ -379,7 +493,21 @@ func answerWithAppVoiceModel(ctx context.Context, role, modelID, system, user st
 			}
 		}
 	}
-	return strings.TrimSpace(sb.String()), nil
+	out := strings.TrimSpace(sb.String())
+	if out == "" {
+		// A reasoning model that spends its whole budget on `thinking` returns
+		// content blocks with no text block in them. Returning ("", nil) here
+		// made that indistinguishable from success: toolAppAnswer reported
+		// answer:"" with grounded:true, and toolAppJudge burned its retry and
+		// blamed the model for "no parsable score". Both looked like app bugs
+		// and neither named the cause.
+		//
+		// The Python client on the same gateway already raises here
+		// (skills/llm.py: "gateway returned empty text (thinking-only or
+		// truncated)"); this is Go catching up to a guard that already existed.
+		return "", errors.New("model returned no text (thinking-only or truncated)")
+	}
+	return out, nil
 }
 
 // toolAppFeedback records a correction against an app and STAGES it for review.
@@ -449,7 +577,14 @@ func toolAppFeedback(userID, app, note string, rating int, fc feedbackContext) (
 	out := map[string]any{
 		"ok": true, "app": app, "draft_id": d.ID, "agent": agent,
 		"state": "pending",
-		"next":  "captured in this app's Review queue, where it can be read in full or dismissed. Ingestion into the analyst's memory is not wired yet — say so if the user asks what happens next, rather than implying it already shapes answers",
+		// The two rungs of the ladder have DIFFERENT fates, and saying so is the
+		// whole point: a memory is recorded but nothing recalls it yet, while an
+		// approved skill-card edit really does shape later answers. This string
+		// used to deny both, contradicting what dbDraftApprove tells the user
+		// minutes later in the same session.
+		"next": "captured in this app's Review queue, where it can be read in full or dismissed. " +
+			"Approving it records the correction; the analyst does not yet RECALL memories in later " +
+			"answers, so do not tell the user this one will change what it says",
 	}
 
 	// Second rung: a card-shaped correction also proposes a PROMPT edit. Only
@@ -468,8 +603,9 @@ func toolAppFeedback(userID, app, note string, rating int, fc feedbackContext) (
 		if err := draftStoreStage(sd); err == nil {
 			out["skill_draft_id"] = sd.ID
 			out["next"] = "TWO drafts are in Review: a memory the analyst should recall, and an edit to the " +
-				fc.Skill + " skill card that shaped the answer. Both are readable and dismissable; neither is applied, " +
-				"and the ingest step that would apply them is not built yet."
+				fc.Skill + " skill card that shaped the answer. Approving the CARD EDIT applies it for real — " +
+				"every later answer that uses that card carries the correction. The memory is recorded but not " +
+				"yet recalled. Neither is applied until the user approves it in Review."
 		}
 	}
 	return out, true

@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -111,6 +112,13 @@ const lqtStrategyPATRenewBefore = 20 * time.Minute
 // stored as "<expiry_epoch>:<token>" so the expiry travels with it and no
 // introspect round-trip is needed on the hot path.
 func lqtStrategyPATCached(userSub string) string {
+	// Cache-miss REASON logging. The cache row is written on every mint
+	// (verified: one row per user, updated_at seconds old) yet the read never
+	// hits — measured 2026-08-27, 10 of 10 fetches returned distinct tokens,
+	// so this misses 100% of the time and every cycle mints a live credential.
+	// Which of the four gates below fails was not deducible from the outside,
+	// hence the reason string: silence is what made this cost hours.
+	miss := ""
 	var row models.AppSecret
 	if err := common.DB.Where("user_sub = ? AND app_slug = ? AND `key` = ?",
 		userSub, lqtStrategyApp, lqtStrategyPATCacheKey).First(&row).Error; err == nil {
@@ -120,10 +128,21 @@ func lqtStrategyPATCached(userSub string) string {
 					if time.Until(time.Unix(unix, 0)) > lqtStrategyPATRenewBefore {
 						return tok
 					}
+					miss = fmt.Sprintf("expires too soon (in %s, need >%s)",
+						time.Until(time.Unix(unix, 0)).Round(time.Second), lqtStrategyPATRenewBefore)
+				} else {
+					miss = "expiry not parseable: " + exp
 				}
+			} else {
+				miss = "cached value has no <expiry>:<token> shape"
 			}
+		} else {
+			miss = "decrypt failed: " + err.Error()
 		}
+	} else {
+		miss = "no cache row: " + err.Error()
 	}
+	log.Printf("[lqt-strategy-pat] cache MISS for %s — %s (minting a new PAT)", userSub, miss)
 	tok := mintLQTStrategyPAT(userSub)
 	if tok == "" {
 		return ""

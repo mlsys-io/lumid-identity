@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 )
@@ -97,18 +98,50 @@ func toolAppJudge(c context.Context, userID, role, app, caseID, question, answer
 		covered int
 		total   int
 	}
-	var scored []seatScore
-	var dropped []string
-	for _, seat := range seats {
+	// Seats run CONCURRENTLY. They are independent calls, so running them in
+	// sequence made the panel cost the SUM of its members on a turn the user is
+	// watching -- and it is the sum that brushes the per-call timeout when the
+	// fleet is contended, which is how a healthy seat gets dropped and a 2-seat
+	// panel silently becomes a 1-seat one. Measured 2026-08-27: the two seats
+	// took 13.7s and 285.4s on the same prompt, so sequential wall-time was
+	// ~299s against a 300s budget. Concurrent, the panel costs its SLOWEST
+	// member instead of all of them.
+	type seatOut struct {
+		parsed map[string]any
+		id     string
+		seat   string
+	}
+	outs := make([]seatOut, len(seats))
+	var wg sync.WaitGroup
+	for i, seat := range seats {
 		id := resolveJudgeSeat(seat)
+		outs[i] = seatOut{seat: seat, id: id}
 		if id == "" {
 			// Do NOT fall through to the caller's role default here: that is how
 			// a panel silently collapses into the analyst model grading its own
 			// answer while still reporting a full panel.
+			continue
+		}
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			outs[i].parsed = judgeSeatScore(c, role, id, sys, user)
+		}(i, id)
+	}
+	wg.Wait()
+
+	var scored []seatScore
+	var dropped []string
+	// Collected in DECLARED order, not completion order, so judge_models and the
+	// median are reproducible across runs of the same panel.
+	for _, o := range outs {
+		seat := o.seat
+		id := o.id
+		if id == "" {
 			dropped = append(dropped, seat+" (no such model)")
 			continue
 		}
-		parsed := judgeSeatScore(c, role, id, sys, user)
+		parsed := o.parsed
 		if parsed == nil {
 			dropped = append(dropped, seat+" (no parsable score)")
 			continue

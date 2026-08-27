@@ -160,6 +160,18 @@ func approvedCardCorrections(userID, app string) map[string][]string {
 	if err != nil || len(rows) == 0 {
 		return nil
 	}
+	return cardCorrectionsFromDrafts(rows)
+}
+
+// cardCorrectionsFromDrafts is the pure half of approvedCardCorrections: given
+// approved draft rows, which skill card does each correct, and with what text.
+//
+// Split out so the mapping that actually matters — marker parsing, the
+// allowlist re-check, and skipping bodies that name no card — is testable
+// without a database. The DB half above is a one-line query; this is where the
+// decisions are, and it was previously reachable only through draftStoreList,
+// so the only test of it skipped whenever TEST_MYSQL_DSN was unset.
+func cardCorrectionsFromDrafts(rows []models.MeDraft) map[string][]string {
 	out := map[string][]string{}
 	for _, d := range rows {
 		// skillFromDraftBody re-checks knownSkillCards, so a draft body cannot
@@ -171,6 +183,9 @@ func approvedCardCorrections(userID, app string) map[string][]string {
 		if body := strings.TrimSpace(d.Body); body != "" {
 			out[card] = append(out[card], body)
 		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

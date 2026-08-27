@@ -299,10 +299,15 @@ func toolPatchLoop(userID, app, loop string, patch map[string]any) map[string]an
 	}
 }
 
-// dbDraftAction handles the DB-backed drafts app_feedback stages. Dismiss is
-// real. Approval deliberately refuses rather than flipping a state nothing
-// consumes: a button that reports success and changes nothing is worse than one
-// that says it is not wired yet, because the user stops watching for the effect.
+// dbDraftAction handles the DB-backed drafts app_feedback stages. Both actions
+// are real now: dismiss rejects, and "send" approves via dbDraftApprove.
+//
+// This comment used to say approval deliberately REFUSED rather than flipping a
+// state nothing consumes — correct when written, and the reasoning still holds
+// (a button that reports success and changes nothing is worse than one that
+// admits it is not wired). It is no longer the behaviour: approval now flips the
+// state AND the reader consumes it, so the effect is observable on the next
+// answer.
 func dbDraftAction(userID, id, action string) map[string]any {
 	rows, err := draftStoreList(userID, "", "")
 	if err != nil {
@@ -382,6 +387,18 @@ func dbDraftApprove(userID string, d *models.MeDraft) map[string]any {
 	} else {
 		out["applies"] = "ingests the correction into " + d.Agent + ", so it can be recalled in later answers"
 	}
-	out["next"] = "queued for the scheduler; it lands within a minute or two, not instantly"
+	if skill != "" {
+		// The skill rung is live on approval, not on the scheduler's clock:
+		// skillCardsWithCorrections reads approved drafts directly, so the very
+		// next answer using this card already carries the correction. Saying
+		// "within a minute or two" here taught the user to wait for something
+		// that had already happened — and it is the same class of wrong string
+		// this app had three of, all telling users their corrections did not
+		// apply when they did.
+		out["next"] = "already in effect — your next answer using this card carries it. " +
+			"The scheduler also writes it into your own copy of the bundle shortly."
+	} else {
+		out["next"] = "queued for the scheduler; it lands within a minute or two, not instantly"
+	}
 	return out
 }

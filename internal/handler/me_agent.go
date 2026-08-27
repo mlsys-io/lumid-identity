@@ -723,7 +723,7 @@ var llmProviders = []llmProvider{
 		// to the OpenRouter catch-all, so a stale value here silently bills
 		// OpenRouter and can return an empty completion instead of erroring.
 		id:                  "deepseek-v4-flash",
-		displayName:         "DeepSeek-V4-Flash (Lumid GPU)",
+		displayName:         "DeepSeek-V4-Flash (Chat · Lumid GPU)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
 		upstreamModel:       "deepseek-v4-flash",
 		authHeader:          "Authorization",
@@ -737,9 +737,19 @@ var llmProviders = []llmProvider{
 	},
 	{
 		// glm-5.3-flash — GLM-5.3-Flash (Zhipu, MIT), 321B total / 18B active MoE,
-		// 1M context. Served by lumid-llm, which routes it to our own s0 CPU
-		// backend (NUMA node1, 8 slots x 1M ctx) and overflows to OpenRouter only
-		// when that backend is at its roof.
+		// 1M context. Served through lumid-llm by OPENROUTER.
+		//
+		// It was briefly CPU-first and the label said "(Lumid CPU)". Both were
+		// reverted the same day: CPU PREFILL is ~92 tok/s, and Studio chat carries
+		// a ~19k-token tool catalog on every turn (~3.5 min before a first token),
+		// so chat appeared dead. Decode was never the issue — 13.0 tok/s, ahead of
+		// deepseek's 12.2. The s0 instance is still there as glm-5.3-flash-cpu, a
+		// direct-dial id for SHORT prompts, mirroring deepseek-v4-flash-cpu; it is
+		// deliberately not offered as a chip, because the failure it produces on a
+		// long prompt is a silent hang rather than an error.
+		//
+		// No hardware qualifier in the display name: it is OpenRouter-served, like
+		// the qwen entries below, which also carry none.
 		//
 		// dailyBudgetTokens is FINITE even though the primary backend is our own
 		// hardware, and that is deliberate: the ladder is CPU -> OpenRouter with
@@ -756,7 +766,7 @@ var llmProviders = []llmProvider{
 		//
 		// KEEP upstreamModel IN SYNC WITH THE GATEWAY — see the deepseek note above.
 		id:                  "glm-5.3-flash",
-		displayName:         "GLM-5.3-Flash (Lumid CPU)",
+		displayName:         "GLM-5.3-Flash",
 		endpoint:            lumidLLMBase() + "/v1/messages",
 		upstreamModel:       "glm-5.3-flash",
 		authHeader:          "Authorization",
@@ -882,34 +892,19 @@ var llmProviders = []llmProvider{
 		minRole:           "super_admin", // pool: fable = super_admin only
 		dailyBudgetTokens: -1,
 	},
-	// External models through the pool proxy's OpenAI-compat path (separate
-	// API keys — no Anthropic pool 5h/7d consumption, but metered per-user
-	// with real cost + recorded on /claude-sessions). The proxy itself gates
-	// these admin+ by the PAT's role; minRole mirrors that.
-	{
-		id:                "claude-code-kimi",
-		displayName:       "Kimi K3 (Code)",
-		endpoint:          "",
-		upstreamModel:     "kimi-k3", // Moonshot via pool proxy oaicompat
-		authHeader:        "",
-		authPrefix:        "",
-		keyFn:             claudeCodeKeyFn,
-		supportsVision:    false,
-		minRole:           "admin",
-		dailyBudgetTokens: -1,
-	},
-	{
-		id:                "claude-code-glm",
-		displayName:       "GLM-5.2 (Code)",
-		endpoint:          "",
-		upstreamModel:     "z-ai/glm-5.2", // OpenRouter via pool proxy oaicompat
-		authHeader:        "",
-		authPrefix:        "",
-		keyFn:             claudeCodeKeyFn,
-		supportsVision:    false,
-		minRole:           "admin",
-		dailyBudgetTokens: -1,
-	},
+	// REMOVED 2026-08-28: claude-code-kimi (kimi-k3) and claude-code-glm
+	// (z-ai/glm-5.2). Both were DEAD CHIPS — advertised in the picker, selectable
+	// by an admin, and refused on every call.
+	//
+	// The mechanism: they route through claude-proxy's oaicompat path, where
+	// denyExternalModelForRole refuses any non-Anthropic model that is not in
+	// SELF_HOSTED_MODELS. That list is "deepseek-v4-flash,glm-5.3-flash" — so
+	// kimi-k3 and z-ai/glm-5.2 were denied for ALL roles, admin included. The
+	// chips existed only to produce a 403.
+	//
+	// If either is wanted back, adding the chip is NOT enough: the id has to go
+	// into SELF_HOSTED_MODELS on claude-proxy first, which is a deliberate
+	// decision to carry an external bill, not a picker entry.
 	{
 		// Claude Code HARNESS on our own GPU — the "lumid-llm/<model>" prefix
 		// tells claude-sandbox to run the full agentic loop (Bash/Edit/Todo in

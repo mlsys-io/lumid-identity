@@ -360,7 +360,7 @@ func MeExperiments(c *gin.Context) {
 	}
 	all := []gin.H{}
 	seen := map[string]bool{}
-	for _, root := range []string{tenantAppsDir(userID), filepath.Join(operatorHome(), ".xp", "apps")} {
+	for _, root := range appListRoots(userID) {
 		entries, err := os.ReadDir(root)
 		if err != nil {
 			continue

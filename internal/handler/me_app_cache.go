@@ -623,3 +623,28 @@ func uniquePublicOwner(repos []any, app string) string {
 	}
 	return ""
 }
+
+// appListRoots returns every directory a READ-ONLY "walk all of this user's
+// apps" scan should consider, in resolveAppDir's precedence: the caller's
+// tenant install, the operator-shared bundles, then the materialised cache.
+//
+// The cache root is the one these scans were missing. resolveAppDir already
+// falls back to materialiseTenantApp for a SINGLE named app, so per-app reads
+// worked; the list endpoints walked only the first two directories and so
+// reported nothing for a cloud tenant whose apps live in the cache. That is why
+// the chat's list_apps answered "0 apps" and /me/skills returned an empty
+// inventory for an account whose app /me/apps reports ready.
+//
+// Read-only by construction: the cache is refreshed on a TTL by a RemoveAll +
+// directory swap, so nothing may be written here. Writers must keep using
+// resolveOwnedAppDir, which deliberately refuses the cache.
+//
+// Callers MUST dedupe by app name — an app can appear in more than one root,
+// and precedence is "first root wins".
+func appListRoots(userSub string) []string {
+	return []string{
+		tenantAppsDir(userSub),
+		filepath.Join(operatorHome(), ".xp", "apps"),
+		filepath.Join(tenantCacheRoot(), userSub),
+	}
+}

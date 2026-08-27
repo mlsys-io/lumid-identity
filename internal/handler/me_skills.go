@@ -111,7 +111,7 @@ func MeSkills(c *gin.Context) {
 	//    rest of /me/*: a tenant app wins over a same-named shared one.
 	usages := map[string]*skillUsage{} // repo → usage
 	seenApps := map[string]bool{}
-	for _, root := range []string{tenantAppsDir(userID), filepath.Join(operatorHome(), ".xp", "apps")} {
+	for _, root := range appListRoots(userID) {
 		entries, err := os.ReadDir(root)
 		if err != nil {
 			continue

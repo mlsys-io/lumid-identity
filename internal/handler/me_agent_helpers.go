@@ -27,15 +27,17 @@ func toolListApps(userID string) map[string]any {
 		HasMfst bool   `json:"has_manifest"`
 	}
 	out := []appCard{}
+	seen := map[string]bool{}
 	walk := func(root string, isTenant bool) {
 		entries, err := os.ReadDir(root)
 		if err != nil {
 			return
 		}
 		for _, e := range entries {
-			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || seen[e.Name()] {
 				continue
 			}
+			seen[e.Name()] = true
 			_, mfstOk := ResolveManifestPath(filepath.Join(root, e.Name()))
 			out = append(out, appCard{
 				Name:    e.Name(),
@@ -44,8 +46,16 @@ func toolListApps(userID string) map[string]any {
 			})
 		}
 	}
-	walk(tenantAppsDir(userID), true)
-	walk(filepath.Join(operatorHome(), ".xp", "apps"), false)
+	// Walk every root, cache included — this reported "0 apps" to the chat for a
+	// cloud tenant whose apps live in the materialised cache rather than on a
+	// disk identity mounts. The agent then told the user, in its own words, that
+	// they had no apps installed while /me/apps said ready.
+	//
+	// Dedupe by name: appListRoots can surface the same app from more than one
+	// root and the first root wins, matching resolveAppDir.
+	for i, root := range appListRoots(userID) {
+		walk(root, i != 1) // index 1 is the operator-shared root
+	}
 	return map[string]any{"apps": out, "count": len(out)}
 }
 

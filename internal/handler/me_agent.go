@@ -730,10 +730,10 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,    // multimodal; image blocks verified via lumid-llm
-		minRole:             "admin", // costed: billed per call upstream; users default to the free in-cluster models, // everyone
-		maxOutputTokens:     16384,   // 262K ctx, free local GPU — let answers/structured output run
-		dailyBudgetTokens:   -1,      // free local GPU; the 6000/min gateway rate-limit is the abuse guard
+		supportsVision:      true,   // multimodal; image blocks verified via lumid-llm
+		minRole:             "user", // in-house on our own GPUs; the default for everyone
+		maxOutputTokens:     16384,  // 262K ctx, free local GPU — let answers/structured output run
+		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
 	{
 		// glm-5.3-flash — GLM-5.3-Flash (Zhipu, MIT), 321B total / 18B active MoE,
@@ -811,7 +811,7 @@ var llmProviders = []llmProvider{
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
 		supportsVision:      false,
-		minRole:             "user",    // scoring runs on behalf of ordinary users
+		minRole:             "admin",   // qwen: metered upstream
 		maxOutputTokens:     8192,      // matches skills/llm.py's gateway floor
 		dailyBudgetTokens:   1_500_000, // see the GLM row: sized in TURNS, not round numbers
 	},
@@ -830,7 +830,7 @@ var llmProviders = []llmProvider{
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
 		supportsVision:    false,
-		minRole:           "admin", // costed: consumes the shared Claude pool quota, // pool allows user→sonnet; pool quota gates volume
+		minRole:           "admin", // consumes the shared Claude pool quota
 		dailyBudgetTokens: -1,
 	},
 	{
@@ -902,7 +902,7 @@ var llmProviders = []llmProvider{
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
 		supportsVision:    false,
-		minRole:           "admin", // costed: despite the name, upstreamModel is deepseek-v4-flash,
+		minRole:           "admin", // qwen lane
 		dailyBudgetTokens: -1,
 	},
 	{

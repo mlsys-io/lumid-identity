@@ -48,6 +48,36 @@ const (
 type lqtReadSpec struct {
 	path string
 	list bool
+	// needsID marks an endpoint whose path is completed by a caller-supplied
+	// strategy id: `path` is a fmt template with exactly one %s.
+	//
+	// This does NOT loosen the SSRF guard. The model still names an endpoint
+	// from the allowlist and never supplies a path; the id is separately
+	// validated by `safeLQTID` and is the ONLY caller-controlled text that
+	// reaches the URL. Without this, a chat grounded to a strategy could list
+	// every strategy but not read the one it was grounded to — which is the
+	// whole point of grounding it.
+	needsID bool
+}
+
+// safeLQTID accepts only what a strategy id can actually be: a uuid, or the
+// human ids the registry also carries (`researcher_meanrev_hold_v2`,
+// `bt-<uuid>`). Everything else is refused rather than escaped — an id is a
+// closed alphabet, so a rejection here can never be a false negative on a real
+// id, while accepting a path separator would hand the model a URL.
+func safeLQTID(v string) (string, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" || len(v) > 128 {
+		return "", false
+	}
+	for _, r := range v {
+		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_'
+		if !ok {
+			return "", false
+		}
+	}
+	return v, true
 }
 
 // lqtReadEndpoints — the allowlist of LQT mailbox read surfaces the model may
@@ -63,6 +93,10 @@ var lqtReadEndpoints = map[string]lqtReadSpec{
 	"results":             {path: "/xpio/results", list: true},
 	"cycles_nyc":          {path: "/runtime/cycles/nyc", list: true},
 	"signals_venue_mid":   {path: "/lqt/signals/venue_mid", list: true},
+	// Per-strategy reads — what a grounded chat actually needs. Tenant-scoped
+	// server-side (unlike the cross-tenant `results` feed), so this narrows
+	// exposure rather than widening it.
+	"strategy_cycles": {path: "/lqt/inspect/cycles/%s", list: true, needsID: true},
 }
 
 // lqtMailboxBase resolves the base URL of the LQT mailbox read/write ingress.
@@ -183,12 +217,22 @@ func resolveLqtEndpoint(e string) (lqtReadSpec, bool) {
 // returns the parsed JSON. `endpoint` names a known-good surface (see
 // lqtReadEndpoints); `limit` caps list endpoints. Read-only — no gating beyond
 // the endpoint allowlist, mirroring data_query.
-func toolLqtMailboxRead(endpoint string, limit int) (map[string]any, bool) {
+func toolLqtMailboxRead(endpoint, strategyID string, limit int) (map[string]any, bool) {
 	spec, ok := resolveLqtEndpoint(endpoint)
 	if !ok {
 		return map[string]any{"error": fmt.Sprintf("unknown lqt endpoint %q — use one of: %s", endpoint, strings.Join(sortedKeys(lqtReadEndpoints), ", "))}, false
 	}
 	path := spec.path
+	if spec.needsID {
+		id, ok := safeLQTID(strategyID)
+		if !ok {
+			return map[string]any{"error": fmt.Sprintf(
+				"endpoint %q needs a strategy_id (letters, digits, - and _ only)", endpoint)}, false
+		}
+		// The id is validated to a closed alphabet above, so it cannot escape
+		// the path segment; PathEscape belts-and-braces it anyway.
+		path = fmt.Sprintf(spec.path, url.PathEscape(id))
+	}
 	if spec.list {
 		if limit <= 0 || limit > 1000 {
 			limit = lqtReadLimit

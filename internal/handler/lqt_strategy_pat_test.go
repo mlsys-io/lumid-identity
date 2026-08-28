@@ -1,6 +1,9 @@
 package handler
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // The mint is a SIDE EFFECT, so the predicate that gates it is the part worth
 // pinning: it must fire for an lqt-mailbox deploy and for nothing else.
@@ -75,5 +78,56 @@ func TestLQTStrategyAppMatchesTheShippedManifestSlug(t *testing.T) {
 	// The gate must stay narrow — minting is a side effect.
 	if isLQTStrategyApp("venue-link-matcher") || isLQTStrategyApp("") {
 		t.Error("gate is too wide: only strategy-deploying apps may mint a deploy PAT")
+	}
+}
+
+// The per-strategy read endpoint is the one place a caller-supplied string
+// reaches the LQT URL, so the validator is the SSRF guard for it. A closed
+// alphabet means a rejection can never be a false negative on a real id.
+func TestSafeLQTIDRefusesAnythingThatCouldEscapeAPathSegment(t *testing.T) {
+	good := []string{
+		"9bd27442-7dfb-4b7b-bb0e-1f0d0d0d0d0d", // uuid
+		"researcher_meanrev_hold_v2",           // human id
+		"bt-5b895da4-459f-40e1-92ba-54ac075d",  // backtest id
+		"sm_user_prodpaper",
+	}
+	for _, g := range good {
+		if _, ok := safeLQTID(g); !ok {
+			t.Errorf("safeLQTID(%q) rejected a legitimate strategy id", g)
+		}
+	}
+	bad := []string{
+		"", "   ",
+		"../../etc/passwd",
+		"a/b",                    // path separator
+		"x?limit=1",              // query injection
+		"x#frag",                 // fragment
+		"x y",                    // space
+		"x%2f",                   // pre-encoded separator
+		"http://evil/",           // absolute URL
+		strings.Repeat("a", 129), // over the length cap
+	}
+	for _, b := range bad {
+		if _, ok := safeLQTID(b); ok {
+			t.Errorf("safeLQTID(%q) ACCEPTED input that could escape the path segment", b)
+		}
+	}
+}
+
+// A parameterised endpoint must refuse to build a URL without an id, rather
+// than silently reading some other surface.
+func TestStrategyCyclesRequiresAnID(t *testing.T) {
+	spec, ok := resolveLqtEndpoint("strategy_cycles")
+	if !ok {
+		t.Fatal("strategy_cycles must be in the allowlist — a grounded chat needs it")
+	}
+	if !spec.needsID {
+		t.Error("strategy_cycles must be marked needsID, or its path template goes unfilled")
+	}
+	if out, ok := toolLqtMailboxRead("strategy_cycles", "", 10); ok {
+		t.Errorf("expected refusal without a strategy_id, got %v", out)
+	}
+	if out, ok := toolLqtMailboxRead("strategy_cycles", "../etc", 10); ok {
+		t.Errorf("expected refusal for a traversal id, got %v", out)
 	}
 }

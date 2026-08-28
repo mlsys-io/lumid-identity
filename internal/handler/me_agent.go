@@ -3057,12 +3057,13 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "lqt_mailbox_read",
-			"description": "Read data from the LQT prediction-market mailbox (venues, strategies, results, telemetry). Read-only. Pick one endpoint: venue_health_nyc|venue_health_chi|venue_health_dublin (venue health), stats (strategy/result/telemetry counts), strategies (list), results (list), cycles_nyc (runtime cycles), signals_venue_mid (venue mid-price signals). Use limit for the list endpoints.",
+			"description": "Read data from the LQT prediction-market mailbox (venues, strategies, results, telemetry). Read-only. Pick one endpoint: venue_health_nyc|venue_health_chi|venue_health_dublin (venue health), stats (strategy/result/telemetry counts), strategies (list), results (list), cycles_nyc (runtime cycles), signals_venue_mid (venue mid-price signals), strategy_cycles (the decision funnel — proposed/submitted/rejected and why — for ONE strategy; needs strategy_id, and is tenant-scoped). When the conversation is about a specific strategy, prefer strategy_cycles over listing everything. It reports DECISIONS, not PnL. Use limit for the list endpoints.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"endpoint": map[string]any{"type": "string", "enum": []string{"venue_health_nyc", "venue_health_chi", "venue_health_dublin", "stats", "strategies", "results", "cycles_nyc", "signals_venue_mid"}, "description": "Which LQT mailbox surface to read."},
-					"limit":    map[string]any{"type": "integer", "description": "Optional row cap for list endpoints (strategies/results/cycles_nyc/signals_venue_mid). Default 100, max 1000."},
+					"endpoint":    map[string]any{"type": "string", "enum": []string{"venue_health_nyc", "venue_health_chi", "venue_health_dublin", "stats", "strategies", "results", "cycles_nyc", "signals_venue_mid", "strategy_cycles"}, "description": "Which LQT mailbox surface to read."},
+					"strategy_id": map[string]any{"type": "string", "description": "Required for strategy_cycles: the strategy to read the decision funnel for. Use the id of the strategy under discussion."},
+					"limit":       map[string]any{"type": "integer", "description": "Optional row cap for list endpoints (strategies/results/cycles_nyc/signals_venue_mid/strategy_cycles). Default 100, max 1000."},
 				},
 				"required": []string{"endpoint"},
 			},
@@ -4195,11 +4196,12 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 
 	case "lqt_mailbox_read":
 		endpoint, _ := args["endpoint"].(string)
+		strategyID, _ := args["strategy_id"].(string)
 		limit := 0
 		if v, ok := args["limit"].(float64); ok {
 			limit = int(v)
 		}
-		return toolLqtMailboxRead(endpoint, limit)
+		return toolLqtMailboxRead(endpoint, strategyID, limit)
 
 	case "remember_about_me":
 		note, _ := args["note"].(string)

@@ -905,6 +905,34 @@ var llmProviders = []llmProvider{
 		minRole:           "user",
 		dailyBudgetTokens: -1,
 	},
+	{
+		// GLM-5.3-Flash in the Claude Code harness. Permitted because
+		// SELF_HOSTED_MODELS on claude-proxy names it, which is the gate every
+		// non-Anthropic model in this lane passes through.
+		//
+		// The id is claude-code-glm53, NOT claude-code-glm. That name belonged to
+		// the GLM-5.2 chip removed on 2026-08-28, and personas / saved chats
+		// persist model ids — reusing it would silently resolve someone's stored
+		// GLM-5.2 selection onto a different model.
+		//
+		// READ BEFORE PICKING THIS ONE. A Claude Code turn carries ~45k tokens of
+		// tool definitions, and glm-5.3-flash is served CPU-first where prefill is
+		// ~65-90 tok/s — roughly eight minutes for a prompt that size. In practice
+		// the 30s hedge fires and OpenRouter answers, so this lane runs almost
+		// entirely on metered tokens, which is why the budget is finite and why
+		// deepseek (GB10, ~20x the prefill, uncapped) stays the default for coding.
+		// It is here for a second opinion and for 1M-context jobs, not for volume.
+		id:                "claude-code-glm53",
+		displayName:       "GLM-5.3-Flash (Code)",
+		endpoint:          "",
+		upstreamModel:     "lumid-llm/glm-5.3-flash",
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "user",
+		dailyBudgetTokens: 1_500_000, // finite: this lane hedges to OpenRouter on nearly every turn
+	},
 	// claude-opus and claude-haiku (direct Anthropic API) are registered only
 	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.
 	// The claude-code-* sandbox providers cover Anthropic models instead.

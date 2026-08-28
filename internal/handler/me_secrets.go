@@ -255,7 +255,7 @@ func InternalAppSecretsFetch(c *gin.Context) {
 	// set the key themselves — a hand-set LQT_STRATEGY_PAT stays authoritative.
 	// See lqt_strategy_pat.go for why a scoped PAT (not the login JWT, not an
 	// aud=lqt session-bearer) is the only credential the consumer accepts.
-	if body.App == lqtStrategyApp {
+	if isLQTStrategyApp(body.App) {
 		if _, userSet := out["LQT_STRATEGY_PAT"]; !userSet {
 			if tok := lqtStrategyPATCached(body.UserSub); tok != "" {
 				out["LQT_STRATEGY_PAT"] = tok

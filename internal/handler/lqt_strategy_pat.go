@@ -51,8 +51,40 @@ const (
 	lqtStrategyPATTTL = 2 * time.Hour
 
 	lqtStrategyScope = "lqt:strategy"
-	lqtStrategyApp   = "lqt-mailbox"
+
+	// The app_secrets slug the minted deploy PAT is CACHED under. Deliberately
+	// the legacy name: it is a cache key, not a display name, and one row per
+	// user is correct no matter which name the app is installed as — the
+	// credential is identical either way. Changing it would orphan every live
+	// cached token for no gain.
+	lqtStrategyApp = "lqt-mailbox"
 )
+
+// lqtStrategyApps — every app slug whose `run_loop` deploy needs the scoped PAT.
+//
+// THE RENAME BUG. The app was renamed `lqt-mailbox` → `quant-research` at
+// v0.7.0, and the UI's row actions post `app: quant-research`. This gate still
+// matched only the OLD name, so after the rename a Deploy from the Studio page
+// was handed no `lqt:strategy` PAT at all — reintroducing, silently, the exact
+// failure this file was written to fix.
+//
+// Measured on the live mailbox 2026-08-28: of 53 rejected submissions, **42
+// were `no bearer credential in payload.auth.{pat,jwt}`** and 2 more
+// `jwt_invalid` — 83% of all rejections were this one gate missing its app.
+//
+// BOTH names are matched, not just the new one: an install predating the
+// rename still runs as `lqt-mailbox`, and breaking those to fix the new name
+// would just move the outage.
+var lqtStrategyApps = map[string]bool{
+	"quant-research": true, // current name (v0.7.0+)
+	"lqt-mailbox":    true, // legacy installs
+}
+
+// isLQTStrategyApp reports whether this app slug deploys strategies and so
+// needs a scoped deploy PAT injected.
+func isLQTStrategyApp(app string) bool {
+	return lqtStrategyApps[strings.TrimSpace(app)]
+}
 
 // lqtIntentNeedsStrategyPAT reports whether this claimed intent is an
 // lqt-mailbox run that will try to deploy.
@@ -65,7 +97,7 @@ func lqtIntentNeedsStrategyPAT(action string, payload map[string]any) bool {
 		return false
 	}
 	app, _ := payload["app"].(string)
-	return app == lqtStrategyApp
+	return isLQTStrategyApp(app)
 }
 
 // mintLQTStrategyPAT returns a fresh `lqt:strategy` PAT for userSub, or "" if

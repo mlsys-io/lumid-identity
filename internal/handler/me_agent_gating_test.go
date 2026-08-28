@@ -125,7 +125,10 @@ func TestFirstToolCapableProvider(t *testing.T) {
 		role   string
 		wantID string
 	}{
-		{"user", "deepseek-v4-flash"},
+		// A plain user no longer reaches deepseek: it is billed per call, so it
+		// was moved behind admin and the user falls to the first FREE
+		// in-cluster model.
+		{"user", "glm-5.3-flash"},
 		{"admin", "deepseek-v4-flash"},
 		{"super_admin", "deepseek-v4-flash"},
 	}
@@ -172,10 +175,13 @@ func TestProviderAllowed(t *testing.T) {
 		p    llmProvider
 		want bool
 	}{
-		{"user", gemma, true},
+		// deepseek is COSTED — admin+ only, so a user cannot select it and
+		// cannot default onto it.
+		{"user", gemma, false},
 		{"admin", gemma, true},
 		{"super_admin", gemma, true},
-		{"user", sonnet, true},
+		// sonnet consumes the shared Claude pool quota — admin+ only.
+		{"user", sonnet, false},
 		{"admin", sonnet, true},
 		{"super_admin", sonnet, true},
 		{"user", opus, false},

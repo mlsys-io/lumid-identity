@@ -731,7 +731,7 @@ var llmProviders = []llmProvider{
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
 		supportsVision:      true,   // multimodal; image blocks verified via lumid-llm
-		minRole:             "user", // everyone
+		minRole:             "admin", // costed: billed per call upstream; users default to the free in-cluster models, // everyone
 		maxOutputTokens:     16384,  // 262K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
@@ -830,7 +830,7 @@ var llmProviders = []llmProvider{
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
 		supportsVision:    false,
-		minRole:           "user", // pool allows user→sonnet; pool quota gates volume
+		minRole:           "admin", // costed: consumes the shared Claude pool quota, // pool allows user→sonnet; pool quota gates volume
 		dailyBudgetTokens: -1,
 	},
 	{
@@ -902,7 +902,7 @@ var llmProviders = []llmProvider{
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
 		supportsVision:    false,
-		minRole:           "user",
+		minRole:           "admin", // costed: despite the name, upstreamModel is deepseek-v4-flash,
 		dailyBudgetTokens: -1,
 	},
 	{

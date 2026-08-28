@@ -773,10 +773,24 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      false,   // text-only through this path; see above
-		minRole:             "user",  // everyone
-		maxOutputTokens:     16384,   // 1M ctx; reasoning model, give answers room
-		dailyBudgetTokens:   200_000, // finite: OpenRouter overflow is billed
+		supportsVision:      false,  // text-only through this path; see above
+		minRole:             "user", // everyone
+		maxOutputTokens:     16384,  // 1M ctx; reasoning model, give answers room
+		// FINITE because the ladder is CPU -> OpenRouter with no tier-0, so a turn
+		// arriving while the 8 CPU slots are busy is billed.
+		//
+		// SIZE IT IN TURNS, NOT IN ROUND NUMBERS. This was 200_000 -- copied from
+		// the qwen rows rather than divided by what a turn actually costs -- and a
+		// Studio turn carries the whole tool catalog as INPUT: ~16.3k tokens on the
+		// full catalog, ~7.4k in Simple view. 200k is therefore ~12 turns/day, or
+		// ~27 in Simple. Users hit it in an afternoon and it reads as "the model is
+		// broken", which is exactly how it was reported.
+		//
+		// 1.5M is ~200 Simple turns or ~90 full-catalog turns -- a real working day.
+		// At GLM's $0.15/M in + $0.50/M out that is ~$0.25/day worst case if every
+		// single turn overflowed to OpenRouter, and near zero while the CPU serves
+		// them. The cap is a runaway guard, not a rationing device.
+		dailyBudgetTokens: 1_500_000,
 	},
 	{
 		// qwen3.8-27b — the INDEPENDENT judge seat for app scoring panels.
@@ -797,9 +811,9 @@ var llmProviders = []llmProvider{
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
 		supportsVision:      false,
-		minRole:             "user",  // scoring runs on behalf of ordinary users
-		maxOutputTokens:     8192,    // matches skills/llm.py's gateway floor
-		dailyBudgetTokens:   200_000, // finite: billed upstream
+		minRole:             "user",    // scoring runs on behalf of ordinary users
+		maxOutputTokens:     8192,      // matches skills/llm.py's gateway floor
+		dailyBudgetTokens:   1_500_000, // see the GLM row: sized in TURNS, not round numbers
 	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a

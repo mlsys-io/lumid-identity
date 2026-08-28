@@ -2291,6 +2291,15 @@ func buildToolDefsForRole(role string) []map[string]any {
 	defs = append(defs, accountToolDefs()...)
 	// Media generation (image + speech via the lumid-llm gateway) — every role.
 	defs = append(defs, mediaToolDefs()...)
+	// LQT strategy submission is a per-USER write, not a control-plane one: it
+	// deploys into the caller's OWN tenant on their own scoped PAT, which is
+	// the documented self-serve path. It stays in destructiveTools (interactive
+	// approval) and audited, and dispatch re-checks the role. Real-money and
+	// the nightly-dk canary are gated downstream in the consumer on the PAT's
+	// role — not here.
+	if role == "user" || role == "admin" || role == "super_admin" {
+		defs = append(defs, lqtToolDefs()...)
+	}
 	// Admin control-plane tools are advertised only to admin/super_admin (the
 	// model never sees them otherwise); dispatch re-checks role as well.
 	if role == "admin" || role == "super_admin" {
@@ -2301,9 +2310,6 @@ func buildToolDefsForRole(role string) []map[string]any {
 	// — the model never sees it for any lesser role; dispatch re-checks too.
 	if role == "super_admin" {
 		defs = append(defs, operatorToolDefs()...)
-		// LQT mailbox strategy submission is a WRITE — super_admin-only, same
-		// posture as the operator tools (dispatch re-checks role + approval).
-		defs = append(defs, lqtToolDefs()...)
 	}
 	return defs
 }

@@ -124,6 +124,41 @@ func lqtMailboxDo(method, path string, body []byte) (map[string]any, int, error)
 	return out, resp.StatusCode, nil
 }
 
+// lqtMailboxDoAs performs an LQT mailbox request authenticated as a SPECIFIC
+// bearer rather than the operator's PAT. Used by the submit path so the drop is
+// attributed to the caller, matching the credential carried in
+// `payload.auth.pat` — reads keep using the operator PAT via lqtMailboxDo.
+func lqtMailboxDoAs(method, path string, body []byte, bearer string) (map[string]any, int, error) {
+	u := lqtMailboxBase() + path
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, u, rd)
+	if err != nil {
+		return nil, 0, err
+	}
+	if strings.TrimSpace(bearer) != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	client := &http.Client{Timeout: lqtMailboxTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("lqt mailbox unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	_ = json.Unmarshal(rb, &out)
+	if out == nil {
+		out = map[string]any{"raw": truncateStr(string(rb), 520)}
+	}
+	return out, resp.StatusCode, nil
+}
+
 // resolveLqtEndpoint normalizes a model-supplied endpoint string to a
 // whitelisted spec. Accepts the friendly key ("strategies") or the raw path
 // ("/xpio/strategies", "xpio/strategies"). Returns ok=false for anything not on
@@ -171,12 +206,44 @@ func toolLqtMailboxRead(endpoint string, limit int) (map[string]any, bool) {
 }
 
 // toolLqtMailboxSubmit submits a strategy to the LQT mailbox via the
-// `strategy.deploy` topic (POST /xpio/strategies). super_admin-gated + in
-// destructiveTools (interactive approval) + audited — defense in depth, the
-// same posture as operator_remediate.
+// `strategy.deploy` topic (POST /xpio/strategies). In destructiveTools
+// (interactive approval) + audited.
+//
+// # Two things this had to fix before the role gate could open
+//
+//  1. THE ENVELOPE WAS WRONG. It posted `{strategy_id, name, version,
+//     strategy}` flat. The shape the consumer actually reads — proven by the
+//     app bundle's `send_strategy.py`, the only submit path with deploys to
+//     show for it — is `{name, version, strategy_id, payload: {...}}`, the
+//     spec NESTED under `payload`.
+//
+//  2. IT CARRIED NO CALLER CREDENTIAL. The consumer authorises a deploy from
+//     `payload.auth.pat`, NOT from the request's Authorization header. This
+//     sent neither, so every chatbox submit was accepted into the mailbox and
+//     then refused, asynchronously and invisibly, at consume time —
+//     `auth_denied: no bearer credential in payload.auth.{pat,jwt}`, which is
+//     42 of the 53 rejections on the live mailbox (measured 2026-08-28). The
+//     tool was structurally incapable of a successful deploy for EVERY role,
+//     super_admin included.
+//
+// # Why opening the gate is safe now, and was not before
+//
+// The old code authenticated with the OPERATOR's PAT (`lqtMailboxHeaders`).
+// Had it worked, a user's strategy would have registered under the operator's
+// tenant, not their own. Opening the role gate on top of that would have been
+// a cross-tenant write.
+//
+// It now carries the CALLER's own short-lived `lqt:strategy` PAT, so the
+// consumer introspects it and resolves the caller's tenant and role — the same
+// per-tenant attribution `send_strategy.py` gets. A `user` therefore lands in
+// their own tenant's prod-paper lane, which is the documented self-serve path.
+// Real-money and the nightly-dk canary stay gated downstream, in the consumer,
+// on the PAT's own role — this tool cannot widen them.
 func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy string) (map[string]any, bool) {
-	if role != "super_admin" {
-		return map[string]any{"error": "lqt_mailbox_submit requires super_admin"}, false
+	switch role {
+	case "user", "admin", "super_admin":
+	default:
+		return map[string]any{"error": "lqt_mailbox_submit requires a signed-in role"}, false
 	}
 	name = strings.TrimSpace(name)
 	version = strings.TrimSpace(version)
@@ -184,22 +251,46 @@ func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy 
 	if name == "" || version == "" || strategy == "" {
 		return map[string]any{"error": "name, version and strategy are all required"}, false
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"strategy_id": name + "@" + version,
+	// The credential the DEPLOY is authorised from. Minted per caller, scoped
+	// `lqt:strategy`, short-lived, cached — see lqt_strategy_pat.go. Without it
+	// the submit is accepted and then silently rejected, so refuse up front
+	// rather than report a success the consumer will undo.
+	pat := lqtStrategyPATCached(userID)
+	if pat == "" {
+		return map[string]any{"error": "could not mint an lqt:strategy PAT for you — " +
+			"the deploy would be rejected at consume time with " +
+			"'no bearer credential in payload.auth.{pat,jwt}'"}, false
+	}
+	body, _ := json.Marshal(map[string]any{
 		"name":        name,
 		"version":     version,
-		"strategy":    map[string]any{"dsl": strategy},
+		"strategy_id": name + "@" + version,
+		// Spec NESTED under `payload`, with `auth` inside it — the shape
+		// send_strategy.py uses and the consumer reads.
+		"payload": map[string]any{
+			"dsl":  strategy,
+			"auth": map[string]any{"pat": pat},
+		},
 	})
-	out, status, err := lqtMailboxDo(http.MethodPost, "/xpio/strategies", payload)
+	out, status, err := lqtMailboxDoAs(http.MethodPost, "/xpio/strategies", body, pat)
 	if err != nil {
 		return map[string]any{"error": err.Error()}, false
 	}
 	writeAudit(c, userID, userID, "lqt:strategy.submit",
-		fmt.Sprintf("name=%s version=%s (via chatbox)", name, version))
+		fmt.Sprintf("name=%s version=%s role=%s (via chatbox)", name, version, role))
 	if status >= 300 {
 		return map[string]any{"error": fmt.Sprintf("lqt mailbox submit %d: %s", status, out["raw"])}, false
 	}
-	return map[string]any{"name": name, "version": version, "acked": out}, true
+	return map[string]any{
+		"name":    name,
+		"version": version,
+		"acked":   out,
+		// "sent" means the MAILBOX took it. Registration happens later, in the
+		// consumer, and can still fail on auth or compile. Saying otherwise is
+		// how a submit path that never once worked kept reporting success.
+		"note": "accepted into the mailbox — NOT yet registered. Confirm with a " +
+			"registry row carrying a non-empty program_hash before believing it landed.",
+	}, true
 }
 
 // sortedKeys returns the map keys in lexical order — used to render the
@@ -213,15 +304,17 @@ func sortedKeys(m map[string]lqtReadSpec) []string {
 	return keys
 }
 
-// lqtToolDefs returns the super_admin-only LQT mailbox WRITE tool definition.
-// Appended in buildToolDefsForRole only when the caller is super_admin, so the
-// model never sees it otherwise (mirrors operatorToolDefs). lqt_mailbox_read is
-// in the base catalog — read-only, available to every role.
+// lqtToolDefs returns the LQT mailbox WRITE tool definition. Offered to any
+// signed-in role: it deploys into the CALLER's own tenant on the caller's own
+// scoped PAT (paper lane), so it is a per-user write rather than a
+// control-plane one. Still in destructiveTools (interactive approval) and
+// audited, and dispatch re-checks the role. lqt_mailbox_read is in the base
+// catalog — read-only, available to every role.
 func lqtToolDefs() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "lqt_mailbox_submit",
-			"description": "Submit a strategy to the LQT mailbox for deployment (strategy.deploy topic). WRITE — super_admin only, requires explicit user approval, audited. Provide the strategy name, semantic version, and the .lqts DSL source.",
+			"description": "Submit a strategy to the LQT mailbox for deployment (strategy.deploy topic). WRITE — deploys into YOUR tenant's paper lane on your own scoped credential; requires explicit user approval and is audited. Provide the strategy name, semantic version, and the .lqts DSL source. A successful submit means the mailbox ACCEPTED it, not that it registered: confirm a registry row with a non-empty program_hash.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

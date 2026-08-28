@@ -31,14 +31,23 @@ func TestDumpStudioWarmPayload(t *testing.T) {
 	if out == "" {
 		t.Skip("set WARM_OUT to emit")
 	}
-	tools := buildToolDefsForRole("user")
+	// ROLE matters as much as SIMPLE. buildSystemPrompt emits a different role
+	// block for admin/super_admin, and the cached prefix is a TOKEN SEQUENCE --
+	// so a payload built for role=user warms nothing for an admin. That was a
+	// real gap: admin@lum.id paid a full cold prefill on every turn while a
+	// role=user account was warm, which read as "the model is slow for me".
+	role := os.Getenv("ROLE")
+	if role == "" {
+		role = "user"
+	}
+	tools := buildToolDefsForRole(role)
 	if os.Getenv("SIMPLE") != "" {
 		tools = filterSimpleTools(tools)
 	}
 	payload := map[string]any{
 		"model":      "glm-5.3-flash",
 		"max_tokens": 8,
-		"system":     buildSystemPrompt("warmup-no-such-user", "user", ""),
+		"system":     buildSystemPrompt("warmup-no-such-user", role, ""),
 		"tools":      tools,
 		"messages":   []map[string]any{{"role": "user", "content": "warmup"}},
 	}
@@ -49,5 +58,5 @@ func TestDumpStudioWarmPayload(t *testing.T) {
 	if err := os.WriteFile(out, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("wrote %s: %d tools, %d bytes (~%d tokens of prefix)", out, len(tools), len(b), len(b)/4)
+	t.Logf("wrote %s: role=%s %d tools, %d bytes (~%d tokens of prefix)", out, role, len(tools), len(b), len(b)/4)
 }

@@ -778,55 +778,6 @@ var llmProviders = []llmProvider{
 		maxOutputTokens:     16384,   // 1M ctx; reasoning model, give answers room
 		dailyBudgetTokens:   200_000, // finite: OpenRouter overflow is billed
 	},
-	// The two qwen entries below moved from ON-PREM to OPENROUTER, and the id
-	// form moved with them. lumid-llm resolves a bare id only via
-	// LUMID_LLM_BACKENDS (what luyao1 served); everything in
-	// LUMID_LLM_OPENROUTER_MODEL_MAP is "qwen/"-prefixed. So the bare ids these
-	// entries used to carry now 503 with "unknown model ... unrecognised ids are
-	// never forwarded to OpenRouter" — measured in-cluster 2026-08-27 against
-	// lumid-llm:8088, where `qwen3.6-35b-a3b` fails and `qwen/qwen3.6-35b-a3b`
-	// returns 200. The MODELS are alive; only the naming moved.
-	//
-	// Two consequences the old comments got wrong, and they are the reason this
-	// block is annotated rather than just re-prefixed:
-	//   - they are no longer "free local GPU" — every call is BILLED through
-	//     OpenRouter, so dailyBudgetTokens must be finite. -1 (no cap) on a
-	//     minRole:"user" billed model is an uncapped spend path for every user,
-	//     and this field is the only per-user backstop (effectiveDailyBudget).
-	//   - supportsVision was true because of the mmproj build on luyao1. That
-	//     box no longer serves these. Vision on the OpenRouter route is
-	//     UNVERIFIED, so claim false: a false negative only hides the image
-	//     affordance, a false positive breaks the turn.
-	{
-		// qwen3.6-35b-a3b — MoE (35B/A3B), 262K context. Strong general model.
-		id:                  "lumid-qwen3-35b",
-		displayName:         "Qwen3.6-35B-A3B",
-		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "qwen/qwen3.6-35b-a3b",
-		authHeader:          "Authorization",
-		authPrefix:          "Bearer ",
-		keyFn:               kvrunPAT,
-		addAnthropicVersion: false,
-		supportsVision:      false,   // unverified on the OpenRouter route
-		minRole:             "user",  // everyone — but now billed, hence the cap
-		maxOutputTokens:     16384,   // 262K ctx
-		dailyBudgetTokens:   200_000, // finite: billed upstream
-	},
-	{
-		// qwen3.6-27b — dense 27B, 32K context.
-		id:                  "lumid-qwen3-27b",
-		displayName:         "Qwen3.6-27B",
-		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "qwen/qwen3.6-27b",
-		authHeader:          "Authorization",
-		authPrefix:          "Bearer ",
-		keyFn:               kvrunPAT,
-		addAnthropicVersion: false,
-		supportsVision:      false,   // unverified on the OpenRouter route
-		minRole:             "user",  // everyone — but now billed, hence the cap
-		maxOutputTokens:     8192,    // 32K ctx — smaller output budget
-		dailyBudgetTokens:   200_000, // finite: billed upstream
-	},
 	{
 		// qwen3.8-27b — the INDEPENDENT judge seat for app scoring panels.
 		//

@@ -3387,26 +3387,8 @@ func buildToolDefs() []map[string]any {
 			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
-			// Alias of agent_list (legacy name). Kept so in-flight clients/prompts
-			// calling app_list keep working; both dispatch to the same op.
-			"name":         "app_list",
-			"description":  "Alias of agent_list (legacy name). List all xpio agents installed on this host.",
-			"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
-		{
 			"name":        "agent_marketplace",
 			"description": "Browse the xp.io agent marketplace.",
-			"input_schema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"q":    map[string]any{"type": "string"},
-					"kind": map[string]any{"type": "string", "description": "agent | skill | workflow | dataset | memory. Default: agent."},
-				},
-			},
-		},
-		{
-			"name":        "app_marketplace",
-			"description": "Alias of agent_marketplace (legacy name). Browse the xp.io agent marketplace.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -3425,29 +3407,8 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "app_detail",
-			"description": "Alias of agent_detail (legacy name). Get metadata and schema for a specific xpio agent from the marketplace.",
-			"input_schema": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"slug": map[string]any{"type": "string"}},
-				"required":   []string{"slug"},
-			},
-		},
-		{
 			"name":        "agent_install",
 			"description": "Install an xpio agent from xp.io to this host.",
-			"input_schema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"slug":     map[string]any{"type": "string"},
-					"new_name": map[string]any{"type": "string"},
-				},
-				"required": []string{"slug"},
-			},
-		},
-		{
-			"name":        "app_install",
-			"description": "Alias of agent_install (legacy name). Install an xpio agent from xp.io to this host.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -3530,18 +3491,6 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "app_push",
-			"description": "Alias of agent_push (legacy name). Push a local xpio agent to xp.io (publish / update). Auto-bumps patch version if content changed. Requires approval.",
-			"input_schema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"name":    map[string]any{"type": "string"},
-					"message": map[string]any{"type": "string"},
-				},
-				"required": []string{"name"},
-			},
-		},
-		{
 			"name":        "agent_validate",
 			"description": "Validate an installed xpio agent's manifest and config before pushing.",
 			"input_schema": map[string]any{
@@ -3551,26 +3500,8 @@ func buildToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "app_validate",
-			"description": "Alias of agent_validate (legacy name). Validate an installed xpio agent's manifest and config before pushing.",
-			"input_schema": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"name": map[string]any{"type": "string"}},
-				"required":   []string{"name"},
-			},
-		},
-		{
 			"name":        "agent_update",
 			"description": "Pull the latest version of an installed agent from xp.io.",
-			"input_schema": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"name": map[string]any{"type": "string"}},
-				"required":   []string{"name"},
-			},
-		},
-		{
-			"name":        "app_update",
-			"description": "Alias of agent_update (legacy name). Pull the latest version of an installed agent from xp.io.",
 			"input_schema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"name": map[string]any{"type": "string"}},

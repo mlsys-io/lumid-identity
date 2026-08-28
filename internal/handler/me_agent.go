@@ -1286,6 +1286,15 @@ type meAgentChatBody struct {
 	// but the strong nudge mirrors what ChatGPT/Claude do with their
 	// "Search" buttons.
 	Mode string `json:"mode,omitempty"`
+	// Simple: the caller is in Studio's SIMPLE (chat-first) view, so send the
+	// curated core tool set instead of the whole catalog.
+	//
+	// Defaults FALSE on purpose — absent means the full catalog, which is what
+	// every existing API caller already gets. Making Simple the default would
+	// silently strip tools from anyone who has not been updated, and a tool that
+	// is merely absent produces a worse answer rather than an error, so the
+	// regression would be invisible. The UI opts in explicitly.
+	Simple bool `json:"simple,omitempty"`
 	// Independent toggle: enable extended thinking on Anthropic
 	// providers (Claude shows its reasoning before the answer).
 	// kv.run/MiniMax always emits thinking deltas by default; this
@@ -1983,10 +1992,76 @@ func min(a, b int) int {
 // wantTools=false skips the tool-catalog build (and the persona tool
 // filter) entirely — the claude-code path replaces our tools with the
 // CLI's own, so constructing the full catalog there is dead work.
+// simpleModeTools is the curated core advertised in Studio's SIMPLE view.
+//
+// An ALLOWLIST, not a deny-list, and the direction matters: with a deny-list a
+// newly added tool silently joins Simple and quietly re-inflates the prefix,
+// which is exactly the drift this exists to stop. The cost is that a genuinely
+// core new tool has to be added here on purpose.
+//
+// WHY: Studio sends this catalog on EVERY turn — 121 tools, ~14.3k tokens, 91%
+// of the ~16.3k-token prefix. What Simple drops is the authoring and operator
+// surface (app/workflow authoring, casebook + evaluation, host-scope loop
+// control, low-level xp_* plumbing, FlowMesh, shell/file editing) — real
+// capability, but not what a chat-first turn reaches for.
+//
+// Three entries are load-bearing for behaviour, not convenience, and must not
+// be dropped to save bytes:
+//   - app_answer   — the "Ask the app" affordance sets tool_choice to it, and
+//     tool_choice is validated with toolAvailable(), so filtering
+//     it out turns that button into a silently ignored request.
+//   - run_loop_now — the system prompt REQUIRES calling it in the same turn the
+//     user asks to run a workflow.
+//   - remember_about_me, generate_image, text_to_speech, data_catalog,
+//     data_query, query_findata, web_search, web_fetch, deep_research —
+//     all named imperatively in the system prompt. A prompt that
+//     orders a tool call the catalog does not offer is a turn
+//     that cannot succeed.
+var simpleModeTools = map[string]bool{
+	// research + data
+	"web_search": true, "web_fetch": true, "deep_research": true,
+	"query_findata": true, "data_catalog": true, "data_query": true,
+	// knowledge
+	"query_my_knowledge": true, "knowledge_agents": true, "knowledge_memories": true,
+	"xp_ask": true, "remember_about_me": true,
+	// assistant basics
+	"today_summary": true, "list_tasks": true, "task_output": true,
+	"send_email": true, "create_calendar_event": true,
+	"list_drafts": true, "edit_draft": true, "send_draft": true, "dismiss_draft": true,
+	// output
+	"generate_image": true, "text_to_speech": true, "save_artifact": true,
+	// delegation
+	"spawn_agent": true, "spawn_agents": true,
+	// the user's own apps + workflows (read + run, not authoring)
+	"list_workflows": true, "workflow_detail": true, "loops_health": true,
+	"list_runs": true, "run_detail": true, "run_loop_now": true, "pause_workflow": true,
+	"agent_list": true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
+	"agent_marketplace": true, "search_marketplace": true,
+	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
+	"show_app_surface": true, "give_feedback": true,
+	// account self-service
+	"account_set_profile": true, "account_list_pat": true, "account_revoke_pat": true,
+}
+
+// filterSimpleTools keeps only the curated core. Applied AFTER the role filter,
+// never instead of it: Simple narrows an experience, it must never widen access.
+func filterSimpleTools(defs []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(simpleModeTools))
+	for _, d := range defs {
+		if n, _ := d["name"].(string); simpleModeTools[n] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 func resolvePromptAndTools(userID, role string, body meAgentChatBody, wantTools bool) (string, []map[string]any, string) {
 	var tools []map[string]any
 	if wantTools {
 		tools = buildToolDefsForRole(role)
+		if body.Simple {
+			tools = filterSimpleTools(tools)
+		}
 	}
 	// Viewing context rides on every prompt variant (persona included) —
 	// it's per-request situational awareness, not persona flavor. Both

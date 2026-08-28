@@ -1850,7 +1850,19 @@ func tokensUsedLast24h(userSub string) int {
 	}
 	row := common.DB.
 		Model(&models.UsageEvent{}).
-		Where("user_sub = ? AND ts > ?", userSub, cutoff).
+		// kind = 'chat' ONLY. This used to sum EVERY usage_events row for the
+		// user, so unrelated products spent the Studio chat budget. Measured
+		// 2026-08-28 on one account: 986,478 tokens against a 200,000 cap, of
+		// which 711,652 (72%) was `claude_proxy` -- Claude Code turns through
+		// lum.id/claude, which carry a ~45k-token tool catalog each. The user was
+		// locked out of every metered chat model by traffic from a different
+		// surface, while deepseek kept working only because its budget is -1.
+		//
+		// The error this feeds says "daily CHAT budget", and that is what it must
+		// measure. Anything else makes the cap unpredictable: a background job or
+		// an unrelated CLI session silently consumes it, and the failure surfaces
+		// as "the model is broken" in a product the user was not even using.
+		Where("user_sub = ? AND kind = ? AND ts > ?", userSub, "chat", cutoff).
 		// NB: `out` is a MySQL reserved word — aliasing to it yields a 1064
 		// syntax error ("... as out FROM ...") and the budget query silently
 		// fail-opens (usage always 0 ⇒ no enforcement). Use `outp`. Scan is

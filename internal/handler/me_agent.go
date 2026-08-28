@@ -730,10 +730,10 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,   // multimodal; image blocks verified via lumid-llm
+		supportsVision:      true,    // multimodal; image blocks verified via lumid-llm
 		minRole:             "admin", // costed: billed per call upstream; users default to the free in-cluster models, // everyone
-		maxOutputTokens:     16384,  // 262K ctx, free local GPU — let answers/structured output run
-		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
+		maxOutputTokens:     16384,   // 262K ctx, free local GPU — let answers/structured output run
+		dailyBudgetTokens:   -1,      // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
 	{
 		// glm-5.3-flash — GLM-5.3-Flash (Zhipu, MIT), 321B total / 18B active MoE,

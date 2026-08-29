@@ -23,6 +23,7 @@ package handler
 //         filtering lands when cloud runtime stands up (P2).
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -32,6 +33,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
 )
 
 type meLoopPatchBody struct {
@@ -200,18 +204,24 @@ func MeLoopRunNow(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app/loop name")
 		return
 	}
-	// The app must actually resolve before we accept the run. Without this the
-	// handler returned 202 "one-shot queued" for ANY name — so a user on a
-	// renamed or mistyped slug got the success toast ("Backtest queued — poll
-	// for the verdict") and nothing ever ran. A confident success over a no-op
-	// is worse than an error: there is no signal to act on, and the surface
-	// polls an empty table forever.
+	// A slug that resolves NOWHERE is rejected here, cheaply, without writing a
+	// queue row: resolveAppDir returns "" only when the name is not a tenant
+	// app, not operator-shared, and not published (so its materialise fallback
+	// fails too). A typo is a real signal, and it is the ONLY signal this check
+	// carries.
 	//
-	// NOTE this catches a nonexistent app, not every wrong-app case:
-	// resolveAppDir falls back to the operator-shared bundle, so a published
-	// app resolves for anyone. Run history is still keyed per (user, app) in
-	// me_app_data.go, so a legacy-slug user can pass here and still read empty.
-	// That needs the slug alias, which is a separate fix.
+	// It used to carry more weight than that, wrongly. Because resolveAppDir
+	// MATERIALISES the published bundle onto identity's own pod when it finds
+	// nothing local (me_datasets.go), it returns a directory for any published
+	// app — so the check passed for everyone, including the 28 tenants whose
+	// scheduler-side install was still under the pre-rename slug. Every one of
+	// them got "one-shot queued" for a cycle that died a second later with
+	// `app 'quant-research' not installed for this user`. A check that cannot
+	// fail is not a check.
+	//
+	// So: this means "the slug exists somewhere", nothing more. Whether the
+	// cycle can actually RUN is answered by the settle-wait below, which asks
+	// the one process that knows.
 	if resolveAppDir(userID, app) == "" {
 		fail(c, http.StatusNotFound, 1404, "app not found: "+app)
 		return
@@ -248,10 +258,104 @@ func MeLoopRunNow(c *gin.Context) {
 	if id == "" {
 		return // writeIntent already wrote the error response
 	}
+
+	// Wait briefly for the scheduler's own verdict before reporting success.
+	//
+	// Identity cannot answer "can this actually run?" by itself: it mounts no
+	// tenant volume (only signing-keys), so the tenant tree it would stat is
+	// not the one the cycle Job reads — that lives on the scheduler's
+	// `xpio-state` PVC on another cluster entirely. Any local stat is a guess,
+	// and the materialising one above was a guess that always said yes.
+	//
+	// The scheduler DOES know, and it tells us: it posts the result back to
+	// /internal/me-intents/:id/result, which lands in this same table. A
+	// dispatch that cannot happen fails in about a second (missing app,
+	// undeclared loop), so a short wait converts the common silent failure
+	// into a real error while a genuinely-running cycle falls through to the
+	// 202 this endpoint has always returned. We report what happened instead
+	// of predicting it.
+	if reason, failed := runNowSettled(c.Request.Context(), id); failed {
+		fail(c, http.StatusBadGateway, 1502, "cycle did not start: "+reason)
+		return
+	}
+
 	c.JSON(http.StatusAccepted, gin.H{
 		"ret_code": 0, "message": "one-shot queued",
 		"data": gin.H{"job_id": id, "state": "queued"},
 	})
+}
+
+// How long MeLoopRunNow waits for a fast failure before falling back to 202.
+// Measured on the live queue: a run_loop that cannot dispatch completes in
+// 1-5s (claim + resolve + fail). Long enough to catch that, short enough that
+// a healthy request stays snappy — and a cycle that outlives it is reported as
+// queued, which is exactly what it is.
+const (
+	runNowSettleWait = 6 * time.Second
+	runNowPollEvery  = 300 * time.Millisecond
+)
+
+// runNowSettled polls the intent row for an early failure. Returns
+// (reason, true) only when the scheduler has actually reported the intent
+// failed. Everything else — still pending, completed OK, DB unavailable,
+// caller hung up — returns false, because this must never turn a working
+// dispatch into an error. It degrades to the old always-202 behaviour.
+func runNowSettled(ctx context.Context, intentID string) (string, bool) {
+	if common.DB == nil || intentID == "" {
+		return "", false
+	}
+	deadline := time.Now().Add(runNowSettleWait)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", false
+		case <-time.After(runNowPollEvery):
+		}
+		var row models.MeAppIntent
+		if err := common.DB.Select("status", "result").
+			Where("id = ?", intentID).First(&row).Error; err != nil {
+			return "", false // row not visible yet, or DB trouble — not a failure
+		}
+		if row.Status != "failed" {
+			// "done" means it dispatched; "pending"/"claimed" means keep waiting.
+			if row.Status == "done" {
+				return "", false
+			}
+			continue
+		}
+		return intentFailureReason(row.Result), true
+	}
+	return "", false
+}
+
+// intentFailureReason pulls the scheduler's own error out of the result
+// envelope. The envelope is the scheduler's to shape, so treat every field as
+// optional and fall back to a generic line rather than leaking raw JSON at a
+// user.
+func intentFailureReason(result string) string {
+	const generic = "the scheduler could not start this cycle"
+	if strings.TrimSpace(result) == "" {
+		return generic
+	}
+	var env struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(result), &env) != nil {
+		return generic
+	}
+	msg := strings.TrimSpace(env.Error)
+	if msg == "" {
+		return generic
+	}
+	// Keep it to one line and bounded: this reaches a toast, and the full
+	// envelope stays readable at GET /me/intents/:id.
+	if i := strings.IndexAny(msg, "\n\r"); i >= 0 {
+		msg = msg[:i]
+	}
+	if len(msg) > 300 {
+		msg = msg[:300] + "…"
+	}
+	return msg
 }
 
 // POST /api/v1/me/loops/:app/:loop/stop

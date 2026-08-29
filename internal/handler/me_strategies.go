@@ -33,6 +33,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -218,7 +219,17 @@ func MeStrategies(c *gin.Context) {
 	//
 	// Best-effort: a failure here must not take down the strategy list, which is
 	// the primary answer. Rejections are additive context.
-	data["rejected"] = recentRejections(ctx, conn, tenant)
+	if rej, rejErr := recentRejections(ctx, conn, tenant); rejErr != "" {
+		// Report, do not swallow. An empty list and a failed query are the same
+		// value to a reader, and that ambiguity cost real time: the surfacing
+		// this block exists for was itself debugged blind because a failure here
+		// looked exactly like "you have no rejections". Same lesson the feature
+		// teaches a student — a silent failure is worse than a stated one.
+		data["rejected"] = []map[string]any{}
+		data["rejected_unavailable"] = rejErr
+	} else {
+		data["rejected"] = rej
+	}
 	switch {
 	case len(out) == 0 && scanFailures > 0:
 		// Rows existed and none could be read — a schema/scan mismatch, NOT an
@@ -238,7 +249,7 @@ func MeStrategies(c *gin.Context) {
 // recentRejections returns submissions this tenant made that failed to compile,
 // newest first, with the consumer's own reason. Empty slice on any error — the
 // caller treats this as additive context, never as the primary answer.
-func recentRejections(ctx context.Context, conn *pgx.Conn, tenant uuid.UUID) []map[string]any {
+func recentRejections(ctx context.Context, conn *pgx.Conn, tenant uuid.UUID) ([]map[string]any, string) {
 	// Read the ACK, not xpio.strategies.
 	//
 	// The first version joined xpio.strategies, which only has a row when the
@@ -268,13 +279,15 @@ func recentRejections(ctx context.Context, conn *pgx.Conn, tenant uuid.UUID) []m
 	out := []map[string]any{}
 	rows, err := conn.Query(ctx, q, tenant)
 	if err != nil {
-		return out
+		return out, "rejection query failed: " + err.Error()
 	}
 	defer rows.Close()
+	scanFail := 0
 	for rows.Next() {
 		var name, reason *string
 		var at *time.Time
 		if rows.Scan(&name, &at, &reason) != nil {
+			scanFail++
 			continue
 		}
 		r := map[string]any{"name": deref(name), "reason": deref(reason)}
@@ -283,7 +296,13 @@ func recentRejections(ctx context.Context, conn *pgx.Conn, tenant uuid.UUID) []m
 		}
 		out = append(out, r)
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return out, "rejection read interrupted: " + err.Error()
+	}
+	if scanFail > 0 && len(out) == 0 {
+		return out, fmt.Sprintf("%d rejection row(s) could not be decoded", scanFail)
+	}
+	return out, ""
 }
 
 func deref(s *string) string {

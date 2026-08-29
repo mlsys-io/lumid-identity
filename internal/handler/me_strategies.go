@@ -239,13 +239,31 @@ func MeStrategies(c *gin.Context) {
 // newest first, with the consumer's own reason. Empty slice on any error — the
 // caller treats this as additive context, never as the primary answer.
 func recentRejections(ctx context.Context, conn *pgx.Conn, tenant uuid.UUID) []map[string]any {
+	// Read the ACK, not xpio.strategies.
+	//
+	// The first version joined xpio.strategies, which only has a row when the
+	// submission came through POST /xpio/strategies — the Studio form's path.
+	// A submission through the self-serve relay (POST /registry/strategies)
+	// writes mailbox.lqt_inbox directly, so it has NO xpio row and its rejection
+	// was invisible again. Verified 2026-08-29: a relay submission that the
+	// consumer rejected with a precise reason returned 0 rows from that query.
+	//
+	// mailbox.lqt_outbox is where the reason actually lives, and the consumer
+	// writes it for EVERY path — so this covers the form, the relay, and
+	// anything else that reaches the inbox. The name comes from the inbox row
+	// the ack points back at, so a rejected submission is identifiable even
+	// though it never became a strategy.
 	const q = `
-		SELECT s.name, s.created_at, s.ack_payload->>'reason' AS reason
-		  FROM xpio.strategies s
-		  JOIN mailbox.processed p ON p.msg_id = s.msg_id
+		SELECT i.payload->>'name'   AS name,
+		       o.created_at,
+		       o.payload->>'reason' AS reason
+		  FROM mailbox.lqt_outbox o
+		  JOIN mailbox.processed  p ON p.msg_id = o.payload->>'ack_of'
+		  JOIN mailbox.lqt_inbox  i ON i.msg_id = o.payload->>'ack_of'
 		 WHERE p.verified_tenant_id = $1
-		   AND s.status = 'rejected'
-		 ORDER BY s.created_at DESC
+		   AND o.topic = 'strategy.ack'
+		   AND o.payload->>'status' = 'rejected'
+		 ORDER BY o.created_at DESC
 		 LIMIT 20`
 	out := []map[string]any{}
 	rows, err := conn.Query(ctx, q, tenant)

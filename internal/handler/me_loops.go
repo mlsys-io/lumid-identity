@@ -23,7 +23,6 @@ package handler
 //         filtering lands when cloud runtime stands up (P2).
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -33,9 +32,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-
-	"lumid_identity/internal/common"
-	"lumid_identity/models"
 )
 
 type meLoopPatchBody struct {
@@ -259,103 +255,28 @@ func MeLoopRunNow(c *gin.Context) {
 		return // writeIntent already wrote the error response
 	}
 
-	// Wait briefly for the scheduler's own verdict before reporting success.
+	// Whether it can actually RUN is answered by POLLING `job_id`, not by
+	// blocking here.
 	//
-	// Identity cannot answer "can this actually run?" by itself: it mounts no
-	// tenant volume (only signing-keys), so the tenant tree it would stat is
-	// not the one the cycle Job reads — that lives on the scheduler's
-	// `xpio-state` PVC on another cluster entirely. Any local stat is a guess,
-	// and the materialising one above was a guess that always said yes.
+	// Identity cannot decide that on its own: it mounts no tenant volume (only
+	// signing-keys), so the tree it would stat is not the one the cycle Job
+	// reads — that lives on the scheduler's `xpio-state` PVC in another
+	// cluster. The scheduler knows, and reports back to
+	// /internal/me-intents/:id/result, into this same table. That is what
+	// makes `job_id` the useful half of this response: GET /me/intents/:id
+	// carries the real outcome and the scheduler's own error text.
 	//
-	// The scheduler DOES know, and it tells us: it posts the result back to
-	// /internal/me-intents/:id/result, which lands in this same table. A
-	// dispatch that cannot happen fails in about a second (missing app,
-	// undeclared loop), so a short wait converts the common silent failure
-	// into a real error while a genuinely-running cycle falls through to the
-	// 202 this endpoint has always returned. We report what happened instead
-	// of predicting it.
-	if reason, failed := runNowSettled(c.Request.Context(), id); failed {
-		fail(c, http.StatusBadGateway, 1502, "cycle did not start: "+reason)
-		return
-	}
-
+	// v0.5.273 tried to wait here for an early failure. MEASURED on the live
+	// queue that does not work: a FAILED dispatch reports at ~6-7s and a
+	// SUCCESSFUL one at ~8s, so no bound separates them. A 6s wait caught most
+	// failures and turned every healthy call from 0.4s into 6.2s — a 15x
+	// regression on every click, to make a subset of failures louder. Removed.
+	// The reporting belongs in the client, which can poll `job_id` without
+	// holding a request open.
 	c.JSON(http.StatusAccepted, gin.H{
 		"ret_code": 0, "message": "one-shot queued",
 		"data": gin.H{"job_id": id, "state": "queued"},
 	})
-}
-
-// How long MeLoopRunNow waits for a fast failure before falling back to 202.
-// Measured on the live queue: a run_loop that cannot dispatch completes in
-// 1-5s (claim + resolve + fail). Long enough to catch that, short enough that
-// a healthy request stays snappy — and a cycle that outlives it is reported as
-// queued, which is exactly what it is.
-const (
-	runNowSettleWait = 6 * time.Second
-	runNowPollEvery  = 300 * time.Millisecond
-)
-
-// runNowSettled polls the intent row for an early failure. Returns
-// (reason, true) only when the scheduler has actually reported the intent
-// failed. Everything else — still pending, completed OK, DB unavailable,
-// caller hung up — returns false, because this must never turn a working
-// dispatch into an error. It degrades to the old always-202 behaviour.
-func runNowSettled(ctx context.Context, intentID string) (string, bool) {
-	if common.DB == nil || intentID == "" {
-		return "", false
-	}
-	deadline := time.Now().Add(runNowSettleWait)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return "", false
-		case <-time.After(runNowPollEvery):
-		}
-		var row models.MeAppIntent
-		if err := common.DB.Select("status", "result").
-			Where("id = ?", intentID).First(&row).Error; err != nil {
-			return "", false // row not visible yet, or DB trouble — not a failure
-		}
-		if row.Status != "failed" {
-			// "done" means it dispatched; "pending"/"claimed" means keep waiting.
-			if row.Status == "done" {
-				return "", false
-			}
-			continue
-		}
-		return intentFailureReason(row.Result), true
-	}
-	return "", false
-}
-
-// intentFailureReason pulls the scheduler's own error out of the result
-// envelope. The envelope is the scheduler's to shape, so treat every field as
-// optional and fall back to a generic line rather than leaking raw JSON at a
-// user.
-func intentFailureReason(result string) string {
-	const generic = "the scheduler could not start this cycle"
-	if strings.TrimSpace(result) == "" {
-		return generic
-	}
-	var env struct {
-		Error string `json:"error"`
-	}
-	if json.Unmarshal([]byte(result), &env) != nil {
-		return generic
-	}
-	msg := strings.TrimSpace(env.Error)
-	if msg == "" {
-		return generic
-	}
-	// Keep it to one line and bounded: this reaches a toast, and the full
-	// envelope stays readable at GET /me/intents/:id.
-	if i := strings.IndexAny(msg, "\n\r"); i >= 0 {
-		msg = msg[:i]
-	}
-	if len(msg) > 300 {
-		msg = msg[:300] + "…"
-	}
-	return msg
 }
 
 // POST /api/v1/me/loops/:app/:loop/stop

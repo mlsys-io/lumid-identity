@@ -196,6 +196,29 @@ func MeStrategies(c *gin.Context) {
 	}
 
 	data["strategies"] = out
+
+	// REJECTED SUBMISSIONS — the half a student could not see.
+	//
+	// A strategy whose .lqts does not compile never reaches core.tenant_strategies,
+	// so the list above is silent about it. The consumer does the right thing: it
+	// parses, fails, and acks `status: rejected` with an exact reason and
+	// character offsets ("expected `when` to start a guard, found identifier
+	// `param`"). That ack lands in mailbox.lqt_outbox and nothing rendered it.
+	//
+	// Measured 2026-08-29: 4 of 14 submissions across four e2e runs were rejected
+	// this way. Every one presented to the student as "Queued send_strategy" and
+	// then a row that never appeared — no error, anywhere. It reads exactly like
+	// data loss and is the opposite: a precise diagnosis nobody surfaced.
+	//
+	// Scoped the same way as the query above: mailbox.processed.verified_tenant_id
+	// is the tenant the CONSUMER verified from the submitter's own token, bound and
+	// never interpolated. Deliberately NOT read from /xpio/strategies, which the
+	// surface layer reaches through a shared service PAT and which would therefore
+	// show another tenant's submissions.
+	//
+	// Best-effort: a failure here must not take down the strategy list, which is
+	// the primary answer. Rejections are additive context.
+	data["rejected"] = recentRejections(ctx, conn, tenant)
 	switch {
 	case len(out) == 0 && scanFailures > 0:
 		// Rows existed and none could be read — a schema/scan mismatch, NOT an
@@ -210,6 +233,46 @@ func MeStrategies(c *gin.Context) {
 		data["reason"] = "no strategies yet"
 	}
 	ok(c, "ok", data)
+}
+
+// recentRejections returns submissions this tenant made that failed to compile,
+// newest first, with the consumer's own reason. Empty slice on any error — the
+// caller treats this as additive context, never as the primary answer.
+func recentRejections(ctx context.Context, conn *pgx.Conn, tenant uuid.UUID) []map[string]any {
+	const q = `
+		SELECT s.name, s.created_at, s.ack_payload->>'reason' AS reason
+		  FROM xpio.strategies s
+		  JOIN mailbox.processed p ON p.msg_id = s.msg_id
+		 WHERE p.verified_tenant_id = $1
+		   AND s.status = 'rejected'
+		 ORDER BY s.created_at DESC
+		 LIMIT 20`
+	out := []map[string]any{}
+	rows, err := conn.Query(ctx, q, tenant)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, reason *string
+		var at *time.Time
+		if rows.Scan(&name, &at, &reason) != nil {
+			continue
+		}
+		r := map[string]any{"name": deref(name), "reason": deref(reason)}
+		if at != nil {
+			r["submitted_at"] = at.UTC().Format(time.RFC3339)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // MeStrategyDetail — GET /api/v1/me/strategies/:id

@@ -104,25 +104,54 @@ func compilePageSpec(b []byte) (string, error) {
 				continue
 			}
 		}
-		for _, w := range widgets {
-			wtype := strings.TrimSpace(w["type"].(string))
-			body := make(map[string]any, len(w))
-			for k, v := range w {
-				if k != "type" {
-					body[k] = v
+		// A RUN of consecutive `stat` widgets lays out side by side even when
+		// the author declared no `columns`.
+		//
+		// A stat renders as a small fixed-width badge (inline-flex, min-w
+		// 120px) — it is built to sit in a row. Emitted as its own fence it
+		// becomes a block-level element, so four of them stacked into four
+		// lines of number-over-label and pushed the real content off the fold.
+		// Reported from the live Strategies page, whose Overview is exactly
+		// four stats.
+		//
+		// An explicit `columns:` still wins (handled above), and ONLY stats
+		// group: a table or form beside them keeps its own full-width fence. A
+		// lone stat is left alone — a one-cell grid is a stat with extra markup.
+		for i := 0; i < len(widgets); {
+			run := statRunLength(widgets[i:])
+			if run < 2 {
+				if emitWidgetFence(&sb, widgets[i]) {
+					emitted++
 				}
-			}
-			yb, err := yaml.Marshal(body)
-			if err != nil {
+				i++
 				continue
 			}
-			sb.WriteString("```lumid:" + wtype + "\n")
+			// LumidColumns clamps to 4; a bigger number silently collapses
+			// there and the extras wrap. Clamp here, where the intent is
+			// readable, and still pass every widget in the run.
+			cols := run
+			if cols > 4 {
+				cols = 4
+			}
+			yb, err := yaml.Marshal(map[string]any{"columns": cols, "blocks": widgets[i : i+run]})
+			if err != nil {
+				// Fall back to one fence each rather than dropping the row.
+				for _, w := range widgets[i : i+run] {
+					if emitWidgetFence(&sb, w) {
+						emitted++
+					}
+				}
+				i += run
+				continue
+			}
+			sb.WriteString("```lumid:columns\n")
 			sb.Write(yb)
 			if !strings.HasSuffix(string(yb), "\n") {
 				sb.WriteString("\n")
 			}
 			sb.WriteString("```\n\n")
-			emitted++
+			emitted += run
+			i += run
 		}
 	}
 	out := strings.TrimRight(sb.String(), "\n") + "\n"
@@ -130,4 +159,42 @@ func compilePageSpec(b []byte) (string, error) {
 		return "", fmt.Errorf("page.yaml produced no widgets")
 	}
 	return out, nil
+}
+
+// statRunLength counts the leading consecutive `stat` widgets in ws.
+func statRunLength(ws []map[string]any) int {
+	n := 0
+	for _, w := range ws {
+		t, _ := w["type"].(string)
+		if strings.TrimSpace(t) != "stat" {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// emitWidgetFence writes one widget as its own ```lumid:<type>``` fence.
+// Reports whether anything was written, so the caller's count stays honest
+// when a widget fails to marshal.
+func emitWidgetFence(sb *strings.Builder, w map[string]any) bool {
+	wtype, _ := w["type"].(string)
+	wtype = strings.TrimSpace(wtype)
+	body := make(map[string]any, len(w))
+	for k, v := range w {
+		if k != "type" {
+			body[k] = v
+		}
+	}
+	yb, err := yaml.Marshal(body)
+	if err != nil {
+		return false
+	}
+	sb.WriteString("```lumid:" + wtype + "\n")
+	sb.Write(yb)
+	if !strings.HasSuffix(string(yb), "\n") {
+		sb.WriteString("\n")
+	}
+	sb.WriteString("```\n\n")
+	return true
 }

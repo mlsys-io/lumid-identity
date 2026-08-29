@@ -53,6 +53,11 @@ const (
 	// A workspace list, not an export. Bounded so one tenant with a runaway
 	// registry cannot turn this into a slow query.
 	strategiesRowCap = 500
+
+	// Rejections are additive context beside the list, not a history export.
+	// The reader clamps this server-side too, so a wrong value here cannot widen
+	// the read.
+	rejectionRowCap = 20
 )
 
 func strategiesDSN() string { return strings.TrimSpace(os.Getenv("LQT_CORE_DSN")) }
@@ -250,34 +255,33 @@ func MeStrategies(c *gin.Context) {
 // newest first, with the consumer's own reason. Empty slice on any error — the
 // caller treats this as additive context, never as the primary answer.
 func recentRejections(ctx context.Context, conn *pgx.Conn, tenant uuid.UUID) ([]map[string]any, string) {
-	// Read the ACK, not xpio.strategies.
+	// Call the narrow reader, do not join the tables.
 	//
-	// The first version joined xpio.strategies, which only has a row when the
-	// submission came through POST /xpio/strategies — the Studio form's path.
-	// A submission through the self-serve relay (POST /registry/strategies)
-	// writes mailbox.lqt_inbox directly, so it has NO xpio row and its rejection
-	// was invisible again. Verified 2026-08-29: a relay submission that the
-	// consumer rejected with a precise reason returned 0 rows from that query.
+	// The reason lives in mailbox.lqt_outbox, and the consumer writes it for
+	// EVERY submit path — the Studio form, the self-serve relay, anything that
+	// reaches the inbox. (An earlier version joined xpio.strategies, which only
+	// has a row for the form's path, so relay rejections stayed invisible.)
 	//
-	// mailbox.lqt_outbox is where the reason actually lives, and the consumer
-	// writes it for EVERY path — so this covers the form, the relay, and
-	// anything else that reaches the inbox. The name comes from the inbox row
-	// the ack points back at, so a rejected submission is identifiable even
-	// though it never became a strategy.
-	const q = `
-		SELECT i.payload->>'name'   AS name,
-		       o.created_at,
-		       o.payload->>'reason' AS reason
-		  FROM mailbox.lqt_outbox o
-		  JOIN mailbox.processed  p ON p.msg_id = o.payload->>'ack_of'
-		  JOIN mailbox.lqt_inbox  i ON i.msg_id = o.payload->>'ack_of'
-		 WHERE p.verified_tenant_id = $1
-		   AND o.topic = 'strategy.ack'
-		   AND o.payload->>'status' = 'rejected'
-		 ORDER BY o.created_at DESC
-		 LIMIT 20`
+	// But identity CANNOT read those tables, and must not be able to: measured
+	// 2026-08-29, 1,381,921 of 1,382,164 mailbox.lqt_inbox rows carry a live PAT
+	// at payload.auth.pat, because that is how the consumer authenticates a
+	// submission. Granting this service USAGE on schema mailbox to render a
+	// one-line error would put ~1.38M live bearer tokens one SELECT away.
+	//
+	// LQT migration 0079 provides core.read_tenant_rejections(tenant, limit) —
+	// a SECURITY DEFINER reader owned by postgres that returns three scalar
+	// columns and never the payload it read them from. It is defined in `core`
+	// precisely so schema `mailbox` is never opened to identity_strategies_ro at
+	// all (EXECUTE alone cannot call a function; PostgreSQL also wants USAGE on
+	// its schema). Verified as that role: the call returns rows, and a direct
+	// read of mailbox.lqt_inbox still fails with permission denied.
+	//
+	// The tenant is bound and comes from the authenticated session — there is no
+	// request field that reaches this argument.
+	const q = `SELECT name, submitted_at, reason FROM core.read_tenant_rejections($1, $2)`
+
 	out := []map[string]any{}
-	rows, err := conn.Query(ctx, q, tenant)
+	rows, err := conn.Query(ctx, q, tenant, rejectionRowCap)
 	if err != nil {
 		return out, "rejection query failed: " + err.Error()
 	}

@@ -159,6 +159,14 @@ func Register(r *gin.Engine) {
 			// gate internal doc routes (e.g. lum.id/docs/plugin-image-cd) to
 			// admin/super_admin only — RequireAdmin admits both roles.
 			admin.GET("/check", AdminCheck)
+
+			// Cohort research review — the reviewer's side of the progress
+			// protocol. Every /me/* path is scoped to the caller, which is right
+			// for filing and leaves a twenty-person cohort unreadable; this is the
+			// one job that genuinely reads across tenants, so it gets its own
+			// admin-gated door rather than widening the researcher-facing one.
+			// Read-only: there is no write path in that file.
+			admin.GET("/cohort/submissions", AdminCohortSubmissions)
 			admin.POST("/invitation-codes", AdminInviteMint)
 			admin.GET("/invitation-codes", AdminInviteList)
 			admin.DELETE("/invitation-codes/:code", AdminInviteRevoke)

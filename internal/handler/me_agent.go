@@ -230,7 +230,28 @@ func dispatchLumidosTool(userID, name string, args map[string]any) (map[string]a
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return map[string]any{"error": "lumidos unreachable: " + err.Error()}, false
+		// Say what is actually wrong, and what to do instead.
+		//
+		// This used to surface the raw Go dial error into a chat turn
+		// ("lumidos unreachable: Post \"http://lumidos-server:9100/...\": dial
+		// ..."), which a model reads as a transient blip: it retries, burns
+		// another turn, and a student watching their first session sees a
+		// stack-shaped string and silence. Measured 2026-08-29: the bridge is
+		// not flaky, it is ABSENT — no `lumidos-server` Service exists in the
+		// cluster, so all of these tools fail every time.
+		//
+		// Naming the alternative matters more than naming the fault: every app
+		// operation the bridge fronts is also reachable through /me/apps and
+		// the Studio Library, so a caller told that can finish the job instead
+		// of retrying a hop that cannot come back inside this conversation.
+		return map[string]any{
+			"error":     "lumidos tool bridge unavailable (" + err.Error() + ")",
+			"retryable": false,
+			"hint": "The LumidOS tool bridge is not reachable from this deployment, so " +
+				"app_*/agent_* tools cannot run. Do not retry them. Installing, listing and " +
+				"inspecting apps still works through the /me/apps API and the Studio Library " +
+				"page; use those, or tell the user to use the Library UI.",
+		}, false
 	}
 	defer resp.Body.Close()
 	var out map[string]any

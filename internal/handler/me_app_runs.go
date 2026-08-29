@@ -104,9 +104,36 @@ func loopMetricName(userSub, app, loop string) string {
 
 // appRunsFor returns the caller's runs for an app (optionally one loop), oldest
 // first. The cross-node source for trajectory + experiment metrics.
+// appAliases returns every historical name a bundle's run rows may be filed
+// under, including `app` itself.
+//
+// Run rows are keyed on (user_sub, app), so a RENAMED app orphans its own
+// history: rows written as `lqt-mailbox` are unreachable from `quant-research`
+// surfaces and vice versa. The surfaces then read empty forever with no
+// diagnostic, while the Strategies table — which is server-scoped and
+// slug-independent — still shows real rows. The user sees "my strategies exist
+// but backtesting is broken", which is not what happened.
+//
+// Keep this list tiny and explicit. It is a compatibility shim for renames that
+// already shipped, not a general aliasing feature: a wrong entry here silently
+// merges two apps' histories, which is a worse failure than the one it fixes.
+func appAliases(app string) []string {
+	groups := [][]string{
+		{"quant-research", "lqt-mailbox"},
+	}
+	for _, g := range groups {
+		for _, name := range g {
+			if name == app {
+				return g
+			}
+		}
+	}
+	return []string{app}
+}
+
 func appRunsFor(userSub, app, loop string) []models.MeAppRun {
 	var rows []models.MeAppRun
-	q := common.DB.Where("user_sub = ? AND app = ?", userSub, app)
+	q := common.DB.Where("user_sub = ? AND app IN ?", userSub, appAliases(app))
 	if loop != "" {
 		q = q.Where("`loop` = ?", loop) // reserved word — backtick-quote
 	}
@@ -215,7 +242,10 @@ func lastRunFromDB(userSub, app, loop string) (float64, bool, bool) {
 		return 0, false, false
 	}
 	var row models.MeAppRun
-	err := common.DB.Where("user_sub = ? AND app = ? AND `loop` = ?", userSub, app, loop).
+	// Alias-aware like appRunsFor: a renamed app must not appear to have never
+	// run. The WRITE path (upsertAppRun) deliberately keeps its exact key — a
+	// write matching several names would merge histories rather than record one.
+	err := common.DB.Where("user_sub = ? AND app IN ? AND `loop` = ?", userSub, appAliases(app), loop).
 		Order("run_ts DESC").Limit(1).First(&row).Error
 	if err != nil || row.RunTs == 0 {
 		return 0, false, false

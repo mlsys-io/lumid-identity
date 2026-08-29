@@ -200,6 +200,23 @@ func MeLoopRunNow(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app/loop name")
 		return
 	}
+	// The app must actually resolve before we accept the run. Without this the
+	// handler returned 202 "one-shot queued" for ANY name — so a user on a
+	// renamed or mistyped slug got the success toast ("Backtest queued — poll
+	// for the verdict") and nothing ever ran. A confident success over a no-op
+	// is worse than an error: there is no signal to act on, and the surface
+	// polls an empty table forever.
+	//
+	// NOTE this catches a nonexistent app, not every wrong-app case:
+	// resolveAppDir falls back to the operator-shared bundle, so a published
+	// app resolves for anyone. Run history is still keyed per (user, app) in
+	// me_app_data.go, so a legacy-slug user can pass here and still read empty.
+	// That needs the slug alias, which is a separate fix.
+	if resolveAppDir(userID, app) == "" {
+		fail(c, http.StatusNotFound, 1404, "app not found: "+app)
+		return
+	}
+
 	var body meLoopRunBody
 	_ = c.ShouldBindJSON(&body) // optional body
 

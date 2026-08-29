@@ -361,6 +361,26 @@ func cardsFromIntents(rows []models.MeAppIntent, onDisk map[string]bool) []pendi
 			}
 		case "failed":
 			seen[appName] = true
+			// A FAILED install does not mean the app is absent. Re-installing
+			// something already present fails by design ("app already installed
+			// at …; use a different --new-name or uninstall first"), and a user
+			// clicking Install twice — or re-installing to pick up an update —
+			// hits exactly that.
+			//
+			// Reporting the app as `failed` on that basis is worse than
+			// cosmetic: MeAppsList only backfills the `ui:` block for cards that
+			// are `ready`, so a poisoned card loses its surfaces, its sidebar
+			// label and its icon, and the Studio workspace silently downgrades a
+			// working app to the bare workflow view. Measured 2026-08-29 on a
+			// live account whose app was installed and healthy the whole time.
+			//
+			// So look further back: if an OLDER install for this app succeeded
+			// and nothing uninstalled it since, the app is present and the newer
+			// failure is a redundant attempt, not a broken install.
+			if installedEarlier(rows[i+1:], appName) {
+				cards = append(cards, pendingCard{name: appName, status: "ready"})
+				continue
+			}
 			_, msg := installResultOK([]byte(r.Result))
 			if msg == "" {
 				msg = "install failed"
@@ -377,6 +397,37 @@ func cardsFromIntents(rows []models.MeAppIntent, onDisk map[string]bool) []pendi
 		}
 	}
 	return cards
+}
+
+// installedEarlier reports whether `older` (newest-first, strictly older than
+// the row being judged) shows this app successfully installed and NOT removed
+// since. It scans newest-first and stops at the first decisive row, so an
+// uninstall that came after the successful install correctly wins.
+func installedEarlier(older []models.MeAppIntent, app string) bool {
+	for i := range older {
+		r := older[i]
+		var payload map[string]any
+		if r.Payload != "" {
+			_ = json.Unmarshal([]byte(r.Payload), &payload)
+		}
+		if intentAppName(payload) != app {
+			continue
+		}
+		if r.Action == "uninstall" {
+			// Removed at some point after any older install — decisive.
+			return r.Status == "failed"
+		}
+		if r.Action == "install" && r.Status == "done" {
+			ok, _ := true, ""
+			if r.Result != "" {
+				ok, _ = installResultOK([]byte(r.Result))
+			}
+			if ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // installResultOK interprets a picker result file. The picker writes

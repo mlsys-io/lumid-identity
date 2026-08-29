@@ -163,3 +163,66 @@ func TestIntentAppName(t *testing.T) {
 		})
 	}
 }
+
+// A FAILED install must not report an app the user still has as broken.
+//
+// Re-installing an already-present app fails by design ("app already installed
+// at …; use a different --new-name or uninstall first"), which a user hits by
+// clicking Install twice or re-installing for an update. Before this, the newer
+// failure won outright: the card went `failed`, MeAppsList skipped the `ui:`
+// backfill it only does for `ready` cards, and the Studio workspace lost the
+// app's surfaces, sidebar label and icon while the app itself kept working.
+func TestFailedReinstallDoesNotPoisonAnInstalledApp(t *testing.T) {
+	failedRow := func(app string, ageMin int) models.MeAppIntent {
+		r := intentRow("install", app, "failed", ageMin)
+		r.Result = `{"ok":false,"error":"app already installed at /home/x/.xp/agents/` + app + `"}`
+		return r
+	}
+
+	t.Run("older successful install wins over a redundant failure", func(t *testing.T) {
+		cards := cardsFromIntents([]models.MeAppIntent{
+			failedRow("quant-research", 1),
+			intentRow("install", "quant-research", "done", 60),
+		}, map[string]bool{})
+		c := cardFor(cards, "quant-research")
+		if c == nil {
+			t.Fatal("no card emitted for an app that is installed")
+		}
+		if c.status != "ready" {
+			t.Fatalf("status = %q, want \"ready\" — a redundant install must not mark a working app broken (err=%q)", c.status, c.err)
+		}
+	})
+
+	t.Run("a genuinely first-time failure still reports failed", func(t *testing.T) {
+		cards := cardsFromIntents([]models.MeAppIntent{
+			failedRow("never-worked", 1),
+		}, map[string]bool{})
+		c := cardFor(cards, "never-worked")
+		if c == nil || c.status != "failed" {
+			t.Fatalf("card = %+v, want status \"failed\" — nothing older says this ever installed", c)
+		}
+	})
+
+	t.Run("uninstall after the successful install still means gone", func(t *testing.T) {
+		cards := cardsFromIntents([]models.MeAppIntent{
+			failedRow("removed-app", 1),
+			intentRow("uninstall", "removed-app", "done", 30),
+			intentRow("install", "removed-app", "done", 60),
+		}, map[string]bool{})
+		if c := cardFor(cards, "removed-app"); c != nil && c.status == "ready" {
+			t.Fatal("reported ready for an app uninstalled after its successful install")
+		}
+	})
+
+	t.Run("a FAILED uninstall does not hide the install", func(t *testing.T) {
+		u := intentRow("uninstall", "kept-app", "failed", 30)
+		cards := cardsFromIntents([]models.MeAppIntent{
+			failedRow("kept-app", 1), u,
+			intentRow("install", "kept-app", "done", 60),
+		}, map[string]bool{})
+		c := cardFor(cards, "kept-app")
+		if c == nil || c.status != "ready" {
+			t.Fatalf("card = %+v, want \"ready\" — the uninstall failed, so the app is still there", c)
+		}
+	})
+}

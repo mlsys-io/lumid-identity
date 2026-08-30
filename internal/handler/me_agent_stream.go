@@ -366,7 +366,7 @@ func MeAgentChatStream(c *gin.Context) {
 			// via DELETE /me/agent/tool-grants/:name).
 			if destructiveTools[tu.name] && !hasToolGrant(userID, tu.name) {
 				approvalID := uuid.New().String()
-				ch := requestApproval(approvalID)
+				ch, releaseApproval := requestApproval(approvalID)
 				emit(map[string]any{
 					"type":        "tool_approval_required",
 					"id":          tu.id,
@@ -378,10 +378,12 @@ func MeAgentChatStream(c *gin.Context) {
 				select {
 				case approved = <-ch:
 				case <-time.After(10 * time.Minute):
-					toolApprovals.Delete(approvalID)
 				case <-ctx.Done():
-					toolApprovals.Delete(approvalID)
 				}
+				// Drops the local entry, cancels the cross-replica subscription
+				// and clears the Redis pending key — one call for all three, so
+				// no path can tear down two of them and leak the third.
+				releaseApproval()
 				if !approved {
 					// Audit the denial/timeout — dispatchTool never runs, so the
 					// [app-ops] audit line can't cover this. Greppable as [me-agent].

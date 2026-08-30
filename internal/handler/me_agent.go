@@ -635,12 +635,75 @@ func checkExecRateLimit(userID string) bool {
 // the user approves or 30 s pass. The approval is delivered via a separate
 // HTTP endpoint (MeAgentToolApprove).
 
-// requestApproval registers a pending approval and returns the channel.
-// The caller must call emit before reading from the channel.
-func requestApproval(approvalID string) chan bool {
+// Cross-replica approval delivery.
+//
+// `toolApprovals` is a sync.Map — PER-POD memory. The SSE stream is one
+// long-lived request pinned to the pod that registered the approval; the
+// approve POST is a SEPARATE request the load balancer routes independently.
+// With replicas=2 that is a coin flip: land on the other pod and LoadAndDelete
+// finds nothing, the caller gets a 404, and the pod actually holding the
+// stream waits out its full 10-minute timeout having never been told.
+//
+// Measured 2026-08-30 with an in-page probe teeing both sides: the UI posted
+// the exact approval_id the server had emitted and still got 404, and walk
+// outcomes were perfectly bimodal — 34-44s when the POST happened to land on
+// the right pod, 297-298s (the whole budget) when it did not. Roughly half of
+// all chat tool approvals were hanging for ten minutes with no error.
+//
+// This is the same defect the "always" grants already hit and already fixed by
+// moving to Redis (see me_agent_grants.go: ".tool-grants.json flapped by
+// replica"). The one-shot approval channel never made that migration.
+//
+// Redis is the carrier, not the store: the key exists so an approve POST on
+// ANY pod can tell "pending somewhere" from "unknown or expired", and the
+// pub/sub message carries the decision to whichever pod is blocked on it. With
+// no Redis configured this degrades to exactly the old single-pod behaviour.
+const approvalPendingTTL = 10 * time.Minute
+
+func approvalKey(id string) string     { return "claude:approval:" + id }
+func approvalChannel(id string) string { return "claude:approval-ch:" + id }
+
+// requestApproval registers a pending approval and returns the channel plus a
+// release func. The caller must call emit before reading from the channel, and
+// must call release when it stops waiting (approved, timed out, or client
+// gone) so the subscription and the Redis key do not outlive the turn.
+func requestApproval(approvalID string) (chan bool, func()) {
 	ch := make(chan bool, 1)
 	toolApprovals.Store(approvalID, ch)
-	return ch
+
+	if common.Redis == nil {
+		return ch, func() { toolApprovals.Delete(approvalID) }
+	}
+
+	setCtx, setCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	_ = common.Redis.Set(setCtx, approvalKey(approvalID), "pending", approvalPendingTTL).Err()
+	setCancel()
+
+	subCtx, subCancel := context.WithCancel(context.Background())
+	sub := common.Redis.Subscribe(subCtx, approvalChannel(approvalID))
+	go func() {
+		defer sub.Close()
+		m, err := sub.ReceiveMessage(subCtx)
+		if err != nil {
+			return // released, or the connection went away
+		}
+		// LoadAndDelete so a decision arriving on both paths (local POST and
+		// pub/sub) can only be delivered once.
+		if c, ok := toolApprovals.LoadAndDelete(approvalID); ok {
+			select {
+			case c.(chan bool) <- (m.Payload == "1"):
+			default:
+			}
+		}
+	}()
+
+	return ch, func() {
+		subCancel()
+		toolApprovals.Delete(approvalID)
+		delCtx, delCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_ = common.Redis.Del(delCtx, approvalKey(approvalID)).Err()
+		delCancel()
+	}
 }
 
 // MeAgentToolApprove — POST /api/v1/me/agent/chat/tool-approve
@@ -670,6 +733,33 @@ func MeAgentToolApprove(c *gin.Context) {
 	// cap-1 channel and leak a goroutine). The loser gets the 404 below.
 	ch, ok := toolApprovals.LoadAndDelete(body.ApprovalID)
 	if !ok {
+		// NOT OURS — it may belong to another replica holding the SSE stream.
+		// DEL is atomic and returns the number of keys removed, so exactly one
+		// concurrent POST can win and publish; the losers (and genuinely
+		// unknown or expired ids) fall through to the 404 below.
+		if common.Redis != nil {
+			rctx, rcancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			n, derr := common.Redis.Del(rctx, approvalKey(body.ApprovalID)).Result()
+			if derr == nil && n > 0 {
+				if body.Approved && body.Always && destructiveTools[body.Tool] {
+					_ = grantTool(userID, body.Tool)
+				}
+				payload := "0"
+				if body.Approved {
+					payload = "1"
+				}
+				perr := common.Redis.Publish(rctx, approvalChannel(body.ApprovalID), payload).Err()
+				rcancel()
+				if perr == nil {
+					c.JSON(http.StatusOK, gin.H{"ok": true})
+					return
+				}
+				log.Printf("[me-agent] approval publish failed id=%s err=%v", body.ApprovalID, perr)
+				fail(c, http.StatusInternalServerError, 1500, "could not deliver approval")
+				return
+			}
+			rcancel()
+		}
 		fail(c, http.StatusNotFound, 1404, "approval not found (may have timed out)")
 		return
 	}

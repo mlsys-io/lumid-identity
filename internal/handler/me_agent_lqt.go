@@ -21,6 +21,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const (
@@ -283,6 +285,101 @@ func toolLqtMailboxRead(endpoint, strategyID string, limit int) (map[string]any,
 // their own tenant's prod-paper lane, which is the documented self-serve path.
 // Real-money and the nightly-dk canary stay gated downstream, in the consumer,
 // on the PAT's own role — this tool cannot widen them.
+// ---------------------------------------------------------------------------
+// WAIT FOR THE COMPILER, NOT JUST THE MAILBOX
+//
+// This tool used to return the moment the mailbox ACKed, with a note telling
+// the caller to go confirm a program_hash themselves. No model does that, and
+// the student never sees the reason either — so a strategy that failed to
+// compile presented as a successful submit and then simply never appeared.
+//
+// Measured 2026-08-29/30 across five onboarding walks: chat-authored strategies
+// were rejected in 10-15ms with exact parse errors ("expected `when` to start a
+// guard, found identifier `param`"), and every one was reported to the model as
+// accepted. A model that gets "accepted" has nothing to correct against.
+//
+// So the submit now waits for the verdict and hands the compiler's own words
+// back in the same turn. Deployed reads core.tenant_strategies; rejected reads
+// core.read_tenant_rejections (LQT migration 0079) — the narrow SECURITY
+// DEFINER reader, so identity still needs no access to schema mailbox, which
+// holds a live PAT on every row.
+//
+// Budget: the chat turn also pays a cold sandbox spawn and an approval click,
+// so this stays well inside a 180s turn.
+const lqtVerdictTimeout = 35 * time.Second
+const lqtVerdictInterval = 2 * time.Second
+
+type lqtVerdict struct {
+	status      string // "deployed" | "rejected" | "" (no verdict in time)
+	programHash string
+	reason      string
+}
+
+// awaitLqtVerdict polls this tenant's own registry + rejection list.
+//
+// Never returns an error: a read failure here must not turn a real submit into
+// a reported failure. An empty status means "no verdict yet", which the caller
+// reports as unknown rather than as success.
+func awaitLqtVerdict(ctx context.Context, userID, name string) lqtVerdict {
+	if strategiesDSN() == "" {
+		return lqtVerdict{}
+	}
+	tenant, err := uuid.Parse(strings.TrimSpace(userID))
+	if err != nil {
+		return lqtVerdict{}
+	}
+	deadline := time.Now().Add(lqtVerdictTimeout)
+	for time.Now().Before(deadline) {
+		if v, ok := lqtVerdictOnce(ctx, tenant, name); ok {
+			return v
+		}
+		time.Sleep(lqtVerdictInterval)
+	}
+	return lqtVerdict{}
+}
+
+// lqtVerdictOnce is a single poll. ok=false means "nothing decided yet", which
+// includes every read failure — the caller keeps waiting rather than reporting
+// a verdict it does not have.
+func lqtVerdictOnce(ctx context.Context, tenant uuid.UUID, name string) (lqtVerdict, bool) {
+	pollCtx, cancel := context.WithTimeout(ctx, strategiesOpTimeout)
+	defer cancel()
+	conn, err := strategiesConnect(pollCtx)
+	if err != nil {
+		return lqtVerdict{}, false
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	// Registered? A non-empty program_hash is the only proof.
+	var hash *string
+	if qerr := conn.QueryRow(pollCtx,
+		`SELECT program_hash FROM core.tenant_strategies
+		  WHERE tenant_id = $1 AND name = $2
+		  ORDER BY registered_at DESC NULLS LAST LIMIT 1`,
+		tenant, name).Scan(&hash); qerr == nil && hash != nil && *hash != "" {
+		return lqtVerdict{status: "deployed", programHash: *hash}, true
+	}
+
+	// Rejected? Read the ack through the definer (migration 0079), so identity
+	// still needs no access to schema mailbox.
+	rows, rerr := conn.Query(pollCtx,
+		`SELECT name, reason FROM core.read_tenant_rejections($1, $2)`, tenant, 20)
+	if rerr != nil {
+		return lqtVerdict{}, false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rn, rr *string
+		if rows.Scan(&rn, &rr) != nil {
+			continue
+		}
+		if rn != nil && *rn == name && rr != nil && *rr != "" {
+			return lqtVerdict{status: "rejected", reason: *rr}, true
+		}
+	}
+	return lqtVerdict{}, false
+}
+
 func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy string) (map[string]any, bool) {
 	switch role {
 	case "user", "admin", "super_admin":
@@ -325,16 +422,45 @@ func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy 
 	if status >= 300 {
 		return map[string]any{"error": fmt.Sprintf("lqt mailbox submit %d: %s", status, out["raw"])}, false
 	}
-	return map[string]any{
-		"name":    name,
-		"version": version,
-		"acked":   out,
-		// "sent" means the MAILBOX took it. Registration happens later, in the
-		// consumer, and can still fail on auth or compile. Saying otherwise is
-		// how a submit path that never once worked kept reporting success.
-		"note": "accepted into the mailbox — NOT yet registered. Confirm with a " +
-			"registry row carrying a non-empty program_hash before believing it landed.",
-	}, true
+	// The mailbox took it. Now wait for the COMPILER, so a rejection reaches the
+	// caller in this turn instead of becoming a strategy that never appears.
+	switch v := awaitLqtVerdict(c.Request.Context(), userID, name); v.status {
+	case "deployed":
+		return map[string]any{
+			"name":         name,
+			"version":      version,
+			"status":       "deployed",
+			"program_hash": v.programHash,
+			"note":         "registered — the consumer compiled it and the registry row carries a program_hash.",
+		}, true
+	case "rejected":
+		// THE POINT. The compiler's own message, with character offsets into the
+		// source that was just submitted, handed straight back so the model can
+		// fix it and resubmit without a human relaying the error.
+		return map[string]any{
+			"name":    name,
+			"version": version,
+			"status":  "rejected",
+			"error":   v.reason,
+			"note": "REJECTED — this strategy did NOT deploy. The error above is the " +
+				"compiler's, with character offsets into your source. Fix the source " +
+				"and submit again. Do not report this as queued or successful.",
+		}, false
+	default:
+		// No verdict inside the window. Unknown is neither success nor failure,
+		// and saying "sent" here is how a submit path that never once worked kept
+		// reporting success.
+		return map[string]any{
+			"name":    name,
+			"version": version,
+			"status":  "submitted",
+			"acked":   out,
+			"note": "accepted into the mailbox, but no compile verdict within " +
+				lqtVerdictTimeout.String() + " — the consumer may be backlogged. NOT yet " +
+				"registered: confirm a registry row with a non-empty program_hash before " +
+				"believing it landed.",
+		}, true
+	}
 }
 
 // sortedKeys returns the map keys in lexical order — used to render the
@@ -358,7 +484,7 @@ func lqtToolDefs() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "lqt_mailbox_submit",
-			"description": "Submit a strategy to the LQT mailbox for deployment (strategy.deploy topic). WRITE — deploys into YOUR tenant's paper lane on your own scoped credential; requires explicit user approval and is audited. Provide the strategy name, semantic version, and the .lqts DSL source. A successful submit means the mailbox ACCEPTED it, not that it registered: confirm a registry row with a non-empty program_hash.",
+			"description": "Submit a strategy to the LQT mailbox for deployment (strategy.deploy topic). WRITE — deploys into YOUR tenant's paper lane on your own scoped credential; requires explicit user approval and is audited. Provide the strategy name, semantic version, and the .lqts DSL source. THIS WAITS FOR THE COMPILER and returns one of: status=deployed (with program_hash — it really is registered), status=rejected (with `error`: the compiler's parse message and character offsets into YOUR source — READ IT, fix the source, and submit again), or status=submitted (no verdict in time, which is unknown, NOT success). Do not report a rejection as queued or successful.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

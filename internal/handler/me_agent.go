@@ -737,7 +737,10 @@ var llmProviders = []llmProvider{
 		// suites — renaming it would have orphaned every saved selection. It is
 		// now the honest id; `kvrun-gemma4` lives on in modelIDAliases, so saved
 		// selections and the UI/e2e references still resolve here. Upstream moved
-		// Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash. 256K context.
+		// Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash. 512K context (deployed
+		// ceiling on the current H100 backend as of 2026-08-30; the model is
+		// architecturally trained up to 1M via YaRN, but 512K is the highest
+		// validated safe under real concurrent load on this hardware).
 		//
 		// KEEP upstreamModel IN SYNC WITH THE GATEWAY. A retired id does NOT fail
 		// loudly: LUMID_LLM_BACKENDS is an allowlist but unknown ids fall through
@@ -753,7 +756,7 @@ var llmProviders = []llmProvider{
 		addAnthropicVersion: false,
 		supportsVision:      true,   // multimodal; image blocks verified via lumid-llm
 		minRole:             "user", // in-house on our own GPUs; the default for everyone
-		maxOutputTokens:     16384,  // 262K ctx, free local GPU — let answers/structured output run
+		maxOutputTokens:     16384,  // 512K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
 	{

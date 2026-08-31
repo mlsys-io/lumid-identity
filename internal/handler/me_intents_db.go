@@ -12,9 +12,11 @@ package handler
 import (
 	"encoding/json"
 	"log"
+	"math/rand"
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -192,6 +194,78 @@ func InternalMeIntentsClaim(c *gin.Context) {
 	})
 }
 
+// ── Retryable write conflicts ────────────────────────────────────────────────
+//
+// MySQL 1213 (deadlock) and 1205 (lock wait timeout) are RETRYABLE BY DESIGN —
+// the server's own message says "try restarting transaction". They are not
+// failures of the request, they are the server picking a victim so someone can
+// make progress, and the victim is expected to come back.
+//
+// This path had no retry, so a deadlock surfaced as a 500 and the cycle's
+// result was DISCARDED. Measured 2026-08-31: a home-k3s cycle Job ran
+// successfully, produced a real digest, posted its result, and got
+//
+//	me_intents_db.go:216 Error 1213 (40001): Deadlock found when trying to get
+//	lock; try restarting transaction
+//
+// The intent stayed un-completed, the run never reached me_app_runs, and every
+// surface that reads it (studio trajectory, experiments, the cohort-submissions
+// reviewer view) showed silence. The work was done and then thrown away.
+//
+// The contention is structural, not incidental: InternalMeIntentsClaim holds
+// `FOR UPDATE SKIP LOCKED` over me_app_intents while draining, and this handler
+// updates the same rows as cycles finish. Concurrent drains and completions
+// will keep meeting.
+//
+// Matched on the error TEXT rather than a typed *mysql.MySQLError because the
+// driver is an indirect dependency here; promoting it to direct for two error
+// numbers would churn go.mod/go.sum in a repo other sessions share. Both the
+// numeric code and the server's wording are matched, so a driver that reformats
+// one still trips the other.
+const (
+	meIntentTxAttempts = 4
+	meIntentTxBackoff  = 25 * time.Millisecond
+)
+
+func isRetryableTxConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, needle := range []string{
+		"Error 1213", "Deadlock found", "try restarting transaction",
+		"Error 1205", "Lock wait timeout exceeded",
+	} {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// retryTxConflict runs fn until it succeeds, fails for a non-retryable reason,
+// or the attempt budget is spent. Backoff is jittered so two victims of the
+// same deadlock do not retry in lockstep and deadlock again.
+func retryTxConflict(what string, fn func() error) error {
+	var err error
+	for attempt := 1; attempt <= meIntentTxAttempts; attempt++ {
+		if err = fn(); !isRetryableTxConflict(err) {
+			if attempt > 1 && err == nil {
+				log.Printf("[me-intents] %s succeeded on attempt %d after a retryable conflict", what, attempt)
+			}
+			return err
+		}
+		if attempt == meIntentTxAttempts {
+			break
+		}
+		// 25ms, 50ms, 100ms — plus up to 100% jitter.
+		backoff := meIntentTxBackoff << (attempt - 1)
+		time.Sleep(backoff + time.Duration(rand.Int63n(int64(backoff)+1)))
+	}
+	log.Printf("[me-intents] %s exhausted %d attempts against a retryable conflict: %v", what, meIntentTxAttempts, err)
+	return err
+}
+
 // InternalMeIntentResult — POST /api/v1/internal/me-intents/:id/result
 // (X-Bridge-Secret). Body is the picker's result envelope (arbitrary JSON).
 // Marks the row done|failed (via installResultOK) and stores the result for
@@ -212,13 +286,18 @@ func InternalMeIntentResult(c *gin.Context) {
 	if ok, _ := installResultOK(rb); ok {
 		status = "done"
 	}
-	res := common.DB.Model(&models.MeAppIntent{}).Where("id = ?", id).
-		Updates(map[string]any{"status": status, "result": string(rb), "completed_at": time.Now()})
-	if res.Error != nil {
-		fail(c, http.StatusInternalServerError, 1500, "result: "+res.Error.Error())
+	var rowsAffected int64
+	err := retryTxConflict("intent result "+id, func() error {
+		res := common.DB.Model(&models.MeAppIntent{}).Where("id = ?", id).
+			Updates(map[string]any{"status": status, "result": string(rb), "completed_at": time.Now()})
+		rowsAffected = res.RowsAffected
+		return res.Error
+	})
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "result: "+err.Error())
 		return
 	}
-	if res.RowsAffected == 0 {
+	if rowsAffected == 0 {
 		fail(c, http.StatusNotFound, 1404, "intent not found")
 		return
 	}

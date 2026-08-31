@@ -72,11 +72,28 @@ type cohortSubmission struct {
 //
 // Query: app (default lumid-cohort-digest), period (exact, e.g. 2026-08-29),
 //
-//	user (sub), limit (default 200, max 1000).
+//	user (sub), limit (default 200, max 1000), loop (default "submit").
+//
+// `loop` exists because me_app_runs had NO reader that could list it. The
+// trajectory and /me/runs surfaces both reconstruct history from the tenant
+// tree on disk — which identity cannot mount — and merely OVERLAY the run
+// store onto what they find there. So a row could be written correctly and
+// still be invisible everywhere, and on 2026-08-31 that turned a four-layer
+// scheduler bug into a hunt: every reader answered "nothing" whether the
+// write had worked or not.
+//
+// Defaulting to "submit" keeps this endpoint's own contract unchanged; naming
+// another loop turns it into the direct read of the run store that was
+// missing. Same admin gate, same tenant-resolution, one more WHERE.
 func AdminCohortSubmissions(c *gin.Context) {
 	app := c.DefaultQuery("app", cohortDigestApp)
 	if !slugRe.MatchString(app) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app")
+		return
+	}
+	loop := c.DefaultQuery("loop", "submit")
+	if !slugRe.MatchString(loop) {
+		fail(c, http.StatusBadRequest, 1400, "invalid loop")
 		return
 	}
 	limit := 200
@@ -92,7 +109,7 @@ func AdminCohortSubmissions(c *gin.Context) {
 		limit = n
 	}
 
-	q := common.DB.Where("app IN ? AND `loop` = ?", appAliases(app), "submit")
+	q := common.DB.Where("app IN ? AND `loop` = ?", appAliases(app), loop)
 	if u := c.Query("user"); u != "" {
 		q = q.Where("user_sub = ?", u)
 	}

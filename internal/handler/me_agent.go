@@ -1015,11 +1015,11 @@ var llmProviders = []llmProvider{
 		// turn arriving while all 8 slots are busy IS billed, same guard as the
 		// plain chat chip above.
 		//
-		// nativeToolCallsInText is UNVERIFIED for this model (see qwenProfile's
-		// own comment in claude-proxy) — GLM needed a prose-tool-call workaround
-		// on our own llama.cpp and qwen3.8-27b has never been tested for the
-		// same failure mode. Smoke-test tool-calling live before trusting this
-		// lane for real coding work.
+		// Tool-calling smoke-tested live 2026-09-01 through claude-proxy with a
+		// real tool definition — proper `tool_use` block, structured input,
+		// no prose fallback needed (see qwenProfile's own comment in
+		// claude-proxy for the full result). Unlike GLM, this lane does not
+		// need a prose-extraction workaround.
 		id:                "claude-code-qwen38",
 		displayName:       "Qwen3.8-27B (Code · Lumid GPU)",
 		endpoint:          "",

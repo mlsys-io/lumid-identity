@@ -193,37 +193,34 @@ func TestProviderUpstreamModelsAreRoutable(t *testing.T) {
 // looked fine in the picker.
 func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
 	// claude-proxy's SELF_HOSTED_MODELS now names TWO models
-	// (deepseek-v4-flash,glm-5.3-flash), but this guard is deliberately NARROWER
+	// (deepseek-v4-flash,qwen3.8-27b), but this guard is deliberately NARROWER
 	// than "whatever claude-proxy forwards". Its question is "may this chip be
 	// offered to every ordinary user in the SANDBOX lane?"
 	//
-	// UPDATED 2026-08-27: the trigger this comment used to name HAS fired —
-	// glm-5.3-flash now has a real on-prem backend
-	// (glm-5.3-flash=http://100.117.154.126:4005 in LUMID_LLM_BACKENDS, our own
-	// s0 CPU on NUMA node1). So "OpenRouter-served, real money per token" is no
-	// longer why it is excluded, and leaving that reason here would have rotted
-	// into a false statement.
-	//
-	// GLM was then made pool-EXEMPT the same day, which was the condition this
-	// guard named for admitting it — so it is permitted here now, on the same
-	// footing as deepseek: both are served from hardware we own and neither is
-	// refused when a user's Claude window is exhausted.
+	// UPDATED 2026-09-01: glm-5.3-flash dropped (part of the qwen3.6/GLM purge —
+	// its on-prem backend had already been retired 2026-08-29, so its chip was
+	// running almost entirely on metered OpenRouter tokens). qwen3.8-27b added
+	// in its place — PARITY with how the deepseek and glm-5.3-flash harness
+	// chips were built: a claude-proxy SELF_HOSTED_MODELS entry, a modelProfile
+	// (qwenProfile), and this chip. It has a real on-prem backend (luyao1 RTX
+	// 5090, tier=0) and is pool-exempt for the same reason GLM was — see
+	// qwenProfile's own comment in claude-proxy/app/oaicompat.go.
 	//
 	// What that does NOT mean: pool-exempt is about REFUSAL, not accounting.
-	// identity still counts both models against the window at
-	// claudeWeightNonClaude (poolCapApplies is unconditional and ClaudePoolUsage
-	// has no model filter), so admitting GLM here does not hide its spend.
-	permitted := map[string]bool{"deepseek-v4-flash": true, "glm-5.3-flash": true}
+	// identity still counts it against the window at claudeWeightNonClaude
+	// (poolCapApplies is unconditional and ClaudePoolUsage has no model
+	// filter), so admitting it here does not hide its spend.
+	permitted := map[string]bool{"deepseek-v4-flash": true, "qwen3.8-27b": true}
 	for _, p := range llmProviders {
 		rest, ok := strings.CutPrefix(p.upstreamModel, "lumid-llm/")
 		if !ok {
 			continue
 		}
 		if !permitted[rest] {
-			t.Errorf("provider %q routes in-house at %q, but claude-proxy forwards only %q "+
-				"among non-Anthropic models in this lane — every call through it is "+
-				"refused for all roles",
-				p.id, rest, "deepseek-v4-flash")
+			t.Errorf("provider %q routes in-house at %q, but claude-proxy forwards only "+
+				"deepseek-v4-flash/qwen3.8-27b among non-Anthropic models in this lane — "+
+				"every call through it is refused for all roles",
+				p.id, rest)
 		}
 	}
 }

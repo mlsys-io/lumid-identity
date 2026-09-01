@@ -394,6 +394,18 @@ func judgePanelFor(appDir string) (seats []string, minAgree int) {
 // Returns "" when the seat names nothing servable, so the caller can drop it
 // rather than route it at the caller's role default — which is how a panel
 // silently collapses into the analyst grading itself.
+// judgeSeatUpstreamAliases maps an alternate UPSTREAM MODEL spelling app
+// authors may write in a judge_panel spec to the provider id that serves it.
+// Distinct from modelIDAliases (provider id -> provider id, for a rename):
+// this is for one model reachable under more than one caller-facing name.
+// qwen3.8-27b's chip now sends the BARE id (LUMID_LLM_BACKENDS keys the local
+// luyao1 backend that way, so bare hits tier=0 first) but
+// LUMID_LLM_OPENROUTER_MODEL_MAP, the LumidOS SDK, and existing judge_panel
+// specs also use the namespaced "qwen/qwen3.8-27b" — both must resolve.
+var judgeSeatUpstreamAliases = map[string]string{
+	"qwen/qwen3.8-27b": "lumid-qwen38-27b",
+}
+
 func resolveJudgeSeat(seat string) string {
 	if _, ok := providerByID(seat); ok {
 		return seat
@@ -401,6 +413,11 @@ func resolveJudgeSeat(seat string) string {
 	for _, p := range llmProviders {
 		if p.upstreamModel == seat {
 			return p.id
+		}
+	}
+	if id, ok := judgeSeatUpstreamAliases[seat]; ok {
+		if _, ok := providerByID(id); ok {
+			return id
 		}
 	}
 	return ""

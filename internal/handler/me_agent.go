@@ -850,84 +850,52 @@ var llmProviders = []llmProvider{
 		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
 	{
-		// glm-5.3-flash — GLM-5.3-Flash (Zhipu, MIT), 321B total / 18B active MoE,
-		// 1M context. Served through lumid-llm by OPENROUTER.
+		// qwen3.8-27b — DUAL PURPOSE: the general chat chip AND the INDEPENDENT
+		// judge seat for app scoring panels (paired with deepseek-v4-flash as
+		// seat 1 by mbb-consultant's judge_panel, median of 2,
+		// panel_min_agreement 2 — the judge must not be the same model as the
+		// analyst, and deepseek is this table's default/analyst provider).
 		//
-		// It was briefly CPU-first and the label said "(Lumid CPU)". Both were
-		// reverted the same day: CPU PREFILL is ~92 tok/s, and Studio chat carries
-		// a ~19k-token tool catalog on every turn (~3.5 min before a first token),
-		// so chat appeared dead. Decode was never the issue — 13.0 tok/s, ahead of
-		// deepseek's 12.2. The s0 instance is still there as glm-5.3-flash-cpu, a
-		// direct-dial id for SHORT prompts, mirroring deepseek-v4-flash-cpu; it is
-		// deliberately not offered as a chip, because the failure it produces on a
-		// long prompt is a silent hang rather than an error.
+		// PROMOTED 2026-09-01 from admin-only to everyone, replacing the removed
+		// glm-5.3-flash chip in the roster (same purge that dropped qwen3.6-* and
+		// GLM from LUMID_LLM_OPENROUTER_MODEL_MAP — see lumid-llm.yaml). Real
+		// on-prem backend now (luyao1 RTX 5090, tier=0, 376000 ctx / parallel=8,
+		// stress-tested clean), same trigger condition that flipped GLM's role
+		// gate open on 2026-08-27 and, later, its poolEnforced flag.
 		//
-		// No hardware qualifier in the display name: it is OpenRouter-served, like
-		// the qwen entries below, which also carry none.
+		// upstreamModel is the BARE id, not "qwen/qwen3.8-27b" — THIS WAS A REAL
+		// BUG, found while wiring this promotion. LUMID_LLM_BACKENDS keys the
+		// local luyao1 backend under the bare "qwen3.8-27b"; the namespaced
+		// spelling has no local match in resolve(), so every request through this
+		// chip fell straight through to OpenRouter and NEVER reached the GPU that
+		// was deployed and stress-tested the same day. Fixed by sending the bare
+		// id here, matching deepseek's own pattern. The namespaced spelling still
+		// works as an OpenRouter overflow destination (see lumid-llm.yaml) and is
+		// still what me_agent_app_judge.go's resolveJudgeSeat / the LumidOS SDK
+		// accept as an alternate caller-facing spelling — only THIS chip's wire
+		// value changed.
 		//
 		// dailyBudgetTokens is FINITE even though the primary backend is our own
-		// hardware, and that is deliberate: the ladder is CPU -> OpenRouter with
-		// no tier-0, so every request that arrives while the 8 CPU slots are busy
-		// is BILLED. -1 here would be an uncapped spend path for every user at
-		// exactly the moment the model is most popular — the same trap the qwen
-		// block below documents, reached by a different route. Matched to the qwen
-		// entries rather than invented.
-		//
-		// supportsVision is false although GLM-5.3-Flash IS natively multimodal:
-		// claude-proxy still drops image blocks (text-only scope) and llama.cpp is
-		// text-only for this architecture. A false negative just hides the image
-		// affordance; a false positive breaks the turn.
+		// hardware — same reasoning the GLM row used to carry: the ladder is
+		// local GPU -> OpenRouter overflow with only ONE physical tier, so a
+		// request arriving while the 8 slots are saturated IS billed. Sized in
+		// TURNS, not a round number, mirroring GLM's own sizing note: 1.5M is
+		// ~200 Simple-view turns or ~90 full-tool-catalog turns — a real working
+		// day — at a worst case of every turn overflowing.
 		//
 		// KEEP upstreamModel IN SYNC WITH THE GATEWAY — see the deepseek note above.
-		id:                  "glm-5.3-flash",
-		displayName:         "GLM-5.3-Flash",
-		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "glm-5.3-flash",
-		authHeader:          "Authorization",
-		authPrefix:          "Bearer ",
-		keyFn:               kvrunPAT,
-		addAnthropicVersion: false,
-		supportsVision:      false,  // text-only through this path; see above
-		minRole:             "user", // everyone
-		maxOutputTokens:     16384,  // 1M ctx; reasoning model, give answers room
-		// FINITE because the ladder is CPU -> OpenRouter with no tier-0, so a turn
-		// arriving while the 8 CPU slots are busy is billed.
-		//
-		// SIZE IT IN TURNS, NOT IN ROUND NUMBERS. This was 200_000 -- copied from
-		// the qwen rows rather than divided by what a turn actually costs -- and a
-		// Studio turn carries the whole tool catalog as INPUT: ~16.3k tokens on the
-		// full catalog, ~7.4k in Simple view. 200k is therefore ~12 turns/day, or
-		// ~27 in Simple. Users hit it in an afternoon and it reads as "the model is
-		// broken", which is exactly how it was reported.
-		//
-		// 1.5M is ~200 Simple turns or ~90 full-catalog turns -- a real working day.
-		// At GLM's $0.15/M in + $0.50/M out that is ~$0.25/day worst case if every
-		// single turn overflowed to OpenRouter, and near zero while the CPU serves
-		// them. The cap is a runaway guard, not a rationing device.
-		dailyBudgetTokens: 1_500_000,
-	},
-	{
-		// qwen3.8-27b — the INDEPENDENT judge seat for app scoring panels.
-		//
-		// Exists as its own entry rather than reusing a chat chip because the
-		// judge must not be the same model as the analyst: for role `user`,
-		// claude-proxy's aliasClaudeForRole rewrites claude-sonnet/haiku to
-		// deepseek-v4-flash, which is also this table's default provider — so a
-		// deepseek judge scoring a deepseek answer is self-assessment, and the
-		// score is the product here. Paired with deepseek-v4-flash as seat 1 by
-		// mbb-consultant's judge_panel (median of 2, panel_min_agreement 2).
 		id:                  "lumid-qwen38-27b",
-		displayName:         "Qwen3.8-27B",
+		displayName:         "Qwen3.8-27B (Chat · Lumid GPU)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "qwen/qwen3.8-27b",
+		upstreamModel:       "qwen3.8-27b",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
 		supportsVision:      false,
-		minRole:             "admin",   // qwen: metered upstream
-		maxOutputTokens:     8192,      // matches skills/llm.py's gateway floor
-		dailyBudgetTokens:   1_500_000, // see the GLM row: sized in TURNS, not round numbers
+		minRole:             "user", // in-house GPU now, like deepseek — everyone
+		maxOutputTokens:     8192,   // matches skills/llm.py's gateway floor
+		dailyBudgetTokens:   1_500_000,
 	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a
@@ -1019,33 +987,49 @@ var llmProviders = []llmProvider{
 		minRole:           "admin", // qwen lane
 		dailyBudgetTokens: -1,
 	},
+	// REMOVED 2026-09-01: claude-code-glm53 (glm-5.3-flash). Part of the same
+	// purge that dropped qwen3.6-* and GLM from LUMID_LLM_OPENROUTER_MODEL_MAP —
+	// GLM's local s0 backend was already retired 2026-08-29, so this chip had
+	// been running almost entirely on metered OpenRouter tokens (see its own
+	// removed comment below, kept for the pattern claude-code-qwen38 follows).
+	// If GLM is wanted back, re-adding this chip is NOT enough — the id has to
+	// go back into SELF_HOSTED_MODELS on claude-proxy AND LUMID_LLM_OPENROUTER_MODEL_MAP
+	// first, same caveat the claude-code-kimi/claude-code-glm removal note above
+	// already states for that pair.
 	{
-		// GLM-5.3-Flash in the Claude Code harness. Permitted because
-		// SELF_HOSTED_MODELS on claude-proxy names it, which is the gate every
-		// non-Anthropic model in this lane passes through.
+		// Qwen3.8-27B in the Claude Code harness. Added 2026-09-01, PARITY with
+		// how deepseek and (the now-removed) glm-5.3-flash harness chips were
+		// built: a claude-proxy SELF_HOSTED_MODELS entry, a modelProfile
+		// (qwenProfile in oaicompat.go), and this chip.
 		//
-		// The id is claude-code-glm53, NOT claude-code-glm. That name belonged to
-		// the GLM-5.2 chip removed on 2026-08-28, and personas / saved chats
-		// persist model ids — reusing it would silently resolve someone's stored
-		// GLM-5.2 selection onto a different model.
+		// Permitted because SELF_HOSTED_MODELS on claude-proxy now names
+		// qwen3.8-27b, the same gate every non-Anthropic model in this lane
+		// passes through (denyExternalModelForRole).
 		//
-		// READ BEFORE PICKING THIS ONE. A Claude Code turn carries ~45k tokens of
-		// tool definitions, and glm-5.3-flash is served CPU-first where prefill is
-		// ~65-90 tok/s — roughly eight minutes for a prompt that size. In practice
-		// the 30s hedge fires and OpenRouter answers, so this lane runs almost
-		// entirely on metered tokens, which is why the budget is finite and why
-		// deepseek (GB10, ~20x the prefill, uncapped) stays the default for coding.
-		// It is here for a second opinion and for 1M-context jobs, not for volume.
-		id:                "claude-code-glm53",
-		displayName:       "GLM-5.3-Flash (Code)",
+		// UNLIKE glm-5.3-flash's removed chip: qwen3.8-27b has a REAL tier-0
+		// local backend (luyao1 RTX 5090, 376000 ctx / parallel=8), not a
+		// CPU-only ladder with no tier-0 — so this lane should run mostly free
+		// at the margin rather than "almost entirely on metered tokens" the way
+		// GLM's chip did. dailyBudgetTokens stays finite anyway: the ladder is
+		// still local -> OpenRouter overflow with only one physical tier, so a
+		// turn arriving while all 8 slots are busy IS billed, same guard as the
+		// plain chat chip above.
+		//
+		// nativeToolCallsInText is UNVERIFIED for this model (see qwenProfile's
+		// own comment in claude-proxy) — GLM needed a prose-tool-call workaround
+		// on our own llama.cpp and qwen3.8-27b has never been tested for the
+		// same failure mode. Smoke-test tool-calling live before trusting this
+		// lane for real coding work.
+		id:                "claude-code-qwen38",
+		displayName:       "Qwen3.8-27B (Code · Lumid GPU)",
 		endpoint:          "",
-		upstreamModel:     "lumid-llm/glm-5.3-flash",
+		upstreamModel:     "lumid-llm/qwen3.8-27b",
 		authHeader:        "",
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
 		supportsVision:    false,
 		minRole:           "user",
-		dailyBudgetTokens: 1_500_000, // finite: this lane hedges to OpenRouter on nearly every turn
+		dailyBudgetTokens: 1_500_000, // finite: still one physical tier, overflow is billed
 	},
 	// claude-opus and claude-haiku (direct Anthropic API) are registered only
 	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.

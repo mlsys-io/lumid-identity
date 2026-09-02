@@ -380,6 +380,11 @@ func lqtVerdictOnce(ctx context.Context, tenant uuid.UUID, name string) (lqtVerd
 	return lqtVerdict{}, false
 }
 
+// lqtSubmitApp is the app a mailbox submission is filed under when the chat is
+// not grounded on a surface. `quant-research` is the current name; run rows for
+// its former name are reachable through appAliases.
+const lqtSubmitApp = "quant-research"
+
 func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy string) (map[string]any, bool) {
 	switch role {
 	case "user", "admin", "super_admin":
@@ -437,7 +442,16 @@ func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy 
 			d[k] = v
 		}
 		j, _ := json.Marshal(d)
+		// Prefer the surface the caller is actually on, but fall back to the
+		// canonical name rather than leaving it blank: this tool only ever
+		// submits LQT strategies, so the submission belongs to that app whether
+		// or not the chat happened to be grounded on its page. An untagged row
+		// is invisible to every per-app query, which is the failure this whole
+		// change exists to fix.
 		app := groundedApp(c)
+		if app == "" {
+			app = lqtSubmitApp
+		}
 		writeAuditAppMetrics(c, userID, userID, "lqt:strategy.submit", app, string(j),
 			httpStatus, int(time.Since(started).Milliseconds()))
 	}

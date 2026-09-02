@@ -197,6 +197,11 @@ func Register(r *gin.Engine) {
 			admin.GET("/backup-status", AdminBackupStatus)
 			admin.GET("/build-status", AdminBuildStatus)
 			admin.GET("/loops", AdminLoops)
+			// Per-app user-insight rollup, cross-tenant. Admin, not
+			// super_admin: reviewing how a cohort used an app is oversight,
+			// like /admin/cohort/submissions. Reports chat COUNTS only —
+			// transcripts stay super_admin.
+			admin.GET("/apps/:app/insights", AdminAppInsights)
 			admin.GET("/codebase-repos", AdminCodebaseRepos)
 			admin.GET("/jobs", Jobs)
 			admin.GET("/cycle-artifact", CycleArtifact)

@@ -62,7 +62,11 @@ type onpremBackendStats struct {
 	Healthy    bool     `json:"healthy"`
 	TokS       *float64 `json:"tok_s"`
 	QPS        *float64 `json:"qps"`
-	QueueDepth int32    `json:"queue_depth"`
+	// Inflight/PeakInflight5m added 2026-09-02 alongside lumid-llm's own
+	// llm_stats.rs change — pure passthrough, no new fields to compute here.
+	Inflight       int32  `json:"inflight"`
+	PeakInflight5m *int32 `json:"peak_inflight_5m"`
+	QueueDepth     int32  `json:"queue_depth"`
 }
 
 // llmBackendStatsResp mirrors lumid-llm's raw /admin/llm-backend-stats body.

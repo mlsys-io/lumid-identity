@@ -539,6 +539,22 @@ func getTurnBlobs(blobKey string) (meta, msgs, resp []byte) {
 	return fetch("request_meta.gz"), fetch("new_messages.gz"), fetch("response.gz")
 }
 
+// deleteTurnBlobs removes a turn's three S3 objects, mirroring putTurnBlobs.
+// Returns the number of the three that failed to delete (0 = clean), so the
+// caller can tell an incomplete erasure from a clean one instead of assuming
+// success — this is the exact gap that let DELETE /claude-sessions/:conv
+// remove only the DB index while leaving the real content behind in S3.
+func deleteTurnBlobs(blobKey string) int {
+	failed := 0
+	for _, suffix := range []string{"request_meta.gz", "new_messages.gz", "response.gz"} {
+		if err := common.Blobs.Delete(blobKey + "/" + suffix); err != nil {
+			log.Printf("blobstore: delete %s/%s: %v", blobKey, suffix, err)
+			failed++
+		}
+	}
+	return failed
+}
+
 // GET /api/v1/me/claude-sessions
 func MeClaudeSessions(c *gin.Context) {
 	uid, ok := currentUserID(c)
@@ -635,8 +651,17 @@ func AdminClaudeSessionDetail(c *gin.Context) {
 	getSession(c, "", convKey)
 }
 
-// deleteSession removes a session and its turns. ownerSub != "" restricts to
-// that owner.
+// deleteSession removes a session, its turns, AND their S3-backed content.
+// ownerSub != "" restricts to that owner.
+//
+// FIXED 2026-09-02: this used to delete only the ClaudeSession/
+// ClaudeSessionTurn rows. When blobs live in S3 (BlobKey != "", the default
+// in production — see blobstore.go), the actual recorded content —
+// prompts, tool call args/results, file contents, model responses — was
+// left permanently orphaned in the bucket, retrievable by anyone holding
+// the shared object-storage credential, while the product told the user
+// their data was deleted. Now fetches each turn's BlobKey before removing
+// the DB rows and issues a real S3 DELETE for all three of its objects.
 func deleteSession(c *gin.Context, ownerSub, convKey string) {
 	var sess models.ClaudeSession
 	if common.DB.Where("conv_key = ?", convKey).First(&sess).Error != nil {
@@ -647,8 +672,27 @@ func deleteSession(c *gin.Context, ownerSub, convKey string) {
 		fail(c, http.StatusNotFound, 1404, "session not found")
 		return
 	}
+
+	blobFailures := 0
+	if common.Blobs != nil {
+		var turns []models.ClaudeSessionTurn
+		common.DB.Where("conv_key = ? AND blob_key != ''", convKey).Find(&turns)
+		for _, t := range turns {
+			blobFailures += deleteTurnBlobs(t.BlobKey)
+		}
+	}
+
 	common.DB.Where("conv_key = ?", convKey).Delete(&models.ClaudeSessionTurn{})
 	common.DB.Where("conv_key = ?", convKey).Delete(&models.ClaudeSession{})
+
+	if blobFailures > 0 {
+		// Still 200: the DB index is gone either way, and a stuck object is
+		// not something the caller can retry their way out of from here — but
+		// say so rather than a blanket "ok" that reads as a clean erasure.
+		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "session deleted; " +
+			fmt.Sprintf("%d object(s) failed to delete from storage — see server logs", blobFailures)})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
 }
 

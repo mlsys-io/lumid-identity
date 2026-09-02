@@ -95,6 +95,15 @@ func (b *BlobStore) Get(relKey string) ([]byte, error) {
 	return b.s3get(b.prefix + relKey)
 }
 
+// Delete removes claude-sessions/{relKey}. A missing object is not an error —
+// S3 DELETE is idempotent (204/404 both mean "gone"), and the caller (session
+// deletion) must not fail just because a blob was already removed or never
+// wrote successfully in the first place (see putTurnBlobs' partial-failure
+// fallback to DB storage).
+func (b *BlobStore) Delete(relKey string) error {
+	return b.s3delete(b.prefix + relKey)
+}
+
 // ── SigV4 helpers ───────────────────────────────────────────────────────────
 
 func sha256hex(data []byte) string {
@@ -201,4 +210,22 @@ func (b *BlobStore) s3get(objKey string) ([]byte, error) {
 		return nil, fmt.Errorf("s3 GET %s: %d %s", objKey, resp.StatusCode, strings.TrimSpace(string(rb)))
 	}
 	return io.ReadAll(resp.Body)
+}
+
+func (b *BlobStore) s3delete(objKey string) error {
+	req, err := b.signedRequest("DELETE", objKey, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	// 404 is success here — see Delete's own doc comment.
+	if resp.StatusCode >= 300 && resp.StatusCode != 404 {
+		rb, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("s3 DELETE %s: %d %s", objKey, resp.StatusCode, strings.TrimSpace(string(rb)))
+	}
+	return nil
 }

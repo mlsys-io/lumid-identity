@@ -606,10 +606,29 @@ func Register(r *gin.Engine) {
 			// Reset the per-user SHORT-window quota clock. super_admin, not admin:
 			// it hands capacity back to users, which is a budget decision.
 			superAdmin.POST("/claude-pool/reset-window", AdminClaudePoolResetWindow)
+			// FIXED 2026-09-02 (security audit finding): these three used to sit
+			// in adminQuota below, reachable by plain `admin`. That contradicted
+			// BOTH the public docs (claude_pool.md's "Session recording" section:
+			// "super_admin operators can read any user's [session] — full content
+			// — treat the pool as operator-visible") AND this file's own
+			// claude_transcript.go header comment ("(super_admin: all users)") —
+			// only the actual route registration disagreed. Full recorded
+			// session content is prompts, tool call args/results, file
+			// contents and model responses for potentially every `user`-role
+			// account; moved to super_admin to match the two other places that
+			// already stated that intent, rather than picking the third,
+			// more permissive one as the source of truth. `/claude-field-boxes`
+			// (aggregate per-field-box traffic + health, no per-user content)
+			// deliberately stayed in adminQuota below — it was never the thing
+			// this finding was about.
+			superAdmin.GET("/claude-sessions", AdminClaudeSessions)
+			superAdmin.GET("/claude-sessions/:conv", AdminClaudeSessionDetail)
+			superAdmin.DELETE("/claude-sessions/:conv", AdminClaudeSessionDelete)
 		}
 
 		// admin + super_admin — Claude Code quota dashboard (/quota page) and
-		// pool session transcripts.
+		// pool aggregate stats. Full per-user session TRANSCRIPT CONTENT is
+		// super_admin-only — see the superAdmin group above, not here.
 		adminQuota := v1.Group("/admin", RequireAdmin())
 		{
 			adminQuota.GET("/claude-quota", AdminClaudeQuota)
@@ -633,12 +652,9 @@ func Register(r *gin.Engine) {
 			// Label-only update — move an account between field boxes without
 			// re-adding it (which would mean re-running `claude auth login`).
 			adminQuota.PATCH("/claude-token/:email", AdminClaudeTokenLabel)
-			// Pool session transcripts — admin can view all users' sessions.
-			// Per-field-box traffic + via_relay health.
+			// Per-field-box traffic + via_relay health — aggregate, not
+			// per-user session content, so this stays admin-level.
 			adminQuota.GET("/claude-field-boxes", AdminClaudeFieldBoxes)
-			adminQuota.GET("/claude-sessions", AdminClaudeSessions)
-			adminQuota.GET("/claude-sessions/:conv", AdminClaudeSessionDetail)
-			adminQuota.DELETE("/claude-sessions/:conv", AdminClaudeSessionDelete)
 		}
 	}
 }

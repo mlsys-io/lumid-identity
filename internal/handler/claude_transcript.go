@@ -575,80 +575,20 @@ func MeClaudeSessionDetail(c *gin.Context) {
 	getSession(c, uid, c.Param("conv"))
 }
 
-// adminIsSuperAdmin returns true when the RequireAdmin middleware detected super_admin.
-func adminIsSuperAdmin(c *gin.Context) bool {
-	v, _ := c.Get("admin_user_role")
-	r, _ := v.(string)
-	return r == "super_admin"
-}
-
-// listSessionsForAdmin returns sessions visible to a role=admin caller:
-// sessions owned by role=user accounts, plus the caller's own sessions.
-func listSessionsForAdmin(c *gin.Context, callerSub string) {
-	var rows []models.ClaudeSession
-	q := common.DB.
-		Joins("JOIN users ON users.id = claude_sessions.user_sub").
-		Where("users.role = ? OR claude_sessions.user_sub = ?", "user", callerSub).
-		Order("claude_sessions.last_ts DESC").Limit(200)
-	if err := q.Find(&rows).Error; err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "list: "+err.Error())
-		return
-	}
-	cards := make([]sessionCard, len(rows))
-	for i, s := range rows {
-		cards[i] = sessionCard{
-			ConvKey: s.ConvKey, UserSub: s.UserSub, UserEmail: subToEmail(s.UserSub),
-			Account: s.Account, FieldBox: s.FieldBox, ViaRelay: s.ViaRelay, Model: s.Model,
-			Title: s.Title, TurnCount: s.TurnCount, InputTokens: s.InputTokens,
-			OutputTokens: s.OutputTokens, ToolUseCount: s.ToolUseCount,
-			FirstTs: s.FirstTs, LastTs: s.LastTs,
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"sessions": cards, "count": len(cards)}})
-}
-
-// adminCanAccessSession checks whether a role=admin caller may read/delete a session:
-// allowed if the session belongs to the caller OR the session owner has role=user.
-func adminCanAccessSession(sessionOwner, callerSub string) bool {
-	if sessionOwner == callerSub {
-		return true
-	}
-	var u models.User
-	if err := common.DB.Select("role").Where("id = ?", sessionOwner).First(&u).Error; err != nil {
-		return false
-	}
-	return u.Role == "user"
-}
-
-// GET /api/v1/admin/claude-sessions   (admin+)
+// GET /api/v1/admin/claude-sessions   (super_admin only — see router.go's
+// 2026-09-02 security-audit comment on why this moved out of the plain-admin
+// group. listSessionsForAdmin/adminCanAccessSession, which used to give a
+// plain role=admin caller narrower cross-user access, were removed as dead
+// code: the route can no longer be reached by anything but super_admin, for
+// whom "sub-scoped to role=user owners" was never the intended behavior —
+// see listSessions(c, "") below, which reads every session unrestricted.)
 func AdminClaudeSessions(c *gin.Context) {
-	if adminIsSuperAdmin(c) {
-		listSessions(c, "")
-		return
-	}
-	callerSub := c.GetString("admin_user_id")
-	listSessionsForAdmin(c, callerSub)
+	listSessions(c, "")
 }
 
-// GET /api/v1/admin/claude-sessions/:conv   (admin+)
+// GET /api/v1/admin/claude-sessions/:conv   (super_admin only)
 func AdminClaudeSessionDetail(c *gin.Context) {
-	convKey := c.Param("conv")
-	if adminIsSuperAdmin(c) {
-		getSession(c, "", convKey)
-		return
-	}
-	// role=admin: verify session belongs to a user-role account or the caller
-	callerSub := c.GetString("admin_user_id")
-	var sess models.ClaudeSession
-	if common.DB.Where("conv_key = ?", convKey).First(&sess).Error != nil {
-		fail(c, http.StatusNotFound, 1404, "session not found")
-		return
-	}
-	if !adminCanAccessSession(sess.UserSub, callerSub) {
-		fail(c, http.StatusNotFound, 1404, "session not found")
-		return
-	}
-	getSession(c, "", convKey)
+	getSession(c, "", c.Param("conv"))
 }
 
 // deleteSession removes a session, its turns, AND their S3-backed content.
@@ -708,23 +648,7 @@ func MeClaudeSessionDelete(c *gin.Context) {
 
 // DELETE /api/v1/admin/claude-sessions/:conv   (admin+)
 func AdminClaudeSessionDelete(c *gin.Context) {
-	convKey := c.Param("conv")
-	if adminIsSuperAdmin(c) {
-		deleteSession(c, "", convKey)
-		return
-	}
-	// role=admin: may only delete sessions from role=user accounts or their own
-	callerSub := c.GetString("admin_user_id")
-	var sess models.ClaudeSession
-	if common.DB.Where("conv_key = ?", convKey).First(&sess).Error != nil {
-		fail(c, http.StatusNotFound, 1404, "session not found")
-		return
-	}
-	if !adminCanAccessSession(sess.UserSub, callerSub) {
-		fail(c, http.StatusNotFound, 1404, "session not found")
-		return
-	}
-	deleteSession(c, "", convKey)
+	deleteSession(c, "", c.Param("conv"))
 }
 
 // GET /api/v1/me/claude-recording

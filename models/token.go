@@ -31,11 +31,9 @@ type AuditLog struct {
 	ID         uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
 	UserID     string    `gorm:"type:varchar(36);index" json:"user_id"`
 	TokenID    string    `gorm:"type:varchar(36);index" json:"token_id,omitempty"`
-	Event      string    `gorm:"type:varchar(32);not null" json:"event"`   // login | logout | mint | revoke | introspect | oauth
-	Source     string    `gorm:"type:varchar(32)" json:"source,omitempty"` // lqa | runmesh | flowmesh | lumilake | web
-	// App scopes an event to one xpio app so per-app analytics can slice this
-	// table. Empty for auth/admin events, which belong to no app.
-	App        string    `gorm:"type:varchar(128);index" json:"app,omitempty"`
+	Event      string    `gorm:"type:varchar(32);not null" json:"event"`       // login | logout | mint | revoke | introspect | oauth
+	Source     string    `gorm:"type:varchar(32)" json:"source,omitempty"`     // lqa | runmesh | flowmesh | lumilake | web
+	App        string    `gorm:"type:varchar(128);index" json:"app,omitempty"` // owning xpio app; empty for auth/admin events
 	Method     string    `gorm:"type:varchar(8)" json:"method,omitempty"`
 	Path       string    `gorm:"type:varchar(255)" json:"path,omitempty"`
 	Status     int       `json:"status,omitempty"`

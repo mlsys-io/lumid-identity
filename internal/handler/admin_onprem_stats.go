@@ -56,12 +56,12 @@ type onpremStatsPayload struct {
 }
 
 type onpremBackendStats struct {
-	Label      string   `json:"label"`
-	URL        string   `json:"url"`
-	Tier       uint32   `json:"tier"`
-	Healthy    bool     `json:"healthy"`
-	TokS       *float64 `json:"tok_s"`
-	QPS        *float64 `json:"qps"`
+	Label   string   `json:"label"`
+	URL     string   `json:"url"`
+	Tier    uint32   `json:"tier"`
+	Healthy bool     `json:"healthy"`
+	TokS    *float64 `json:"tok_s"`
+	QPS     *float64 `json:"qps"`
 	// Inflight/PeakInflight5m added 2026-09-02 alongside lumid-llm's own
 	// llm_stats.rs change — pure passthrough, no new fields to compute here.
 	Inflight       int32  `json:"inflight"`

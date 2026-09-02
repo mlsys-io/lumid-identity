@@ -729,6 +729,8 @@ type auditRow struct {
 	TokenID    string    `json:"token_id,omitempty"`
 	Event      string    `json:"event"`
 	Source     string    `json:"source,omitempty"`
+	App        string    `json:"app,omitempty"`
+	Detail     string    `json:"detail,omitempty"`
 	Method     string    `json:"method,omitempty"`
 	Path       string    `json:"path,omitempty"`
 	Status     int       `json:"status,omitempty"`
@@ -741,6 +743,11 @@ type auditRow struct {
 func AdminAuditList(c *gin.Context) {
 	userID := c.Query("user_id")
 	event := c.Query("event")
+	app := c.Query("app")
+	// A cohort question is always "in this window" — without a date range the
+	// only way to reach last week is to page through everything since.
+	since := c.Query("since")
+	until := c.Query("until")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	if page < 1 {
 		page = 1
@@ -759,6 +766,28 @@ func AdminAuditList(c *gin.Context) {
 	}
 	if event != "" {
 		db = db.Where("event = ?", event)
+	}
+	if app != "" {
+		db = db.Where("app = ?", app)
+	}
+	// RFC3339 in, half-open [since, until). A malformed bound is rejected
+	// rather than dropped: a filter that silently does nothing returns the
+	// whole table under a heading claiming a window.
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			fail(c, http.StatusBadRequest, 1400, "since must be RFC3339: "+err.Error())
+			return
+		}
+		db = db.Where("created_at >= ?", t)
+	}
+	if until != "" {
+		t, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			fail(c, http.StatusBadRequest, 1400, "until must be RFC3339: "+err.Error())
+			return
+		}
+		db = db.Where("created_at < ?", t)
 	}
 
 	var total int64
@@ -782,6 +811,8 @@ func AdminAuditList(c *gin.Context) {
 			TokenID:    tokenID,
 			Event:      r.Event,
 			Source:     r.Source,
+			App:        r.App,
+			Detail:     r.Detail,
 			Method:     r.Method,
 			Path:       r.Path,
 			Status:     r.Status,
@@ -805,20 +836,45 @@ func AdminAuditList(c *gin.Context) {
 // mutating admin handler — errors are logged and swallowed so a write
 // failure doesn't block the parent operation.
 func writeAudit(c *gin.Context, actorID, targetID, event, detail string) {
+	writeAuditApp(c, actorID, targetID, event, "", detail)
+}
+
+// writeAuditApp is writeAudit with an owning xpio app, so per-app analytics can
+// slice this table by `app` instead of pattern-matching event names.
+func writeAuditApp(c *gin.Context, actorID, targetID, event, app, detail string) {
+	writeAuditAppMetrics(c, actorID, targetID, event, app, detail, 0, 0)
+}
+
+// writeAuditAppMetrics additionally records the outcome status and how long the
+// action took. Both columns were declared on audit_log from the first migration
+// and never written by anything, so "how often does this fail and how slow is
+// it" was unanswerable for every audited action. Pass 0 to leave either unset.
+//
+// The detail goes in the `detail` TEXT column. It used to be appended to
+// UserAgent — a varchar(255) already holding the browser UA plus the actor —
+// on the reasoning that this was "easier than a schema change". That silently
+// truncates anything long, which is disqualifying for the thing we most want to
+// record here: a compiler diagnostic with character offsets into the user's own
+// source. The column was declared from the start and never written to.
+//
+// The actor stays in the UserAgent suffix. That one IS a deliberate dodge for a
+// missing column, the format is parseable, and nothing reads it yet.
+func writeAuditAppMetrics(c *gin.Context, actorID, targetID, event, app, detail string, status, durationMs int) {
 	row := models.AuditLog{
-		UserID:    targetID,
-		Event:     event,
-		Source:    "admin-web",
-		Method:    c.Request.Method,
-		Path:      c.Request.URL.Path,
-		IP:        c.ClientIP(),
-		UserAgent: c.GetHeader("User-Agent"),
+		UserID:     targetID,
+		Event:      event,
+		Source:     "admin-web",
+		App:        app,
+		Method:     c.Request.Method,
+		Path:       c.Request.URL.Path,
+		Status:     status,
+		DurationMs: durationMs,
+		IP:         c.ClientIP(),
+		UserAgent:  c.GetHeader("User-Agent"),
+		Detail:     detail,
 	}
 	if actorID != "" {
-		// Encode the actor in UserAgent suffix since we don't have a
-		// dedicated column; easier than a schema change. Format lets a
-		// later migration pull it back out.
-		row.UserAgent = fmt.Sprintf("%s | actor=%s | %s", row.UserAgent, actorID, detail)
+		row.UserAgent = fmt.Sprintf("%s | actor=%s", row.UserAgent, actorID)
 	}
 	_ = common.DB.Create(&row).Error
 }

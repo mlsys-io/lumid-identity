@@ -413,19 +413,49 @@ func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy 
 			"auth": map[string]any{"pat": pat},
 		},
 	})
+	// One audit row per submission, written once the OUTCOME is known.
+	//
+	// It used to be written here, before awaitLqtVerdict below, so it recorded
+	// that someone submitted and never what happened. The compiler's verdict
+	// does persist — in xpio.strategies.ack_payload->>'reason' — but that table
+	// has no tenant_id, and the only bridge back to a user (mailbox.processed)
+	// is field-local, never synced, and has no read endpoint. So the two halves
+	// existed and nothing joined them: 70 submissions from 31 users on
+	// 2026-08-30, and no way to say whether any compiled.
+	//
+	// Recording the verdict against the caller here is the cheap bridge. The
+	// reject reason is the compiler's own diagnostic with offsets into the
+	// user's source — the "what do people get wrong" corpus — so it goes in the
+	// `detail` TEXT column, as JSON, not the varchar(255) that would clip it.
+	started := time.Now()
+	audit := func(outcome string, httpStatus int, fields map[string]any) {
+		d := map[string]any{
+			"name": name, "version": version, "role": role,
+			"via": "chatbox", "outcome": outcome,
+		}
+		for k, v := range fields {
+			d[k] = v
+		}
+		j, _ := json.Marshal(d)
+		app := groundedApp(c)
+		writeAuditAppMetrics(c, userID, userID, "lqt:strategy.submit", app, string(j),
+			httpStatus, int(time.Since(started).Milliseconds()))
+	}
+
 	out, status, err := lqtMailboxDoAs(http.MethodPost, "/xpio/strategies", body, pat)
 	if err != nil {
+		audit("transport_error", 0, map[string]any{"error": err.Error()})
 		return map[string]any{"error": err.Error()}, false
 	}
-	writeAudit(c, userID, userID, "lqt:strategy.submit",
-		fmt.Sprintf("name=%s version=%s role=%s (via chatbox)", name, version, role))
 	if status >= 300 {
+		audit("mailbox_refused", status, map[string]any{"error": fmt.Sprintf("%v", out["raw"])})
 		return map[string]any{"error": fmt.Sprintf("lqt mailbox submit %d: %s", status, out["raw"])}, false
 	}
 	// The mailbox took it. Now wait for the COMPILER, so a rejection reaches the
 	// caller in this turn instead of becoming a strategy that never appears.
 	switch v := awaitLqtVerdict(c.Request.Context(), userID, name); v.status {
 	case "deployed":
+		audit("deployed", status, map[string]any{"program_hash": v.programHash})
 		return map[string]any{
 			"name":         name,
 			"version":      version,
@@ -437,6 +467,7 @@ func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy 
 		// THE POINT. The compiler's own message, with character offsets into the
 		// source that was just submitted, handed straight back so the model can
 		// fix it and resubmit without a human relaying the error.
+		audit("rejected", status, map[string]any{"reason": v.reason})
 		return map[string]any{
 			"name":    name,
 			"version": version,
@@ -450,6 +481,7 @@ func toolLqtMailboxSubmit(c *gin.Context, userID, role, name, version, strategy 
 		// No verdict inside the window. Unknown is neither success nor failure,
 		// and saying "sent" here is how a submit path that never once worked kept
 		// reporting success.
+		audit("no_verdict", status, map[string]any{"timeout_s": lqtVerdictTimeout.Seconds()})
 		return map[string]any{
 			"name":    name,
 			"version": version,

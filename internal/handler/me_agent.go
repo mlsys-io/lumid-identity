@@ -1786,7 +1786,19 @@ func MeAgentChat(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 600*time.Second)
+	// 600s -> 3600s (2026-09-03). This was the shortest ceiling in its own
+	// chain, working against its own stated design intent: maxToolLoopIterations
+	// = 50 ("Claude Code parity -- long refactors routinely need dozens of
+	// steps"), and each LumidOS tool call gets up to 90s
+	// (dispatchLumidosTool, xp_status on a large KG alone measures ~35s) --
+	// just 7 slow tool calls in a row (7*90s=630s) already exceeded this
+	// handler's own 600s budget, well short of the 50-iteration ceiling the
+	// loop is designed to support. Matched to nginx's /api/v1/me/ block
+	// (raised 600s -> 3600s the same day, k8s-lift/lumid-landing/
+	// nginx-cm-v52.yaml) so this handler is never the artificial ceiling for
+	// a genuinely complex, many-tool-call query -- same reasoning, one layer
+	// deeper in the same chain.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3600*time.Second)
 	defer cancel()
 
 	// Tool-use loop.

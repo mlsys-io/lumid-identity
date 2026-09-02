@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -195,8 +196,27 @@ func AdminAppInsights(c *gin.Context) {
 	// me_app_intents is the only record of what someone clicked, with the
 	// arguments they chose and what came back. Nothing has ever read it.
 	var intents []models.MeAppIntent
-	common.DB.Where("created_at >= ?", since).
-		Order("created_at ASC").Limit(insightsRowCap).Find(&intents)
+	// Narrow to this app IN SQL before the row cap bites. The app lives inside
+	// the payload JSON (a TEXT column, so no JSON_EXTRACT), and filtering in Go
+	// after `LIMIT insightsRowCap` would cap on ALL apps' intents and then
+	// discard most of them — silently undercounting this app whenever the fleet
+	// is busy. LIKE is a prefilter only; the exact match still happens below on
+	// the decoded payload.
+	q := common.DB.Where("created_at >= ?", since)
+	likes := common.DB.Session(&gorm.Session{NewDB: true})
+	for i, a := range aliases {
+		// Match the bare name, not `"app":"<name>"`. The exact check below is
+		// on the decoded payload, so this only has to narrow — and a pattern
+		// keyed on the serialised shape would silently match nothing the day
+		// something writes that JSON with a space after the colon.
+		pat := "%" + a + "%"
+		if i == 0 {
+			likes = likes.Where("payload LIKE ?", pat)
+		} else {
+			likes = likes.Or("payload LIKE ?", pat)
+		}
+	}
+	q.Where(likes).Order("created_at ASC").Limit(insightsRowCap).Find(&intents)
 	intentsByAction := map[string]int{}
 	intentsByStatus := map[string]int{}
 	intentUsers := map[string]bool{}

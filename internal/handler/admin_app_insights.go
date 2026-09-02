@@ -73,8 +73,12 @@ type submissionFunnel struct {
 		Transport int `json:"transport_error"`
 	} `json:"attributed"`
 	// Rows written before the verdict was recorded. Counted, never guessed at.
-	UnknownOutcome int            `json:"unknown_outcome"`
-	RejectReasons  []insightCount `json:"reject_reasons"`
+	UnknownOutcome int `json:"unknown_outcome"`
+	// Users every one of whose submissions predates outcome recording. They are
+	// NOT "never deployed" — we do not know what happened to them, and saying
+	// otherwise turns a gap in our records into a claim about a person.
+	UsersOutcomeUnknown int            `json:"users_outcome_unknown"`
+	RejectReasons       []insightCount `json:"reject_reasons"`
 	// Attempts a user made before their first `deployed`, for those who got
 	// there. Users who never deployed are reported separately, not as a large
 	// number that would drag an average toward a fake answer.
@@ -151,15 +155,6 @@ func AdminAppInsights(c *gin.Context) {
 	aliases := appAliases(app)
 
 	byDay := map[string]*insightDay{}
-	touch := func(t time.Time) *insightDay {
-		k := t.UTC().Format("2006-01-02")
-		d, ok := byDay[k]
-		if !ok {
-			d = &insightDay{Day: k}
-			byDay[k] = d
-		}
-		return d
-	}
 
 	// ── submissions ──────────────────────────────────────────────────────────
 	var subs []models.AuditLog
@@ -169,27 +164,57 @@ func AdminAppInsights(c *gin.Context) {
 
 	funnel, subDays := computeSubmissionFunnel(subs)
 	for day, n := range subDays {
-		byDay[day] = &insightDay{Day: day, Submissions: n}
+		touch2(byDay, day).Submissions = n
 	}
 
 	// ── runs ─────────────────────────────────────────────────────────────────
-	var runs []models.MeAppRun
-	common.DB.Where("app IN ? AND run_ts >= ?", aliases, since.Unix()).
-		Order("run_ts ASC").Limit(insightsRowCap).Find(&runs)
+	// Aggregated in SQL, not by loading rows. This app produces ~20k runs a
+	// month across the fleet, so a row scan hits the cap and reports the cap as
+	// a total; GROUP BY is both exact and cheaper. `loop` is a MySQL reserved
+	// word and must stay backticked.
+	type loopAgg struct {
+		Loop  string
+		N     int
+		Fails int
+	}
+	var loopAggs []loopAgg
+	common.DB.Model(&models.MeAppRun{}).
+		Select("`loop` as loop, COUNT(*) as n, SUM(CASE WHEN ok THEN 0 ELSE 1 END) as fails").
+		Where("app IN ? AND run_ts >= ?", aliases, since.Unix()).
+		Group("`loop`").Scan(&loopAggs)
+
 	runsByLoop := map[string]int{}
 	runFails := map[string]int{}
-	runUsers := map[string]bool{}
+	runTotal := 0
+	for _, a := range loopAggs {
+		runsByLoop[a.Loop] = a.N
+		runTotal += a.N
+		if a.Fails > 0 {
+			runFails[a.Loop] = a.Fails
+		}
+	}
+
+	var runUsersN int64
+	common.DB.Model(&models.MeAppRun{}).
+		Where("app IN ? AND run_ts >= ?", aliases, since.Unix()).
+		Distinct("user_sub").Count(&runUsersN)
+
 	var newestRun int64
-	for _, r := range runs {
-		runsByLoop[r.Loop]++
-		runUsers[r.UserSub] = true
-		if !r.Ok {
-			runFails[r.Loop]++
-		}
-		if r.RunTs > newestRun {
-			newestRun = r.RunTs
-		}
-		touch(time.Unix(r.RunTs, 0)).Runs++
+	common.DB.Model(&models.MeAppRun{}).
+		Where("app IN ?", aliases).
+		Select("COALESCE(MAX(run_ts), 0)").Scan(&newestRun)
+
+	type dayAgg struct {
+		Day string
+		N   int
+	}
+	var runDays []dayAgg
+	common.DB.Model(&models.MeAppRun{}).
+		Select("DATE_FORMAT(FROM_UNIXTIME(run_ts), '%Y-%m-%d') as day, COUNT(*) as n").
+		Where("app IN ? AND run_ts >= ?", aliases, since.Unix()).
+		Group("day").Scan(&runDays)
+	for _, d := range runDays {
+		touch2(byDay, d.Day).Runs = d.N
 	}
 
 	// ── UI actions that ran a loop ───────────────────────────────────────────
@@ -236,7 +261,7 @@ func AdminAppInsights(c *gin.Context) {
 		intentsByAction[it.Action]++
 		intentsByStatus[it.Status]++
 		intentUsers[it.UserSub] = true
-		touch(it.CreatedAt).Intents++
+		touch2(byDay, it.CreatedAt.UTC().Format("2006-01-02")).Intents++
 		if it.ClaimedAt != nil {
 			queueMs = append(queueMs, int(it.ClaimedAt.Sub(it.CreatedAt).Milliseconds()))
 			if it.CompletedAt != nil {
@@ -264,15 +289,26 @@ func AdminAppInsights(c *gin.Context) {
 		staleSecs = time.Now().Unix() - newestRun
 	}
 
+	// A capped scan must SAY it was capped. `total: 20000` against a cap of
+	// 20000 is not a total, it is the cap wearing a total's name — and it reads
+	// as a precise number, which is worse than an obviously rounded one.
+	truncated := gin.H{
+		"submissions": len(subs) >= insightsRowCap,
+		"runs":        false, // aggregated in SQL — exact
+		"intents":     len(intents) >= insightsRowCap,
+		"row_cap":     insightsRowCap,
+	}
+
 	ok(c, "ok", gin.H{
 		"app":          app,
+		"truncated":    truncated,
 		"aliases":      aliases,
 		"window_days":  days,
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
 		"submissions":  funnel,
 		"runs": gin.H{
-			"total":            len(runs),
-			"users":            len(runUsers),
+			"total":            runTotal,
+			"users":            runUsersN,
 			"by_loop":          topCounts(runsByLoop, 0),
 			"failures_by_loop": topCounts(runFails, 0),
 			"newest_run_ts":    newestRun,
@@ -321,6 +357,7 @@ func computeSubmissionFunnel(subs []models.AuditLog) (submissionFunnel, map[stri
 	subUsers := map[string]bool{}
 	attempts := map[string]int{}
 	deployedAt := map[string]int{}
+	knownOutcome := map[string]bool{}
 
 	for _, r := range subs {
 		funnel.Total++
@@ -362,16 +399,23 @@ func computeSubmissionFunnel(subs []models.AuditLog) (submissionFunnel, map[stri
 			// rather than folded into an outcome we do not actually know.
 			funnel.UnknownOutcome++
 		}
+		if outcome != "" {
+			knownOutcome[r.UserID] = true
+		}
 	}
 
 	funnel.Users = len(subUsers)
 	funnel.RejectReasons = topCounts(reasons, 20)
 	tries := map[string]int{}
 	for u := range subUsers {
-		if n, ok := deployedAt[u]; ok {
-			tries[strconv.Itoa(n)]++
-		} else {
+		switch {
+		case deployedAt[u] > 0:
+			tries[strconv.Itoa(deployedAt[u])]++
+		case knownOutcome[u]:
+			// Had at least one recorded outcome, none of them a deploy.
 			funnel.UsersNeverDeployed++
+		default:
+			funnel.UsersOutcomeUnknown++
 		}
 	}
 	funnel.AttemptsToFirstDeploy = topCounts(tries, 10)
@@ -379,4 +423,14 @@ func computeSubmissionFunnel(subs []models.AuditLog) (submissionFunnel, map[stri
 	funnel.VerdictMsP50 = pctl(verdictMs, 0.50)
 	funnel.VerdictMsP95 = pctl(verdictMs, 0.95)
 	return funnel, perDay
+}
+
+// touch2 returns the per-day bucket for an ISO day key, creating it on demand.
+func touch2(m map[string]*insightDay, day string) *insightDay {
+	d, ok := m[day]
+	if !ok {
+		d = &insightDay{Day: day}
+		m[day] = d
+	}
+	return d
 }

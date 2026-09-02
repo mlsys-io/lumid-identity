@@ -65,8 +65,13 @@ func TestSubmissionFunnelAttemptsToFirstDeploy(t *testing.T) {
 	if f.Attributed.NoVerdict != 1 {
 		t.Errorf("NoVerdict = %d, want 1", f.Attributed.NoVerdict)
 	}
+	// carol has recorded outcomes (rejected, no_verdict), none a deploy — she
+	// genuinely never deployed, which is a different statement from unknown.
 	if f.UsersNeverDeployed != 1 {
 		t.Errorf("UsersNeverDeployed = %d, want 1 (carol)", f.UsersNeverDeployed)
+	}
+	if f.UsersOutcomeUnknown != 0 {
+		t.Errorf("UsersOutcomeUnknown = %d, want 0", f.UsersOutcomeUnknown)
 	}
 
 	got := map[string]int{}
@@ -110,8 +115,14 @@ func TestSubmissionFunnelLegacyRowsAreUnknownNotInferred(t *testing.T) {
 	if f.Attributed.Deployed != 1 {
 		t.Errorf("Deployed = %d, want 1 — legacy rows must not be counted as deploys", f.Attributed.Deployed)
 	}
-	if f.UsersNeverDeployed != 1 {
-		t.Errorf("UsersNeverDeployed = %d, want 1 (dana)", f.UsersNeverDeployed)
+	// dana has only unknown-outcome rows. She is NOT "never deployed" — we do
+	// not know what happened, and reporting a gap in our records as a fact
+	// about her is the failure this whole endpoint exists to avoid.
+	if f.UsersNeverDeployed != 0 {
+		t.Errorf("UsersNeverDeployed = %d, want 0 — unknown is not a failure", f.UsersNeverDeployed)
+	}
+	if f.UsersOutcomeUnknown != 1 {
+		t.Errorf("UsersOutcomeUnknown = %d, want 1 (dana)", f.UsersOutcomeUnknown)
 	}
 	// A user with only unknown rows must not land in the attempts histogram at
 	// all; a "0 attempts" bucket would read as an instant success.

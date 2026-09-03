@@ -216,6 +216,10 @@ type meLoopEnqueueBody struct {
 	Cases []string `json:"cases,omitempty"`
 	// ExperimentID names the study these runs belong to (experiments[].id).
 	ExperimentID string `json:"experiment_id,omitempty"`
+	// Args are the loop's own invocation args ({{ args.* }}). An arm changes
+	// CONFIG; the loop still needs a SUBJECT. Without these a dispatched arm
+	// runs cleanly and measures nothing.
+	Args map[string]any `json:"args,omitempty"`
 }
 
 // MeLoopEnqueue — POST /me/apps/:app/loops/:loop/enqueue
@@ -272,6 +276,9 @@ func MeLoopEnqueue(c *gin.Context) {
 	}
 	if body.ExperimentID != "" {
 		payload["experiment"] = body.ExperimentID
+	}
+	if len(body.Args) > 0 {
+		payload["args"] = body.Args
 	}
 	id := writeIntent(c, "enqueue_runs", userSub, payload)
 	if id == "" {

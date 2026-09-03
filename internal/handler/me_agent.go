@@ -2594,6 +2594,10 @@ func buildToolDefs() []map[string]any {
 					"arm":        map[string]any{"type": "string", "description": "One of that experiment's declared arm ids."},
 					"samples":    map[string]any{"type": "integer", "description": "How many cycles to run for this arm (default 1)."},
 					"cases":      map[string]any{"type": "string", "description": "Optional case subset — a case_id or comma-separated ids. Omit for the full set."},
+					"args": map[string]any{
+						"type":        "object",
+						"description": "The loop's own invocation args ({{ args.* }}) — the SUBJECT of the run, e.g. {\"case\":\"Case_019\",\"q\":\"Q1\"} for an interview, or {\"symbol\":\"KXBTC\",\"strategy\":\"…\"} for a backtest. An arm changes CONFIG; without a subject the cycle runs and measures nothing. Check the app's surface or ask the user if you don't know what it needs.",
+					},
 				},
 				"required": []string{"app", "experiment", "arm"},
 			},
@@ -3958,6 +3962,9 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		}
 		if cs, _ := args["cases"].(string); cs != "" {
 			payload["cases"] = splitCases(cs)
+		}
+		if ra, ok := args["args"].(map[string]any); ok && len(ra) > 0 {
+			payload["args"] = ra
 		}
 		intentID := writeIntentDirect(userID, "enqueue_runs", payload)
 		if intentID == "" {

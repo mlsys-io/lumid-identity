@@ -85,6 +85,17 @@ func chatCycleMetrics(toolCalls []toolCallResult) map[string]any {
 		if v, ok := res["grounded"].(bool); ok {
 			m["grounded"] = v
 		}
+		// A dispatched ARM, when the turn queued one. Mirrors what the
+		// scheduler's _self_report_run stamps, so an arm dispatched from chat
+		// and one dispatched from the panel are countable together in the one
+		// cross-tenant store (me_app_runs) — the per-tenant ledger cannot be
+		// aggregated across tenants at all.
+		if v, ok := res["arm"].(string); ok && v != "" {
+			m["arm"] = v
+		}
+		if v, ok := res["experiment"].(string); ok && v != "" {
+			m["experiment"] = v
+		}
 		if v, ok := res["score"].(float64); ok {
 			m["score"] = v
 		}

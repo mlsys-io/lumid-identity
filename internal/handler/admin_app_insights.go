@@ -383,10 +383,65 @@ func AdminAppInsights(c *gin.Context) {
 	// A capped scan must SAY it was capped. `total: 20000` against a cap of
 	// 20000 is not a total, it is the cap wearing a total's name — and it reads
 	// as a precise number, which is worse than an obviously rounded one.
+	// ── experiments ──────────────────────────────────────────────────────────
+	// The cross-tenant view of arm activity. It has to come from me_app_runs:
+	// record_result writes the per-tenant .lumid/experiments/ ledger on the
+	// scheduler PVC, identity reads that ledger PER TENANT, and there is no
+	// cross-tenant aggregate of experiment rows anywhere in the system. So the
+	// ledger stays the scientific record (arms, dims, dataset_version, the
+	// evaluate() verdict) and THIS is the fleet counter. They answer different
+	// questions and neither should borrow the other's authority.
+	//
+	// `metrics` is TEXT, so there is no JSON_EXTRACT to GROUP BY on and the
+	// rollup happens in Go — which means the insightsRowCap scan would report
+	// the cap as the total for an app like quant-research (28k runs/month).
+	// Narrow in SQL FIRST with a LIKE prefilter, exactly as the intents panel
+	// does; arm runs are rare against the plumbing, so this stays far under.
+	var expRows []models.MeAppRun
+	common.DB.Where("app IN ? AND run_ts >= ? AND metrics LIKE ?",
+		aliases, since.Unix(), "%\"arm\"%").
+		Order("run_ts DESC").Limit(insightsRowCap).Find(&expRows)
+
+	armRuns := map[string]int{}
+	armFails := map[string]int{}
+	expRuns := map[string]int{}
+	armUsers := map[string]map[string]bool{}
+	for _, r := range expRows {
+		var m map[string]any
+		if r.Metrics == "" || json.Unmarshal([]byte(r.Metrics), &m) != nil {
+			continue
+		}
+		arm, _ := m["arm"].(string)
+		if arm == "" {
+			continue // the LIKE can match a substring; the decode is the truth
+		}
+		armRuns[arm]++
+		if !r.Ok {
+			armFails[arm]++
+		}
+		if armUsers[arm] == nil {
+			armUsers[arm] = map[string]bool{}
+		}
+		armUsers[arm][r.UserSub] = true
+		if e, _ := m["experiment"].(string); e != "" {
+			expRuns[e]++
+		}
+	}
+	armRows := []gin.H{}
+	for arm, n := range armRuns {
+		armRows = append(armRows, gin.H{
+			"arm": arm, "runs": n, "failed": armFails[arm], "users": len(armUsers[arm]),
+		})
+	}
+	sort.Slice(armRows, func(i, j int) bool {
+		return armRows[i]["runs"].(int) > armRows[j]["runs"].(int)
+	})
+
 	truncated := gin.H{
 		"submissions": len(subs) >= insightsRowCap,
 		"runs":        false, // aggregated in SQL — exact
 		"intents":     len(intents) >= insightsRowCap,
+		"experiments": len(expRows) >= insightsRowCap,
 		"row_cap":     insightsRowCap,
 	}
 
@@ -424,6 +479,14 @@ func AdminAppInsights(c *gin.Context) {
 			"users":      chatUsersN,
 			"is_floor":   true,
 			"floor_note": "threads carry an app only when opened from an app page; general-chatbox threads about this app are not counted",
+		},
+		// Cross-tenant arm activity. NOT a verdict — verdicts live in each
+		// tenant's ledger, where the instrument guard applies.
+		"experiments": gin.H{
+			"by_arm":        armRows,
+			"by_experiment": topCounts(expRuns, 12),
+			"total_runs":    len(expRows),
+			"note":          "run counts across all tenants; per-arm RESULTS live in each tenant's experiment ledger",
 		},
 		"backtests": gin.H{
 			"total":      len(btRows),

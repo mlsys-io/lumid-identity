@@ -346,6 +346,10 @@ func Register(r *gin.Engine) {
 			me.POST("/agent/chat/stream", MeAgentChatStream)
 			// Tool approval — unblocks a destructive tool pending user consent.
 			me.POST("/agent/chat/tool-approve", MeAgentToolApprove)
+			// Studio surface interactions (closed vocabulary, no payload
+			// bodies). The caller's identity comes from the session, never
+			// the body.
+			me.POST("/interaction-events", MeInteractionEventRecord)
 			// Cooperative stop for a live Claude Code turn (see
 			// me_agent_claude_code.go) — beats aborting the fetch, which
 			// SIGKILLed the CLI and discarded partial work.

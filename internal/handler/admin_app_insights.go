@@ -285,6 +285,45 @@ func AdminAppInsights(c *gin.Context) {
 	sort.Ints(queueMs)
 	sort.Ints(runMs)
 
+	// ── surface interactions ─────────────────────────────────────────────────
+	// The only record of someone opening a page and doing nothing, which is
+	// exactly the population a funnel otherwise cannot see.
+	type actionAgg struct {
+		Action string
+		N      int
+	}
+	var actionAggs []actionAgg
+	if err := common.DB.Model(&models.MeInteractionEvent{}).
+		Select("action, COUNT(*) as n").
+		Where("app IN ? AND created_at >= ?", aliases, since).
+		Group("action").Scan(&actionAggs).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "interactions rollup: "+err.Error())
+		return
+	}
+	byAction := map[string]int{}
+	ixTotal := 0
+	for _, a := range actionAggs {
+		byAction[a.Action] = a.N
+		ixTotal += a.N
+	}
+	var ixUsers int64
+	common.DB.Model(&models.MeInteractionEvent{}).
+		Where("app IN ? AND created_at >= ?", aliases, since).
+		Distinct("user_sub").Count(&ixUsers)
+
+	var surfaceAggs []struct {
+		Surface string
+		N       int
+	}
+	common.DB.Model(&models.MeInteractionEvent{}).
+		Select("surface, COUNT(*) as n").
+		Where("app IN ? AND created_at >= ? AND action = ?", aliases, since, "surface_view").
+		Group("surface").Scan(&surfaceAggs)
+	bySurface := map[string]int{}
+	for _, a := range surfaceAggs {
+		bySurface[a.Surface] = a.N
+	}
+
 	// ── chats (counts only — never content) ──────────────────────────────────
 	var chatTotal, chatUsersN int64
 	common.DB.Model(&models.MeChat{}).Where("app IN ?", aliases).Count(&chatTotal)
@@ -346,6 +385,12 @@ func AdminAppInsights(c *gin.Context) {
 			"users":      chatUsersN,
 			"is_floor":   true,
 			"floor_note": "threads carry an app only when opened from an app page; general-chatbox threads about this app are not counted",
+		},
+		"interactions": gin.H{
+			"total":      ixTotal,
+			"users":      ixUsers,
+			"by_action":  topCounts(byAction, 0),
+			"by_surface": topCounts(bySurface, 0),
 		},
 		"activity": days30,
 		"caveats": []string{

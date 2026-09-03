@@ -53,6 +53,8 @@ func main() {
 	// inside 161 MB, on a 2Gi PVC that had hit 95% full. This IS the auth
 	// authority's database.
 	handler.StartSessionReclaimLoop()
+	// Retention for the interaction-event table, started with the writer.
+	handler.StartInteractionReclaimLoop()
 
 	// Drop client-fingerprint observations too old for any window to read.
 	handler.StartClaudeFingerprintGC()

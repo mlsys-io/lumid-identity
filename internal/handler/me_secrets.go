@@ -230,19 +230,34 @@ func InternalAppSecretsFetch(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	// Secrets are keyed on app_slug, so a RENAMED app orphans every credential
+	// its users set before the rename — the same failure appAliases was written
+	// for on run rows. lqt-mailbox -> quant-research shipped at v0.7.0; anything
+	// a user entered under the old slug became invisible the moment the app was
+	// updated, and the cycle then fails at its own credential check as though
+	// they had never set one.
+	aliases := appAliases(body.App)
 	var rows []models.AppSecret
-	if err := common.DB.Where("user_sub = ? AND app_slug = ?", body.UserSub, body.App).
+	if err := common.DB.Where("user_sub = ? AND app_slug IN ?", body.UserSub, aliases).
 		Find(&rows).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "lookup: "+err.Error())
 		return
 	}
+	// The CURRENT slug wins when a key exists under both, so a value set after
+	// the rename is never shadowed by a stale one carrying the same key.
 	out := map[string]string{}
-	for i := range rows {
-		if rows[i].Key == lqtStrategyPATCacheKey {
-			continue // machine-managed cache, not a user credential
-		}
-		if v, err := common.DecryptGrant(rows[i].ValueEncrypted); err == nil {
-			out[rows[i].Key] = v
+	for _, pass := range []bool{false, true} {
+		for i := range rows {
+			isCurrent := rows[i].AppSlug == body.App
+			if isCurrent != pass {
+				continue
+			}
+			if rows[i].Key == lqtStrategyPATCacheKey {
+				continue // machine-managed cache, not a user credential
+			}
+			if v, err := common.DecryptGrant(rows[i].ValueEncrypted); err == nil {
+				out[rows[i].Key] = v
+			}
 		}
 	}
 	// An lqt-mailbox DEPLOY needs an `lqt:strategy`-scoped PAT, which no user

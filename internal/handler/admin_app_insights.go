@@ -285,6 +285,45 @@ func AdminAppInsights(c *gin.Context) {
 	sort.Ints(queueMs)
 	sort.Ints(runMs)
 
+	// ── backtest honesty ─────────────────────────────────────────────────────
+	// The three axes the backtest loop records, straight from its own metrics
+	// block. This is the only panel where an aggregate could quietly launder a
+	// synthetic number into an apparent result, so the split is preserved
+	// rather than summed: `presentable` counts ONLY runs where all three axes
+	// came back real. Runs that carry no axes at all (queued, refused, or
+	// written before the loop emitted them) are counted as unlabelled, never
+	// as not-presentable — absent and false are different claims.
+	var btRows []models.MeAppRun
+	common.DB.Where("app IN ? AND `loop` = ? AND run_ts >= ?", aliases, "backtest", since.Unix()).
+		Order("run_ts DESC").Limit(insightsRowCap).Find(&btRows)
+
+	bt := map[string]int{}
+	replayProv := map[string]int{}
+	for _, r := range btRows {
+		var m map[string]any
+		if r.Metrics == "" || json.Unmarshal([]byte(r.Metrics), &m) != nil {
+			bt["unlabelled"]++
+			continue
+		}
+		if v, ok := m["replay"].(string); ok && v != "" {
+			replayProv[v]++
+		}
+		p, hasP := m["presentable_as_performance"].(bool)
+		_, hasAxis := m["replay"]
+		switch {
+		case hasP && p:
+			bt["presentable (all 3 axes real)"]++
+		case hasP && !p:
+			bt["not presentable"]++
+		case hasAxis:
+			// Axes present but no verdict flag — still a run we know something
+			// about, but not one we can call presentable.
+			bt["partial labels"]++
+		default:
+			bt["unlabelled"]++
+		}
+	}
+
 	// ── surface interactions ─────────────────────────────────────────────────
 	// The only record of someone opening a page and doing nothing, which is
 	// exactly the population a funnel otherwise cannot see.
@@ -385,6 +424,12 @@ func AdminAppInsights(c *gin.Context) {
 			"users":      chatUsersN,
 			"is_floor":   true,
 			"floor_note": "threads carry an app only when opened from an app page; general-chatbox threads about this app are not counted",
+		},
+		"backtests": gin.H{
+			"total":      len(btRows),
+			"by_verdict": topCounts(bt, 0),
+			"by_tape":    topCounts(replayProv, 0),
+			"truncated":  len(btRows) >= insightsRowCap,
 		},
 		"interactions": gin.H{
 			"total":      ixTotal,

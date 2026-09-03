@@ -1261,6 +1261,16 @@ var controlIntentPhrases = []string{
 	// runs
 	"promote the run", "promote this run", "promote run", "discard the run",
 	"discard this run", "discard run",
+	// run a DECLARED experiment arm. Without these the turn stays on
+	// claude-code, whose CLI toolset cannot see the me_agent registry, and the
+	// model correctly answers "I don't have a tool called
+	// dispatch_experiment_arm" — the control plane silently unavailable on the
+	// operator's own default provider (super_admin defaults to
+	// claude-code-sonnet; everyone else already gets a tool-capable provider).
+	"run the arm", "run this arm", "run that arm", "dispatch the arm",
+	"run the experiment", "run this experiment", "run the baseline arm",
+	"experiment arm", "run the variant", "run this variant",
+	"compare the arms", "run both arms",
 	// app surface / config authoring
 	"edit the app ui", "edit the page", "edit the ui", "edit the config",
 	"edit the app config", "update the config", "update the app config",

@@ -14,12 +14,15 @@ package handler
 //	apps workflows loops runs cycles drafts knowledge config experiments users ui prompts
 var toolDataScopes = map[string][]string{
 	// loop / workflow execution + schedule
-	"run_loop":       {"runs", "cycles", "loops", "workflows"},
-	"run_loop_now":   {"runs", "cycles", "loops", "workflows"},
-	"stop_loop":      {"runs", "cycles", "loops", "workflows"},
-	"patch_loop":     {"loops", "workflows"},
-	"pause_workflow": {"loops", "workflows"},
-	"delete_loop":    {"loops", "workflows", "apps"},
+	"run_loop":     {"runs", "cycles", "loops", "workflows"},
+	"run_loop_now": {"runs", "cycles", "loops", "workflows"},
+	// A dispatched arm produces a run AND moves the experiment ledger, so the
+	// experiments panel must refetch too or it shows a stale "no results yet".
+	"dispatch_experiment_arm": {"experiments", "runs", "cycles", "workflows"},
+	"stop_loop":               {"runs", "cycles", "loops", "workflows"},
+	"patch_loop":              {"loops", "workflows"},
+	"pause_workflow":          {"loops", "workflows"},
+	"delete_loop":             {"loops", "workflows", "apps"},
 	// app lifecycle
 	"install_app":           {"apps", "workflows", "loops"},
 	"uninstall_app":         {"apps", "workflows", "loops"},

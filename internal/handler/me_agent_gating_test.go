@@ -36,6 +36,13 @@ func TestDestructiveToolsGating(t *testing.T) {
 
 	notGated := []string{
 		"app_ui_get", "app_read", "app_actions", "show_app_surface", "run_loop_now",
+		// Same reasoning as run_loop_now (see me_agent.go:90): firing a cycle of
+		// an already-installed loop is the assistant's core action, and gating it
+		// forced an approval round-trip the tool-using model never completed, so
+		// "run X" never ran. A dispatched ARM is that same action with different
+		// arguments — it applies a declared config and is bounded by the queue's
+		// own back-pressure and the caller's cycle quota.
+		"dispatch_experiment_arm",
 	}
 	for _, name := range notGated {
 		t.Run("not_gated/"+name, func(t *testing.T) {

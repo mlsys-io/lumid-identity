@@ -2199,6 +2199,7 @@ var simpleModeTools = map[string]bool{
 	// the user's own apps + workflows (read + run, not authoring)
 	"list_workflows": true, "workflow_detail": true, "loops_health": true,
 	"list_runs": true, "run_detail": true, "run_loop_now": true, "pause_workflow": true,
+	"dispatch_experiment_arm": true, "list_experiments": true,
 	"agent_list": true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
 	"agent_marketplace": true, "search_marketplace": true,
 	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
@@ -2570,6 +2571,21 @@ func buildToolDefs() []map[string]any {
 					"cases": map[string]any{"type": "string", "description": "Optional run scope — a case_id (e.g. 'Case_019') or comma-separated ids. Omit for all cases."},
 				},
 				"required": []string{"app", "loop"},
+			},
+		},
+		{
+			"name":        "dispatch_experiment_arm",
+			"description": "Run one DECLARED ARM of an experiment (experiments[].arms[] in the app's manifest) — the measured way to try a change. Use when the user names an arm or asks to run/compare/try one (\"run the median-panel arm\", \"try cards_v2\"). Call list_experiments first if you don't know the arm ids. Unlike run_loop_now this applies the arm's config and tags the resulting rows with it, so the result lands in the experiment ledger against its baseline. `samples` runs the arm more than once (each is a separate cycle — keep it small).",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":        map[string]any{"type": "string"},
+					"experiment": map[string]any{"type": "string", "description": "experiments[].id, e.g. 'judge_panel_parity'"},
+					"arm":        map[string]any{"type": "string", "description": "One of that experiment's declared arm ids."},
+					"samples":    map[string]any{"type": "integer", "description": "How many cycles to run for this arm (default 1)."},
+					"cases":      map[string]any{"type": "string", "description": "Optional case subset — a case_id or comma-separated ids. Omit for the full set."},
+				},
+				"required": []string{"app", "experiment", "arm"},
 			},
 		},
 		{
@@ -3886,6 +3902,64 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		}
 		return map[string]any{"upstream": upstream, "pull": resp["pr"],
 			"pulls_url": "https://xp.io/" + upstream + "/pulls"}, true
+
+	case "dispatch_experiment_arm":
+		// Runs a DECLARED arm. Resolves it against the app's own manifest first,
+		// so an arm the model invented is refused by name rather than silently
+		// running the baseline and being recorded as if it were the arm.
+		app, _ := args["app"].(string)
+		expID, _ := args["experiment"].(string)
+		armID, _ := args["arm"].(string)
+		if app == "" || expID == "" || armID == "" {
+			return map[string]any{"error": "app, experiment and arm are required"}, false
+		}
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not installed: " + app}, false
+		}
+		decl, armCfg, loopName, err := resolveExperimentArm(dir, expID, armID)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, false
+		}
+		if loopName == "" {
+			return map[string]any{"error": "experiment '" + expID + "' is not attached to any loop " +
+				"(engine.experiment / steps[].experiment), so there is nowhere to dispatch it"}, false
+		}
+		samples := 1
+		if n, ok := args["samples"].(float64); ok && int(n) > 1 {
+			samples = int(n)
+		}
+		if samples > 20 {
+			samples = 20 // a chat turn must not be able to queue an unbounded run
+		}
+		// The variant shape _variant.resolve() consumes: the arm's own config
+		// plus `arm` naming it (that name is what evaluate() aggregates on, and
+		// what `baseline: {arm: <id>}` matches).
+		variant := map[string]any{}
+		for k, v := range armCfg {
+			variant[k] = v
+		}
+		variant["arm"] = armID
+		payload := map[string]any{
+			"app": app, "loop": loopName,
+			"variants":     repeatVariant(variant, samples),
+			"branch_label": armID,
+			"experiment":   expID,
+		}
+		if cs, _ := args["cases"].(string); cs != "" {
+			payload["cases"] = splitCases(cs)
+		}
+		intentID := writeIntentDirect(userID, "enqueue_runs", payload)
+		if intentID == "" {
+			return map[string]any{"error": "could not queue the arm"}, false
+		}
+		return map[string]any{
+			"queued": true, "intent_id": intentID, "app": app, "loop": loopName,
+			"experiment": expID, "arm": armID, "samples": samples,
+			"hypothesis": decl,
+			"note": "Queued into the app's experiment queue; the scheduler drains it. " +
+				"Results land in the experiment ledger under this arm id.",
+		}, true
 
 	case "run_loop_now":
 		app, _ := args["app"].(string)

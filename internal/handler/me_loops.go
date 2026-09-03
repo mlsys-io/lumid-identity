@@ -177,17 +177,22 @@ type meLoopRunBody struct {
 	//   Criteria    — Phase B: success criteria for this run (judge prompt).
 	//   AutoPromote — Phase B: auto-promote the produced run if it wins.
 	//   Cases       — Phase C: casebook case ids to evaluate this run against.
-	//   NotBefore   — Phase D: ISO-8601 earliest-start gate (deferred run).
+	//   (NotBefore was removed 2026-09-04: it was accepted here and forwarded
+	//   into the intent payload, but me_intent_picker never read it — only the
+	//   legacy drain_oneshots path did — so a "defer until" run started
+	//   immediately. No UI ever set it. Reinstate it WITH a picker-side gate,
+	//   not before.)
 	Criteria    string   `json:"criteria,omitempty"`
 	AutoPromote bool     `json:"auto_promote,omitempty"`
 	Cases       []string `json:"cases,omitempty"`
-	NotBefore   string   `json:"not_before,omitempty"`
 }
 
 // POST /api/v1/me/loops/:app/:loop/run
 //
-// Appends a row to ~/.lumilake/jobs.jsonl that the lumid-scheduler
-// picks up. Schema matches sdk/ops/jobs.py::record_submission.
+// Queues a `run_loop` intent in me_app_intents, which the scheduler's picker
+// drains. (This comment described the old ~/.lumilake/jobs.jsonl ledger, which
+// the body stopped using long ago and which was deleted 2026-09-04 — it was
+// pod-local on identity and nothing ever read it.)
 func MeLoopRunNow(c *gin.Context) {
 	userID, authed := currentUserID(c)
 	if !authed {
@@ -246,9 +251,6 @@ func MeLoopRunNow(c *gin.Context) {
 	}
 	if len(body.Cases) > 0 {
 		payload["cases"] = body.Cases
-	}
-	if body.NotBefore != "" {
-		payload["not_before"] = body.NotBefore
 	}
 	id := writeIntent(c, "run_loop", userID, payload)
 	if id == "" {
@@ -398,29 +400,17 @@ func MeLoopsHealth(c *gin.Context) {
 
 // --- jobs.jsonl + overrides file helpers ------------------------------------
 
-func jobsLedgerPath() string {
-	return filepath.Join(operatorHome(), ".lumilake", "jobs.jsonl")
-}
-
-func appendJobRow(row map[string]any) error {
-	if err := os.MkdirAll(filepath.Dir(jobsLedgerPath()), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(jobsLedgerPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	b, err := json.Marshal(row)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(append(b, '\n')); err != nil {
-		return err
-	}
-	return nil
-}
-
+// The one-shot jobs.jsonl ledger was REMOVED here on 2026-09-04.
+//
+// jobsLedgerPath() resolved to identity's own ~/.lumilake/jobs.jsonl, but the
+// drainer (XpioSchedulerDaemon.drain_oneshots) reads the SCHEDULER's copy on
+// its xpio-state PVC in another cluster. Every row written here was invisible:
+// the live pod held 3, all state=queued, including two users' quant-research
+// backtests that the chatbox had reported as queued a day earlier.
+//
+// Both callers now write a `run_loop` intent instead (MeLoopRunNow always did;
+// agentEnqueueOneshot was migrated). Nothing writes this file — the helpers are
+// gone rather than left available to be wired up again.
 // readSimpleOverrides reads a tiny YAML-ish file. We restrict the
 // surface to keys we own: `loops: {<loop>: {runtime, schedule,
 // enabled}}` + `_meta`. Anything else in the file (CLI-edited keys

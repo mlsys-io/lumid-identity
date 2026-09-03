@@ -71,29 +71,43 @@ func writeIntentDirect(userSub, action string, payload map[string]any) string {
 	return id
 }
 
-// agentEnqueueOneshot appends a one-shot job to ~/.lumilake/jobs.jsonl.
-// Same schema MeLoopRunNow writes. Optional `args` (e.g. {"cases":"Case_019"})
-// scopes the run — the loop's {{ args.* }} template expands them; nil = full.
+// agentEnqueueOneshot queues one cycle of an installed loop for the chat tools
+// (`run_loop_now`), via the DB-backed intent queue.
+//
+// It used to append to ~/.lumilake/jobs.jsonl — which is POD-LOCAL on identity.
+// The drainer for that ledger (XpioSchedulerDaemon.drain_oneshots) reads the
+// SCHEDULER's ~/.lumilake on its own xpio-state PVC, in another cluster, so
+// nothing ever read what we wrote. MeLoopRunNow migrated off it for exactly
+// this reason and its comment says so ("pod-local on identity and never
+// reaches the scheduler on UKS"); the chat path was left behind.
+//
+// Measured on the live pod 2026-09-04: /root/.lumilake/jobs.jsonl held 3 rows,
+// all still state=queued — two users' quant-research backtests from 2026-09-03
+// and one venue-link-matcher cycle. The chat said the run was queued; no cycle
+// ever ran. Now it writes the same `run_loop` intent MeLoopRunNow writes, so a
+// chat-triggered run takes the transport that actually crosses the boundary.
+//
+// Optional `args` (e.g. {"cases":"Case_019"}) scopes the run — the loop's
+// {{ args.* }} template expands them; nil = full. `variant` / `experiment`
+// thread an experiment ARM through to the cycle.
 func agentEnqueueOneshot(userID, app, loop string, args map[string]any) (string, error) {
-	jobID := fmt.Sprintf("oneshot-%d", time.Now().UnixNano())
-	payload := map[string]any{"oneshot": true, "via": "agent"}
+	payload := map[string]any{"app": app, "loop": loop, "via": "agent"}
+	// Pull the run-shaping keys up to the top level, where _process_run_loop
+	// reads them; anything else stays in `args` for the loop's template.
+	for _, k := range []string{"variant", "experiment", "from_run_ts", "branch_label", "criteria"} {
+		if v, ok := args[k]; ok {
+			payload[k] = v
+			delete(args, k)
+		}
+	}
 	if len(args) > 0 {
 		payload["args"] = args
 	}
-	row := map[string]any{
-		"job_id":         jobID,
-		"source":         "loop_cycle",
-		"submitter_app":  app,
-		"submitter_loop": loop,
-		"state":          "queued",
-		"submitted_at":   time.Now().UTC().Format(time.RFC3339),
-		"submitted_by":   userID,
-		"payload":        payload,
+	id := writeIntentDirect(userID, "run_loop", payload)
+	if id == "" {
+		return "", fmt.Errorf("could not queue the run")
 	}
-	if err := appendJobRow(row); err != nil {
-		return "", err
-	}
-	return jobID, nil
+	return id, nil
 }
 
 // agentStopLoop — chat twin of REST MeLoopStop. Writes the per-loop cooperative

@@ -15,6 +15,7 @@ package handler
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -188,8 +189,14 @@ func loadAppExperiments(appDir string) []gin.H {
 			"dataset_id": d.DatasetID, "metric": d.Metric,
 			"benchmark_id": d.Benchmark, "baseline": d.Baseline,
 			"success_criteria": d.Criteria, "min_samples": d.MinSamples,
-			"status":       strOr(d.Status, "active"),
-			"loops":        loops[d.ID],
+			"status": strOr(d.Status, "active"),
+			"loops":  loops[d.ID],
+			// The DECLARED arms. expDecl has parsed these since it was written
+			// and the row dropped them, so the only arms any client could see
+			// were the ones already OBSERVED in state.variants — i.e. a
+			// never-run arm was invisible, and nothing could offer to run it.
+			// This is the backend half of per-arm dispatch.
+			"arms":         d.Arms,
 			"n_results":    0,
 			"criteria_met": false,
 		}
@@ -197,6 +204,12 @@ func loadAppExperiments(appDir string) []gin.H {
 			"n_results", "variants", "best_variant", "baseline_value",
 			"delta", "delta_pp", "criteria_met", "criteria_reason",
 			"verdict", "updated_at", "metric", "higher_is_better",
+			// Instrument/definition honesty, written by experiments.evaluate():
+			// `comparable:false` means the ranking was withheld because the arms
+			// were measured under different instruments — the client must not
+			// render a winner in that case.
+			"comparable", "instruments", "compare_within",
+			"dataset_version", "dataset_versions_seen",
 		} {
 			if v, ok := st[k]; ok && v != nil {
 				if k == "metric" {
@@ -511,4 +524,93 @@ func MeAppExperimentCase(c *gin.Context) {
 	ok(c, "ok", gin.H{
 		"case_id": caseID, "rows": caseRows, "latest_by_question": latestByQ,
 	})
+}
+
+// ── arm resolution for dispatch ──────────────────────────────────────────────
+
+// resolveExperimentArm looks up ONE declared arm of ONE experiment in the app's
+// own spec, and reports which loop that experiment is attached to.
+//
+// Resolving against the manifest — rather than trusting the caller — is what
+// keeps a dispatch honest. An arm id that does not exist must be refused BY
+// NAME: the alternative is a cycle that runs the baseline and is then recorded
+// under a label nobody declared, which is indistinguishable in the ledger from
+// a real result. (The same failure the run-a-variant break produced for months,
+// where unapplied variants landed as "current".)
+//
+// Returns (hypothesis, arm config minus its id/description, loop name).
+func resolveExperimentArm(appDir, experimentID, armID string) (string, map[string]any, string, error) {
+	m := readExpManifest(appDir)
+	var decl *expDecl
+	for i := range m.Experiments {
+		if m.Experiments[i].ID == experimentID {
+			decl = &m.Experiments[i]
+			break
+		}
+	}
+	if decl == nil {
+		known := make([]string, 0, len(m.Experiments))
+		for _, d := range m.Experiments {
+			known = append(known, d.ID)
+		}
+		if len(known) == 0 {
+			return "", nil, "", fmt.Errorf("this app declares no experiments")
+		}
+		return "", nil, "", fmt.Errorf("no experiment %q — declared: %s",
+			experimentID, strings.Join(known, ", "))
+	}
+	var arm map[string]any
+	names := make([]string, 0, len(decl.Arms))
+	for _, a := range decl.Arms {
+		id, _ := a["id"].(string)
+		if id == "" {
+			continue
+		}
+		names = append(names, id)
+		if id == armID {
+			arm = a
+		}
+	}
+	if arm == nil {
+		return "", nil, "", fmt.Errorf("experiment %q has no arm %q — declared: %s",
+			experimentID, armID, strings.Join(names, ", "))
+	}
+	cfg := map[string]any{}
+	for k, v := range arm {
+		if k == "id" || k == "description" {
+			continue
+		}
+		cfg[k] = v
+	}
+	// Which loop runs it: engine.experiment / steps[].experiment.
+	loopName := ""
+	for exp, loops := range expLoops(m) {
+		if exp == experimentID && len(loops) > 0 {
+			loopName = loops[0]
+			break
+		}
+	}
+	return decl.Hypothesis, cfg, loopName, nil
+}
+
+// repeatVariant returns n copies of one variant — the enqueue contract is one
+// entry per run, and each becomes its own queued unit so the drain's
+// back-pressure (budget per tick, serial within an app) still applies.
+func repeatVariant(v map[string]any, n int) []map[string]any {
+	out := make([]map[string]any, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, v)
+	}
+	return out
+}
+
+// splitCases turns "Case_001, Case_002" into a list, dropping blanks.
+func splitCases(s string) []string {
+	out := []string{}
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

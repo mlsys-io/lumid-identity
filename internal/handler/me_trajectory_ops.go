@@ -27,7 +27,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -211,6 +210,12 @@ type meLoopEnqueueBody struct {
 	Criteria    string           `json:"criteria,omitempty"`
 	Priority    int              `json:"priority,omitempty"`
 	Variants    []map[string]any `json:"variants"`
+	// Cases was declared in src/api/me.ts's enqueueRuns contract from the start
+	// but existed in neither this struct nor experiment_queue.enqueue — a
+	// three-layer drift, so a fanned-out arm silently ran the FULL casebook.
+	Cases []string `json:"cases,omitempty"`
+	// ExperimentID names the study these runs belong to (experiments[].id).
+	ExperimentID string `json:"experiment_id,omitempty"`
 }
 
 // MeLoopEnqueue — POST /me/apps/:app/loops/:loop/enqueue
@@ -247,34 +252,50 @@ func MeLoopEnqueue(c *gin.Context) {
 		return
 	}
 
-	priority := body.Priority
-	queued := 0
-	for _, variant := range body.Variants {
-		vjson, err := json.Marshal(variant)
-		if err != nil {
-			continue // skip un-marshalable variant; best-effort
-		}
-		args := []string{
-			"enqueue",
-			"--app", app,
-			"--loop", loop,
-			"--count", "1",
-			"--priority", strconv.Itoa(priority),
-			"--variant-json", string(vjson),
-		}
-		if body.FromRunTs != "" {
-			args = append(args, "--from-run-ts", body.FromRunTs)
-		}
-		if body.BranchLabel != "" {
-			args = append(args, "--branch-label", body.BranchLabel)
-		}
-		if body.Criteria != "" {
-			args = append(args, "--criteria", body.Criteria)
-		}
-		args = append(args, "--by", userSub)
-		if _, err, _ := runTrajectoryCLI(userSub, args...); err == nil {
-			queued++
-		}
+	payload := map[string]any{
+		"app":      app,
+		"loop":     loop,
+		"variants": body.Variants,
+		"priority": body.Priority,
 	}
-	ok(c, "queued", gin.H{"queued": queued})
+	if body.FromRunTs != "" {
+		payload["from_run_ts"] = body.FromRunTs
+	}
+	if body.BranchLabel != "" {
+		payload["branch_label"] = body.BranchLabel
+	}
+	if body.Criteria != "" {
+		payload["criteria"] = body.Criteria
+	}
+	if len(body.Cases) > 0 {
+		payload["cases"] = body.Cases
+	}
+	if body.ExperimentID != "" {
+		payload["experiment"] = body.ExperimentID
+	}
+	id := writeIntent(c, "enqueue_runs", userSub, payload)
+	if id == "" {
+		return // writeIntent already wrote the error response
+	}
+
+	// 202, and NO `queued` count.
+	//
+	// Identity does not know the count and must not claim one. The old handler
+	// shelled `lumid-trajectory` once per variant and counted the successes —
+	// but that CLI does not exist in this image (the pod holds /app/{configs,
+	// identity} and mounts one volume, signing-keys), so every exec failed,
+	// `queued` stayed 0, and this returned HTTP 200 {"queued": 0}. A success
+	// status over work that never happened.
+	//
+	// It cannot be fixed by packaging either: the app trees live on the
+	// scheduler's xpio-state PVC (ReadWriteOnce, another cluster), so a CLI
+	// running here would write a queue file nothing drains. me_app_intents is
+	// the only transport that crosses, and the scheduler's enqueue_runs handler
+	// does the writes and returns the real count on the intent result —
+	// pollable at GET /me/intents/:id, the same argument MeLoopRunNow makes for
+	// job_id.
+	c.JSON(http.StatusAccepted, gin.H{
+		"code": 0, "message": "queued",
+		"data": gin.H{"intent_id": id, "requested": len(body.Variants), "state": "queued"},
+	})
 }

@@ -50,6 +50,9 @@ const (
 type lqtReadSpec struct {
 	path string
 	list bool
+	// crossTenant marks a feed that returns EVERY tenant's rows with no tenant
+	// column to filter on. Restricted to super_admin — see lqtReadEndpoints.
+	crossTenant bool
 	// needsID marks an endpoint whose path is completed by a caller-supplied
 	// strategy id: `path` is a fmt template with exactly one %s.
 	//
@@ -91,8 +94,15 @@ var lqtReadEndpoints = map[string]lqtReadSpec{
 	"venue_health_chi":    {path: "/lqt/venue-health/chi", list: false},
 	"venue_health_dublin": {path: "/lqt/venue-health/dublin", list: false},
 	"stats":               {path: "/xpio/stats", list: false},
-	"strategies":          {path: "/xpio/strategies", list: true},
-	"results":             {path: "/xpio/results", list: true},
+	// CROSS-TENANT. Both return `scope: "all_tenants"` and their rows carry no
+	// tenant/owner/user column at all — there is nothing to filter on, here or
+	// downstream. `strategies` rows include `payload`, i.e. the .lqts SOURCE.
+	// Until lqt-data scopes them server-side, any signed-in user asking "what
+	// strategies exist?" would read every other user's work; for a graded
+	// cohort that is an answer-sharing channel that needs no intent to open.
+	// Reported 2026-08-31, verified live 2026-09-03.
+	"strategies": {path: "/xpio/strategies", list: true, crossTenant: true},
+	"results":    {path: "/xpio/results", list: true, crossTenant: true},
 	"cycles_nyc":          {path: "/runtime/cycles/nyc", list: true},
 	"signals_venue_mid":   {path: "/lqt/signals/venue_mid", list: true},
 	// Per-strategy reads — what a grounded chat actually needs. Tenant-scoped
@@ -219,10 +229,19 @@ func resolveLqtEndpoint(e string) (lqtReadSpec, bool) {
 // returns the parsed JSON. `endpoint` names a known-good surface (see
 // lqtReadEndpoints); `limit` caps list endpoints. Read-only — no gating beyond
 // the endpoint allowlist, mirroring data_query.
-func toolLqtMailboxRead(endpoint, strategyID string, limit int) (map[string]any, bool) {
+func toolLqtMailboxRead(role, endpoint, strategyID string, limit int) (map[string]any, bool) {
 	spec, ok := resolveLqtEndpoint(endpoint)
 	if !ok {
 		return map[string]any{"error": fmt.Sprintf("unknown lqt endpoint %q — use one of: %s", endpoint, strings.Join(sortedKeys(lqtReadEndpoints), ", "))}, false
+	}
+	// A cross-tenant feed is operator-only. The refusal names the tenant-scoped
+	// alternative rather than just denying, so a grounded chat asking about ITS
+	// OWN strategy still has a way through instead of dead-ending.
+	if spec.crossTenant && role != "super_admin" {
+		return map[string]any{"error": fmt.Sprintf(
+			"%q is a platform-wide feed carrying every tenant's rows, so it is restricted to operators. "+
+				"For this user's own work use endpoint \"strategy_cycles\" with a strategy_id, or the "+
+				"app's own Strategies / Backtest surfaces, which are tenant-scoped.", endpoint)}, false
 	}
 	path := spec.path
 	if spec.needsID {

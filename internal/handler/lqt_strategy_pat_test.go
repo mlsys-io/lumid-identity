@@ -124,10 +124,10 @@ func TestStrategyCyclesRequiresAnID(t *testing.T) {
 	if !spec.needsID {
 		t.Error("strategy_cycles must be marked needsID, or its path template goes unfilled")
 	}
-	if out, ok := toolLqtMailboxRead("strategy_cycles", "", 10); ok {
+	if out, ok := toolLqtMailboxRead("user", "strategy_cycles", "", 10); ok {
 		t.Errorf("expected refusal without a strategy_id, got %v", out)
 	}
-	if out, ok := toolLqtMailboxRead("strategy_cycles", "../etc", 10); ok {
+	if out, ok := toolLqtMailboxRead("user", "strategy_cycles", "../etc", 10); ok {
 		t.Errorf("expected refusal for a traversal id, got %v", out)
 	}
 }

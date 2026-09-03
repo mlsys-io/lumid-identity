@@ -3259,7 +3259,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "lqt_mailbox_read",
-			"description": "Read data from the LQT prediction-market mailbox (venues, strategies, results, telemetry). Read-only. Pick one endpoint: venue_health_nyc|venue_health_chi|venue_health_dublin (venue health), stats (strategy/result/telemetry counts), strategies (list), results (list), cycles_nyc (runtime cycles), signals_venue_mid (venue mid-price signals), strategy_cycles (the decision funnel — proposed/submitted/rejected and why — for ONE strategy; needs strategy_id, and is tenant-scoped). When the conversation is about a specific strategy, prefer strategy_cycles over listing everything. It reports DECISIONS, not PnL. Use limit for the list endpoints.",
+			"description": "Read data from the LQT prediction-market mailbox (venues, strategies, results, telemetry). Read-only. Pick one endpoint: venue_health_nyc|venue_health_chi|venue_health_dublin (venue health), stats (strategy/result/telemetry counts), strategies (list, OPERATORS ONLY), results (list, OPERATORS ONLY), cycles_nyc (runtime cycles), signals_venue_mid (venue mid-price signals), strategy_cycles (the decision funnel — proposed/submitted/rejected and why — for ONE strategy; needs strategy_id, and is tenant-scoped). When the conversation is about a specific strategy, prefer strategy_cycles over listing everything. It reports DECISIONS, not PnL. Use limit for the list endpoints. NOTE: `strategies` and `results` are PLATFORM-WIDE feeds covering every tenant, so they are restricted to operators and will refuse for anyone else. For a specific user's own work use `strategy_cycles` with a strategy_id, or read the app's own tenant-scoped surfaces.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -4459,7 +4459,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if v, ok := args["limit"].(float64); ok {
 			limit = int(v)
 		}
-		return toolLqtMailboxRead(endpoint, strategyID, limit)
+		return toolLqtMailboxRead(role, endpoint, strategyID, limit)
 
 	case "remember_about_me":
 		note, _ := args["note"].(string)

@@ -123,3 +123,52 @@ func TestSplitCasesAndRepeatVariant(t *testing.T) {
 		t.Errorf("repeatVariant produced %d entries, want 3", n)
 	}
 }
+
+// A loop may attach ONE experiment or SEVERAL. The list form used to unmarshal
+// into a bare string field and vanish, leaving the second experiment with
+// `loops: null` — never attached, so never passed to refresh_for_cycle, so
+// permanently n=0 no matter how many rows it accumulated. That reads as
+// "declared but idle" rather than "broken", which is the whole failure class
+// this work exists to remove.
+func TestExperimentAttachmentAcceptsScalarOrList(t *testing.T) {
+	cases := []struct {
+		name string
+		spec string
+		want map[string][]string
+	}{
+		{"scalar", `
+loops:
+  - name: interview
+    engine: {experiment: judge_panel_parity}
+`, map[string][]string{"judge_panel_parity": {"interview"}}},
+		{"list", `
+loops:
+  - name: backtest
+    engine: {experiment: [backtest_evidence, backtest_performance]}
+`, map[string][]string{
+			"backtest_evidence":    {"backtest"},
+			"backtest_performance": {"backtest"},
+		}},
+		{"steps form", `
+loops:
+  - name: sweep
+    steps:
+      - {experiment: [a, b]}
+      - {experiment: c}
+`, map[string][]string{"a": {"sweep"}, "b": {"sweep"}, "c": {"sweep"}}},
+		{"none", "loops:\n  - name: plain\n", map[string][]string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := expLoops(parseExpManifestBytes([]byte(tc.spec)))
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for id, loops := range tc.want {
+				if len(got[id]) != len(loops) || (len(loops) > 0 && got[id][0] != loops[0]) {
+					t.Errorf("experiment %q attached to %v, want %v", id, got[id], loops)
+				}
+			}
+		})
+	}
+}

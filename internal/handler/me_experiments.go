@@ -47,10 +47,10 @@ type expManifest struct {
 	Loops       []struct {
 		Name   string `yaml:"name"`
 		Engine struct {
-			Experiment string `yaml:"experiment"`
+			Experiment expRef `yaml:"experiment"`
 		} `yaml:"engine"`
 		Steps []struct {
-			Experiment string `yaml:"experiment"`
+			Experiment expRef `yaml:"experiment"`
 		} `yaml:"steps"`
 	} `yaml:"loops"`
 }
@@ -88,16 +88,46 @@ func parseExpManifestBytes(b []byte) expManifest {
 }
 
 // expLoops — experiment id → loops attached to it.
+// expRef is one experiment id, or a list of them.
+//
+// A single loop can legitimately feed several experiments — quant-research's
+// `backtest` loop measures both backtest_evidence (every resolved claim) and
+// backtest_performance (only the three-axes-real subset). Decoding into a bare
+// string made the list form unmarshal to empty, so the second experiment showed
+// `loops: null`: never attached, never evaluated, permanently n=0 while looking
+// merely idle.
+type expRef []string
+
+func (e *expRef) UnmarshalYAML(value *yaml.Node) error {
+	var one string
+	if err := value.Decode(&one); err == nil {
+		if one != "" {
+			*e = []string{one}
+		}
+		return nil
+	}
+	var many []string
+	if err := value.Decode(&many); err != nil {
+		return nil // malformed: attach nothing rather than fail the whole spec
+	}
+	*e = many
+	return nil
+}
+
 func expLoops(m expManifest) map[string][]string {
 	out := map[string][]string{}
 	for _, l := range m.Loops {
 		ids := map[string]bool{}
-		if l.Engine.Experiment != "" {
-			ids[l.Engine.Experiment] = true
+		for _, id := range l.Engine.Experiment {
+			if id != "" {
+				ids[id] = true
+			}
 		}
 		for _, st := range l.Steps {
-			if st.Experiment != "" {
-				ids[st.Experiment] = true
+			for _, id := range st.Experiment {
+				if id != "" {
+					ids[id] = true
+				}
 			}
 		}
 		for id := range ids {

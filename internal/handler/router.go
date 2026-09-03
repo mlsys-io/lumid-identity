@@ -555,6 +555,10 @@ func Register(r *gin.Engine) {
 			// here so the Studio trajectory/experiments surfaces (which can't
 			// read the scheduler PVC) can reconstruct run history. App-agnostic.
 			internal.POST("/app-runs", InternalAppRunRecord)
+			// Experiment state, same reason as app-runs: the ledger is on the
+			// scheduler volume and identity mounts none, so the panel could show
+			// declared arms whose results never appeared.
+			internal.POST("/app-experiments", InternalAppExperimentRecord)
 			// Claude Code quota reporter — each account's cron/stop-hook
 			// POSTs here; no user session, only X-Bridge-Secret.
 			internal.POST("/claude-quota/report", InternalClaudeQuotaReport)

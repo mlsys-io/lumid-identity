@@ -22,6 +22,9 @@ import (
 	"sort"
 	"strings"
 
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
+
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
@@ -137,14 +140,37 @@ func expLoops(m expManifest) map[string][]string {
 	return out
 }
 
+// readExpState returns one experiment's evaluated state.
+//
+// Disk first, then the self-reported copy in MySQL. The ledger is written on
+// the SCHEDULER's volume and identity mounts no tenant volume, so for a tenant
+// install the disk read finds identity's own materialised copy of the published
+// bundle — declaration, never results. Disk still WINS when it has something,
+// because an operator-shared app runs in the daemon's own HOME and that ledger
+// is the freshest copy.
+//
+// userSub/app may be empty (callers that only have a directory); the fallback
+// is simply skipped then.
 func readExpState(appDir, id string) map[string]any {
+	return readExpStateFor("", "", appDir, id)
+}
+
+func readExpStateFor(userSub, app, appDir, id string) map[string]any {
 	st := map[string]any{}
 	p, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "experiments", id, "state.json"))
-	b, err := os.ReadFile(p)
-	if err != nil {
+	if b, err := os.ReadFile(p); err == nil {
+		_ = json.Unmarshal(b, &st)
+	}
+	// "Has something" means it actually carries results — an empty or
+	// zero-result state.json must not mask a real self-reported one.
+	if n, ok := st["n_results"].(float64); ok && n > 0 {
 		return st
 	}
-	_ = json.Unmarshal(b, &st)
+	if userSub != "" && app != "" {
+		if stored := storedExpState(userSub, app, id); stored != nil {
+			return stored
+		}
+	}
 	return st
 }
 
@@ -206,6 +232,14 @@ func readExpRows(appDir, id string, capN int) []expRow {
 // loadAppExperiments — declarations merged with ledger state. Shared with
 // the chat tools (list_experiments).
 func loadAppExperiments(appDir string) []gin.H {
+	return loadAppExperimentsFor("", "", appDir)
+}
+
+// loadAppExperimentsFor is the same, with the identity needed to fall back to
+// the self-reported state when the ledger is on a volume identity cannot read.
+// Callers that only have a directory (chat tools resolving an operator app) use
+// loadAppExperiments and simply get the disk view.
+func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 	m := readExpManifest(appDir)
 	loops := expLoops(m)
 	out := make([]gin.H, 0, len(m.Experiments))
@@ -213,7 +247,7 @@ func loadAppExperiments(appDir string) []gin.H {
 		if d.ID == "" {
 			continue
 		}
-		st := readExpState(appDir, d.ID)
+		st := readExpStateFor(userSub, app, appDir, d.ID)
 		row := gin.H{
 			"id": d.ID, "hypothesis": d.Hypothesis, "kind": d.Kind,
 			"dataset_id": d.DatasetID, "metric": d.Metric,
@@ -287,6 +321,10 @@ func baselineFromDecl(d expDecl) float64 {
 // loadExperimentDetail — state + results tail + per-variant series +
 // per-case grouping (casebook observability). Shared with chat tools.
 func loadExperimentDetail(appDir, id string) (gin.H, bool) {
+	return loadExperimentDetailFor("", "", appDir, id)
+}
+
+func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 	m := readExpManifest(appDir)
 	var decl *expDecl
 	for i := range m.Experiments {
@@ -298,7 +336,7 @@ func loadExperimentDetail(appDir, id string) (gin.H, bool) {
 	if decl == nil {
 		return nil, false
 	}
-	st := readExpState(appDir, id)
+	st := readExpStateFor(userSub, app, appDir, id)
 	rows := readExpRows(appDir, id, expResultsTailCap)
 	metricName, _ := st["metric"].(string)
 	if metricName == "" {
@@ -490,7 +528,7 @@ func MeAppExperiments(c *gin.Context) {
 		ok(c, "ok", gin.H{"experiments": []gin.H{}, "count": 0})
 		return
 	}
-	exps := loadAppExperiments(appDir)
+	exps := loadAppExperimentsFor(userID, app, appDir)
 	ok(c, "ok", gin.H{"experiments": exps, "count": len(exps)})
 }
 
@@ -511,7 +549,7 @@ func MeAppExperiment(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	detail, found := loadExperimentDetail(appDir, id)
+	detail, found := loadExperimentDetailFor(userID, app, appDir, id)
 	if !found {
 		fail(c, http.StatusNotFound, 1404, "experiment not found")
 		return
@@ -643,4 +681,78 @@ func splitCases(s string) []string {
 		}
 	}
 	return out
+}
+
+// ── cross-node experiment state ──────────────────────────────────────────────
+
+type appExperimentBody struct {
+	UserSub      string         `json:"user_sub"`
+	App          string         `json:"app"`
+	ExperimentID string         `json:"experiment_id"`
+	State        map[string]any `json:"state"`
+}
+
+// InternalAppExperimentRecord — POST /api/v1/internal/app-experiments
+//
+// The cycle self-reports an experiment's evaluated state so identity can serve
+// it. The ledger lives on the SCHEDULER's volume; identity mounts no tenant
+// volume and therefore reads its own materialised copy of the published
+// bundle, which carries the declaration and never the results. Without this the
+// Experiments panel shows declared arms whose results can never appear —
+// measured 2026-09-04, a real row on disk against n=0 over the API.
+//
+// Idempotent on (user_sub, app, experiment_id): each cycle overwrites with the
+// freshly evaluated state, which is what evaluate() already does to state.json.
+func InternalAppExperimentRecord(c *gin.Context) {
+	var b appExperimentBody
+	if err := c.ShouldBindJSON(&b); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	if b.UserSub == "" || b.App == "" || b.ExperimentID == "" {
+		fail(c, http.StatusBadRequest, 1400, "user_sub, app, experiment_id required")
+		return
+	}
+	sj := "{}"
+	n := 0
+	if b.State != nil {
+		if raw, err := json.Marshal(b.State); err == nil {
+			sj = string(raw)
+		}
+		if v, ok := b.State["n_results"].(float64); ok {
+			n = int(v)
+		}
+	}
+	row := models.MeAppExperiment{
+		UserSub: b.UserSub, App: b.App, ExperimentID: b.ExperimentID,
+		State: sj, NResults: n,
+	}
+	res := common.DB.Where("user_sub = ? AND app = ? AND experiment_id = ?",
+		b.UserSub, b.App, b.ExperimentID).Assign(row).FirstOrCreate(&models.MeAppExperiment{})
+	if res.Error != nil {
+		fail(c, http.StatusInternalServerError, 1500, "save: "+res.Error.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "recorded",
+		"data": gin.H{"app": b.App, "experiment_id": b.ExperimentID, "n_results": n}})
+}
+
+// storedExpState returns the self-reported state for one experiment, or nil.
+//
+// DISK WINS when it has rows: an operator-shared app runs in the daemon's own
+// HOME, so identity can read that ledger directly and it is the freshest copy.
+// The DB is the fallback for everything identity cannot see — which is every
+// tenant install.
+func storedExpState(userSub, app, experimentID string) map[string]any {
+	var row models.MeAppExperiment
+	q := common.DB.Where("user_sub = ? AND app = ? AND experiment_id = ?",
+		userSub, app, experimentID).First(&row)
+	if q.Error != nil || row.State == "" {
+		return nil
+	}
+	var st map[string]any
+	if json.Unmarshal([]byte(row.State), &st) != nil {
+		return nil
+	}
+	return st
 }

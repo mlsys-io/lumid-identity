@@ -424,3 +424,39 @@ done:
 // _silence_unused_compile_errors — keeps go vet quiet about bytes/buffer
 // helpers used elsewhere in this file under different code paths.
 var _ = bytes.NewReader
+
+// oneshotArgsFrom merges a run_loop_now call's invocation args: the loop's own
+// {{ args.* }} map, plus the legacy `cases` shorthand.
+//
+// Why this exists at all. run_loop_now accepted ONLY `cases`, so no chat turn
+// could ever pass a loop its actual subject. quant-research's `backtest` reads
+// action/name/symbol/strategy; called bare it submitted an empty strategy and
+// reported success. Both the Backtest page ("every action on this page is also
+// a chat tool") and the onboarding doc ("run the whole loop in sentences
+// instead of forms") promised a capability the tool surface did not have, and
+// a 2026-08-31 walkthrough hit exactly that wall: "there is no tool on my side
+// that can invoke backtest with parameters."
+//
+// `cases` LOSES to an explicit args.cases rather than overwriting it — the
+// shorthand is the older, coarser channel, so when a caller supplies both, the
+// specific one is the one they meant. Returns nil (not an empty map) when
+// there is nothing to pass, because _process_run_loop skips the arg-threading
+// branch entirely on a falsy value and an empty map would add empty --arg
+// noise to the runner's argv.
+func oneshotArgsFrom(args map[string]any) map[string]any {
+	out := map[string]any{}
+	if raw, ok := args["args"].(map[string]any); ok {
+		for k, v := range raw {
+			out[k] = v
+		}
+	}
+	if cases, _ := args["cases"].(string); cases != "" {
+		if _, taken := out["cases"]; !taken {
+			out["cases"] = cases
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

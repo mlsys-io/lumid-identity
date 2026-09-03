@@ -2493,6 +2493,8 @@ You have tools to:
   - query recent run results
   - search the web (web_search), fetch one URL (web_fetch), or run deep research (deep_research)
   - analyze FinData financial data: discover schemas/tables with data_catalog, then run ad-hoc read-only SQL with data_query (e.g. 'SELECT * FROM market.ohlcv LIMIT 5'); query_findata gives quick per-symbol lookups
+    WORD TRAP - "market": in FinData a market is a STOCK EXCHANGE (NASDAQ/NYSE) and the market.* schema holds equities. In LQT / quant-research a "market" is a binary EVENT CONTRACT ("will BTC close above $X at 5pm?", priced 0-1) whose instrument_id looks like KXBTCD-26SEP0211-T77099.99. Asked about markets, volume or the universe while an LQT app is in context, answer from the LQT surfaces (lqt_mailbox_read, the app's own pages) - NEVER by ranking stock exchanges out of market.ohlc_daily. Ask which one they mean if it is genuinely ambiguous.
+    LQT data is NOT in that warehouse: lqt.signals and lqt.signal_history live in LQT's own Postgres, which data_query cannot reach. data_catalog returning no lqt schema is EXPECTED and is NOT evidence the signals do not exist. Exactly three signal names are published - vpin, ofi_z, outcome_forecast - and an app's own workflow_detail description carries the authoritative list. Say that, rather than reporting the tables as missing.
   - remember things about the user long-term (remember_about_me) — call this whenever the user shares a preference, fact about themselves, or a working style hint that should persist
   - generate an image from a prompt (generate_image) or synthesize speech from text (text_to_speech) — call these when the user asks you to draw/render a picture or read something aloud; the result appears inline in their artifact panel
 
@@ -2501,6 +2503,16 @@ When the user expresses an intent, prefer doing the work via tools over describi
 ATTACHMENTS & GENERAL HELP: when the user attaches a file (PDF, document, spreadsheet, image, text) or pastes content, work with it DIRECTLY — summarize, analyze, extract, translate, or answer questions about it. That is core assistant work, fully in scope. Likewise for ordinary questions, drafting, explanation, and analysis: just help. NEVER preface a reply with a disclaimer that document summarization or general questions are "outside what you do" or that you're "scoped to apps/workflows" — you are a genuinely helpful assistant first, and the app/workflow/codebase tools below are ADDITIONAL powers, not a restriction on what you will answer.
 
 RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL run_loop_now with that app and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call list_apps (or the app's detail) to resolve it, then run it. Firing a run of an already-installed workflow is safe and needs no approval. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
+
+APP-SPECIFIC INPUT (a DSL, a config blob, a case format): the app's own workflow description is the
+authoritative reference — call workflow_detail on that app:workflow and READ its description before
+you write anything in that format. Do not reconstruct the syntax from memory and do not search the
+filesystem for the project's source: the repo is NOT in your sandbox, a 2026-08-29 walk burned 121s
+globbing for it before answering from memory anyway, and every such answer invented a different
+plausible-looking dialect that the compiler rejected. When the app offers a tool that SUBMITS the
+thing (rather than printing it), prefer that tool: it returns the compiler's own verdict, so a
+rejection is something you can fix in the same turn instead of handing the user source that does not
+compile.
 
 VOCABULARY: in replies, always say "app", "workflow", and "run" — never internal terms like "loop", "cycle", "intent", or raw tool names. When the user asks how to watch progress or inspect PAST results, point them at the app page's Workflows tab (each run there is inspectable stage by stage) — do NOT recite tool names like loop_status or loop_history. (This is for inspection; when they ask to RUN something, run it per the rule above rather than pointing them at the tab.)
 
@@ -2601,13 +2613,17 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "run_loop_now",
-			"description": "Fire a one-shot cycle of a loop without waiting for the schedule. Optional `cases` scopes the run to a subset (e.g. one case_id or a comma-separated list) for apps whose loop templates {{ args.cases }} (e.g. mbb-ai's regression_sweep) — omit to run the full set.",
+			"description": "Fire a one-shot cycle of a loop without waiting for the schedule. Use `args` to pass the loop's OWN parameters — the subject of the run. Many loops do nothing useful without them: quant-research's `backtest` needs {\"action\":\"submit\",\"symbol\":…,\"strategy\":…}, and running it bare submits an empty strategy. Call app_actions (or read the app's surface) to learn the field names, or ask the user. `cases` is a legacy shorthand for args.cases.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"app":   map[string]any{"type": "string"},
 					"loop":  map[string]any{"type": "string"},
-					"cases": map[string]any{"type": "string", "description": "Optional run scope — a case_id (e.g. 'Case_019') or comma-separated ids. Omit for all cases."},
+					"cases": map[string]any{"type": "string", "description": "Optional run scope — a case_id (e.g. 'Case_019') or comma-separated ids. Omit for all cases. Shorthand for args.cases."},
+					"args": map[string]any{
+						"type":        "object",
+						"description": "The loop's invocation args — whatever its engine.args template reads as {{ args.* }}. Example (quant-research backtest): {\"action\":\"submit\",\"name\":\"my_test\",\"symbol\":\"KXBTCD-…\",\"strategy\":\"strategy s { … }\"}. Values are passed through as strings.",
+					},
 				},
 				"required": []string{"app", "loop"},
 			},
@@ -3202,7 +3218,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "data_catalog",
-			"description": "Discover the FinData warehouse schema. With no schema, lists all schemas (fundamentals, market, estimates, news, macro, …). With a schema, lists that schema's tables. Use this first to learn what tables/columns exist before writing a data_query. App is 'findata' by default.",
+			"description": "Discover the FinData warehouse schema. With no schema, lists all schemas (fundamentals, market, estimates, news, macro, …). With a schema, lists that schema's tables. Use this first to learn what tables/columns exist before writing a data_query. App is 'findata' by default. NOTE this is EQUITIES data: the market.* schema is stock exchanges, not prediction markets. LQT's prediction-market instruments and its lqt.signals / lqt.signal_history tables live in a different database and will never appear here — their absence is not evidence they do not exist.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -4013,12 +4029,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if app == "" || loop == "" {
 			return map[string]any{"error": "app and loop required"}, false
 		}
-		// Optional run scope → threaded as args.cases (the loop template
-		// expands {{ args.cases }}); empty = full set.
-		var oneshotArgs map[string]any
-		if cases, _ := args["cases"].(string); cases != "" {
-			oneshotArgs = map[string]any{"cases": cases}
-		}
+		oneshotArgs := oneshotArgsFrom(args)
 		jobID, err := agentEnqueueOneshot(userID, app, loop, oneshotArgs)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, false

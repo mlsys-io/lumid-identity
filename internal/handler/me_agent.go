@@ -1267,6 +1267,23 @@ var controlIntentPatterns = []*regexp.Regexp{
 	// the tool by name — an explicit instruction should always route.
 	regexp.MustCompile(`\bdispatch_experiment_arm\b`),
 	regexp.MustCompile(`\blist_experiments\b`),
+
+	// Firing a named workflow. "run the workflow" is already a literal phrase,
+	// but nobody says it that way — they name the thing: "run quant-research's
+	// backtest workflow", "trigger the harvest loop".
+	regexp.MustCompile(`\b(run|fire|trigger|dispatch|kick off|execute|start)\b[^.?!]{0,50}\b(workflow|loop)\b`),
+
+	// Backtests. The 2026-08-31 walkthrough asked a super_admin session to
+	// "backtest this strategy on symbol …"; nothing here matched, so the turn
+	// stayed on claude-code — whose CLI toolset cannot see this registry — and
+	// the model answered "this session doesn't have a tool bound that can
+	// invoke that app's commands". Correct, and a dead end for the one action
+	// the onboarding doc is built around. A VERB near "backtest", or a
+	// backtest named against a strategy/symbol, is unambiguously platform
+	// work; bare "backtest" is deliberately NOT a phrase, so "explain the
+	// backtest worker code" still reaches claude-code.
+	regexp.MustCompile(`\b(run|fire|dispatch|submit|kick off|execute|queue|start|do)\b[^.?!]{0,40}\bback-?test\b`),
+	regexp.MustCompile(`\bback-?test\b[^.?!]{0,60}\b(strategy|symbol|instrument|ticker)\b`),
 }
 
 // controlIntentPhrases — platform-control cues. Deliberately phrase-level (e.g.

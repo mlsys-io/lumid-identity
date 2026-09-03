@@ -173,24 +173,34 @@ func AdminAppInsights(c *gin.Context) {
 	// a total; GROUP BY is both exact and cheaper. `loop` is a MySQL reserved
 	// word and must stay backticked.
 	type loopAgg struct {
-		Loop  string
-		N     int
-		Fails int
+		LoopName string
+		N        int
+		Fails    int
 	}
 	var loopAggs []loopAgg
-	common.DB.Model(&models.MeAppRun{}).
-		Select("`loop` as loop, COUNT(*) as n, SUM(CASE WHEN ok THEN 0 ELSE 1 END) as fails").
+	// Alias to loop_name, NOT loop. `loop` is a MySQL reserved word, so
+	// "SELECT `loop` as loop" is a syntax error — and because the Scan error
+	// was ignored this produced an EMPTY aggregate beside a working
+	// COUNT(DISTINCT user_sub), i.e. a panel reading "0 runs across 43 users".
+	// Self-contradictory numbers are worse than an error, so the error is
+	// surfaced now rather than swallowed.
+	aggErr := common.DB.Model(&models.MeAppRun{}).
+		Select("`loop` as loop_name, COUNT(*) as n, SUM(CASE WHEN ok THEN 0 ELSE 1 END) as fails").
 		Where("app IN ? AND run_ts >= ?", aliases, since.Unix()).
-		Group("`loop`").Scan(&loopAggs)
+		Group("`loop`").Scan(&loopAggs).Error
+	if aggErr != nil {
+		fail(c, http.StatusInternalServerError, 1500, "runs rollup: "+aggErr.Error())
+		return
+	}
 
 	runsByLoop := map[string]int{}
 	runFails := map[string]int{}
 	runTotal := 0
 	for _, a := range loopAggs {
-		runsByLoop[a.Loop] = a.N
+		runsByLoop[a.LoopName] = a.N
 		runTotal += a.N
 		if a.Fails > 0 {
-			runFails[a.Loop] = a.Fails
+			runFails[a.LoopName] = a.Fails
 		}
 	}
 
@@ -209,10 +219,13 @@ func AdminAppInsights(c *gin.Context) {
 		N   int
 	}
 	var runDays []dayAgg
-	common.DB.Model(&models.MeAppRun{}).
+	if err := common.DB.Model(&models.MeAppRun{}).
 		Select("DATE_FORMAT(FROM_UNIXTIME(run_ts), '%Y-%m-%d') as day, COUNT(*) as n").
 		Where("app IN ? AND run_ts >= ?", aliases, since.Unix()).
-		Group("day").Scan(&runDays)
+		Group("day").Scan(&runDays).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "runs by day: "+err.Error())
+		return
+	}
 	for _, d := range runDays {
 		touch2(byDay, d.Day).Runs = d.N
 	}

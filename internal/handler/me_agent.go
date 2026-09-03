@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1237,7 +1238,35 @@ func controlIntent(msgs []chatMessage) bool {
 			return true
 		}
 	}
+	// Literal phrases miss the way people actually name things. "run the arm"
+	// does not match "run the panel_single arm of the judge_panel_parity
+	// experiment" — measured by e2e, where the tool was never called and the
+	// turn stayed on claude-code, whose CLI toolset cannot see this registry.
+	// These patterns keep the same platform-specific bar (a verb NEAR a
+	// platform noun) without demanding the exact wording.
+	for _, re := range controlIntentPatterns {
+		if re.MatchString(text) {
+			return true
+		}
+	}
 	return false
+}
+
+// controlIntentPatterns — verb-near-noun forms the literal list cannot express.
+// Bounded gaps, so "run the tests and later look at that arm of the codebase"
+// does not qualify.
+var controlIntentPatterns = []*regexp.Regexp{
+	// run / dispatch / launch / fire … <name> arm
+	regexp.MustCompile(`\b(run|dispatch|launch|fire|kick off|execute)\b[^.?!]{0,60}\barms?\b`),
+	// … arm … of/on/for the <x> experiment
+	regexp.MustCompile(`\barms?\b[^.?!]{0,40}\bexperiments?\b`),
+	regexp.MustCompile(`\bexperiments?\b[^.?!]{0,40}\barms?\b`),
+	// asking to see them is also a registry need: claude-code has no catalog,
+	// so an experiment READ must re-route too or it answers from nothing.
+	regexp.MustCompile(`\b(list|show|what)\b[^.?!]{0,40}\bexperiments?\b`),
+	// the tool by name — an explicit instruction should always route.
+	regexp.MustCompile(`\bdispatch_experiment_arm\b`),
+	regexp.MustCompile(`\blist_experiments\b`),
 }
 
 // controlIntentPhrases — platform-control cues. Deliberately phrase-level (e.g.

@@ -271,9 +271,47 @@ func InternalAppSecretsFetch(c *gin.Context) {
 	// See lqt_strategy_pat.go for why a scoped PAT (not the login JWT, not an
 	// aud=lqt session-bearer) is the only credential the consumer accepts.
 	if isLQTStrategyApp(body.App) {
+		// One cached token serves BOTH keys — mint/renew it at most once here.
+		var cached string
+		cachedOnce := func() string {
+			if cached == "" {
+				cached = lqtStrategyPATCached(body.UserSub)
+			}
+			return cached
+		}
 		if _, userSet := out["LQT_STRATEGY_PAT"]; !userSet {
-			if tok := lqtStrategyPATCached(body.UserSub); tok != "" {
+			if tok := cachedOnce(); tok != "" {
 				out["LQT_STRATEGY_PAT"] = tok
+			}
+		}
+		// LUMID_PAT is what the app's own reads authenticate with —
+		// `xpio_client._pat()` resolves LUMID_PAT then ~/.lumilake/pat, and a
+		// TENANT cycle has neither: `_run_loop_cycle` deliberately pops
+		// LUMID_PAT so a tenant never borrows the operator's credential, and
+		// HOME is the tenant root, so the operator's mounted pat file is not
+		// on its path either. Every scheduled harvest therefore died on
+		// "No LUMID_PAT env var and ~/.lumilake/pat not found" — 400/day on
+		// 2026-08-31, and after the scheduler stopped hiding two thirds of the
+		// fleet, enough consecutive failures to SUSPEND 120 tenant loops.
+		//
+		// The credential that worked was the operator's, reaching Job-runner
+		// cycles through `envFrom: scheduler-env` — i.e. the one path that
+		// "worked" did so by handing tenant cycles the operator's PAT, exactly
+		// what the in-pod scrub exists to prevent. Injecting the tenant's own
+		// token fixes the failure AND closes that: app-secret values are
+		// written after the scrub in-pod, and reach the Job as explicit `env`
+		// entries, which outrank `envFrom`.
+		//
+		// SAME token as the deploy PAT, deliberately — no second credential.
+		// Verified against the read surface (lumid-data-service) 2026-09-04:
+		// its only scope gates are `lumilake:write` for blob writes and a
+		// sync-peer credential; the read plane asks solely for a valid Lumid
+		// PAT ("present a Lumid PAT as 'Authorization: Bearer <token>'").
+		// Minting a second, differently-scoped token would add credential
+		// sprawl and buy nothing.
+		if _, userSet := out["LUMID_PAT"]; !userSet {
+			if tok := cachedOnce(); tok != "" {
+				out["LUMID_PAT"] = tok
 			}
 		}
 	}

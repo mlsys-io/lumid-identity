@@ -702,6 +702,26 @@ func tenantInstalledAppNames(userSub string) []string {
 			names = append(names, n)
 		}
 	}
+	// Intent history is not the whole truth: an install that predates the
+	// intent system — or arrived under a previous app name and was renamed on
+	// the scheduler's volume — has no `install` row, so the published-spec
+	// fallback above never fired and the app's loops were invisible here
+	// (admin's quant-research: 948 recorded runs, zero workflow rows). The
+	// run record crosses nodes and cannot lie about which apps actually run
+	// for this user, so union it in.
+	var runApps []string
+	if err := common.DB.Model(&models.MeAppRun{}).
+		Distinct("app").
+		Where("user_sub = ?", userSub).
+		Order("app").Limit(100).
+		Pluck("app", &runApps).Error; err == nil {
+		for _, n := range runApps {
+			if n != "" && !seen[n] {
+				seen[n] = true
+				names = append(names, n)
+			}
+		}
+	}
 	return names
 }
 

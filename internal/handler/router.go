@@ -637,6 +637,13 @@ func Register(r *gin.Engine) {
 			superAdmin.GET("/claude-sessions", AdminClaudeSessions)
 			superAdmin.GET("/claude-sessions/:conv", AdminClaudeSessionDetail)
 			superAdmin.DELETE("/claude-sessions/:conv", AdminClaudeSessionDelete)
+			// New pool = a new named grant of subscription budget with its own
+			// owner_sub — that's the same "hands out capacity" character as
+			// reset-window above, so creation sits at super_admin. Every other
+			// pool operation (view, update, delete, membership) is ordinary
+			// structural administration over a pool that already exists and
+			// stays admin-level in adminQuota below.
+			superAdmin.POST("/claude-pools", AdminClaudePoolCreate)
 		}
 
 		// admin + super_admin — Claude Code quota dashboard (/quota page) and
@@ -675,8 +682,9 @@ func Register(r *gin.Engine) {
 			// account add/remove/drain above, and this codebase's own
 			// precedent (the DELETE/drain pairing above) is that a destructive
 			// op sits at the SAME gate as its reversible sibling, not above
-			// it. See claude_pool_admin.go's file header.
-			adminQuota.POST("/claude-pools", AdminClaudePoolCreate)
+			// it. See claude_pool_admin.go's file header. Creation itself is
+			// the one exception — POST /claude-pools lives in the superAdmin
+			// group above, not here.
 			adminQuota.GET("/claude-pools", AdminClaudePoolList)
 			adminQuota.PATCH("/claude-pools/:id", AdminClaudePoolUpdate)
 			adminQuota.DELETE("/claude-pools/:id", AdminClaudePoolDelete)

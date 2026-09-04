@@ -172,3 +172,57 @@ loops:
 		})
 	}
 }
+
+// dispatch.loop routes an arm to the loop that is self-sufficient for a
+// dispatch. judge_panel_parity is fed by both `interview` (needs a case — a
+// bare dispatch answers nothing) and `case_eval` (defaults walk a bounded
+// subset on their own); without the hint, loops[0] won and the button fired
+// the loop that measures nothing.
+func TestResolveExperimentArmHonorsDispatchLoop(t *testing.T) {
+	const spec = `
+name: mbb-consultant
+experiments:
+  - id: judge_panel_parity
+    kind: arms
+    metric: {name: avg_question_score, higher_is_better: true}
+    dispatch: {loop: case_eval}
+    arms:
+      - {id: panel_single, judge_model: qwen3.8-27b}
+loops:
+  - name: interview
+    engine: {experiment: judge_panel_parity}
+  - name: case_eval
+    engine: {experiment: judge_panel_parity}
+`
+	dir := writeArmSpec(t, spec)
+	_, _, loop, err := resolveExperimentArm(dir, "judge_panel_parity", "panel_single")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loop != "case_eval" {
+		t.Fatalf("dispatch.loop ignored: got %q, want case_eval", loop)
+	}
+
+	// A dispatch.loop naming an UNATTACHED loop must not be trusted — fall
+	// back to the first attached loop rather than dispatching into a loop the
+	// experiment does not feed.
+	const bad = `
+name: x
+experiments:
+  - id: e1
+    kind: arms
+    dispatch: {loop: not_attached}
+    arms: [{id: a1, k: v}]
+loops:
+  - name: l1
+    engine: {experiment: e1}
+`
+	dir2 := writeArmSpec(t, bad)
+	_, _, loop2, err := resolveExperimentArm(dir2, "e1", "a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loop2 != "l1" {
+		t.Fatalf("unattached dispatch.loop should fall back: got %q, want l1", loop2)
+	}
+}

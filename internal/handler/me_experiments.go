@@ -43,6 +43,15 @@ type expDecl struct {
 	Criteria   string           `yaml:"success_criteria" json:"success_criteria,omitempty"`
 	MinSamples int              `yaml:"min_samples" json:"min_samples,omitempty"`
 	Status     string           `yaml:"status" json:"status,omitempty"`
+	// Dispatch — app-authored routing for "run this arm":
+	//   loop: which attached loop a dispatch should use (defaults to the
+	//         first attached loop; matters when several loops feed one
+	//         experiment and only the batch one is self-sufficient);
+	//   ask:  when present, the arm needs a SUBJECT the button cannot know
+	//         (e.g. which strategy) — the UI hands dispatch to the chat rail
+	//         with this question instead of firing a run that measures
+	//         nothing. The surface shows; the chat acts.
+	Dispatch map[string]any `yaml:"dispatch" json:"dispatch,omitempty"`
 }
 
 type expManifest struct {
@@ -263,6 +272,9 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			"arms":         d.Arms,
 			"n_results":    0,
 			"criteria_met": false,
+		}
+		if len(d.Dispatch) > 0 {
+			row["dispatch"] = d.Dispatch
 		}
 		for _, k := range []string{
 			"n_results", "variants", "best_variant", "baseline_value",
@@ -650,13 +662,24 @@ func resolveExperimentArm(appDir, experimentID, armID string) (string, map[strin
 		}
 		cfg[k] = v
 	}
-	// Which loop runs it: engine.experiment / steps[].experiment.
+	// Which loop runs it. The declaration's dispatch.loop wins when it names
+	// an ATTACHED loop — several loops can feed one experiment and only one
+	// of them may be self-sufficient for a dispatch (mbb-consultant's
+	// judge_panel_parity is fed by both `interview`, which needs a case, and
+	// `case_eval`, whose defaults walk a bounded case subset on their own).
+	// Falls back to the first attached loop, as before.
 	loopName := ""
-	for exp, loops := range expLoops(m) {
-		if exp == experimentID && len(loops) > 0 {
-			loopName = loops[0]
-			break
+	attached := expLoops(m)[experimentID]
+	if want, _ := decl.Dispatch["loop"].(string); want != "" {
+		for _, l := range attached {
+			if l == want {
+				loopName = want
+				break
+			}
 		}
+	}
+	if loopName == "" && len(attached) > 0 {
+		loopName = attached[0]
 	}
 	return decl.Hypothesis, cfg, loopName, nil
 }

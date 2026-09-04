@@ -508,8 +508,19 @@ func currentUserID(c *gin.Context) (string, bool) {
 	if tok == "" {
 		return "", false
 	}
-	// JWT path — fast, no DB hit.
+	// JWT path — fast, no DB hit, plus a sub-millisecond revocation check.
+	//
+	// Signature alone is NOT enough. ChangePasswordHandler has always written
+	// revoked_at on the user's other sessions and nothing read it, so a revoked
+	// session kept working for the full 24h token lifetime — the column was
+	// decoration and e2e 06 has been red for it. The denylist is Redis because
+	// identity runs 2 replicas and an in-process cache would let the other one
+	// keep honouring a session this one just killed; it fails OPEN, so a Redis
+	// blip degrades to the old behaviour rather than locking every user out.
 	if claims, err := common.VerifyJWT(tok); err == nil {
+		if common.IsSessionRevoked(c.Request.Context(), claims.ID) {
+			return "", false
+		}
 		return claims.Subject, true
 	}
 	// PAT path (lm_pat_* and rm_pat_*).

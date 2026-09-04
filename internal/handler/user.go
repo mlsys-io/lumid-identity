@@ -304,6 +304,22 @@ func ChangePasswordHandler(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "update pw: "+err.Error())
 		return
 	}
+	// Read the jtis BEFORE the update, so we know which sessions to publish to
+	// the denylist. Writing revoked_at alone changed nothing observable: the
+	// auth path accepts a JWT on signature, so every one of these kept working
+	// until it expired on its own.
+	var doomed []models.Session
+	scopeQ := tx.Model(&models.Session{}).
+		Where("user_id = ? AND revoked_at IS NULL AND expires_at > ?", uid, now)
+	if currentJTI != "" {
+		scopeQ = scopeQ.Where("jti <> ?", currentJTI)
+	}
+	if err := scopeQ.Find(&doomed).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusInternalServerError, 1500, "read sessions: "+err.Error())
+		return
+	}
+
 	revokeQ := tx.Model(&models.Session{}).
 		Where("user_id = ? AND revoked_at IS NULL", uid)
 	if currentJTI != "" {
@@ -315,6 +331,13 @@ func ChangePasswordHandler(c *gin.Context) {
 		return
 	}
 	tx.Commit()
+
+	// AFTER the commit — a denylist entry for a session the DB did not actually
+	// revoke would lock someone out with no durable record explaining why. Each
+	// key lives exactly as long as the token it kills, so the list self-trims.
+	for i := range doomed {
+		common.RevokeSessionJTI(c.Request.Context(), doomed[i].JTI, time.Until(doomed[i].ExpiresAt))
+	}
 
 	ok(c, "password changed", nil)
 }

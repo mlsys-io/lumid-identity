@@ -131,38 +131,70 @@ func MeAppData(c *gin.Context) {
 //
 // A param naming a field no row has matches NOTHING rather than being ignored.
 // Ignoring it is how a filtered-looking table quietly shows every row.
+//
+// Two honesty rules added 2026-09-05, both from live confusion:
+//   - `limit` is a CONTROL param, not a field filter. Treated as a field it
+//     matched nothing and blanked the table silently — a surface author adding
+//     `&limit=50` zeroed their own rows with no error. It caps the row arrays
+//     (tail — rows arrive run_ts ASC, so the tail is the newest).
+//   - after filtering, `count` is rewritten to what the caller actually GOT
+//     and the pre-filter figure moves to `total`. Before, `count` stayed at
+//     the unfiltered total, so `?loop=backtest` returned count:945 beside 5
+//     rows and a stat tile bound to `count` showed every loop's runs under a
+//     "Your backtests" label.
 func filterAppData(c *gin.Context, res map[string]any) map[string]any {
 	filters := map[string]string{}
+	limit := 0
 	for k, v := range c.Request.URL.Query() {
 		if k == "tool" || k == "app" || len(v) == 0 || v[0] == "" {
 			continue
 		}
+		if k == "limit" {
+			fmt.Sscanf(v[0], "%d", &limit)
+			continue
+		}
 		filters[k] = v[0]
 	}
-	if len(filters) == 0 || res == nil {
+	if (len(filters) == 0 && limit <= 0) || res == nil {
 		return res
 	}
 	out := make(map[string]any, len(res))
+	filteredAny := false
+	keptTotal := 0
 	for key, val := range res {
 		rows, isRows := val.([]map[string]any)
 		if !isRows {
 			out[key] = val
 			continue
 		}
-		kept := make([]map[string]any, 0, len(rows))
-		for _, r := range rows {
-			match := true
-			for fk, fv := range filters {
-				if fmt.Sprintf("%v", r[fk]) != fv {
-					match = false
-					break
+		kept := rows
+		if len(filters) > 0 {
+			kept = make([]map[string]any, 0, len(rows))
+			for _, r := range rows {
+				match := true
+				for fk, fv := range filters {
+					if fmt.Sprintf("%v", r[fk]) != fv {
+						match = false
+						break
+					}
+				}
+				if match {
+					kept = append(kept, r)
 				}
 			}
-			if match {
-				kept = append(kept, r)
-			}
+		}
+		if limit > 0 && len(kept) > limit {
+			kept = kept[len(kept)-limit:] // tail = newest (rows are run_ts ASC)
 		}
 		out[key] = kept
+		filteredAny = true
+		keptTotal += len(kept)
+	}
+	if filteredAny {
+		if prev, ok := out["count"]; ok {
+			out["total"] = prev
+		}
+		out["count"] = keptTotal
 	}
 	return out
 }

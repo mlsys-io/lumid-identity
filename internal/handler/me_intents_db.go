@@ -246,12 +246,20 @@ func isRetryableTxConflict(err error) bool {
 // retryTxConflict runs fn until it succeeds, fails for a non-retryable reason,
 // or the attempt budget is spent. Backoff is jittered so two victims of the
 // same deadlock do not retry in lockstep and deadlock again.
+//
+// General-purpose despite living in this file (named/tuned for its original
+// me_app_intents contention) — also used by AdminClaudePoolAddMember, whose
+// UPDATE-then-INSERT-on-a-different-pool_id shape hits the identical MySQL
+// 1213 class under concurrent same-user-different-pool calls (caught by a
+// stress test, not by the original review). The "[me-intents]" log prefix
+// stays literal in each call site's own message — `what` — rather than in
+// this function, so a reader sees which feature actually hit the conflict.
 func retryTxConflict(what string, fn func() error) error {
 	var err error
 	for attempt := 1; attempt <= meIntentTxAttempts; attempt++ {
 		if err = fn(); !isRetryableTxConflict(err) {
 			if attempt > 1 && err == nil {
-				log.Printf("[me-intents] %s succeeded on attempt %d after a retryable conflict", what, attempt)
+				log.Printf("%s succeeded on attempt %d after a retryable conflict", what, attempt)
 			}
 			return err
 		}
@@ -262,7 +270,7 @@ func retryTxConflict(what string, fn func() error) error {
 		backoff := meIntentTxBackoff << (attempt - 1)
 		time.Sleep(backoff + time.Duration(rand.Int63n(int64(backoff)+1)))
 	}
-	log.Printf("[me-intents] %s exhausted %d attempts against a retryable conflict: %v", what, meIntentTxAttempts, err)
+	log.Printf("%s exhausted %d attempts against a retryable conflict: %v", what, meIntentTxAttempts, err)
 	return err
 }
 
@@ -287,7 +295,7 @@ func InternalMeIntentResult(c *gin.Context) {
 		status = "done"
 	}
 	var rowsAffected int64
-	err := retryTxConflict("intent result "+id, func() error {
+	err := retryTxConflict("[me-intents] intent result "+id, func() error {
 		res := common.DB.Model(&models.MeAppIntent{}).Where("id = ?", id).
 			Updates(map[string]any{"status": status, "result": string(rb), "completed_at": time.Now()})
 		rowsAffected = res.RowsAffected

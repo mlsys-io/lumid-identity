@@ -502,35 +502,46 @@ func AdminClaudePoolAddMember(c *gin.Context) {
 		return
 	}
 	admin, _ := currentUserID(c)
-	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		var totalCount int64
-		if err := tx.Model(&models.ClaudePoolMember{}).Where("user_sub = ?", userSub).Count(&totalCount).Error; err != nil {
-			return err
-		}
-		// A user's very first-ever membership MUST be primary — every user
-		// must have exactly one, which resolveUserPool depends on — so force
-		// it regardless of what the caller passed (or omitted).
-		forcedFirst := totalCount == 0
-		makePrimary := forcedFirst || (body.IsPrimary != nil && *body.IsPrimary)
-		touchPrimary := forcedFirst || body.IsPrimary != nil
-		if makePrimary {
-			if err := tx.Model(&models.ClaudePoolMember{}).Where("user_sub = ?", userSub).
-				Update("is_primary", false).Error; err != nil {
+	// Retried: this transaction's UPDATE (clear other primaries for userSub)
+	// + INSERT (this pool's row) touches overlapping rows for the SAME user
+	// across DIFFERENT pool_ids, so two admins (or a provisioning script)
+	// adding the SAME user to DIFFERENT pools concurrently can lock-order
+	// against each other — a stress test reproduced a 7/8 failure rate under
+	// an 8-way concurrent race before this retry was added. MySQL 1213 is
+	// retryable by design (the server picks a victim so someone progresses);
+	// reuses the general-purpose retryTxConflict already used for the
+	// structurally similar me_app_intents contention (me_intents_db.go).
+	err := retryTxConflict("claude-pool: add member "+userSub+" to "+id, func() error {
+		return common.DB.Transaction(func(tx *gorm.DB) error {
+			var totalCount int64
+			if err := tx.Model(&models.ClaudePoolMember{}).Where("user_sub = ?", userSub).Count(&totalCount).Error; err != nil {
 				return err
 			}
-		}
-		conflict := clause.OnConflict{Columns: []clause.Column{{Name: "pool_id"}, {Name: "user_sub"}}}
-		if touchPrimary {
-			conflict.DoUpdates = clause.AssignmentColumns([]string{"is_primary"})
-		} else {
-			// Caller expressed no opinion and this isn't a brand-new user —
-			// an idempotent re-add of an EXISTING membership must leave
-			// is_primary exactly as it is, never reset it via the upsert.
-			conflict.DoNothing = true
-		}
-		return tx.Clauses(conflict).Create(&models.ClaudePoolMember{
-			PoolID: id, UserSub: userSub, IsPrimary: makePrimary, AddedAt: time.Now(), AddedBy: admin,
-		}).Error
+			// A user's very first-ever membership MUST be primary — every user
+			// must have exactly one, which resolveUserPool depends on — so force
+			// it regardless of what the caller passed (or omitted).
+			forcedFirst := totalCount == 0
+			makePrimary := forcedFirst || (body.IsPrimary != nil && *body.IsPrimary)
+			touchPrimary := forcedFirst || body.IsPrimary != nil
+			if makePrimary {
+				if err := tx.Model(&models.ClaudePoolMember{}).Where("user_sub = ?", userSub).
+					Update("is_primary", false).Error; err != nil {
+					return err
+				}
+			}
+			conflict := clause.OnConflict{Columns: []clause.Column{{Name: "pool_id"}, {Name: "user_sub"}}}
+			if touchPrimary {
+				conflict.DoUpdates = clause.AssignmentColumns([]string{"is_primary"})
+			} else {
+				// Caller expressed no opinion and this isn't a brand-new user —
+				// an idempotent re-add of an EXISTING membership must leave
+				// is_primary exactly as it is, never reset it via the upsert.
+				conflict.DoNothing = true
+			}
+			return tx.Clauses(conflict).Create(&models.ClaudePoolMember{
+				PoolID: id, UserSub: userSub, IsPrimary: makePrimary, AddedAt: time.Now(), AddedBy: admin,
+			}).Error
+		})
 	})
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "add member: "+err.Error())

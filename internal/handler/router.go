@@ -668,6 +668,22 @@ func Register(r *gin.Engine) {
 			// Per-field-box traffic + via_relay health — aggregate, not
 			// per-user session content, so this stays admin-level.
 			adminQuota.GET("/claude-field-boxes", AdminClaudeFieldBoxes)
+
+			// Claude pool CRUD — splits the single shared account pool into
+			// named ClaudePools (own accounts + member users). ADMIN, not
+			// super_admin: this is structural administration exactly like the
+			// account add/remove/drain above, and this codebase's own
+			// precedent (the DELETE/drain pairing above) is that a destructive
+			// op sits at the SAME gate as its reversible sibling, not above
+			// it. See claude_pool_admin.go's file header.
+			adminQuota.POST("/claude-pools", AdminClaudePoolCreate)
+			adminQuota.GET("/claude-pools", AdminClaudePoolList)
+			adminQuota.PATCH("/claude-pools/:id", AdminClaudePoolUpdate)
+			adminQuota.DELETE("/claude-pools/:id", AdminClaudePoolDelete)
+			adminQuota.GET("/claude-pools/:id/members", AdminClaudePoolMembers)
+			adminQuota.POST("/claude-pools/:id/members", AdminClaudePoolAddMember)
+			adminQuota.DELETE("/claude-pools/:id/members/:user_sub", AdminClaudePoolRemoveMember)
+			adminQuota.POST("/claude-pools/:id/members/:user_sub/primary", AdminClaudePoolSetPrimary)
 		}
 	}
 }

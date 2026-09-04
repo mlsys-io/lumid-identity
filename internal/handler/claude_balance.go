@@ -35,6 +35,7 @@ package handler
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -65,7 +66,12 @@ const (
 	activeSessionWindow = 30 * time.Minute
 )
 
-var lastAssignmentRun time.Time
+// lastAssignmentRun is keyed per pool so one pool's TTL/skip decision never
+// affects another's — see EnsureAssignments.
+var (
+	lastAssignmentRunMu sync.Mutex
+	lastAssignmentRun   = map[string]time.Time{}
+)
 
 // userLoad is one user's 7d QUOTA DRAW, expressed in sonnet-equivalent tokens —
 // the quantity being balanced. Not raw tokens: see loadByUser.
@@ -94,7 +100,17 @@ type userLoad struct {
 //
 // Weights are relative, so only their ratio matters; the result stays in
 // sonnet-equivalent tokens to keep load_7d human-readable on the /code panel.
-func loadByUser() ([]userLoad, error) {
+//
+// Scoped to poolID's MEMBERS (claude_pool_members), not the whole user base —
+// each pool balances only the load of the users who may actually be placed
+// on its own accounts. ACCEPTED APPROXIMATION for a user in more than one
+// pool: usage_events carries no account/pool column, so their TOTAL 7d draw
+// is counted toward balance in EVERY pool they belong to, not the share
+// attributable to this pool specifically. This biases placement
+// conservatively (a multi-pool user reads "heavier" than their true per-pool
+// share, never lighter) rather than unsafely; exact attribution would need
+// usage_events to record which account served each request.
+func loadByUser(poolID string) ([]userLoad, error) {
 	var rows []userLoad
 	err := common.DB.Raw(`
 		SELECT ue.user_sub AS user_sub,
@@ -109,7 +125,8 @@ func loadByUser() ([]userLoad, error) {
 		       ), 0) AS SIGNED) AS tokens
 		FROM   usage_events ue
 		WHERE  ue.kind = 'claude_proxy' AND ue.ts >= ?
-		GROUP  BY ue.user_sub`, time.Now().UTC().Add(-7*24*time.Hour)).Scan(&rows).Error
+		  AND  ue.user_sub IN (SELECT user_sub FROM claude_pool_members WHERE pool_id = ?)
+		GROUP  BY ue.user_sub`, time.Now().UTC().Add(-7*24*time.Hour), poolID).Scan(&rows).Error
 	return rows, err
 }
 
@@ -151,13 +168,13 @@ func activeSubsSince(cutoff time.Time) (map[string]bool, error) {
 // to use the pool.
 //
 //nolint:gocyclo
-func pruneIdleAssignments(idle time.Duration) (int, error) {
+func pruneIdleAssignments(poolID string, idle time.Duration) (int, error) {
 	if idle <= 0 {
 		return 0, nil // reclamation disabled
 	}
 	cutoff := time.Now().UTC().Add(-idle)
 	var rows []models.ClaudeUserAssignment
-	if err := common.DB.Find(&rows).Error; err != nil {
+	if err := common.DB.Where("pool_id = ?", poolID).Find(&rows).Error; err != nil {
 		return 0, err
 	}
 	freed := 0
@@ -175,22 +192,24 @@ func pruneIdleAssignments(idle time.Duration) (int, error) {
 		if last.Valid && last.Time.After(cutoff) {
 			continue // active within the window
 		}
-		if err := common.DB.Where("user_sub = ?", r.UserSub).
+		if err := common.DB.Where("pool_id = ? AND user_sub = ?", poolID, r.UserSub).
 			Delete(&models.ClaudeUserAssignment{}).Error; err == nil {
 			freed++
-			log.Printf("claude-pool: released %s's slot on %s — idle since %v", r.UserSub, r.Account, r.AssignedAt.UTC().Format(time.RFC3339))
+			log.Printf("claude-pool[%s]: released %s's slot on %s — idle since %v", poolID, r.UserSub, r.Account, r.AssignedAt.UTC().Format(time.RFC3339))
 		}
 	}
 	return freed, nil
 }
 
-// assignableAccounts returns pooled accounts eligible to host users: present,
-// not quarantined. Quota state is deliberately NOT consulted here — that is a
-// moment-to-moment concern handled at lease time, whereas this is a durable
-// placement decision.
-func assignableAccounts() ([]string, error) {
+// assignableAccounts returns poolID's accounts eligible to host users:
+// present, not quarantined. Quota state is deliberately NOT consulted here —
+// that is a moment-to-moment concern handled at lease time, whereas this is a
+// durable placement decision. Scoped to ONE pool: an account belongs to
+// exactly one ClaudePool (ClaudeQuotaToken.PoolID), so this is the query that
+// actually partitions the account table between pools.
+func assignableAccounts(poolID string) ([]string, error) {
 	var rows []models.ClaudeQuotaToken
-	if err := common.DB.Find(&rows).Error; err != nil {
+	if err := common.DB.Where("pool_id = ?", poolID).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	out := make([]string, 0, len(rows))
@@ -377,7 +396,7 @@ func effectiveUserCap(nUsers, nAccounts, configured int) int {
 // to HRW with nothing written down, and "why is field box X getting no
 // traffic?" had no answer in the logs. The per-account breakdown is the point
 // — an account with 0 users is exactly why its field relay goes quiet.
-func logPlacement(loads []userLoad, accounts []string, ideal map[string]string, configured int, quotas map[string]accountQuota) {
+func logPlacement(poolID string, loads []userLoad, accounts []string, ideal map[string]string, configured int, quotas map[string]accountQuota) {
 	if len(loads) == 0 {
 		return
 	}
@@ -400,8 +419,8 @@ func logPlacement(loads []userLoad, accounts []string, ideal map[string]string, 
 		parts = append(parts, fmt.Sprintf("%s=%d%s", accountWithLabel(a), per[a], suffix))
 	}
 	unplaced := len(loads) - len(ideal)
-	msg := fmt.Sprintf("claude-pool: placed %d/%d users across %d accounts (cap %d/account): %s",
-		len(ideal), len(loads), len(accounts), configured, strings.Join(parts, " "))
+	msg := fmt.Sprintf("claude-pool[%s]: placed %d/%d users across %d accounts (cap %d/account): %s",
+		poolID, len(ideal), len(loads), len(accounts), configured, strings.Join(parts, " "))
 	if unplaced > 0 {
 		// The remediation is more accounts, not more rebalancing — say so.
 		need := len(loads)
@@ -509,7 +528,7 @@ type placementInputs struct {
 // those users have no stable origin to protect, because lease-time is already
 // sending them elsewhere on every request. Moving them is placement catching up
 // to reality, not new churn.
-func placementWrites(in placementInputs) ([]models.ClaudeUserAssignment, int) {
+func placementWrites(poolID string, in placementInputs) ([]models.ClaudeUserAssignment, int) {
 	var writes []models.ClaudeUserAssignment
 	deferred := 0
 	for sub, want := range in.ideal {
@@ -567,7 +586,7 @@ func placementWrites(in placementInputs) ([]models.ClaudeUserAssignment, int) {
 			continue // keep the existing origin
 		}
 		writes = append(writes, models.ClaudeUserAssignment{
-			UserSub: sub, Account: want, Load7d: in.load[sub], Reason: reason,
+			PoolID: poolID, UserSub: sub, Account: want, Load7d: in.load[sub], Reason: reason,
 		})
 	}
 	return writes, deferred
@@ -730,31 +749,61 @@ func StartAssignmentReclaimLoop() {
 	log.Printf("claude-pool: assignment reclaim loop every %v (idle window %v)", interval, common.ClaudeAssignmentIdle())
 }
 
+// EnsureAssignments iterates every non-deleted ClaudePool and runs placement
+// for each independently. Errors are collected, not short-circuited — one
+// broken pool must not stall every other pool's reclaim loop.
 func EnsureAssignments(force bool) error {
-	if !force && time.Since(lastAssignmentRun) < assignmentTTL {
+	var pools []models.ClaudePool
+	if err := common.DB.Find(&pools).Error; err != nil {
+		return err
+	}
+	var errs []error
+	for _, p := range pools {
+		if err := ensurePoolAssignments(p, force); err != nil {
+			errs = append(errs, fmt.Errorf("pool %s: %w", p.ID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ensurePoolAssignments is EnsureAssignments' body for a single pool,
+// serialised across replicas by a PER-POOL MySQL named lock
+// ("claude_assign:<poolID>", bound as a parameter since pool.ID is
+// admin-supplied) — a replica that cannot get the lock simply skips, since
+// another is already doing the work, and pools never serialise against each
+// other's locks.
+func ensurePoolAssignments(pool models.ClaudePool, force bool) error {
+	lastAssignmentRunMu.Lock()
+	last := lastAssignmentRun[pool.ID]
+	lastAssignmentRunMu.Unlock()
+	if !force && time.Since(last) < assignmentTTL {
 		return nil
 	}
+	poolID := pool.ID
+	lockName := "claude_assign:" + poolID
 	return common.DB.Connection(func(tx *gorm.DB) error {
 		var got int
-		if err := tx.Raw("SELECT GET_LOCK('claude_assign', 2)").Scan(&got).Error; err != nil || got != 1 {
+		if err := tx.Raw("SELECT GET_LOCK(?, 2)", lockName).Scan(&got).Error; err != nil || got != 1 {
 			return nil // another replica is on it
 		}
-		defer tx.Exec("DO RELEASE_LOCK('claude_assign')")
-		lastAssignmentRun = time.Now()
+		defer tx.Exec("DO RELEASE_LOCK(?)", lockName)
+		lastAssignmentRunMu.Lock()
+		lastAssignmentRun[poolID] = time.Now()
+		lastAssignmentRunMu.Unlock()
 
-		accounts, err := assignableAccounts()
+		accounts, err := assignableAccounts(poolID)
 		if err != nil || len(accounts) == 0 {
 			return err
 		}
 		// Reclaim dormant slots BEFORE reading `existing`, so freed slots are
 		// available to this same placement pass rather than a later one.
 		idle := common.ClaudeAssignmentIdle()
-		if freed, perr := pruneIdleAssignments(idle); perr != nil {
-			log.Printf("claude-pool: idle-slot reclamation failed: %v", perr)
+		if freed, perr := pruneIdleAssignments(poolID, idle); perr != nil {
+			log.Printf("claude-pool[%s]: idle-slot reclamation failed: %v", poolID, perr)
 		} else if freed > 0 {
-			log.Printf("claude-pool: reclaimed %d idle slot(s)", freed)
+			log.Printf("claude-pool[%s]: reclaimed %d idle slot(s)", poolID, freed)
 		}
-		loads, err := loadByUser()
+		loads, err := loadByUser(poolID)
 		if err != nil {
 			return err
 		}
@@ -770,7 +819,7 @@ func EnsureAssignments(force bool) error {
 				return aerr // never silently fall back to the wider population
 			}
 			var surviving []models.ClaudeUserAssignment
-			common.DB.Find(&surviving)
+			common.DB.Where("pool_id = ?", poolID).Find(&surviving)
 			homed := make(map[string]bool, len(surviving))
 			for _, s := range surviving {
 				homed[s.UserSub] = true
@@ -784,7 +833,7 @@ func EnsureAssignments(force bool) error {
 			loads = kept
 		}
 		var existing []models.ClaudeUserAssignment
-		common.DB.Find(&existing)
+		common.DB.Where("pool_id = ?", poolID).Find(&existing)
 		cur := make(map[string]string, len(existing))
 		for _, e := range existing {
 			cur[e.UserSub] = e.Account
@@ -797,8 +846,6 @@ func EnsureAssignments(force bool) error {
 		// Place everyone HOMED, not just everyone recently active — see
 		// placementPopulation for why the two populations must match.
 		loads = placementPopulation(loads, existing)
-
-		configured := common.ClaudeMaxUsersPerAccount()
 
 		// Place only onto accounts lease-time can actually select. `accounts`
 		// stays the full list for reporting and for skew, so an exhausted
@@ -820,10 +867,34 @@ func EnsureAssignments(force bool) error {
 		canServe := servableAccounts(accounts, quotas)
 		draining := drainingAccounts(accounts)
 		targets := excludeDraining(canServe, draining)
-		maxPer := effectiveUserCap(len(loads), len(targets), configured)
 
-		ideal := computeAssignment(loads, targets, maxPer)
-		logPlacement(loads, accounts, ideal, configured, quotas)
+		servable := make(map[string]bool, len(canServe))
+		for _, a := range canServe {
+			servable[a] = true
+		}
+
+		// DISTRIBUTED vs CONSERVATIVE only changes how `ideal` is computed —
+		// everything downstream (hysteresis, evacuation, logging, persistence)
+		// is identical for both modes.
+		var (
+			ideal      map[string]string
+			configured int
+			maxPer     int
+		)
+		if pool.Mode == models.ClaudePoolModeConservative {
+			ordered, oerr := conservativeOrder(poolID)
+			if oerr != nil {
+				return oerr
+			}
+			ceiling := conservativeCeiling(pool)
+			ideal = computeConservativeAssignment(loads, ordered, cur, servable, draining, ceiling)
+			configured = ceiling // for logPlacement's display only
+		} else {
+			configured = common.ClaudeMaxUsersPerAccount()
+			maxPer = effectiveUserCap(len(loads), len(targets), configured)
+			ideal = computeAssignment(loads, targets, maxPer)
+		}
+		logPlacement(poolID, loads, accounts, ideal, configured, quotas)
 		// Skew must ignore users still sitting on a paused account. skew() sums
 		// into tot[assign[u]] for EVERY user, and Go creates the map entry even
 		// for an account absent from `targets` — so a heavy user deferred on a
@@ -836,20 +907,17 @@ func EnsureAssignments(force bool) error {
 			}
 		}
 		curSkew := skew(loads, targets, curForSkew)
-		sharingTooWide := overCap(cur, valid, maxPer)
+		// overCap (the distributed-mode headcount gate) is meaningless in
+		// conservative mode, which concentrates BY DESIGN and enforces its own
+		// ceiling inside computeConservativeAssignment on INTAKE only, never as
+		// a rebalance trigger — see that function's doc comment.
+		sharingTooWide := pool.Mode != models.ClaudePoolModeConservative && overCap(cur, valid, maxPer)
 
 		// Users sitting on an exhausted account are ALREADY displaced: the valve
 		// sends every one of their requests to a sibling, so their egress IP is
 		// unstable today. Moving them is not new churn — it is placement catching
 		// up to what lease-time is doing anyway, and it restores a stable box.
 		stranded := 0
-		// Built from canServe, NOT targets — see the comment above. A paused
-		// account must read servable here so its active users are deferred
-		// rather than evacuated, and so they are not counted as stranded.
-		servable := make(map[string]bool, len(canServe))
-		for _, a := range canServe {
-			servable[a] = true
-		}
 		for _, acct := range cur {
 			if !servable[acct] {
 				stranded++
@@ -870,7 +938,7 @@ func EnsureAssignments(force bool) error {
 		for _, u := range loads {
 			load[u.UserSub] = u.Tokens
 		}
-		writes, deferred := placementWrites(placementInputs{
+		writes, deferred := placementWrites(poolID, placementInputs{
 			ideal: ideal, cur: cur, load: load,
 			valid: valid, servable: servable, draining: draining,
 			active:         activeUsers(activeSessionWindow),
@@ -882,13 +950,13 @@ func EnsureAssignments(force bool) error {
 			// Visible on purpose: while this is non-zero the cap may read as
 			// violated on the dashboard and that is the intended state, not a
 			// stuck balancer. It clears on its own as those users go quiet.
-			log.Printf("claude-pool: deferred %d mid-session move(s) to the next tick (skew %.2f, cap-wide %v)", deferred, curSkew, sharingTooWide)
+			log.Printf("claude-pool[%s]: deferred %d mid-session move(s) to the next tick (skew %.2f, cap-wide %v)", poolID, deferred, curSkew, sharingTooWide)
 		}
 		if len(writes) == 0 {
 			return nil
 		}
 		if err := common.DB.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "user_sub"}},
+			Columns:   []clause.Column{{Name: "pool_id"}, {Name: "user_sub"}},
 			DoUpdates: clause.AssignmentColumns([]string{"account", "load_7d", "assigned_at", "reason"}),
 		}).Create(&writes).Error; err != nil {
 			return fmt.Errorf("persist assignments: %w", err)
@@ -897,13 +965,15 @@ func EnsureAssignments(force bool) error {
 	})
 }
 
-// assignedAccount returns a user's pinned account, if any.
-func assignedAccount(userSub string) string {
+// assignedAccount returns a user's pinned account within poolID, if any. A
+// user homed in a DIFFERENT pool has no row here — home accounts are per
+// (pool, user), never shared across a multi-pool user's memberships.
+func assignedAccount(poolID, userSub string) string {
 	if userSub == "" {
 		return ""
 	}
 	var row models.ClaudeUserAssignment
-	if common.DB.Where("user_sub = ?", userSub).First(&row).Error != nil {
+	if common.DB.Where("pool_id = ? AND user_sub = ?", poolID, userSub).First(&row).Error != nil {
 		return ""
 	}
 	return row.Account

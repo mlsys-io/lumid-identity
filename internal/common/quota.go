@@ -70,6 +70,18 @@ const (
 	// soft-target semantics where an undersized pool silently widened the cap.
 	DefaultClaudeMaxUsersPerAccount = 5
 
+	// DefaultClaudeConservativeCeiling is the anti-concentration safety
+	// backstop for a "conservative" mode ClaudePool (see models/claude_pool.go).
+	// Distinct from DefaultClaudeMaxUsersPerAccount: a conservative pool
+	// deliberately concentrates users on one account until IT is quota-
+	// exhausted (not headcount-gated, unlike a "distributed" pool's hard
+	// 5-user gate above), so this ceiling is a looser number — 6, not 5 — that
+	// only ever stops NEW placements from piling on indefinitely; it never
+	// evicts an already-seated user, and per-account RPM/concurrency caps
+	// (claude-proxy, a separate anti-suspension mechanism) apply unchanged
+	// underneath it regardless of mode.
+	DefaultClaudeConservativeCeiling = 6
+
 	// DefaultClaudeAssignmentIdle is how long a homed user may go without using
 	// the pool before their slot is released.
 	//
@@ -614,6 +626,13 @@ func ClaudePoolShortWindow() time.Duration {
 // honoured as "disabled" instead of silently falling back to the default.
 func ClaudeMaxUsersPerAccount() int {
 	return envIntNonNeg("LUMID_CLAUDE_MAX_USERS_PER_ACCOUNT", DefaultClaudeMaxUsersPerAccount)
+}
+
+// ClaudeConservativeCeiling is the env-tunable DEFAULT anti-concentration
+// backstop for a "conservative" mode pool with no per-pool override
+// (ClaudePool.ConservativeCeiling == 0). See DefaultClaudeConservativeCeiling.
+func ClaudeConservativeCeiling() int {
+	return envIntNonNeg("LUMID_CLAUDE_CONSERVATIVE_CEILING", DefaultClaudeConservativeCeiling)
 }
 
 // ClaudeAssignmentIdle is the env-tunable dormancy window after which a homed

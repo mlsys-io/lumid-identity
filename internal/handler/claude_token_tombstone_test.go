@@ -155,7 +155,7 @@ func TestTombstoneIsResurrectedByReAdd(t *testing.T) {
 	fresh := models.ClaudeQuotaToken{Email: email, ValueEncrypted: "enc-access-2", RefreshTokenEncrypted: "enc-refresh-2"}
 	if err := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
-		DoUpdates: clause.AssignmentColumns(claudeTokenReAddColumns(false)),
+		DoUpdates: clause.AssignmentColumns(claudeTokenReAddColumns(false, false)),
 	}).Create(&fresh).Error; err != nil {
 		t.Fatalf("re-add upsert: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestReAddColumnSetIncludesDeletedAt(t *testing.T) {
 	// in production if this column is ever dropped from the set.
 	for _, want := range []string{"deleted_at", "revoked_at", "value_encrypted"} {
 		found := false
-		for _, c := range claudeTokenReAddColumns(false) {
+		for _, c := range claudeTokenReAddColumns(false, false) {
 			if c == want {
 				found = true
 				break
@@ -191,7 +191,10 @@ func TestReAddColumnSetIncludesDeletedAt(t *testing.T) {
 			t.Errorf("re-add column set is missing %q", want)
 		}
 	}
-	if got := claudeTokenReAddColumns(true); got[len(got)-1] != "label" {
+	if got := claudeTokenReAddColumns(true, false); got[len(got)-1] != "label" {
 		t.Errorf("withLabel=true must append label, got %v", got)
+	}
+	if got := claudeTokenReAddColumns(true, true); got[len(got)-1] != "pool_id" {
+		t.Errorf("withLabel=true,withPool=true must append pool_id last, got %v", got)
 	}
 }

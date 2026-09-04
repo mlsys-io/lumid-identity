@@ -267,7 +267,7 @@ func basePlacement() placementInputs {
 func TestActiveUserIsNotMovedMidSession(t *testing.T) {
 	in := basePlacement()
 	in.active = map[string]bool{"u1": true}
-	writes, deferred := placementWrites(in)
+	writes, deferred := placementWrites("default", in)
 	if len(writes) != 0 {
 		t.Fatalf("moved a mid-session user: %+v", writes)
 	}
@@ -277,7 +277,7 @@ func TestActiveUserIsNotMovedMidSession(t *testing.T) {
 }
 
 func TestIdleUserIsStillMoved(t *testing.T) {
-	writes, deferred := placementWrites(basePlacement())
+	writes, deferred := placementWrites("default", basePlacement())
 	if len(writes) != 1 || writes[0].Account != "b" {
 		t.Fatalf("idle user not moved: %+v", writes)
 	}
@@ -295,7 +295,7 @@ func TestActiveUserIsStillEvacuatedFromExhaustedAccount(t *testing.T) {
 	in := basePlacement()
 	in.active = map[string]bool{"u1": true}
 	in.servable = map[string]bool{"a": false, "b": true}
-	writes, deferred := placementWrites(in)
+	writes, deferred := placementWrites("default", in)
 	if len(writes) != 1 || writes[0].Reason != "exhausted" {
 		t.Fatalf("active user not evacuated: %+v (deferred=%d)", writes, deferred)
 	}
@@ -305,7 +305,7 @@ func TestActiveUserIsStillMovedOffARemovedAccount(t *testing.T) {
 	in := basePlacement()
 	in.active = map[string]bool{"u1": true}
 	in.valid = map[string]bool{"a": false, "b": true}
-	writes, _ := placementWrites(in)
+	writes, _ := placementWrites("default", in)
 	if len(writes) != 1 || writes[0].Reason != "account-gone" {
 		t.Fatalf("active user not moved off a removed account: %+v", writes)
 	}
@@ -316,7 +316,7 @@ func TestActiveUnplacedUserIsStillPlaced(t *testing.T) {
 	in := basePlacement()
 	in.cur = map[string]string{}
 	in.active = map[string]bool{"u1": true}
-	writes, _ := placementWrites(in)
+	writes, _ := placementWrites("default", in)
 	if len(writes) != 1 || writes[0].Reason != "initial" {
 		t.Fatalf("new active user not placed: %+v", writes)
 	}
@@ -327,11 +327,11 @@ func TestActiveUnplacedUserIsStillPlaced(t *testing.T) {
 func TestDeferredMoveLandsOnceUserGoesQuiet(t *testing.T) {
 	in := basePlacement()
 	in.active = map[string]bool{"u1": true}
-	if w, d := placementWrites(in); len(w) != 0 || d != 1 {
+	if w, d := placementWrites("default", in); len(w) != 0 || d != 1 {
 		t.Fatalf("tick 1 should defer, got writes=%+v deferred=%d", w, d)
 	}
 	in.active = map[string]bool{}
-	w, d := placementWrites(in)
+	w, d := placementWrites("default", in)
 	if len(w) != 1 || w[0].Account != "b" || d != 0 {
 		t.Fatalf("tick 2 should move, got writes=%+v deferred=%d", w, d)
 	}
@@ -354,7 +354,7 @@ func TestSettledUsersDoNotChurnWhileAMoveIsDeferred(t *testing.T) {
 		curSkew:        9.0,
 	}
 	for tick := 0; tick < 5; tick++ {
-		writes, deferred := placementWrites(in)
+		writes, deferred := placementWrites("default", in)
 		if deferred != 1 {
 			t.Fatalf("tick %d: deferred = %d, want 1", tick, deferred)
 		}
@@ -383,7 +383,7 @@ func TestDrainingAccountDefersItsActiveUser(t *testing.T) {
 	in.sharingTooWide = false
 	in.draining = map[string]bool{"a": true}
 	in.active = map[string]bool{"u1": true}
-	writes, deferred := placementWrites(in)
+	writes, deferred := placementWrites("default", in)
 	if len(writes) != 0 {
 		t.Fatalf("moved a mid-session user off a PAUSED account — this splits the session across subscriptions: %+v", writes)
 	}
@@ -399,7 +399,7 @@ func TestDrainingAccountMovesItsIdleUser(t *testing.T) {
 	in.rebalance = false
 	in.sharingTooWide = false
 	in.draining = map[string]bool{"a": true}
-	writes, deferred := placementWrites(in)
+	writes, deferred := placementWrites("default", in)
 	if len(writes) != 1 || writes[0].Account != "b" {
 		t.Fatalf("idle user did not drain off the paused account: %+v", writes)
 	}
@@ -420,7 +420,7 @@ func TestDrainIsNotReportedAsExhausted(t *testing.T) {
 	in.rebalance = false
 	in.sharingTooWide = false
 	in.draining = map[string]bool{"a": true}
-	writes, _ := placementWrites(in)
+	writes, _ := placementWrites("default", in)
 	if len(writes) != 1 || writes[0].Reason == "exhausted" {
 		t.Fatalf("drain reported as an evacuation: %+v", writes)
 	}
@@ -433,7 +433,7 @@ func TestExhaustedBeatsDrainingForAnActiveUser(t *testing.T) {
 	in.draining = map[string]bool{"a": true}
 	in.servable = map[string]bool{"a": false, "b": true}
 	in.active = map[string]bool{"u1": true}
-	writes, _ := placementWrites(in)
+	writes, _ := placementWrites("default", in)
 	if len(writes) != 1 {
 		t.Fatalf("active user stranded on an exhausted+paused account: %+v", writes)
 	}

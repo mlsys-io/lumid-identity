@@ -639,6 +639,10 @@ func canGrant(u models.User, toks []models.Token, rawScope string) bool {
 	if isCapabilityScope(rawScope) {
 		return u.Status == "active"
 	}
+	// "claude-pool:<id>" — see isClaudePoolScope (claude_pool_admin.go).
+	if isClaudePoolScope(u.ID, rawScope) {
+		return u.Status == "active"
+	}
 	svc, lvl := parseScope(rawScope)
 	if svc == "" {
 		return false

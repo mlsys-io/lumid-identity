@@ -20,7 +20,15 @@ import "time"
 // Replaces per-user rendezvous hashing, which distributed users RANDOMLY (3/1/1
 // across three accounts) and was blind to load — one heavy user could outweigh
 // every other account combined.
+// PoolID is part of the primary key, not just another column: once a user
+// can belong to more than one ClaudePool (see ClaudePoolMember), they need a
+// durable "home account" PER POOL, not one home overall — a user in two
+// pools has two independent placements to remember. GORM's AutoMigrate
+// cannot widen an existing PK on MySQL; the (user_sub) -> (pool_id, user_sub)
+// migration is a raw ALTER in EnsureDefaultClaudePool, backfilling
+// pool_id='default' for every pre-existing row.
 type ClaudeUserAssignment struct {
+	PoolID  string `gorm:"column:pool_id;size:64;primaryKey"         json:"pool_id"`
 	UserSub string `gorm:"column:user_sub;size:36;primaryKey"        json:"user_sub"`
 	Account string `gorm:"column:account;size:255;not null"          json:"account"`
 	// Load7d is the token volume that justified this placement, kept so the

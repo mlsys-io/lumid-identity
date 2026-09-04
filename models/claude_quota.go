@@ -40,7 +40,26 @@ type ClaudeQuotaToken struct {
 	// Anthropic-facing call this account makes originates from its one home
 	// network. Unset accounts (the default, and every account that predates
 	// this field) are completely unaffected.
+	//
+	// Label is NOT the pool. Label groups accounts by physical EGRESS NETWORK
+	// (routing only); PoolID groups them by WHO MAY DRAW ON THEM (access
+	// control). An account has exactly one of each, and the two are
+	// orthogonal — a pool can freely mix labelled and unlabelled accounts.
 	Label string `gorm:"column:label;size:64" json:"label,omitempty"`
+	// PoolID — the ClaudePool this account belongs to. An account is a single
+	// Anthropic subscription credential, so it belongs to exactly one pool
+	// (unlike users, who may hold membership in several — see ClaudePoolMember).
+	// Defaults to "default", the pool every pre-existing account is backfilled
+	// into (see EnsureDefaultClaudePool), so this column is a no-op for any
+	// deployment that never creates a second pool.
+	PoolID string `gorm:"column:pool_id;size:64;index;not null;default:'default'" json:"pool_id"`
+	// PoolSortOrder — this account's position in its pool's CONSERVATIVE-mode
+	// fill order (ascending; ties broken by CreatedAt ascending, so an
+	// untouched pool orders itself by add-order with no admin input needed).
+	// Meaningless in a "distributed" pool, kept unconditionally so toggling a
+	// pool's mode back to conservative doesn't need every account's order
+	// re-entered.
+	PoolSortOrder int `gorm:"column:pool_sort_order;not null;default:0" json:"pool_sort_order,omitempty"`
 	// Bench state: a POOL-WIDE cooldown reported by claude-proxy after Anthropic
 	// returned 401/403 for this account. claude-proxy benches locally too, but
 	// its state is per-process, so with >1 replica the sibling pod kept leasing

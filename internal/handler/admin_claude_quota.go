@@ -943,7 +943,7 @@ func AdminClaudeQuota(c *gin.Context) {
 //
 // "label" is included ONLY when the caller supplied one — an unrelated re-add
 // (e.g. a refresh-token rotation) must not wipe an existing field-box tag.
-func claudeTokenReAddColumns(withLabel bool) []string {
+func claudeTokenReAddColumns(withLabel, withPool bool) []string {
 	cols := []string{
 		"value_encrypted", "refresh_token_encrypted", "updated_at",
 		"revoked_at", "revoke_reason",
@@ -952,6 +952,9 @@ func claudeTokenReAddColumns(withLabel bool) []string {
 	}
 	if withLabel {
 		cols = append(cols, "label")
+	}
+	if withPool {
+		cols = append(cols, "pool_id")
 	}
 	return cols
 }
@@ -967,6 +970,11 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		// that box's relay (LUMID_CLAUDE_FIELD_RELAYS). Omit for a normal
 		// pooled account.
 		Label string `json:"label"`
+		// PoolID — optional. Which pool may draw on this account; defaults to
+		// "default" (ClaudeQuotaToken.PoolID's own column default) when
+		// omitted, so an older UI/caller that never sends it keeps today's
+		// exact behavior. Orthogonal to Label — see PoolID's doc comment.
+		PoolID string `json:"pool_id"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -976,6 +984,17 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	email := strings.TrimSpace(strings.ToLower(body.Email))
 	refreshTok := strings.TrimSpace(body.RefreshToken)
 	label := strings.TrimSpace(body.Label)
+	poolID := strings.ToLower(strings.TrimSpace(body.PoolID))
+	if poolID != "" {
+		if !claudePoolIDPattern.MatchString(poolID) {
+			fail(c, http.StatusBadRequest, 1400, "invalid pool_id")
+			return
+		}
+		if common.DB.Where("id = ?", poolID).First(&models.ClaudePool{}).Error != nil {
+			fail(c, http.StatusNotFound, 1404, "no such pool: "+poolID)
+			return
+		}
+	}
 
 	// Verify against Anthropic before storing.
 	valid, status, reason := verifyAnthropic(token)
@@ -996,7 +1015,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "encrypt: "+err.Error())
 		return
 	}
-	row := models.ClaudeQuotaToken{Email: email, ValueEncrypted: enc, Label: label}
+	row := models.ClaudeQuotaToken{Email: email, ValueEncrypted: enc, Label: label, PoolID: poolID}
 	if refreshTok != "" {
 		refEnc, err := common.EncryptGrant(refreshTok)
 		if err != nil {
@@ -1012,9 +1031,10 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 	// It is equally the documented recovery path for a pool-wide bench (the alert
 	// claude-proxy prints says "re-add the account to restore it"), so clear that
 	// too: `row` is freshly built, so these columns assign their zero values.
-	// "label" is only included in the update set when this request actually
-	// supplied one — an unrelated re-add (e.g. refresh-token rotation) with no
-	// label field must not silently wipe an existing field-box tag.
+	// "label"/"pool_id" are only included in the update set when this request
+	// actually supplied one — an unrelated re-add (e.g. refresh-token
+	// rotation) with no label/pool_id field must not silently wipe an
+	// existing field-box tag or move the account to "default".
 	// Safety-net capture: the quarantine branch in refreshTokenLocked already
 	// snapshots at the moment revoked_at/revoke_reason are SET, but this
 	// upsert is the moment they (and bench state) are CLEARED — the last
@@ -1028,7 +1048,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 		}
 	}
 
-	updateCols := claudeTokenReAddColumns(label != "")
+	updateCols := claudeTokenReAddColumns(label != "", poolID != "")
 	if err := common.DB.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "email"}},
 		DoUpdates: clause.AssignmentColumns(updateCols),
@@ -1042,7 +1062,7 @@ func AdminClaudeTokenAdd(c *gin.Context) {
 			"email": email, "valid": true, "stored": true,
 			"has_refresh_token": refreshTok != "",
 			"upstream_status":   status, "reason": reason,
-			"label": label,
+			"label": label, "pool_id": poolID,
 		},
 	})
 }
@@ -1104,21 +1124,32 @@ func AdminClaudeTokenHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"email": email, "history": rows}})
 }
 
-// AdminClaudeTokenLabel updates ONLY a pooled account's field-box Label.
+// AdminClaudeTokenLabel updates a pooled account's field-box Label and/or its
+// ClaudePool assignment. Despite the name (kept for URL/route stability —
+// this is the endpoint an operator already knows), it now handles two
+// ORTHOGONAL axes: Label (egress network routing) and PoolID (who may draw
+// on this account) — see models/claude_quota.go's PoolID doc for why they
+// must never be conflated.
 //
-// PATCH /api/v1/admin/claude-token/:email  {"label": "denmark"}  (RequireSuperAdmin)
+// PATCH /api/v1/admin/claude-token/:email  {"label"?, "pool_id"?, "pool_sort_order"?}  (RequireAdmin)
 //
 // Moving an account between field boxes previously meant re-adding it through
 // /code, which means re-running `claude auth login` and pasting OAuth tokens —
 // an absurd cost for changing one string, and one that risks rotating a
-// perfectly good credential. The label is pure routing metadata; nothing about
-// the token changes.
+// perfectly good credential. Label/pool are pure metadata; nothing about the
+// token changes.
 //
 // An empty label is allowed and means "unlabelled": dispatch direct from the
 // cluster. Callers should be aware that pointing a label at a box with no
 // matching LUMID_CLAUDE_FIELD_RELAYS entry is NOT an error — claude-proxy falls
 // through to direct dispatch — so the account keeps working while silently
 // leaving from the wrong network. Check via_relay after any change.
+//
+// Moving an account to a DIFFERENT pool is placement-affecting, so this
+// handler runs EnsureAssignments(true) for both the old and new pool
+// synchronously after the write — bounded (single-digit accounts per pool
+// today) — so the dashboard reflects the move immediately rather than
+// waiting for the next reclaim tick.
 func AdminClaudeTokenLabel(c *gin.Context) {
 	email := strings.TrimSpace(strings.ToLower(c.Param("email")))
 	if email == "" {
@@ -1126,15 +1157,16 @@ func AdminClaudeTokenLabel(c *gin.Context) {
 		return
 	}
 	var body struct {
-		Label *string `json:"label"`
+		Label         *string `json:"label"`
+		PoolID        *string `json:"pool_id"`
+		PoolSortOrder *int    `json:"pool_sort_order"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.Label == nil {
-		fail(c, http.StatusBadRequest, 1400, `body must be {"label": "<box>"} ("" to unlabel)`)
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
-	label := strings.TrimSpace(*body.Label)
-	if len(label) > 64 {
-		fail(c, http.StatusBadRequest, 1400, "label too long (max 64)")
+	if body.Label == nil && body.PoolID == nil && body.PoolSortOrder == nil {
+		fail(c, http.StatusBadRequest, 1400, `body must set at least one of "label", "pool_id", "pool_sort_order"`)
 		return
 	}
 	var row models.ClaudeQuotaToken
@@ -1142,19 +1174,58 @@ func AdminClaudeTokenLabel(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "account not found: "+email)
 		return
 	}
-	prev := row.Label
-	if err := common.DB.Model(&row).Update("label", label).Error; err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "update label: "+err.Error())
+	updates := map[string]interface{}{}
+	prevLabel, prevPool := row.Label, row.PoolID
+	if body.Label != nil {
+		label := strings.TrimSpace(*body.Label)
+		if len(label) > 64 {
+			fail(c, http.StatusBadRequest, 1400, "label too long (max 64)")
+			return
+		}
+		updates["label"] = label
+	}
+	poolChanged := false
+	if body.PoolID != nil {
+		poolID := strings.ToLower(strings.TrimSpace(*body.PoolID))
+		if !claudePoolIDPattern.MatchString(poolID) {
+			fail(c, http.StatusBadRequest, 1400, "invalid pool_id")
+			return
+		}
+		if common.DB.Where("id = ?", poolID).First(&models.ClaudePool{}).Error != nil {
+			fail(c, http.StatusNotFound, 1404, "no such pool: "+poolID)
+			return
+		}
+		updates["pool_id"] = poolID
+		poolChanged = poolID != prevPool
+	}
+	if body.PoolSortOrder != nil {
+		updates["pool_sort_order"] = *body.PoolSortOrder
+	}
+	if err := common.DB.Model(&row).Updates(updates).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "update account: "+err.Error())
 		return
 	}
-	_, known := fieldRelays[label]
-	log.Printf("claude-token label: %s %q -> %q (relay configured: %v)", email, prev, label, known || label == "")
-	ok(c, "ok", gin.H{
-		"email": email, "label": label, "previous": prev,
+	if body.Label != nil {
+		label := updates["label"].(string)
+		_, known := fieldRelays[label]
+		log.Printf("claude-token label: %s %q -> %q (relay configured: %v)", email, prevLabel, label, known || label == "")
+	}
+	if poolChanged {
+		newPool := updates["pool_id"].(string)
+		log.Printf("claude-token pool: %s %q -> %q", email, prevPool, newPool)
+		if err := EnsureAssignments(true); err != nil {
+			log.Printf("claude-pool: post-move placement refresh failed: %v", err)
+		}
+	}
+	resp := gin.H{"email": email, "updated": updates}
+	if body.Label != nil {
+		label := updates["label"].(string)
+		_, known := fieldRelays[label]
 		// Surfaced so a caller can see immediately whether this label actually
 		// routes, rather than discovering it later from via_relay.
-		"relay_configured": known || label == "",
-	})
+		resp["relay_configured"] = known || label == ""
+	}
+	ok(c, "ok", resp)
 }
 
 // InternalClaudeTokenLease hands the claude-proxy service the healthiest
@@ -1484,6 +1555,15 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		UserSub     string   `json:"user_sub"`
 		SessionKey  string   `json:"session_key"`
 		Exclude     []string `json:"exclude"`
+		// PoolIDHint — optional, extracted by claude-proxy from a
+		// "claude-pool:<id>" scope on the caller's own PAT (identity never
+		// sees that PAT on this internal-bridge call, only what claude-proxy
+		// chooses to forward). Additive: an older claude-proxy that never
+		// sends it falls straight through resolveUserPool to the user's
+		// primary pool, i.e. today's exact behavior. A hint naming a pool the
+		// user is NOT a member of is logged and ignored, never trusted blind —
+		// identity, not claude-proxy, owns membership truth.
+		PoolIDHint string `json:"pool_id_hint"`
 	}
 	_ = c.ShouldBindJSON(&body) // empty body is fine
 
@@ -1521,8 +1601,10 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		log.Printf("claude assignment refresh: %v", err)
 	}
 
+	poolID, poolMode := resolveUserPool(body.UserSub, body.PoolIDHint)
+
 	var rows []models.ClaudeQuotaToken
-	if err := common.DB.Find(&rows).Error; err != nil {
+	if err := common.DB.Where("pool_id = ?", poolID).Find(&rows).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query tokens: "+err.Error())
 		return
 	}
@@ -1672,6 +1754,23 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		resetBiasWindowHrs = 12.0
 		resetBiasMaxPct    = 70.0
 	)
+	// Conservative-mode fill order, computed once per request (not memoized
+	// long-term — one extra indexed query alongside the `rows` query above is
+	// cheap, matching this handler's existing per-request-query style).
+	// Position lookups fall back to "unknown -> last" so an account outside
+	// this ordering (shouldn't happen — cands is already pool_id-scoped) never
+	// wins by accident.
+	var conservativePos map[string]int
+	if poolMode == models.ClaudePoolModeConservative {
+		if ordered, oerr := conservativeOrder(poolID); oerr == nil {
+			conservativePos = make(map[string]int, len(ordered))
+			for i, email := range ordered {
+				conservativePos[email] = i
+			}
+		} else {
+			log.Printf("claude-lease[%s]: conservativeOrder failed, falling back to distributed ordering: %v", poolID, oerr)
+		}
+	}
 	sortKey := func(cd cand) float64 {
 		if cd.row.Email == prefer {
 			return -1
@@ -1681,12 +1780,28 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		}
 		s := cd.snap
 		// Band 3: near-exhausted on either window — last resort, least-spent first.
+		// Applies REGARDLESS of mode: a conservative pool's "current" account
+		// still needs to sort last once it is genuinely unusable, which is
+		// exactly what triggers the roll to the next account in fixed order.
 		if s.FiveHourPct >= nearExhaustCeiling || s.SevenDayPct >= nearExhaustCeiling {
 			worst := s.FiveHourPct
 			if s.SevenDayPct > worst {
 				worst = s.SevenDayPct
 			}
 			return 1e9 + worst
+		}
+		// CONSERVATIVE MODE: no load/HRW spreading at all — the entire ordering
+		// is this account's fixed position (ClaudeQuotaToken.PoolSortOrder,
+		// then CreatedAt), the SAME order placement's conservativeOrder
+		// computes, so lease-time and placement never disagree about "the
+		// order." An account this pass didn't find a position for (shouldn't
+		// happen) sorts last within this band rather than winning by accident.
+		if conservativePos != nil {
+			pos, ok := conservativePos[cd.row.Email]
+			if !ok {
+				pos = len(conservativePos)
+			}
+			return 3e8 + float64(pos)
 		}
 		// ── Band 2 (primary): per-user HRW assignment ────────────────────────
 		//
@@ -1706,7 +1821,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 			// claude_balance.go. HRW is kept only as the fallback for a user with
 			// no row yet, so a brand-new caller still gets a deterministic,
 			// spread-out home instead of piling onto whoever sorts first.
-			if want := assignedAccount(body.UserSub); want != "" {
+			if want := assignedAccount(poolID, body.UserSub); want != "" {
 				if cd.row.Email == want {
 					return 50 // assigned home — ahead of everything but prefer_email
 				}
@@ -2184,6 +2299,10 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		Cap5h        int  `json:"cap_5h"`
 		Cap7d        int  `json:"cap_7d"`
 		CapUnlimited bool `json:"cap_unlimited"`
+		// Pool membership (many-to-many). PrimaryPool is the one used when no
+		// PAT carries an explicit "claude-pool:<id>" scope override.
+		Pools       []string `json:"pools,omitempty"`
+		PrimaryPool string   `json:"primary_pool,omitempty"`
 	}
 	byUser := map[string]*userUsage{}
 	for _, r := range rows {
@@ -2265,8 +2384,29 @@ func AdminClaudeUserUsage(c *gin.Context) {
 			}
 		}
 	}
+	// Pool membership, batched (one query for every user on this page) rather
+	// than a lookup per row.
+	subs := make([]string, 0, len(byUser))
+	for sub := range byUser {
+		subs = append(subs, sub)
+	}
+	var memberRows []models.ClaudePoolMember
+	if len(subs) > 0 {
+		common.DB.Where("user_sub IN ?", subs).Find(&memberRows)
+	}
+	poolsBySub := make(map[string][]string, len(subs))
+	primaryBySub := make(map[string]string, len(subs))
+	for _, m := range memberRows {
+		poolsBySub[m.UserSub] = append(poolsBySub[m.UserSub], m.PoolID)
+		if m.IsPrimary {
+			primaryBySub[m.UserSub] = m.PoolID
+		}
+	}
+
 	users := make([]userUsage, 0, len(byUser))
 	for sub, u := range byUser {
+		u.Pools = poolsBySub[sub]
+		u.PrimaryPool = primaryBySub[sub]
 		// Divide each user by THEIR OWN tier, not by the global. Caps are
 		// role-tiered (admins uncapped, role `user` on LUMID_QUOTA_CLAUDE_USER_*),
 		// so a single divisor mis-states everyone whose tier is not the default —

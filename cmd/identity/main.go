@@ -27,6 +27,14 @@ func main() {
 	if err := models.AutoMigrate(common.DB); err != nil {
 		log.Fatalf("automigrate: %v", err)
 	}
+	// Seeds the "default" Claude pool and backfills every pre-existing
+	// account/user into it. Idempotent (IF-NOT-EXISTS / INSERT-IGNORE
+	// throughout) — safe on every pod boot, every replica. This service is
+	// fully self-deploying with no operator migration step, so this backfill
+	// MUST be code, not a migrations/*.sql file nobody runs by hand.
+	if err := handler.EnsureDefaultClaudePool(common.DB); err != nil {
+		log.Fatalf("seed default claude pool: %v", err)
+	}
 	if err := common.OpenRedis(cfg); err != nil {
 		log.Fatalf("open redis: %v", err)
 	}

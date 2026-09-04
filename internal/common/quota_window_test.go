@@ -396,47 +396,57 @@ func TestClaudePoolWindow_ConcurrentRollConvergence(t *testing.T) {
 	}
 }
 
-// A non-Anthropic model (deepseek-v4-flash) must count toward the SAME shared
-// 5h/7d window as Claude, open the window anchor like Claude, and be able to
-// deny a subsequent Claude request once the shared cap is crossed. This is the
-// metering-gap closure: previously deepseek bypassed entirely (unmetered, never
-// gated). Cost is handled by the weight, not exclusion — weighted tokens of a
-// deepseek charge count against the same caps a Claude charge counts against.
-func TestClaudePoolWindow_NonClaudeCounts(t *testing.T) {
+// A non-Anthropic model (deepseek-v4-flash) is RECORDED (usage_events row,
+// window anchor opens — /me and the admin per-model breakdown still see it)
+// but must NOT count toward the Claude-only 5h/7d window and must NEVER be
+// able to deny a subsequent Claude request, no matter how large.
+//
+// Reverted 2026-09-04 (operator decision) from the 2026-08-23 metering-gap
+// closure (0121ad5), which had non-Claude models draw on the same shared
+// window as Claude. That closed a real gap (unmetered deepseek could never
+// deny) but opened a worse one: the CLI's native usage warning and
+// /me/claude-usage summed ALL models while /code's own dashboard bar showed
+// Claude-only, so a heavy deepseek user's CLI could read "exceeded" while the
+// dashboard read a comfortable low percentage for the exact same account at
+// the exact same instant. See [[project_claude_proxy_cli_vs_dashboard_pct_split]].
+// Non-Claude usage is simply unbounded by this gate again; it needs its own
+// cap if a runaway non-Claude consumer needs bounding.
+func TestClaudePoolWindow_NonClaudeExempt(t *testing.T) {
 	t.Setenv("LUMID_QUOTA_CLAUDE_5H_TOKENS", "1000") // tight share cap for fast test
 	t.Setenv("LUMID_QUOTA_CLAUDE_7D_TOKENS", "10000")
 	db := connectTestDB(t)
 	sub := claudePoolTestSub("nonclaude")
 	t.Cleanup(func() { cleanupSub(t, db, sub) })
 
-	// One deepseek turn: 1000 fresh input. Weighted at claudeWeightNonClaude (0.1)
-	// → 100 weighted units.
+	// One deepseek turn: 1000 fresh input, 200 output — 1200 raw tokens, which
+	// would already exceed the 1000-unit 5h cap if it counted at all.
 	res, err := CheckAndCharge(db, ChargeReq{
 		UserSub: sub, Kind: "claude_proxy", Model: "deepseek-v4-flash",
 		InputTokens: 1000, OutputTokens: 200,
 	})
 	if err != nil || !res.Allowed {
-		t.Fatalf("deepseek charge: err=%v allowed=%v", err, res.Allowed)
+		t.Fatalf("deepseek charge: err=%v allowed=%v (must never be denied by the Claude-only cap)", err, res.Allowed)
 	}
+	// Still recorded: the shared anchor opens off ANY claude_proxy charge,
+	// Claude or not, so /me's window-age display stays meaningful.
 	if res.FiveHourReset == "" {
-		t.Fatalf("deepseek charge should open the shared window anchor, got empty reset")
+		t.Fatalf("deepseek charge should still open the shared window anchor, got empty reset")
 	}
 
-	// The deepseek charge counted into the shared window at its weight.
+	// But it contributes NOTHING to the Claude-only usage sum.
 	status, err := ClaudePoolUsage(db, sub, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("usage after deepseek: %v", err)
 	}
-	if want := int(math.Round(float64(1200) * claudeWeightNonClaude)); status.FiveHourUsed != want {
-		t.Fatalf("five_hour_used=%d want %d (deepseek weighted into the shared window)",
-			status.FiveHourUsed, want)
+	if status.FiveHourUsed != 0 {
+		t.Fatalf("five_hour_used=%d want 0 (deepseek must not count toward the Claude-only window)",
+			status.FiveHourUsed)
 	}
 
-	// A second deepseek charge pushes the SHARED cap past 1000 weighted units →
-	// a subsequent CLAUDE request must now be denied. Cross-model same-window.
+	// A second, much larger deepseek charge — still zero effect on the window.
 	if _, err := CheckAndCharge(db, ChargeReq{
 		UserSub: sub, Kind: "claude_proxy", Model: "deepseek-v4-flash",
-		InputTokens: 9000, OutputTokens: 0, // +900 weighted → total ~1020
+		InputTokens: 9_000_000, OutputTokens: 0,
 	}); err != nil {
 		t.Fatalf("second deepseek charge: %v", err)
 	}
@@ -446,8 +456,8 @@ func TestClaudePoolWindow_NonClaudeCounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gate: %v", err)
 	}
-	if gate.Allowed {
-		t.Fatalf("a Claude model must be denied once the SHARED window (exhausted by deepseek) is over the cap")
+	if !gate.Allowed {
+		t.Fatalf("a Claude request must NEVER be denied by non-Claude (deepseek) usage")
 	}
 }
 
@@ -494,13 +504,17 @@ func TestClaudePoolWindow_AdminStillCounts(t *testing.T) {
 		}
 	}
 
-	// An admin's deepseek charge is allowed (within tier) and still recorded.
+	// An admin's Claude charge is allowed (within tier) and still recorded.
+	// Uses a claude-* model deliberately: deepseek no longer counts toward this
+	// window for ANY role (TestClaudePoolWindow_NonClaudeExempt), so a deepseek
+	// charge here would prove nothing about role exemption — this test is about
+	// admin not being exempt from the Claude-only window, not about model scope.
 	res, err := CheckAndCharge(db, ChargeReq{
-		UserSub: sub, Kind: "claude_proxy", Model: "deepseek-v4-flash",
-		InputTokens: 1_000_000, OutputTokens: 0, // huge, but uncapped
+		UserSub: sub, Kind: "claude_proxy", Model: "claude-sonnet-5",
+		InputTokens: 1_000_000, OutputTokens: 0, // huge, but within the generous tier
 	})
 	if err != nil || !res.Allowed {
-		t.Fatalf("admin deepseek charge: err=%v allowed=%v deny=%q", err, res.Allowed, res.DenyReason)
+		t.Fatalf("admin claude charge: err=%v allowed=%v deny=%q", err, res.Allowed, res.DenyReason)
 	}
 	var evCnt int64
 	db.Model(&models.UsageEvent{}).Where("user_sub = ?", sub).Count(&evCnt)

@@ -9,14 +9,21 @@ import "testing"
 // Allowed=true for everyone, leaving the per-user pool quota UNENFORCED while
 // still reporting success. That regression is why poolCapApplies must gate "".
 //
-// Now every named model — Claude or not — draws on the SAME shared 5h/7d window
-// (deepseek-v4-flash, kimi-k3, glm-5.2 were previously excluded, letting a user
-// draw unlimited LLM usage). So poolCapApplies is constant-true; the critical
-// case that must NEVER regress to false is the empty pre-request gate.
+// Between 2026-08-23 and 2026-09-04, every named model — Claude or not — drew
+// on the same shared 5h/7d window (poolCapApplies was constant-true), closing
+// the unlimited-non-Claude-usage gap above. That in turn opened a DIFFERENT
+// one: the CLI's native usage warning and /me/claude-usage summed all models
+// while /code's own dashboard bar intentionally showed Claude-only, so a heavy
+// deepseek user saw the CLI cross 100% while the dashboard read a comfortable
+// 17% (see [[project_claude_proxy_cli_vs_dashboard_pct_split]]). Reverted back
+// to Claude-only on 2026-09-04 (operator decision) so every surface — gate,
+// CLI header rewrite, /me, /code — agrees on one number again. Non-Claude
+// usage is simply unbounded by THIS gate now; it needs its own cap if a
+// runaway non-Claude consumer needs bounding again.
 //
-// These tests lock the classification, which is the part that regressed in the
-// other direction too. They deliberately avoid a DB: the bug was in which models
-// are gated at all, not in the window arithmetic.
+// These tests lock the classification, which has regressed in both directions
+// now. They deliberately avoid a DB: the bug was in which models are gated at
+// all, not in the window arithmetic.
 func TestPoolGateClassification(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -28,11 +35,12 @@ func TestPoolGateClassification(t *testing.T) {
 		// Claude models.
 		{"claude alias", "claude-sonnet-5", true},
 		{"claude full id", "claude-opus-4-8-20250101", true},
-		// Non-Anthropic models now count toward the shared window — gated too.
-		{"kimi", "kimi-k3", true},
-		{"glm", "z-ai/glm-5.2", true},
-		{"self-hosted deepseek", "deepseek-v4-flash", true},
-		{"in-house qwen", "qwen3.6-35b-a3b", true},
+		// Non-Anthropic models draw on our own compute, not the Anthropic
+		// subscription seats this window protects — ungated.
+		{"kimi", "kimi-k3", false},
+		{"glm", "z-ai/glm-5.2", false},
+		{"self-hosted deepseek", "deepseek-v4-flash", false},
+		{"in-house qwen", "qwen3.6-35b-a3b", false},
 	}
 	for _, c := range cases {
 		got := poolCapApplies(c.model)

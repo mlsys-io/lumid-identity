@@ -218,16 +218,33 @@ type ChargeRes struct {
 // poolCapApplies reports whether a model's usage counts against the per-user
 // pool 5h/7d windows.
 //
-// Every named model — Claude or not — draws on the SAME shared window. Non-Anthropic
-// models (deepseek-v4-flash, kimi-k3, z-ai/glm-5.2) were previously excluded so their
-// usage never counted and could never deny; that metering gap is closed (the cost-model
-// difference is handled by the weight, not by skipping the window).
+// REVERTED 2026-09-04 (operator decision, the "CLI warns while /code looks
+// comfortable" report): only claude-* models draw on the shared window again.
+// Between 2026-08-23 (0121ad5) and today, EVERY named model counted — closing
+// a real gap (unmetered deepseek could never deny) but opening a worse one:
+// the CLI's native usage warning, /me/claude-usage and the /code per-user cap
+// all summed ALL models, while /code's own dashboard BAR intentionally showed
+// only the Claude-only figure (`claude_five_hour_pct`/`claude_seven_day_pct`,
+// admin_claude_quota.go) — three surfaces, two different numerators, same
+// "your usage %" label. A heavy deepseek user (suzhengy: ~74% of her 7d draw)
+// saw the CLI cross 100% while the dashboard bar read 17%. See
+// [[project_claude_proxy_cli_vs_dashboard_pct_split]] for the measured split.
+//
+// This is a deliberate trade: non-Claude usage is no longer bounded by this
+// gate at all (the abuse vector 0121ad5 closed). If a non-Claude runaway
+// consumer needs bounding again, it needs its OWN cap — not a shared window
+// whose meaning then disagrees with what every surface displays as "%used".
 //
 // "" is claude-proxy's PRE-REQUEST dry-run gate (no model, zero tokens). It MUST remain
 // gated: treating "" as non-Anthropic is the regression that silently disabled ALL pool
 // quota enforcement (see quota_gate_test.go). Only claude-proxy's gate sends ""; a real
 // charge always carries a model.
-func poolCapApplies(model string) bool { return true }
+func poolCapApplies(model string) bool {
+	if model == "" {
+		return true
+	}
+	return strings.HasPrefix(strings.ToLower(model), "claude-")
+}
 
 // Model weighting for the pool quota.
 //
@@ -674,13 +691,14 @@ func formatPoolReset(t time.Time) string {
 // handler with no risk of starting anyone's clock; only ClaudePoolCommit
 // opens or rolls an anchor.
 //
-// Every claude_proxy row — Claude or not — counts toward the shared window.
-// Non-Anthropic models (deepseek-v4-flash, kimi-k3, z-ai/glm-5.2) draw on the
-// SAME per-user 5h/7d window as Claude; their cost difference is handled by the
-// model weight (claudeWeightNonClaude), not by excluding them. This closure is
-// what makes the shared-window design work end-to-end: the gate (poolCapApplies),
-// this SUM, and the admin table all agree, so a dashboard never disagrees with
-// the gate about how much a user has drawn.
+// CLAUDE-ONLY as of 2026-09-04 (matches poolCapApplies — see its comment for
+// why the earlier all-models sum was reverted). This SUM, the gate's deny
+// decision, the CLI's rewritten rate-limit headers and the admin table's
+// `claude_five`/`claude_seven` columns all now agree, so a dashboard never
+// disagrees with the gate — or with itself — about how much of the Claude
+// budget a user has drawn. Non-Claude usage is still recorded in usage_events
+// (cost tracking, per-model breakdown, on-prem savings banner) — it just no
+// longer counts against this cap.
 func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStatus, error) {
 	var status ClaudePoolStatus
 	var win models.ClaudePoolWindow
@@ -726,7 +744,7 @@ func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStat
 		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS five_tokens,
 		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS seven_tokens
 		FROM   usage_events
-		WHERE  user_sub = ? AND kind = 'claude_proxy' AND ts >= ?`, w),
+		WHERE  user_sub = ? AND kind = 'claude_proxy' AND model LIKE 'claude-%%' AND ts >= ?`, w),
 		fiveBound, sevenBound, userSub, scanBound).Scan(&row).Error; err != nil {
 		return status, err
 	}
@@ -776,14 +794,14 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		// Fixed 5h/7d windows (not midnight-daily) — mirrors the Anthropic
 		// account quota shape the pool itself is subject to.
 		//
-		// Every named model — Claude or non-Claude — runs this cap check against the
-		// SAME shared 5h/7d window. Non-Anthropic models (deepseek-v4-flash,
-		// kimi-k3, z-ai/glm-5.2) used to bypass here entirely (an explicit
-		// `if !poolCapApplies(req.Model) { break }`), so a user could draw
-		// unlimited LLM usage at /lum.id/code. poolCapApplies is now constant-true
-		// precisely so no named model skips this gate; the historical `""` dry-run
-		// bug (see quota_gate_test.go) is preserved by the fact that the "" gate
-		// request runs THIS same path, not a bypass.
+		// CLAUDE-ONLY as of 2026-09-04 (see poolCapApplies). A non-Claude charge
+		// (deepseek-v4-flash, kimi-k3, z-ai/glm-5.2) still gets recorded below —
+		// cost tracking and per-model breakdowns are unaffected — it just
+		// contributes zero to `tok` and is never the reason for a deny, so it
+		// cannot exhaust another model's shared window. The `""` pre-request
+		// dry-run gate keeps running this same path (poolCapApplies("") is
+		// hardcoded true), preserving the historical dry-run fix in
+		// quota_gate_test.go.
 		//
 		// Role-tiered: a student on the shared pool and an operator doing the
 		// heaviest work on it should not get the same budget. Defaults to the
@@ -799,12 +817,15 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		// to. Note the pre-request gate is a dry run with model="" and zero
 		// tokens, so this is 0 there either way; it matters on the real
 		// post-response charge.
-		tok := ClaudeWeightedTokens(req.Model, req.InputTokens, req.OutputTokens,
-			req.CacheReadTokens, req.CacheCreationTokens, req.CacheCreation1hTokens)
-		if used5+tok > cap5 {
-			deny = "quota_exceeded_claude_5h"
-		} else if used7+tok > cap7 {
-			deny = "quota_exceeded_claude_7d"
+		var tok int
+		if poolCapApplies(req.Model) {
+			tok = ClaudeWeightedTokens(req.Model, req.InputTokens, req.OutputTokens,
+				req.CacheReadTokens, req.CacheCreationTokens, req.CacheCreation1hTokens)
+			if used5+tok > cap5 {
+				deny = "quota_exceeded_claude_5h"
+			} else if used7+tok > cap7 {
+				deny = "quota_exceeded_claude_7d"
+			}
 		}
 		p5 := float64(used5+tok) / float64(cap5) * 100
 		p7 := float64(used7+tok) / float64(cap7) * 100

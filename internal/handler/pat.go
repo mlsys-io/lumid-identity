@@ -553,10 +553,30 @@ func GrantableScopesHandler(c *gin.Context) {
 	for _, svc := range accessServices {
 		matrix[svc] = computeAccess(svc, u, toks, grants).Level
 	}
+
+	// Surface the caller's own Claude pool memberships as candidate
+	// "claude-pool:<id>" scopes so the token-minting UI can offer them —
+	// isClaudePoolScope (claude_pool_admin.go) already grants any of these,
+	// this just makes them discoverable instead of requiring the caller to
+	// already know the exact pool id. Never includes another user's pools.
+	type poolRow struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		IsPrimary bool   `json:"is_primary"`
+	}
+	var claudePools []poolRow
+	common.DB.Table("claude_pool_members AS m").
+		Joins("JOIN claude_pools AS p ON p.id = m.pool_id AND p.deleted_at IS NULL").
+		Where("m.user_sub = ?", userID).
+		Order("m.is_primary DESC, p.name ASC").
+		Select("p.id AS id, p.name AS name, m.is_primary AS is_primary").
+		Scan(&claudePools)
+
 	ok(c, "ok", gin.H{
 		"role":         u.Role,
 		"services":     accessServices,
 		"matrix":       matrix,
 		"can_wildcard": u.Role == "admin" || u.Role == "super_admin",
+		"claude_pools": claudePools,
 	})
 }

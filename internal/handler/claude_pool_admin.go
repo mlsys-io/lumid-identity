@@ -35,7 +35,25 @@ import (
 
 var claudePoolIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|^[a-z0-9]$`)
 
+// validConservativeCeiling accepts the three-way sentinel conservativeCeiling
+// (claude_balance_conservative.go) reads: positive = explicit value, 0 =
+// inherit the global default, -1 = explicitly unlimited. Anything else
+// (e.g. -5) has no defined meaning and is rejected rather than silently
+// coerced.
+func validConservativeCeiling(n int) bool { return n >= -1 }
+
 // ── Migration / backfill ─────────────────────────────────────────────────
+
+// claudePoolMigrationLock serialises the guarded DDL in EnsureDefaultClaudePool
+// across replicas and across concurrent boots (2 identity pods run this on
+// every restart). Without it, two pods can both observe
+// primaryMarkerExists==0 / pkIsComposite==0 and race to run the same ALTER —
+// the loser errors (duplicate column / PK conflict) and log.Fatalf
+// crash-loops the pod, exactly the class of bug fixed once already in commit
+// ff8ba60 for the same PK-widen operation. A 30s wait is generous for
+// one-time DDL that normally completes in milliseconds once the schema is
+// already current.
+const claudePoolMigrationLock = "claude_pool_migration"
 
 // EnsureDefaultClaudePool seeds the "default" pool and backfills every
 // pre-existing account/user into it, idempotently. Called once from
@@ -48,8 +66,18 @@ var claudePoolIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$|
 //
 // Every step is IF-NOT-EXISTS / INSERT-IGNORE, so this is a no-op on every
 // boot after the first, and safe to run concurrently across replicas.
+
 func EnsureDefaultClaudePool(db *gorm.DB) error {
 	const defaultID = models.DefaultClaudePoolID
+
+	var locked int
+	if err := db.Raw("SELECT GET_LOCK(?, 30)", claudePoolMigrationLock).Scan(&locked).Error; err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	if locked != 1 {
+		return fmt.Errorf("could not acquire migration lock %q within 30s — another pod may be stuck mid-migration", claudePoolMigrationLock)
+	}
+	defer db.Exec("DO RELEASE_LOCK(?)", claudePoolMigrationLock)
 
 	// 1. Resolve admin@lum.id's sub for OwnerSub. A missing admin@lum.id row
 	// degrades to an empty owner + a loud warning rather than failing
@@ -63,11 +91,24 @@ func EnsureDefaultClaudePool(db *gorm.DB) error {
 	if ownerSub == "" {
 		log.Printf("claude-pool: admin@lum.id not found — seeding default pool with no owner_sub (attribution only, does not block anything)")
 	}
+	// created_at/updated_at set explicitly: this raw INSERT bypasses GORM's
+	// Create() hooks (autoCreateTime/autoUpdateTime), which only fire for
+	// pools made through AdminClaudePoolCreate. Without this the seeded
+	// "default" pool's timestamps read NULL forever — caught live (not by
+	// any unit test, since those all go through GORM's Create) when the
+	// admin API returned "0001-01-01T00:00:00Z" for it.
 	if err := db.Exec(`
-		INSERT IGNORE INTO claude_pools (id, name, mode, owner_sub, conservative_ceiling)
-		VALUES (?, 'Default Pool', ?, ?, 0)`,
+		INSERT IGNORE INTO claude_pools (id, name, mode, owner_sub, conservative_ceiling, created_at, updated_at)
+		VALUES (?, 'Default Pool', ?, ?, 0, NOW(3), NOW(3))`,
 		defaultID, models.ClaudePoolModeDistributed, ownerSub).Error; err != nil {
 		return fmt.Errorf("seed default pool: %w", err)
+	}
+	// Self-heal a "default" pool seeded by the version of this function that
+	// omitted created_at/updated_at (shipped briefly before this fix) —
+	// idempotent no-op once healed.
+	if err := db.Exec(`UPDATE claude_pools SET created_at = NOW(3), updated_at = NOW(3)
+		WHERE id = ? AND created_at IS NULL`, defaultID).Error; err != nil {
+		return fmt.Errorf("backfill default pool timestamps: %w", err)
 	}
 
 	// 2. claude_pool_members: generated-column + partial-unique-index DDL.
@@ -219,6 +260,10 @@ func AdminClaudePoolCreate(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, `mode must be "distributed" or "conservative"`)
 		return
 	}
+	if !validConservativeCeiling(body.ConservativeCeiling) {
+		fail(c, http.StatusBadRequest, 1400, "conservative_ceiling must be a positive integer, 0 (inherit the global default), or -1 (explicitly unlimited)")
+		return
+	}
 	owner, _ := currentUserID(c)
 	pool := models.ClaudePool{
 		ID: id, Name: name, Mode: mode, OwnerSub: owner,
@@ -303,6 +348,10 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		updates["mode"] = mode
 	}
 	if body.ConservativeCeiling != nil {
+		if !validConservativeCeiling(*body.ConservativeCeiling) {
+			fail(c, http.StatusBadRequest, 1400, "conservative_ceiling must be a positive integer, 0 (inherit the global default), or -1 (explicitly unlimited)")
+			return
+		}
 		updates["conservative_ceiling"] = *body.ConservativeCeiling
 	}
 	if len(updates) == 0 {
@@ -426,9 +475,15 @@ func AdminClaudePoolAddMember(c *gin.Context) {
 		return
 	}
 	var body struct {
-		UserSub   string `json:"user_sub"`
-		Email     string `json:"email"`
-		IsPrimary bool   `json:"is_primary"`
+		UserSub string `json:"user_sub"`
+		Email   string `json:"email"`
+		// Pointer, not bool: distinguishes "caller expressed no opinion" from
+		// "caller explicitly asked for false". A plain bool defaulted to false
+		// on omission, so re-invoking this endpoint as an idempotent "ensure
+		// member" call (no is_primary in the body) on an ALREADY-primary
+		// member silently demoted them via the OnConflict update — fixed
+		// below by only touching the is_primary column when this is non-nil.
+		IsPrimary *bool `json:"is_primary"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -448,25 +503,46 @@ func AdminClaudePoolAddMember(c *gin.Context) {
 	}
 	admin, _ := currentUserID(c)
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
-		if body.IsPrimary {
+		var totalCount int64
+		if err := tx.Model(&models.ClaudePoolMember{}).Where("user_sub = ?", userSub).Count(&totalCount).Error; err != nil {
+			return err
+		}
+		// A user's very first-ever membership MUST be primary — every user
+		// must have exactly one, which resolveUserPool depends on — so force
+		// it regardless of what the caller passed (or omitted).
+		forcedFirst := totalCount == 0
+		makePrimary := forcedFirst || (body.IsPrimary != nil && *body.IsPrimary)
+		touchPrimary := forcedFirst || body.IsPrimary != nil
+		if makePrimary {
 			if err := tx.Model(&models.ClaudePoolMember{}).Where("user_sub = ?", userSub).
 				Update("is_primary", false).Error; err != nil {
 				return err
 			}
 		}
-		return tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "pool_id"}, {Name: "user_sub"}},
-			DoUpdates: clause.AssignmentColumns([]string{"is_primary"}),
-		}).Create(&models.ClaudePoolMember{
-			PoolID: id, UserSub: userSub, IsPrimary: body.IsPrimary, AddedAt: time.Now(), AddedBy: admin,
+		conflict := clause.OnConflict{Columns: []clause.Column{{Name: "pool_id"}, {Name: "user_sub"}}}
+		if touchPrimary {
+			conflict.DoUpdates = clause.AssignmentColumns([]string{"is_primary"})
+		} else {
+			// Caller expressed no opinion and this isn't a brand-new user —
+			// an idempotent re-add of an EXISTING membership must leave
+			// is_primary exactly as it is, never reset it via the upsert.
+			conflict.DoNothing = true
+		}
+		return tx.Clauses(conflict).Create(&models.ClaudePoolMember{
+			PoolID: id, UserSub: userSub, IsPrimary: makePrimary, AddedAt: time.Now(), AddedBy: admin,
 		}).Error
 	})
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "add member: "+err.Error())
 		return
 	}
-	log.Printf("claude-pool: %s added %s to pool %q (primary=%v)", admin, userSub, id, body.IsPrimary)
-	ok(c, "ok", gin.H{"pool_id": id, "user_sub": userSub, "is_primary": body.IsPrimary})
+	// Re-read rather than assume: when the upsert took the DoNothing path
+	// (existing member, caller expressed no opinion), what changed inside
+	// the transaction doesn't tell us the row's actual final state.
+	var final models.ClaudePoolMember
+	common.DB.Where("pool_id = ? AND user_sub = ?", id, userSub).First(&final)
+	log.Printf("claude-pool: %s added/confirmed %s in pool %q (primary=%v)", admin, userSub, id, final.IsPrimary)
+	ok(c, "ok", gin.H{"pool_id": id, "user_sub": userSub, "is_primary": final.IsPrimary})
 }
 
 // AdminClaudePoolRemoveMember removes a user from a pool. Refuses (409) if

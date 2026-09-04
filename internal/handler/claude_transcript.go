@@ -820,16 +820,20 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 	// last hour still has its users homed on it, and that is exactly the case
 	// where an operator is asking "who is on this box".
 	//
-	// The box label lives on the ACCOUNT (claude_quota_tokens.label), and each
-	// field box holds one account, so grouping assignments by that label is the
-	// per-box user count.
+	// The box label lives on the ACCOUNT (claude_quota_tokens.label). Now that
+	// a user can belong to more than one ClaudePool (claude_user_assignments'
+	// PK is (pool_id, user_sub), not just user_sub), the SAME user can have
+	// multiple assignment rows that resolve to the same label — most likely
+	// two unlabeled accounts, both COALESCE-ing to '' — so COUNT(DISTINCT
+	// a.user_sub) is required here, not COUNT(*), or a multi-pool user is
+	// counted once per pool they're homed in rather than once per person.
 	var homed []struct {
 		Label string
 		N     int64
 	}
 	if err := common.DB.Table("claude_user_assignments AS a").
 		Joins("LEFT JOIN claude_quota_tokens AS t ON t.email = a.account").
-		Select("COALESCE(t.label,'') AS label, COUNT(*) AS n").
+		Select("COALESCE(t.label,'') AS label, COUNT(DISTINCT a.user_sub) AS n").
 		Group("t.label").
 		Scan(&homed).Error; err == nil {
 		idx := make(map[string]int, len(rows))

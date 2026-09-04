@@ -44,11 +44,24 @@ func conservativeOrder(poolID string) ([]string, error) {
 // global default (common.ClaudeConservativeCeiling, default 6). This is
 // INDEPENDENT of LUMID_CLAUDE_MAX_USERS_PER_ACCOUNT, which only governs
 // distributed-mode pools' hard headcount gate.
+//
+// Three-way sentinel, not two — ConservativeCeiling's zero value (every
+// pool's default at creation) means "inherit the global default," which
+// collides with "explicitly disable the backstop" if 0 meant both. A
+// negative value (by convention -1, validated in AdminClaudePoolCreate/
+// AdminClaudePoolUpdate) means the LATTER: an admin who deliberately wants
+// unlimited intake for this one pool, distinct from "never configured."
+// Without this distinction, PATCHing a pool to {conservative_ceiling: 0}
+// intending "no limit" silently fell back to the global default instead.
 func conservativeCeiling(pool models.ClaudePool) int {
-	if pool.ConservativeCeiling > 0 {
+	switch {
+	case pool.ConservativeCeiling > 0:
 		return pool.ConservativeCeiling
+	case pool.ConservativeCeiling < 0:
+		return 0 // explicitly unlimited — computeConservativeAssignment treats <=0 as disabled
+	default:
+		return common.ClaudeConservativeCeiling()
 	}
-	return common.ClaudeConservativeCeiling()
 }
 
 // computeConservativeAssignment fills `ordered` accounts IN ORDER rather than

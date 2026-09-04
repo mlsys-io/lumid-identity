@@ -1,6 +1,11 @@
 package handler
 
-import "testing"
+import (
+	"testing"
+
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
+)
 
 func allServable(accounts []string) map[string]bool {
 	m := make(map[string]bool, len(accounts))
@@ -107,5 +112,28 @@ func TestConservativeAssignment_UnplaceableWhenPoolIsFull(t *testing.T) {
 	}
 	if got["u1"] != "acct-1" {
 		t.Fatalf("incumbent u1 should keep its seat, got %q", got["u1"])
+	}
+}
+
+// conservativeCeiling's three-way sentinel: positive = explicit value, 0 =
+// inherit the global default, -1 = explicitly unlimited. A collision between
+// "never configured" and "explicitly disabled" (both reading as 0) was the
+// review-caught bug — the -1 sentinel is what lets an admin actually express
+// "no limit" for one pool without silently falling back to the global default.
+func TestConservativeCeiling_SentinelSemantics(t *testing.T) {
+	global := common.ClaudeConservativeCeiling() // env default, 6 unless overridden
+	cases := []struct {
+		name string
+		pool models.ClaudePool
+		want int
+	}{
+		{"unset (zero value) inherits global default", models.ClaudePool{ConservativeCeiling: 0}, global},
+		{"explicit positive value wins", models.ClaudePool{ConservativeCeiling: 12}, 12},
+		{"explicit -1 means unlimited (0)", models.ClaudePool{ConservativeCeiling: -1}, 0},
+	}
+	for _, c := range cases {
+		if got := conservativeCeiling(c.pool); got != c.want {
+			t.Errorf("%s: conservativeCeiling(%+v) = %d, want %d", c.name, c.pool, got, c.want)
+		}
 	}
 }

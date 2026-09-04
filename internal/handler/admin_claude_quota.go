@@ -2530,6 +2530,7 @@ func AdminClaudeAccountUsers(c *gin.Context) {
 	rows := []struct {
 		Account    string
 		Label      string
+		PoolID     string
 		UserSub    string
 		Email      string
 		Load7d     int64
@@ -2539,6 +2540,7 @@ func AdminClaudeAccountUsers(c *gin.Context) {
 	err := common.DB.Raw(`
 		SELECT a.account                     AS account,
 		       COALESCE(t.label, '')         AS label,
+		       COALESCE(t.pool_id, ?)        AS pool_id,
 		       a.user_sub                    AS user_sub,
 		       COALESCE(u.email, a.user_sub) AS email,
 		       a.load_7d                     AS load_7d,
@@ -2547,10 +2549,28 @@ func AdminClaudeAccountUsers(c *gin.Context) {
 		FROM   claude_user_assignments a
 		LEFT JOIN users u ON u.id = a.user_sub
 		LEFT JOIN claude_quota_tokens t ON t.email = a.account
-		ORDER  BY a.account, a.assigned_at DESC`).Scan(&rows).Error
+		ORDER  BY a.account, a.assigned_at DESC`, models.DefaultClaudePoolID).Scan(&rows).Error
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "query assignments: "+err.Error())
 		return
+	}
+	// Per-pool cap, not one global number: a "conservative" pool is DESIGNED
+	// to legitimately concentrate up to its own ceiling (default 6) on one
+	// account, which used to read as OverCap against the global distributed-
+	// mode headcount gate (default 5) — a false alarm on the very feature
+	// this dashboard exists to show working correctly.
+	var pools []models.ClaudePool
+	common.DB.Find(&pools)
+	poolByID := make(map[string]models.ClaudePool, len(pools))
+	for _, p := range pools {
+		poolByID[p.ID] = p
+	}
+	capForPool := func(poolID string) int {
+		p, ok := poolByID[poolID]
+		if ok && p.Mode == models.ClaudePoolModeConservative {
+			return conservativeCeiling(p) // 0 means unlimited here too
+		}
+		return common.ClaudeMaxUsersPerAccount()
 	}
 
 	type userEntry struct {
@@ -2563,6 +2583,8 @@ func AdminClaudeAccountUsers(c *gin.Context) {
 	type accountGroup struct {
 		Account   string      `json:"account"`
 		Label     string      `json:"label,omitempty"`
+		PoolID    string      `json:"pool_id,omitempty"`
+		Cap       int         `json:"cap"`
 		NUsers    int         `json:"n_users"`
 		OverCap   bool        `json:"over_cap"`
 		TotalLoad int64       `json:"total_load_7d"`
@@ -2573,7 +2595,7 @@ func AdminClaudeAccountUsers(c *gin.Context) {
 	for _, r := range rows {
 		g, ok := byAccount[r.Account]
 		if !ok {
-			g = &accountGroup{Account: r.Account, Label: r.Label}
+			g = &accountGroup{Account: r.Account, Label: r.Label, PoolID: r.PoolID}
 			byAccount[r.Account] = g
 			order = append(order, r.Account)
 		}
@@ -2592,12 +2614,13 @@ func AdminClaudeAccountUsers(c *gin.Context) {
 		}
 	}
 
-	userCap := common.ClaudeMaxUsersPerAccount()
 	overCapAccounts := 0
 	groups := make([]accountGroup, 0, len(order))
 	for _, acct := range order {
 		g := byAccount[acct]
-		if userCap > 0 && g.NUsers > userCap {
+		cap := capForPool(g.PoolID)
+		g.Cap = cap
+		if cap > 0 && g.NUsers > cap {
 			g.OverCap = true
 			overCapAccounts++
 		}
@@ -2607,8 +2630,11 @@ func AdminClaudeAccountUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"accounts":          groups,
-			"configured_cap":    userCap,
+			"accounts": groups,
+			// configured_cap kept for wire compatibility with older callers —
+			// now only meaningful for distributed-mode accounts; each row's
+			// own "cap" field is authoritative (per-pool, per-mode).
+			"configured_cap":    common.ClaudeMaxUsersPerAccount(),
 			"over_cap_accounts": overCapAccounts,
 		},
 	})

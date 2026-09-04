@@ -154,6 +154,7 @@ func ResetPasswordHandler(c *gin.Context) {
 	// Revoke every live session — a password reset means the user
 	// lost control of something; killing existing sessions is safer
 	// than silently keeping stolen cookies alive.
+	doomed := liveSessionsForUser(row.UserID, "")
 	if err := tx.Model(&models.Session{}).
 		Where("user_id = ? AND revoked_at IS NULL", row.UserID).
 		Update("revoked_at", &now).Error; err != nil {
@@ -169,6 +170,12 @@ func ResetPasswordHandler(c *gin.Context) {
 		return
 	}
 	tx.Commit()
+
+	// AFTER the commit. A reset means the user lost control of something, so
+	// leaving the old cookie alive until it expires is the exact failure this
+	// flow exists to prevent -- and flipping revoked_at alone did not stop it,
+	// because the verified-JWT fast path never reads that column.
+	denylistSessions(c.Request.Context(), doomed)
 
 	ok(c, "password updated", nil)
 }

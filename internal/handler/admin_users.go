@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"net/http"
@@ -893,10 +894,17 @@ func revokeUserSessionsAndTokens(userID, reason string) int {
 		Update("revoked_at", &now)
 	n += r1.RowsAffected
 
+	// Captured BEFORE the update -- afterwards these rows no longer match
+	// `revoked_at IS NULL` and the jtis are unrecoverable.
+	doomed := liveSessionsForUser(userID, "")
 	r2 := common.DB.Model(&models.Session{}).
 		Where("user_id = ? AND revoked_at IS NULL", userID).
 		Update("revoked_at", &now)
 	n += r2.RowsAffected
+
+	// An admin suspending an account expects it dead now, not at cookie expiry.
+	denylistSessions(context.Background(), doomed)
+
 	_ = reason
 	return int(n)
 }

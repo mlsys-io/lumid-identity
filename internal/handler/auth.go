@@ -122,6 +122,12 @@ func LogoutHandler(c *gin.Context) {
 			common.DB.Model(&models.Session{}).
 				Where("jti = ?", claims.ID).
 				Update("revoked_at", &now)
+			// ...and deny it NOW. Without this the durable row is flipped but
+			// pat.go's verified-JWT fast path never reads it, so "log out" left
+			// the token working until it expired on its own.
+			if claims.ExpiresAt != nil {
+				common.RevokeSessionJTI(c.Request.Context(), claims.ID, time.Until(claims.ExpiresAt.Time))
+			}
 		}
 	}
 	clearSessionCookie(c)

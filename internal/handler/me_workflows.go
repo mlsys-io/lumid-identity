@@ -539,14 +539,19 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					StepCount:    len(L.Steps),
 					CostCentsMTD: costMap[e.Name()+"."+L.Name],
 				}
-				// Experiments attached to this loop (flask chip).
+				// Experiments attached to this loop (flask chip). expRef —
+				// either key may carry one id or a list.
 				expIDs := map[string]bool{}
-				if L.Engine.Experiment != "" {
-					expIDs[L.Engine.Experiment] = true
+				for _, id := range L.Engine.Experiment {
+					if id != "" {
+						expIDs[id] = true
+					}
 				}
 				for _, st := range L.Steps {
-					if st.Experiment != "" {
-						expIDs[st.Experiment] = true
+					for _, id := range st.Experiment {
+						if id != "" {
+							expIDs[id] = true
+						}
 					}
 				}
 				for eid := range expIDs {
@@ -664,8 +669,8 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				Datasets:       []string(L.Datasets),
 				DatasetsDetail: dsDetail,
 			}
-			if L.Engine.Experiment != "" {
-				row.ExperimentIDs = []string{L.Engine.Experiment}
+			if len(L.Engine.Experiment) > 0 {
+				row.ExperimentIDs = append([]string(nil), L.Engine.Experiment...)
 			}
 			// The only run evidence that survives the node boundary. Without
 			// it an app whose loop is @trigger — "it runs when you talk" —

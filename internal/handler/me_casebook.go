@@ -59,10 +59,12 @@ func loopExperiments(appDir, loop string) []string {
 		Loops []struct {
 			Name   string `yaml:"name"`
 			Engine struct {
-				Experiment string `yaml:"experiment"`
+				// expRef: one id or a list — a plain string fails the whole
+				// unmarshal on a list attachment (scalar-attachment bug #5).
+				Experiment expRef `yaml:"experiment"`
 			} `yaml:"engine"`
 			Steps []struct {
-				Experiment string `yaml:"experiment"`
+				Experiment expRef `yaml:"experiment"`
 			} `yaml:"steps"`
 		} `yaml:"loops"`
 	}
@@ -81,9 +83,13 @@ func loopExperiments(appDir, loop string) []string {
 		if l.Name != loop {
 			continue
 		}
-		add(l.Engine.Experiment)
+		for _, id := range l.Engine.Experiment {
+			add(id)
+		}
 		for _, s := range l.Steps {
-			add(s.Experiment)
+			for _, id := range s.Experiment {
+				add(id)
+			}
 		}
 	}
 	return out

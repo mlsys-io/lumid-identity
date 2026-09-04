@@ -547,17 +547,24 @@ func (f *flexStrings) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// Experiment is expRef (one id OR a list), not string: a loop may feed
+// several experiments — quant-research's `backtest` attaches
+// [backtest_evidence, backtest_performance] — and a plain string made the
+// WHOLE spec unmarshal fail ("cannot unmarshal !!seq into string"), so every
+// loop in the app vanished from /me/workflows and the Workflows tab rendered
+// its empty state. Fifth instance of the scalar-attachment bug; expLoops in
+// me_experiments.go got the same fix first.
 type rawEngine struct {
 	Type       string `json:"type"       yaml:"type"`
 	Module     string `json:"module"     yaml:"module"`
-	Experiment string `json:"experiment" yaml:"experiment"`
+	Experiment expRef `json:"experiment" yaml:"experiment"`
 }
 
 type rawStep struct {
 	ID             string `json:"id"              yaml:"id"`
 	Skill          string `json:"skill"           yaml:"skill"`
 	KnowledgeAgent string `json:"knowledge_agent" yaml:"knowledge_agent"`
-	Experiment     string `json:"experiment"      yaml:"experiment"`
+	Experiment     expRef `json:"experiment"      yaml:"experiment"`
 }
 
 type rawGoal struct {

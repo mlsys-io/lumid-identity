@@ -497,6 +497,17 @@ func MeTrajectory(c *gin.Context) {
 	if expDir == "" {
 		// 9. No experiments dir → linear run chain from cycle dirs.
 		nodes, cycles := linearRunChain(appDir, loop, cycleDirs, durCache, memTimes, declaredDataVer, runModels)
+		if len(nodes) == 0 {
+			// resolveAppDir returned identity's MATERIALIZED BUNDLE CACHE —
+			// non-empty, so the appDir=="" cross-node fallback above never
+			// fired, and this branch walked the cache's (empty) runtime dirs:
+			// the workflow page rendered "No run trajectory yet" for a tenant
+			// loop with hundreds of DB-recorded runs (observed live
+			// 2026-09-05, quant-research.backtest). A cache directory is not
+			// run evidence; when the disk yields nothing, reconstruct from
+			// the run store exactly as the no-dir path does.
+			nodes, cycles = trajNodesFromRuns(appRunsFor(userID, app, loop), loopMetricName(userID, app, loop))
+		}
 		assignNodeVersions(nodes)
 		data["has_variants"] = false
 		data["nodes"] = nodes
@@ -682,6 +693,13 @@ func MeTrajectory(c *gin.Context) {
 		cycles = append(cycles, cyc)
 	}
 
+	if len(nodes) == 0 {
+		// Same cache-shadow as the linear branch: an experiments dir can exist
+		// in identity's materialized copy with zero result rows while the DB
+		// holds the runs. Disk yields nothing → reconstruct from the run store.
+		nodes, cycles = trajNodesFromRuns(appRunsFor(userID, app, loop), loopMetricName(userID, app, loop))
+		data["has_variants"] = false
+	}
 	assignNodeVersions(nodes)
 	data["nodes"] = nodes
 	data["cycles"] = cycles

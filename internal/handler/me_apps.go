@@ -512,7 +512,8 @@ func installAppName(payload map[string]any) string {
 // else "pending". The bearer column is NEVER included in the returned
 // envelope (it lives outside `payload`).
 func MeIntentGet(c *gin.Context) {
-	if _, ok := currentUserID(c); !ok {
+	userID, ok := currentUserID(c)
+	if !ok {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
@@ -521,8 +522,16 @@ func MeIntentGet(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid intent id")
 		return
 	}
+	// Scoped to the CALLER's intents. The lookup used to match on id alone, so
+	// any authenticated user who learned (or guessed) an intent UUID could
+	// read another user's intent — payloads carry app names, loop args and
+	// run subjects. A foreign id 404s indistinguishably from a nonexistent
+	// one, so the endpoint leaks nothing about which ids exist. Admins are
+	// not exempted here on purpose: nothing in the product polls another
+	// user's intent by id, and an ops need reads the DB.
 	var row models.MeAppIntent
-	if err := common.DB.Where("id = ?", id).First(&row).Error; err != nil {
+	if err := common.DB.Where("id = ? AND user_sub = ?", id, userID).
+		First(&row).Error; err != nil {
 		fail(c, http.StatusNotFound, 1404, "intent not found")
 		return
 	}

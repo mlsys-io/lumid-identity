@@ -304,3 +304,29 @@ func TestMeIntentQueueHealthyIntentUnaffected(t *testing.T) {
 		t.Fatalf("attempts=%d, want 1", row.Attempts)
 	}
 }
+
+// MeIntentGet is scoped to the CALLER's intents: matching on id alone let any
+// authenticated user who learned an intent UUID read another user's intent
+// (payloads carry app names, loop args and run subjects). A foreign id must
+// behave exactly like a nonexistent one.
+func TestIntentLookupIsCallerScoped(t *testing.T) {
+	db := setupIntentDB(t)
+	row := models.MeAppIntent{
+		ID: "11111111-2222-4333-8444-555555555555", Action: "run_loop",
+		UserSub: "user-a", Payload: `{"app":"quant-research"}`,
+		Status: "pending", CreatedAt: time.Now(),
+	}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var got models.MeAppIntent
+	// The exact query MeIntentGet issues, for the wrong caller:
+	err := db.Where("id = ? AND user_sub = ?", row.ID, "user-b").First(&got).Error
+	if err == nil {
+		t.Fatal("user-b read user-a's intent — the scoping is gone")
+	}
+	// And for the owner:
+	if err := db.Where("id = ? AND user_sub = ?", row.ID, "user-a").First(&got).Error; err != nil {
+		t.Fatalf("owner could not read their own intent: %v", err)
+	}
+}

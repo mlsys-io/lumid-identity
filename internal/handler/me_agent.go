@@ -2299,6 +2299,10 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody, wantTools 
 			// identity's tool catalog — a file-capable agent can adopt the app's
 			// voice from its prompts without needing a tool at all.
 			ctxBlock += appVoiceHint(userID, app)
+			// Inline the app's @trigger loop descriptions — the authored grammar
+			// (e.g. quant-research's `.lqts` reference) that a grounded chat needs
+			// to write a compilable payload instead of hunting the filesystem.
+			ctxBlock += appVerbsHint(userID, app)
 			// Voice alone left the tool-less path in character but without the
 			// case; carry the content too, so picking a case works on every model.
 			if n := len(body.Messages); n > 0 {

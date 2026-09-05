@@ -1029,6 +1029,70 @@ func groundedActionsHint(userID, app string) string {
 	return b.String()
 }
 
+// appVerbsHint inlines the grounded app's user-invokable loop descriptions
+// (`schedule: @trigger`) into the system prompt. Those descriptions are the
+// app author's own "how to call me" docs — quant-research's `send_strategy`
+// carries the full `.lqts` grammar, a compiled worked example, the three
+// exact parse errors students hit, and the explicit "do NOT go hunting the
+// filesystem: /proj/LQT does not exist in this sandbox" guidance.
+//
+// Before this, none of that reached a grounded chat turn: appActionsCatalog
+// parses UI form/table blocks, not xpcloud loops, and renderViewingContext
+// only names the app. So when a user asked the grounded chat to write a
+// strategy, the model had no grammar — it globbed for a repo that isn't there
+// (measured 121s on 2026-08-29) or refused, and when it did emit source the
+// compiler rejected it (4 of 4 chat-authored strategies rejected). The
+// authored anti-patterns exist precisely to be read at authoring time; this
+// is what puts them in front of the model that authors.
+//
+// Inlined, not a path — the claude-code provider runs in its own sandbox and
+// cannot read the bundle (same reason appVoiceHint inlines the voice prompt).
+func appVerbsHint(userID, app string) string {
+	dir := resolveAppDir(userID, app)
+	if dir == "" {
+		return ""
+	}
+	specPath, ok := ResolveSpecPath(dir)
+	if !ok {
+		return ""
+	}
+	loops, err := readYamlLoops(specPath)
+	if err != nil {
+		return ""
+	}
+	// Budget: the whole point is that send_strategy's grammar (~2.6KB) travels
+	// intact, but a pathological app with many verbose triggers must not blow
+	// the context. Cap the total; keep each description whole until the cap.
+	const maxVerbs = 12 << 10
+	var b strings.Builder
+	used := 0
+	for _, L := range loops {
+		if strings.TrimSpace(L.Schedule) != "@trigger" {
+			continue
+		}
+		desc := strings.TrimSpace(L.Description)
+		if desc == "" || L.Name == "" {
+			continue
+		}
+		if used == 0 {
+			fmt.Fprintf(&b, "\n--- %s: how to call this app's workflows (author payloads from THIS, not from the filesystem) ---\n", app)
+		}
+		block := fmt.Sprintf("\n## %s\n%s\n", L.Name, desc)
+		if used+len(block) > maxVerbs {
+			// Stop cleanly at a loop boundary rather than truncate mid-grammar.
+			break
+		}
+		b.WriteString(block)
+		used += len(block)
+	}
+	if used == 0 {
+		return ""
+	}
+	b.WriteString("\n--- end of workflow reference ---\n")
+	b.WriteString("These descriptions are authoritative and self-contained: everything needed to construct a workflow's arguments is above. Do not search the filesystem or the LQT repo to answer — answer from this reference. When a description shows a worked example or lists rejected forms, follow the example and avoid those forms exactly.\n")
+	return b.String()
+}
+
 // groundedApp pulls the app from the viewing context the chat request carried.
 func groundedApp(c *gin.Context) string {
 	if v, ok := c.Get("viewing_app"); ok {

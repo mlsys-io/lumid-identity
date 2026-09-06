@@ -1048,8 +1048,15 @@ func readYamlLoopMeasurementBytes(b []byte) map[string]loopMeasurement {
 				Primary string `yaml:"primary"`
 			} `yaml:"metrics"`
 			DatasetID string `yaml:"dataset_id"`
-			Engine    struct {
-				Experiment flexStrings `yaml:"experiment"`
+			// expRef, NOT flexStrings: flexStrings decodes into []any and
+			// RETURNS THE ERROR for a scalar, which fails the whole document
+			// and blanks the map for every loop in the app. quant-research's
+			// kol_strategy declares `experiment: kol_alpha` (scalar) while
+			// backtest declares a list, so one scalar cost all ten loops their
+			// metric. expRef takes either and attaches nothing on malformed
+			// input rather than failing the spec.
+			Engine struct {
+				Experiment expRef `yaml:"experiment"`
 			} `yaml:"engine"`
 		} `yaml:"loops"`
 		Experiments []struct {

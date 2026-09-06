@@ -113,9 +113,24 @@ func (ClaudePool) TableName() string { return "claude_pools" }
 // request, and every PAT that isn't deliberately scoped to a non-primary
 // pool. See resolveUserPool in claude_pool_admin.go.
 type ClaudePoolMember struct {
-	PoolID    string    `gorm:"column:pool_id;size:64;primaryKey"                     json:"pool_id"`
-	UserSub   string    `gorm:"column:user_sub;size:36;primaryKey;index:idx_cpm_user" json:"user_sub"`
-	IsPrimary bool      `gorm:"column:is_primary;not null;default:false"              json:"is_primary"`
+	PoolID    string `gorm:"column:pool_id;size:64;primaryKey"                     json:"pool_id"`
+	UserSub   string `gorm:"column:user_sub;size:36;primaryKey;index:idx_cpm_user" json:"user_sub"`
+	IsPrimary bool   `gorm:"column:is_primary;not null;default:false"              json:"is_primary"`
+	// IsManager — may this member administer THIS POOL's Claude accounts:
+	// pause/resume them, and reset the usage clock for this pool's members?
+	//
+	// A delegated slice of two powers that are otherwise admin/super_admin and
+	// estate-wide. Scoped to (pool, user) precisely so a delegate can never
+	// reach an account or a member outside the pool they were given — the
+	// grant IS the scope, rather than a role that would carry estate-wide.
+	//
+	// Granting is super_admin, matching pool creation and reset-window: those
+	// are the "hand out capacity" decisions, and handing out the power to
+	// reset a usage clock is the same act one level removed. Being a manager
+	// confers NO platform role: parseScope and computeAccess never see it, and
+	// it grants nothing outside the two pool-scoped endpoints in
+	// claude_pool_manager.go.
+	IsManager bool      `gorm:"column:is_manager;not null;default:false"              json:"is_manager"`
 	AddedAt   time.Time `gorm:"column:added_at;autoCreateTime"                        json:"added_at"`
 	// AddedBy — the admin sub who added this membership (audit only; empty
 	// for rows created by the migration backfill or by lazy self-enrollment).

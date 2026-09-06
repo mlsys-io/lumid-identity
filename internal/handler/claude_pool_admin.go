@@ -504,11 +504,21 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 // cleaned up. pruneIdleAssignments — which its own comment calls "the only
 // code path that deletes a ClaudeUserAssignment" — evicts on IDLENESS and
 // checks usage_events globally, with no notion of membership at all. So an
-// orphaned row belonging to a user who is still active in some OTHER pool is
-// never reclaimed: it is permanent.
+// orphan belonging to a user who is still active in some OTHER pool is invisible
+// to the only reclaimer there is, and survives for exactly as long as that user
+// keeps working (LUMID_CLAUDE_ASSIGNMENT_IDLE, default 30m, measured from their
+// last turn ANYWHERE — not from their last turn in the pool they left).
+//
+// An earlier version of this comment said "never reclaimed: it is permanent".
+// That was wrong and the live data corrected it: the row observed below was
+// gone ~53 minutes later, once the user had been idle past the window, taking
+// their real placement with it. The defect is a phantom slot held by an ACTIVE
+// user, not an immortal row — which is still worth fixing here, because the
+// slot is charged against a cap in a pool they are not in, and the correct
+// moment to release it is the removal, not whenever they next stop working.
 //
 // Observed live 2026-09-06: a user moved from "default" to "rsi" kept their
-// default-pool placement on ylu@yao.lu indefinitely. Not an isolation breach —
+// default-pool placement on ylu@yao.lu. Not an isolation breach —
 // lease candidates are pool-scoped (WHERE pool_id = ?) and `prefer` comes from
 // the request or the session binding, never from this table — but the row
 // occupies a slot against that account's cap, misreports on /code as a member
@@ -602,16 +612,22 @@ func AdminClaudePoolMembers(c *gin.Context) {
 		return
 	}
 	type memberOut struct {
-		UserSub   string    `json:"user_sub"`
-		Email     string    `json:"email"`
-		IsPrimary bool      `json:"is_primary"`
+		UserSub   string `json:"user_sub"`
+		Email     string `json:"email"`
+		IsPrimary bool   `json:"is_primary"`
+		// IsManager — delegated pool-account management (pause/resume this
+		// pool's accounts, reset this pool's members' usage clocks). Surfaced
+		// here so the members panel can show and grant it; the capability
+		// itself is enforced per request in claude_pool_manager.go, never by
+		// this listing.
+		IsManager bool      `json:"is_manager"`
 		AddedAt   time.Time `json:"added_at"`
 	}
 	out := make([]memberOut, 0, len(members))
 	for _, m := range members {
 		var email string
 		common.DB.Raw(`SELECT email FROM users WHERE id = ?`, m.UserSub).Scan(&email)
-		out = append(out, memberOut{UserSub: m.UserSub, Email: email, IsPrimary: m.IsPrimary, AddedAt: m.AddedAt})
+		out = append(out, memberOut{UserSub: m.UserSub, Email: email, IsPrimary: m.IsPrimary, IsManager: m.IsManager, AddedAt: m.AddedAt})
 	}
 	ok(c, "ok", gin.H{"pool_id": id, "members": out})
 }

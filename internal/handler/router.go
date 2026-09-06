@@ -278,6 +278,16 @@ func Register(r *gin.Engine) {
 			me.POST("/data-query", MeDataQuery)
 			me.GET("/findata-sql", MeFindataSQL)
 			me.POST("/findata-sql/credential", MeFindataSQLMint)
+			// Delegated Claude-pool management. Ordinary-user routes on
+			// purpose: a delegate holds no role, so RequireAdmin would refuse
+			// them. Each handler re-derives the caller's managed pools and
+			// checks them against the resource being touched — see
+			// claude_pool_manager.go. `manage` answers 200-with-nothing for a
+			// non-manager so the UI can hide the section without the API
+			// relying on that hiding.
+			me.GET("/claude-pool/manage", MeClaudePoolManage)
+			me.POST("/claude-pool/accounts/:email/drain", MeClaudePoolAccountDrain)
+			me.POST("/claude-pool/reset-window", MeClaudePoolResetWindow)
 			me.DELETE("/findata-sql/credential", MeFindataSQLRevoke)
 			// Read the stored credential back. PAT-with-scope only — a browser
 			// session must never be able to read a standing warehouse password,
@@ -644,6 +654,10 @@ func Register(r *gin.Engine) {
 			// structural administration over a pool that already exists and
 			// stays admin-level in adminQuota below.
 			superAdmin.POST("/claude-pools", AdminClaudePoolCreate)
+			// Delegating pool-account management is the same "hand out
+			// capacity" act as creating a pool or resetting a window, one
+			// level removed — so it sits at the same gate, not at admin.
+			superAdmin.POST("/claude-pools/:id/members/:user_sub/manager", AdminClaudePoolSetManager)
 		}
 
 		// admin + super_admin — Claude Code quota dashboard (/quota page) and

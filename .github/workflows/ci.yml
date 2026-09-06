@@ -10,6 +10,36 @@ jobs:
   test:
     name: Build & test
     runs-on: ubuntu-latest
+
+    # A DATABASE, because without one this package's DB-backed tests SKIP and a
+    # green run means almost nothing. Measured 2026-09-06: 17 of 32 pool tests
+    # skipped in CI, including every delegated-management containment check
+    # (cross-pool drain, self-reset) and the introspection query-cost
+    # regression. Anyone could have regressed those and CI would have stayed
+    # green — which is also how a broken chat-title test sat unnoticed, passing
+    # only because common.DB was nil.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci
+          MYSQL_DATABASE: lumid_identity
+        ports:
+          - 3306:3306
+        # Without a healthcheck the steps start before mysqld accepts
+        # connections and every DB test fails on dial rather than on its own
+        # assertion — a red build that says nothing about the code.
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      # The gate the tests read. Set here rather than per-step so a new test
+      # file picks it up without touching this workflow.
+      TEST_MYSQL_DSN: "root:ci@tcp(127.0.0.1:3306)/lumid_identity?parseTime=true&charset=utf8mb4"
+
     steps:
       - uses: actions/checkout@v4
 

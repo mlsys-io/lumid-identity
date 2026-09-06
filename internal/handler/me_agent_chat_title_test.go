@@ -1,12 +1,10 @@
 package handler
 
 import (
-	"encoding/json"
-	"lumid_identity/internal/common"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+
+	"lumid_identity/internal/common"
 )
 
 func TestCleanChatTitleStripsModelFormattingHabits(t *testing.T) {
@@ -85,52 +83,45 @@ func TestChatTitleExcerptUsesFirstExchangeAndBlockContent(t *testing.T) {
 // The whole point of the title_summary flag: a later save must not revert a
 // generated title to the truncated first message.
 func TestSetChatTitleIsWriteOnceAndPreservesTranscript(t *testing.T) {
-	// setChatTitle moved from per-pod JSON files to MySQL (chats were invisible
-	// across identity's 2 replicas). This test seeds a FILE and asserts on a
-	// FILE, so it now needs a DB — the legacy-file read path only migrates a
-	// record in, it never writes one back out.
+	// Re-implemented against the STORE, as this test's previous version asked
+	// for. setChatTitle moved from per-pod JSON files to MySQL (chats were
+	// invisible across identity's 2 replicas), but the test still seeded a FILE
+	// and asserted on a FILE — and the legacy-file path only migrates a record
+	// IN, never writes one back out. So it passed only while common.DB was nil
+	// and failed the moment any other test in the package set it, which is
+	// exactly what happens once CI has a database. Green by absence of a DB is
+	// not coverage.
 	//
-	// Gated rather than deleted: "a later save must not revert a generated
-	// title" is still the invariant that matters, and this should be
-	// re-implemented against the store (seed via chatStoreSave, assert via
-	// chatStoreGet) rather than lost.
+	// The invariant is unchanged and is the one worth keeping: a later save
+	// must not revert a generated title, and must not clobber the transcript.
 	if common.DB == nil {
 		t.Skip("needs a DB — setChatTitle is DB-backed since the replica-safety fix")
 	}
 	t.Setenv("LUMID_OPERATOR_HOME", t.TempDir())
 
-	userID := "user-1"
-	cdir := chatsDir(userID)
-	if err := os.MkdirAll(cdir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	userID := "user-chat-title-1"
 	id := "chat-0123456789abcdef"
-	orig := chatRecord{
+	t.Cleanup(func() { common.DB.Exec(`DELETE FROM me_chats WHERE user_sub = ?`, userID) })
+	if err := chatStoreSave(userID, &chatRecord{
 		ID:    id,
 		Title: "how do I rotate the LB cert and then...",
 		Messages: []map[string]any{
 			{"role": "user", "content": "how do I rotate the LB cert"},
 			{"role": "assistant", "content": "Run the reconcile job."},
 		},
-	}
-	b, _ := json.Marshal(orig)
-	if err := os.WriteFile(filepath.Join(cdir, id+".json"), b, 0o644); err != nil {
-		t.Fatal(err)
+	}); err != nil {
+		t.Fatalf("seed chat: %v", err)
 	}
 
 	if err := setChatTitle(userID, id, "Rotating the LB cert"); err != nil {
 		t.Fatalf("setChatTitle: %v", err)
 	}
 	read := func() chatRecord {
-		raw, err := os.ReadFile(chatPath(userID, id))
+		r, err := chatStoreGet(userID, id)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("chatStoreGet: %v", err)
 		}
-		var r chatRecord
-		if err := json.Unmarshal(raw, &r); err != nil {
-			t.Fatal(err)
-		}
-		return r
+		return *r
 	}
 	got := read()
 	if got.Title != "Rotating the LB cert" {

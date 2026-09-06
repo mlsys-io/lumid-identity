@@ -101,10 +101,10 @@ var lqtReadEndpoints = map[string]lqtReadSpec{
 	// strategies exist?" would read every other user's work; for a graded
 	// cohort that is an answer-sharing channel that needs no intent to open.
 	// Reported 2026-08-31, verified live 2026-09-03.
-	"strategies": {path: "/xpio/strategies", list: true, crossTenant: true},
-	"results":    {path: "/xpio/results", list: true, crossTenant: true},
-	"cycles_nyc":          {path: "/runtime/cycles/nyc", list: true},
-	"signals_venue_mid":   {path: "/lqt/signals/venue_mid", list: true},
+	"strategies":        {path: "/xpio/strategies", list: true, crossTenant: true},
+	"results":           {path: "/xpio/results", list: true, crossTenant: true},
+	"cycles_nyc":        {path: "/runtime/cycles/nyc", list: true},
+	"signals_venue_mid": {path: "/lqt/signals/venue_mid", list: true},
 	// Per-strategy reads — what a grounded chat actually needs. Tenant-scoped
 	// server-side (unlike the cross-tenant `results` feed), so this narrows
 	// exposure rather than widening it.

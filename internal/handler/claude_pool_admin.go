@@ -497,6 +497,30 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 	ok(c, "ok", resp)
 }
 
+// dropPoolAssignments deletes placement rows for a pool, optionally narrowed
+// to one user (userSub == "" means every member of the pool).
+//
+// Membership and PLACEMENT are separate tables, and only membership was ever
+// cleaned up. pruneIdleAssignments — which its own comment calls "the only
+// code path that deletes a ClaudeUserAssignment" — evicts on IDLENESS and
+// checks usage_events globally, with no notion of membership at all. So an
+// orphaned row belonging to a user who is still active in some OTHER pool is
+// never reclaimed: it is permanent.
+//
+// Observed live 2026-09-06: a user moved from "default" to "rsi" kept their
+// default-pool placement on ylu@yao.lu indefinitely. Not an isolation breach —
+// lease candidates are pool-scoped (WHERE pool_id = ?) and `prefer` comes from
+// the request or the session binding, never from this table — but the row
+// occupies a slot against that account's cap, misreports on /code as a member
+// of a pool the user left, and silently re-homes them if they ever rejoin.
+func dropPoolAssignments(tx *gorm.DB, poolID, userSub string) error {
+	q := tx.Where("pool_id = ?", poolID)
+	if userSub != "" {
+		q = q.Where("user_sub = ?", userSub)
+	}
+	return q.Delete(&models.ClaudeUserAssignment{}).Error
+}
+
 // AdminClaudePoolDelete removes a pool. Refuses (409) if it still has
 // accounts or members unless ?force=true, in which case both are
 // reassigned to "default" in the same transaction first — never orphaned.
@@ -551,6 +575,11 @@ func AdminClaudePoolDelete(c *gin.Context) {
 			if err := tx.Where("pool_id = ?", id).Delete(&models.ClaudePoolMember{}).Error; err != nil {
 				return err
 			}
+		}
+		// Every placement in this pool, whether or not the pool had members
+		// left: the rows point at a pool_id that is about to stop existing.
+		if err := dropPoolAssignments(tx, id, ""); err != nil {
+			return err
 		}
 		return tx.Delete(&pool).Error
 	})
@@ -704,6 +733,12 @@ func AdminClaudePoolRemoveMember(c *gin.Context) {
 	var promoted string
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("pool_id = ? AND user_sub = ?", id, userSub).Delete(&models.ClaudePoolMember{}).Error; err != nil {
+			return err
+		}
+		// Their placement in THIS pool goes with the membership. Leaving it
+		// behind is what stranded a real user's row on a default-pool account
+		// after they moved to another pool — see dropPoolAssignments.
+		if err := dropPoolAssignments(tx, id, userSub); err != nil {
 			return err
 		}
 		if target.IsPrimary {

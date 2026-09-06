@@ -93,10 +93,23 @@ type ClaudePool struct {
 	//
 	// This flag is an opt-IN: setting it true re-opens externally-billed models
 	// for one pool without lifting the block for anybody else.
-	AllowOpenrouter bool           `gorm:"column:allow_openrouter;not null;default:false" json:"allow_openrouter"`
-	CreatedAt       time.Time      `gorm:"autoCreateTime"                                  json:"created_at"`
-	UpdatedAt       time.Time      `gorm:"autoUpdateTime"                                  json:"updated_at"`
-	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index"                         json:"-"`
+	AllowOpenrouter bool `gorm:"column:allow_openrouter;not null;default:false" json:"allow_openrouter"`
+	// AllowFable — may this pool's members use the Fable tier?
+	//
+	// DEFAULTS FALSE, like AllowOpenrouter and for the same reason: preserve
+	// today's behaviour, which is claude-proxy's modelAllowed refusing any
+	// "fable" id to everyone below super_admin. Fable is also the priciest
+	// tier on the platform ($10/$50 per MTok against Opus's $5/$25).
+	//
+	// The gate this replaces was OURS, not Anthropic's: GET /v1/models on the
+	// pooled credentials lists claude-fable-5-1 with full capabilities, so the
+	// accounts can serve it. A separate, unresolved upstream 429 still refuses
+	// these requests — this flag governs who we let TRY, which is a different
+	// question from whether Anthropic answers.
+	AllowFable bool           `gorm:"column:allow_fable;not null;default:false" json:"allow_fable"`
+	CreatedAt  time.Time      `gorm:"autoCreateTime"                                  json:"created_at"`
+	UpdatedAt  time.Time      `gorm:"autoUpdateTime"                                  json:"updated_at"`
+	DeletedAt  gorm.DeletedAt `gorm:"column:deleted_at;index"                         json:"-"`
 }
 
 func (ClaudePool) TableName() string { return "claude_pools" }

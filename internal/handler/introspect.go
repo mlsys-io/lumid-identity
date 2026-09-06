@@ -111,6 +111,9 @@ type IntrospectResponse struct {
 	// consumer treats an absent value as DENIED, because an old identity
 	// server must not be able to open a spend path.
 	AllowOpenrouter bool `json:"allow_openrouter"`
+	// AllowFable — may this identity use the Fable tier? Same non-omitempty
+	// and fail-closed reasoning as AllowOpenrouter.
+	AllowFable bool `json:"allow_fable"`
 }
 
 // Introspect — POST /oauth/introspect (form or JSON body).
@@ -200,6 +203,7 @@ func enrichClaudePolicy(resp IntrospectResponse) IntrospectResponse {
 	}
 	resp.AllowOnprem = ClaudeOnpremAllowedFor(resp.Sub, resp.Scopes)
 	resp.AllowOpenrouter = ClaudeOpenrouterAllowedFor(resp.Sub, resp.Scopes)
+	resp.AllowFable = ClaudeFableAllowedFor(resp.Sub, resp.Scopes)
 	return resp
 }
 

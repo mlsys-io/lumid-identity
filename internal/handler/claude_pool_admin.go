@@ -278,6 +278,21 @@ func ClaudeOpenrouterAllowedFor(userSub string, scopes []string) bool {
 	return p.AllowOpenrouter
 }
 
+// ClaudeFableAllowedFor reports whether this identity may use the Fable tier.
+// Fails CLOSED, like the OpenRouter verdict and for the same reason: it is the
+// priciest tier, and a DB blip must not open it.
+func ClaudeFableAllowedFor(userSub string, scopes []string) bool {
+	if userSub == "" {
+		return false
+	}
+	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
+	var p models.ClaudePool
+	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
+		return false
+	}
+	return p.AllowFable
+}
+
 // poolModeOf reads a pool's Mode, defaulting to distributed on any lookup
 // failure (fail open: a transient DB error must not silently switch a pool
 // into concentration behavior it never asked for).
@@ -393,7 +408,7 @@ func AdminClaudePoolList(c *gin.Context) {
 // id (slug) itself is immutable — see AdminClaudePoolCreate.
 //
 // PATCH /api/v1/admin/claude-pools/:id  (RequireAdmin)
-// Body: {name?, mode?, conservative_ceiling?, allow_onprem?, allow_openrouter?}
+// Body: {name?, mode?, conservative_ceiling?, allow_onprem?, allow_openrouter?, allow_fable? (super_admin)}
 func AdminClaudePoolUpdate(c *gin.Context) {
 	id := strings.ToLower(strings.TrimSpace(c.Param("id")))
 	var pool models.ClaudePool
@@ -415,6 +430,9 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		// Same *bool discipline as AllowOnprem, and the stakes are higher here:
 		// the zero value would OPEN a spend path rather than close one.
 		AllowOpenrouter *bool `json:"allow_openrouter"`
+		// Changing this one needs super_admin even though the route sits in
+		// the admin group — see the gate below.
+		AllowFable *bool `json:"allow_fable"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -457,6 +475,17 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 	}
 	if body.AllowOpenrouter != nil {
 		updates["allow_openrouter"] = *body.AllowOpenrouter
+	}
+	// Handing out the Fable tier is the same "hand out capacity" act as
+	// creating a pool or resetting a window, both super_admin. Enforced inside
+	// the handler rather than by splitting the route, so a PATCH touching only
+	// the admin-level fields still works for a plain admin.
+	if body.AllowFable != nil {
+		if _, role, okRole := resolveRole(bearerToken(c)); !okRole || role != "super_admin" {
+			fail(c, http.StatusForbidden, 1005, "super_admin required to change allow_fable")
+			return
+		}
+		updates["allow_fable"] = *body.AllowFable
 	}
 	if len(updates) == 0 {
 		fail(c, http.StatusBadRequest, 1400, "nothing to update")

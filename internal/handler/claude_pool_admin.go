@@ -423,7 +423,9 @@ func AdminClaudePoolList(c *gin.Context) {
 // id (slug) itself is immutable — see AdminClaudePoolCreate.
 //
 // PATCH /api/v1/admin/claude-pools/:id  (RequireAdmin)
-// Body: {name?, mode?, conservative_ceiling?, allow_onprem?, allow_openrouter?, allow_fable? (super_admin)}
+// Body: {name?, mode?, conservative_ceiling?, allow_onprem?,
+//
+//	allow_openrouter?/allow_fable? (both super_admin — they grant spend)}
 func AdminClaudePoolUpdate(c *gin.Context) {
 	id := strings.ToLower(strings.TrimSpace(c.Param("id")))
 	var pool models.ClaudePool
@@ -444,10 +446,10 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		AllowOnprem *bool `json:"allow_onprem"`
 		// Same *bool discipline as AllowOnprem, and the stakes are higher here:
 		// the zero value would OPEN a spend path rather than close one.
+		// Both spend-granting fields need super_admin even though the route
+		// sits in the admin group — see the gate below.
 		AllowOpenrouter *bool `json:"allow_openrouter"`
-		// Changing this one needs super_admin even though the route sits in
-		// the admin group — see the gate below.
-		AllowFable *bool `json:"allow_fable"`
+		AllowFable      *bool `json:"allow_fable"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -488,19 +490,40 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		}
 		updates["allow_onprem"] = *body.AllowOnprem
 	}
-	if body.AllowOpenrouter != nil {
-		updates["allow_openrouter"] = *body.AllowOpenrouter
-	}
-	// Handing out the Fable tier is the same "hand out capacity" act as
-	// creating a pool or resetting a window, both super_admin. Enforced inside
-	// the handler rather than by splitting the route, so a PATCH touching only
-	// the admin-level fields still works for a plain admin.
-	if body.AllowFable != nil {
+	// SPEND-GRANTING FIELDS sit at super_admin, the same gate as creating a
+	// pool and resetting a window — the "hand out capacity" decisions.
+	//
+	// allow_openrouter belongs here as much as allow_fable, and originally did
+	// not: it shipped at plain admin while allow_fable was gated, which meant
+	// any admin could PATCH the DEFAULT pool — the one every user is backfilled
+	// into — and re-open externally-billed OpenRouter spend for the entire
+	// estate, themselves included. Same blast radius, strictly more money, one
+	// level lower. Caught in review 2026-09-06.
+	//
+	// Enforced inside the handler rather than by splitting the route, so a
+	// PATCH touching only the admin-level fields (name, mode, ceiling,
+	// allow_onprem) still works for a plain admin. One role resolution covers
+	// both fields, and the error names the ones actually attempted so a denied
+	// caller knows which half of their PATCH was the problem.
+	if body.AllowOpenrouter != nil || body.AllowFable != nil {
+		var spendFields []string
+		if body.AllowOpenrouter != nil {
+			spendFields = append(spendFields, "allow_openrouter")
+		}
+		if body.AllowFable != nil {
+			spendFields = append(spendFields, "allow_fable")
+		}
 		if _, role, okRole := resolveRole(bearerToken(c)); !okRole || role != "super_admin" {
-			fail(c, http.StatusForbidden, 1005, "super_admin required to change allow_fable")
+			fail(c, http.StatusForbidden, 1005,
+				"super_admin required to change "+strings.Join(spendFields, " and "))
 			return
 		}
-		updates["allow_fable"] = *body.AllowFable
+		if body.AllowOpenrouter != nil {
+			updates["allow_openrouter"] = *body.AllowOpenrouter
+		}
+		if body.AllowFable != nil {
+			updates["allow_fable"] = *body.AllowFable
+		}
 	}
 	if len(updates) == 0 {
 		fail(c, http.StatusBadRequest, 1400, "nothing to update")

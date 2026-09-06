@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -166,5 +167,35 @@ func TestEnrichClaudePolicyResolvesThePoolOnce(t *testing.T) {
 	}
 	if !got.AllowOnprem || !got.AllowOpenrouter || !got.AllowFable {
 		t.Errorf("consolidation lost a verdict: %+v", got)
+	}
+}
+
+// Both spend-granting fields sit at super_admin; the admin-level fields must
+// stay reachable by a plain admin. Asserted on the BODY STRUCT + gate pairing
+// rather than through HTTP, because the gate reads the caller's role from the
+// bearer and this package's role helper needs a real session.
+func TestSpendGrantingFieldsAreNamedInTheDenial(t *testing.T) {
+	// The denial must name the field(s) actually attempted — a caller PATCHing
+	// name+allow_openrouter needs to know which half was refused, or they will
+	// retry the whole thing and be denied again.
+	src, err := os.ReadFile("claude_pool_admin.go")
+	if err != nil {
+		t.Fatalf("read handler: %v", err)
+	}
+	h := string(src)
+	for _, want := range []string{
+		`spendFields = append(spendFields, "allow_openrouter")`,
+		`spendFields = append(spendFields, "allow_fable")`,
+		`"super_admin required to change "+strings.Join(spendFields, " and ")`,
+	} {
+		if !strings.Contains(h, want) {
+			t.Errorf("the spend gate no longer names its fields — missing: %s", want)
+		}
+	}
+	// allow_onprem must NOT be in the spend gate: it grants access to hardware
+	// we own at no marginal cost, and gating it at super_admin would put the
+	// safe control out of an admin's reach while leaving the risky ones in it.
+	if strings.Contains(h, `spendFields = append(spendFields, "allow_onprem")`) {
+		t.Error("allow_onprem was pulled into the super_admin spend gate — it costs nothing marginal")
 	}
 }

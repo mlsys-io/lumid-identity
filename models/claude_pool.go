@@ -93,6 +93,10 @@ type ClaudePool struct {
 	//
 	// This flag is an opt-IN: setting it true re-opens externally-billed models
 	// for one pool without lifting the block for anybody else.
+	//
+	// Changing it requires SUPER_ADMIN (AdminClaudePoolUpdate), alongside
+	// AllowFable: both hand out spend, and the default pool holds every user,
+	// so an admin-level toggle there would re-open metered spend estate-wide.
 	AllowOpenrouter bool `gorm:"column:allow_openrouter;not null;default:false" json:"allow_openrouter"`
 	// AllowFable — may this pool's members use the Fable tier?
 	//

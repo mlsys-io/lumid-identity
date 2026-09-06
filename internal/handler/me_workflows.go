@@ -342,6 +342,17 @@ type WorkflowRow struct {
 	// tracked metric names). Drives the app-overview goal header so users see
 	// what the loop is chasing, not just a generic description.
 	Goal *WorkflowGoal `json:"goal,omitempty"`
+	// Metric — the loop's primary metric name (xpcloud.yaml loops[].metrics.
+	// primary). A loop with a metric AND a dataset is an experiment; without a
+	// metric it is a plain workflow. The workflows table renders this as its
+	// own column, so a row can say what it is scored on instead of leaving an
+	// unexplained dash.
+	Metric string `json:"metric,omitempty"`
+	// DatasetID — the subject set this loop runs over. Declared either on the
+	// loop (loops[].dataset_id) or, far more commonly, on the experiment the
+	// loop feeds (experiments[].dataset_id) — resolved here so the table does
+	// not have to fetch and join the experiments payload just to name it.
+	DatasetID string `json:"dataset_id,omitempty"`
 	// Datasets — dataset ids/refs the loop runs against (xpcloud.yaml).
 	Datasets []string `json:"datasets,omitempty"`
 	// DatasetsDetail — the app's top-level dataset repos with their own
@@ -412,6 +423,22 @@ func MeWorkflows(c *gin.Context) {
 	wg.Wait()
 	rows = append(rows, sched...)
 	rows = append(rows, vis...)
+
+	// ?app=<slug> — narrow to one app's workflows. The param was accepted and
+	// IGNORED: every caller got all rows across every app (26 rows spanning 6
+	// apps, measured 2026-09-06) and the UI filtered client-side. A consumer
+	// that trusted the param got another app's loops, and every caller paid for
+	// a payload ~13x what it asked for. Filtering here makes the param mean what
+	// it says; the client-side filter stays harmless.
+	if appFilter := strings.TrimSpace(c.Query("app")); appFilter != "" {
+		kept := rows[:0:0]
+		for _, r := range rows {
+			if r.App == appFilter {
+				kept = append(kept, r)
+			}
+		}
+		rows = kept
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
@@ -488,6 +515,10 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 			// Tolerant goal read — survives loops whose other fields break the
 			// full rawLoop parse (object-typed datasets/skills_invoked).
 			goalsByLoop := readYamlLoopGoals(specPath)
+			// metric + dataset per loop (loops[].metrics.primary, resolving the
+			// dataset through the attached experiment) — the two columns the
+			// workflows table needs to say what a row is measured on.
+			measureByLoop := readYamlLoopMeasurement(specPath)
 			enabledMap := readEnabledOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			scheduleMap := readScheduleOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
 			goalMap := readGoalOverrides(filepath.Join(appDir, ".user-overrides.yaml"))
@@ -573,6 +604,10 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 						row.Goal = &WorkflowGoal{}
 					}
 					row.Goal.Primary = gv
+				}
+				if m, ok := measureByLoop[L.Name]; ok {
+					row.Metric = m.Metric
+					row.DatasetID = m.DatasetID
 				}
 				row.Datasets = []string(L.Datasets)
 				row.DatasetsDetail = appDatasets

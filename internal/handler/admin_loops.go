@@ -1010,6 +1010,88 @@ func readYamlLoopGoals(p string) map[string]rawGoal {
 	return out
 }
 
+// loopMeasurement — what a loop is scored on and what it is scored over.
+type loopMeasurement struct {
+	Metric    string
+	DatasetID string
+}
+
+// readYamlLoopMeasurement returns loop-name → {metric, dataset} from
+// xpcloud.yaml, tolerant in the same way readYamlLoopGoals is (a minimal
+// struct, so one loop with an object-typed field cannot blank the whole map).
+//
+// Apps declare the two halves in different places, which is why this resolves
+// rather than reads: the METRIC sits on the loop (`loops[].metrics.primary`),
+// while the DATASET almost always sits on the experiment the loop feeds
+// (`experiments[].dataset_id`), reached via `engine.experiment` — scalar on one
+// loop, a list on the next. Resolving it here is what lets the workflows table
+// render "backtest · real_tape_rate · tape_covered_v1" instead of a dash.
+func readYamlLoopMeasurement(p string) map[string]loopMeasurement {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Loops []struct {
+			Name    string `yaml:"name"`
+			Metrics struct {
+				Primary string `yaml:"primary"`
+			} `yaml:"metrics"`
+			DatasetID string `yaml:"dataset_id"`
+			Engine    struct {
+				Experiment flexStrings `yaml:"experiment"`
+			} `yaml:"engine"`
+		} `yaml:"loops"`
+		Experiments []struct {
+			ID        string `yaml:"id"`
+			DatasetID string `yaml:"dataset_id"`
+			Metric    struct {
+				Name string `yaml:"name"`
+			} `yaml:"metric"`
+		} `yaml:"experiments"`
+	}
+	if yaml.Unmarshal(b, &doc) != nil {
+		return nil
+	}
+	type expMeta struct{ dataset, metric string }
+	exps := map[string]expMeta{}
+	for _, e := range doc.Experiments {
+		if e.ID != "" {
+			exps[e.ID] = expMeta{dataset: e.DatasetID, metric: e.Metric.Name}
+		}
+	}
+	out := map[string]loopMeasurement{}
+	for _, l := range doc.Loops {
+		if l.Name == "" {
+			continue
+		}
+		m := loopMeasurement{Metric: l.Metrics.Primary, DatasetID: l.DatasetID}
+		// Fall back to the attached experiment for whichever half the loop
+		// itself did not declare. First attached experiment wins: a loop
+		// feeding two experiments (backtest → evidence + performance) runs
+		// them over the same dataset, so naming one is honest.
+		for _, id := range l.Engine.Experiment {
+			e, ok := exps[id]
+			if !ok {
+				continue
+			}
+			if m.DatasetID == "" {
+				m.DatasetID = e.dataset
+			}
+			if m.Metric == "" {
+				m.Metric = e.metric
+			}
+			if m.DatasetID != "" && m.Metric != "" {
+				break
+			}
+		}
+		if m.Metric != "" || m.DatasetID != "" {
+			out[l.Name] = m
+		}
+	}
+	return out
+}
+
 // readYamlMemoryAgents returns the app's knowledge agents — the top-level
 // memory_agents list unioned with roles[].memory_agent — from xpcloud.yaml.
 func readYamlMemoryAgents(p string) []string {

@@ -1574,6 +1574,32 @@ func InternalClaudeAccountMidLife401(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "recorded": true, "fresh": fresh})
 }
 
+// sessionPinPrefer resolves the cross-replica session pin: which pooled
+// account last served this session, for a pod that has no memory of it.
+//
+// SCOPED TO THE CALLER, and that is the whole reason it is a function. The
+// session key is x-claude-code-session-id — a value the CLIENT sends, on a
+// request identity has already authenticated as somebody else's. Matching on
+// it alone made this an unauthenticated lookup into a table of other people's
+// account bindings: present someone else's id and their account came back as
+// your prefer_email. Pool scoping keeps that from crossing pools (candidates
+// are WHERE pool_id = ?, and an account belongs to exactly one pool), but
+// inside a pool it still let one user steer another's session onto their
+// subscription.
+//
+// Rows written before user_sub existed carry "", and are matched only for a
+// caller that sends no sub — the same legacy shape, not a wildcard.
+func sessionPinPrefer(sessionKey, userSub string) string {
+	if sessionKey == "" {
+		return ""
+	}
+	var b models.ClaudeSessionBinding
+	if common.DB.Where("session_key = ? AND user_sub = ?", sessionKey, userSub).First(&b).Error != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(b.Email))
+}
+
 func InternalClaudeTokenLease(c *gin.Context) {
 	var body struct {
 		PreferEmail string   `json:"prefer_email"`
@@ -1611,11 +1637,8 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	// binding is wrong. Deleting here would let one busy moment permanently
 	// re-home a conversation, which is the 2026-08-16 regression.
 	if prefer == "" && sessionKey != "" {
-		var b models.ClaudeSessionBinding
-		if common.DB.Where("session_key = ?", sessionKey).First(&b).Error == nil {
-			if e := strings.ToLower(strings.TrimSpace(b.Email)); e != "" && !excluded[e] {
-				prefer = e
-			}
+		if e := sessionPinPrefer(sessionKey, body.UserSub); e != "" && !excluded[e] {
+			prefer = e
 		}
 	}
 
@@ -1989,6 +2012,11 @@ func InternalClaudeTokenLease(c *gin.Context) {
 				"seven_day_pct":    snap.SevenDayPct,
 				"severity":         snap.Severity,
 				"label":            row.Label,
+				// The pool this lease was scoped by. claude-proxy caches a
+				// lease per session for up to 30 minutes and cannot otherwise
+				// tell that the caller has since moved pools — the candidate
+				// scoping below happened once, when the lease was issued.
+				"pool_id": poolID,
 			},
 		})
 		return

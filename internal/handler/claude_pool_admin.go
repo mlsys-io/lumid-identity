@@ -243,6 +243,16 @@ type claudePoolPolicy struct {
 	Onprem     bool
 	Openrouter bool
 	Fable      bool
+	// PoolID — the pool the three verdicts above were read from, i.e. the
+	// caller's EFFECTIVE pool (hint > primary > default).
+	//
+	// Carried out to introspection so claude-proxy can tell that a cached
+	// lease belongs to a pool the caller is no longer drawing from. Identity
+	// scopes lease candidates by pool, but a lease the proxy already holds was
+	// scoped by the pool as it stood when it was issued — moving a user
+	// between pools cannot retroactively re-scope it, so the proxy has to
+	// compare and re-lease. Without this the window is up to leaseTTL (30m).
+	PoolID string
 }
 
 // claudePolicyFor resolves ALL THREE verdicts with ONE pool resolution and ONE
@@ -261,19 +271,25 @@ type claudePoolPolicy struct {
 // failed lookup keeps today's behaviour rather than inventing a new one — fail
 // open on hardware we own, fail closed on anything that spends money.
 func claudePolicyFor(userSub string, scopes []string) claudePoolPolicy {
-	statusQuo := claudePoolPolicy{Onprem: true, Openrouter: false, Fable: false}
+	statusQuo := claudePoolPolicy{Onprem: true, Openrouter: false, Fable: false, PoolID: models.DefaultClaudePoolID}
 	if userSub == "" {
 		return statusQuo
 	}
 	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
 	var p models.ClaudePool
 	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
+		// The pool row is unreadable, but WHICH pool the caller resolved to is
+		// still known and still true — report it. Suppressing it here would
+		// make a transient DB error look like "no pool", which is the one
+		// answer that disables the consumer's isolation check.
+		statusQuo.PoolID = poolID
 		return statusQuo
 	}
 	return claudePoolPolicy{
 		Onprem:     p.AllowOnprem,
 		Openrouter: p.AllowOpenrouter,
 		Fable:      p.AllowFable,
+		PoolID:     poolID,
 	}
 }
 

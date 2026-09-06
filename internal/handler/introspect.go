@@ -114,6 +114,21 @@ type IntrospectResponse struct {
 	// AllowFable — may this identity use the Fable tier? Same non-omitempty
 	// and fail-closed reasoning as AllowOpenrouter.
 	AllowFable bool `json:"allow_fable"`
+	// ClaudePoolID — the Claude account pool this identity actually draws
+	// from (hint > primary > default), resolved alongside the three verdicts
+	// above at no extra query cost.
+	//
+	// claude-proxy caches a leased pooled credential per session for up to 30
+	// minutes. That lease was pool-scoped WHEN ISSUED; nothing re-scopes it
+	// afterwards, so a user moved between pools would keep serving from their
+	// old pool's subscription for the rest of the lease. The proxy compares
+	// this against the pool stamped on the lease and re-leases on a mismatch.
+	//
+	// omitempty is FINE here, unlike the three flags above: the consumer's
+	// check is a comparison, not a verdict, and it skips the comparison when
+	// either side is empty. An identity too old to send this therefore
+	// degrades to today's behaviour rather than to a wrong answer.
+	ClaudePoolID string `json:"claude_pool_id,omitempty"`
 }
 
 // Introspect — POST /oauth/introspect (form or JSON body).
@@ -208,6 +223,7 @@ func enrichClaudePolicy(resp IntrospectResponse) IntrospectResponse {
 	resp.AllowOnprem = pol.Onprem
 	resp.AllowOpenrouter = pol.Openrouter
 	resp.AllowFable = pol.Fable
+	resp.ClaudePoolID = pol.PoolID
 	return resp
 }
 

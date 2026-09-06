@@ -201,9 +201,13 @@ func enrichClaudePolicy(resp IntrospectResponse) IntrospectResponse {
 	if !resp.Active {
 		return resp
 	}
-	resp.AllowOnprem = ClaudeOnpremAllowedFor(resp.Sub, resp.Scopes)
-	resp.AllowOpenrouter = ClaudeOpenrouterAllowedFor(resp.Sub, resp.Scopes)
-	resp.AllowFable = ClaudeFableAllowedFor(resp.Sub, resp.Scopes)
+	// ONE resolution for all three verdicts. Calling the single-verdict
+	// helpers here cost up to nine queries per introspection, all re-reading
+	// the same pool row, on the auth path for the whole platform.
+	pol := claudePolicyFor(resp.Sub, resp.Scopes)
+	resp.AllowOnprem = pol.Onprem
+	resp.AllowOpenrouter = pol.Openrouter
+	resp.AllowFable = pol.Fable
 	return resp
 }
 

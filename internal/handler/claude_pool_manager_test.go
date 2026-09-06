@@ -206,3 +206,24 @@ func TestManagerCannotPauseTheLastUsableAccount(t *testing.T) {
 		t.Fatalf("pausing the last usable account returned %d, want 409: %s", w.Code, w.Body.String())
 	}
 }
+
+// IsManager is a property OF a membership, so a manager is ALWAYS a member of
+// the pool they manage — meaning the share-a-pool check passes on their own
+// sub. Without an explicit self-refusal a delegate could reset their own
+// clock on demand: an unlimited personal quota, from a capability whose
+// estate-wide equivalent is super_admin precisely because it hands out budget.
+func TestManagerCannotResetTheirOwnClock(t *testing.T) {
+	db := setupClaudePoolTestDB(t)
+	pool := "cptest-mgr-self"
+	db.Exec(`INSERT IGNORE INTO claude_pools (id, name, mode) VALUES (?, 'S', 'distributed')`, pool)
+	cleanupClaudePool(t, db, pool)
+	sub := claudePoolTestUser(t, db, "mgrself")
+	db.Exec(`INSERT IGNORE INTO claude_pool_members (pool_id, user_sub, is_primary, is_manager, added_at) VALUES (?, ?, TRUE, TRUE, NOW())`, pool, sub)
+
+	w := authed(t, http.MethodPost, "/api/v1/me/claude-pool/reset-window",
+		`{"user_sub":"`+sub+`"}`, managerPAT(t, sub))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("self-reset returned %d, want 403 — a manager must not be able to hand themselves budget: %s",
+			w.Code, w.Body.String())
+	}
+}

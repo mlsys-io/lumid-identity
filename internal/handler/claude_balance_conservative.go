@@ -16,6 +16,7 @@ package handler
 
 import (
 	"sort"
+	"strings"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -36,7 +37,92 @@ func conservativeOrder(poolID string) ([]string, error) {
 	for _, r := range rows {
 		out = append(out, r.Email)
 	}
+	// SINGLE-FIELD-BOX POOLS get a better order than add-order. See
+	// expiringFirstOrder; falls through to the fixed order otherwise.
+	if reordered, ok := expiringFirstOrder(rows); ok {
+		return reordered, nil
+	}
 	return out, nil
+}
+
+// expiringFirstOrder re-orders a conservative pool's accounts USE-IT-OR-LOSE-IT:
+// the account whose 7d window resets soonest goes first, 5h reset breaking ties.
+//
+// WHY ONLY FOR ONE-BOX POOLS. The fixed add-order this replaces is not
+// arbitrary — where a pool's accounts sit on DIFFERENT field boxes, reordering
+// by reset time moves egress between boxes (and countries) as those times
+// drift, which is exactly the "one machine running several clients" shape the
+// relay design exists to avoid. When every account shares ONE box they already
+// share an egress IP and client fingerprint, so that objection disappears and
+// only the upside is left: an unused weekly allocation is WIPED at its reset
+// and can never be reclaimed, so the nearest-due budget should be spent first.
+// Same reasoning the distributed-mode sortKey already documents.
+//
+// "Same box" means the same NON-EMPTY label. All-empty is NOT one box: an
+// unlabeled account is adopted onto a box deterministically by account hash
+// (see pickRelay/relayPinHome in claude-proxy), so two unlabeled accounts
+// generally egress from DIFFERENT boxes — treating them as co-located is the
+// one reading of "same field box" that would silently be wrong.
+//
+// Accounts with no snapshot sort LAST rather than first: an unknown reset is
+// not evidence of an imminent one, and the distributed sortKey makes the same
+// call ("no snapshot → probe last").
+//
+// Returns ok=false when the rule does not apply, leaving the caller's fixed
+// order untouched.
+func expiringFirstOrder(rows []models.ClaudeQuotaToken) ([]string, bool) {
+	if len(rows) < 2 {
+		return nil, false // nothing to reorder
+	}
+	label := strings.TrimSpace(rows[0].Label)
+	if label == "" {
+		return nil, false
+	}
+	emails := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if strings.TrimSpace(r.Label) != label {
+			return nil, false // mixed boxes — keep the fixed order
+		}
+		emails = append(emails, r.Email)
+	}
+
+	// Latest snapshot per account. Ordered ASC so the last write per email wins.
+	var snaps []models.ClaudeQuotaSnapshot
+	if err := common.DB.Where("email IN ?", emails).Order("ts ASC").Find(&snaps).Error; err != nil {
+		return nil, false // a lookup failure must not reshuffle live routing
+	}
+	latest := make(map[string]models.ClaudeQuotaSnapshot, len(snaps))
+	for _, s := range snaps {
+		latest[s.Email] = s
+	}
+
+	// Stable base: preserve the incoming fixed order as the final tiebreak, so
+	// two accounts sharing a reset instant do not swap places run to run.
+	pos := make(map[string]int, len(emails))
+	for i, e := range emails {
+		pos[e] = i
+	}
+	out := append([]string(nil), emails...)
+	sort.SliceStable(out, func(i, j int) bool {
+		si, oki := latest[out[i]]
+		sj, okj := latest[out[j]]
+		switch {
+		case !oki && !okj:
+			return pos[out[i]] < pos[out[j]]
+		case !oki:
+			return false // unknown sorts last
+		case !okj:
+			return true
+		}
+		if !si.SevenDayReset.Equal(sj.SevenDayReset) {
+			return si.SevenDayReset.Before(sj.SevenDayReset)
+		}
+		if !si.FiveHourReset.Equal(sj.FiveHourReset) {
+			return si.FiveHourReset.Before(sj.FiveHourReset)
+		}
+		return pos[out[i]] < pos[out[j]]
+	})
+	return out, true
 }
 
 // conservativeCeiling resolves the anti-concentration safety backstop for

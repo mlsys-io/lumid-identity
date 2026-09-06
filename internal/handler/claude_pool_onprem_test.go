@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"gorm.io/gorm"
+
 	"lumid_identity/models"
 )
 
@@ -132,5 +134,37 @@ func TestSubjectlessIdentityGetsStatusQuoOnBothAxes(t *testing.T) {
 	}
 	if ClaudeOpenrouterAllowedFor("", nil) {
 		t.Error("openrouter must fail closed for a subject-less identity")
+	}
+}
+
+// Introspection is the auth path for EVERY service on the platform, not just
+// claude-proxy. Resolving each verdict independently cost up to nine queries
+// per introspection, all re-reading the same claude_pools row — this counts
+// the real ones so a fourth flag cannot quietly restore that.
+func TestEnrichClaudePolicyResolvesThePoolOnce(t *testing.T) {
+	db := setupClaudePoolTestDB(t)
+	pool := "cptest-policy-cost"
+	db.Exec(`INSERT IGNORE INTO claude_pools (id, name, mode, allow_onprem, allow_openrouter, allow_fable)
+	         VALUES (?, 'C', 'distributed', TRUE, TRUE, TRUE)`, pool)
+	cleanupClaudePool(t, db, pool)
+	sub := claudePoolTestUser(t, db, "polcost")
+	db.Exec(`INSERT IGNORE INTO claude_pool_members (pool_id, user_sub, is_primary, added_at) VALUES (?, ?, TRUE, NOW())`, pool, sub)
+
+	var queries int
+	cb := func(tx *gorm.DB) { queries++ }
+	if err := db.Callback().Query().After("gorm:query").Register("cptest:count", cb); err != nil {
+		t.Fatalf("register callback: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Callback().Query().Remove("cptest:count") })
+
+	got := enrichClaudePolicy(IntrospectResponse{Active: true, Sub: sub, Scopes: []string{"claude:proxy"}})
+
+	// One membership lookup (no hint -> primary) + one pool read. The ceiling
+	// is what matters: three independent resolutions would be 6-9.
+	if queries > 3 {
+		t.Errorf("enrichClaudePolicy issued %d queries — the per-verdict resolution is back", queries)
+	}
+	if !got.AllowOnprem || !got.AllowOpenrouter || !got.AllowFable {
+		t.Errorf("consolidation lost a verdict: %+v", got)
 	}
 }

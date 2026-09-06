@@ -154,8 +154,15 @@ func MeClaudePoolAccountDrain(c *gin.Context) {
 		// not be able to take their own pool offline by accident.
 		var usable int64
 		common.DB.Model(&models.ClaudeQuotaToken{}).
-			Where("pool_id = ? AND email <> ? AND draining_since IS NULL AND revoked_at IS NULL AND deleted_at IS NULL",
-				row.PoolID, row.Email).Count(&usable)
+			// No deleted_at clause: ClaudeQuotaToken carries gorm.DeletedAt, so
+			// GORM scopes this to live rows already. Spelling it out here would
+			// imply soft-delete is manual on this model, which it is not.
+			// poolIDOrDefault, matching the authorization check above: a legacy
+			// row holding "" IS the default pool, and reading it raw here made
+			// the two disagree — in a pool mixing '' and 'default' the guard
+			// counted zero siblings and refused every pause.
+			Where("pool_id = ? AND email <> ? AND draining_since IS NULL AND revoked_at IS NULL",
+				poolIDOrDefault(row.PoolID), row.Email).Count(&usable)
 		if usable == 0 {
 			fail(c, http.StatusConflict, 1409,
 				"refusing to pause the last usable account in this pool — it would take the pool offline")
@@ -169,7 +176,7 @@ func MeClaudePoolAccountDrain(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "update account: "+err.Error())
 		return
 	}
-	ok(c, "ok", gin.H{"email": row.Email, "pool_id": row.PoolID, "draining": *body.Draining})
+	ok(c, "ok", gin.H{"email": row.Email, "pool_id": poolIDOrDefault(row.PoolID), "draining": *body.Draining})
 }
 
 // MeClaudePoolResetWindow resets the usage clock for ONE member of a pool the
@@ -210,9 +217,26 @@ func MeClaudePoolResetWindow(c *gin.Context) {
 		return
 	}
 
+	// NEVER YOURSELF. IsManager is a property OF a membership, so a manager is
+	// always a member of the pool they manage and would otherwise pass the
+	// share-a-pool check below on their own sub — handing themselves an
+	// unlimited personal quota, from a capability whose estate-wide equivalent
+	// is super_admin precisely because it HANDS OUT budget.
+	if target == uid {
+		fail(c, http.StatusForbidden, 1403,
+			"a pool manager cannot reset their own usage clock — ask a super_admin")
+		return
+	}
 	// The target must be a member of a pool THIS caller manages. Checked as one
 	// query over both sides so a manager of pool A cannot reset a member of
 	// pool B by naming them.
+	//
+	// CONTAINMENT CAVEAT, deliberate and worth stating: claude_pool_windows is
+	// keyed by user_sub ALONE, with no pool column, so the reset hands back the
+	// target's platform-wide 5h/7d budget — including consumption in pools this
+	// manager has no authority over. Scoping it properly needs a per-pool
+	// window, which is a schema change beyond this delegation. Until then the
+	// blast radius of a delegated reset is the USER, not the pool.
 	pools := managedPools(uid)
 	if len(pools) == 0 {
 		fail(c, http.StatusForbidden, 1403, "you do not manage any Claude pool")

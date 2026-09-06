@@ -238,6 +238,45 @@ func ClaudePoolHintFromScopes(scopes []string) string {
 	return ""
 }
 
+// claudePoolPolicy is the full per-identity model-access verdict set.
+type claudePoolPolicy struct {
+	Onprem     bool
+	Openrouter bool
+	Fable      bool
+}
+
+// claudePolicyFor resolves ALL THREE verdicts with ONE pool resolution and ONE
+// row read.
+//
+// It exists because the single-verdict helpers below each do their own
+// resolution, and introspection needs all three at once — calling them
+// individually cost up to NINE queries per introspection, every one of them
+// fetching the same claude_pools row. That is the authentication path for every
+// service on the platform, not just claude-proxy, so the waste lands on every
+// login and every PAT check in the estate.
+//
+// The zero-value policy is the STATUS QUO, and the three fields deliberately
+// disagree: on-prem open, externally-billed closed, Fable closed. Each mirrors
+// what the platform did before its flag existed, so a no-subject caller or a
+// failed lookup keeps today's behaviour rather than inventing a new one — fail
+// open on hardware we own, fail closed on anything that spends money.
+func claudePolicyFor(userSub string, scopes []string) claudePoolPolicy {
+	statusQuo := claudePoolPolicy{Onprem: true, Openrouter: false, Fable: false}
+	if userSub == "" {
+		return statusQuo
+	}
+	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
+	var p models.ClaudePool
+	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
+		return statusQuo
+	}
+	return claudePoolPolicy{
+		Onprem:     p.AllowOnprem,
+		Openrouter: p.AllowOpenrouter,
+		Fable:      p.AllowFable,
+	}
+}
+
 // ClaudeOnpremAllowedFor reports whether this identity may reach the
 // self-hosted models. Resolves the caller's effective pool (hint > primary >
 // default) and reads its AllowOnprem flag.
@@ -247,15 +286,7 @@ func ClaudePoolHintFromScopes(scopes []string) string {
 // fleet we own. The restrictive answer has to come from a row that actually
 // says so.
 func ClaudeOnpremAllowedFor(userSub string, scopes []string) bool {
-	if userSub == "" {
-		return true
-	}
-	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
-	var p models.ClaudePool
-	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
-		return true
-	}
-	return p.AllowOnprem
+	return claudePolicyFor(userSub, scopes).Onprem
 }
 
 // ClaudeOpenrouterAllowedFor reports whether this identity may reach the
@@ -267,30 +298,14 @@ func ClaudeOnpremAllowedFor(userSub string, scopes []string) bool {
 // billed turn is real money and is currently refused to everyone. A DB blip
 // must not be able to open a spend path.
 func ClaudeOpenrouterAllowedFor(userSub string, scopes []string) bool {
-	if userSub == "" {
-		return false
-	}
-	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
-	var p models.ClaudePool
-	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
-		return false
-	}
-	return p.AllowOpenrouter
+	return claudePolicyFor(userSub, scopes).Openrouter
 }
 
 // ClaudeFableAllowedFor reports whether this identity may use the Fable tier.
 // Fails CLOSED, like the OpenRouter verdict and for the same reason: it is the
 // priciest tier, and a DB blip must not open it.
 func ClaudeFableAllowedFor(userSub string, scopes []string) bool {
-	if userSub == "" {
-		return false
-	}
-	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
-	var p models.ClaudePool
-	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
-		return false
-	}
-	return p.AllowFable
+	return claudePolicyFor(userSub, scopes).Fable
 }
 
 // poolModeOf reads a pool's Mode, defaulting to distributed on any lookup

@@ -78,10 +78,25 @@ type ClaudePool struct {
 	// usable model at all — pooled Sonnet is admin-only. AdminClaudePoolUpdate
 	// warns when the pool has such members; it does not refuse, because a pool
 	// of admins is a legitimate case.
-	AllowOnprem bool           `gorm:"column:allow_onprem;not null;default:true" json:"allow_onprem"`
-	CreatedAt   time.Time      `gorm:"autoCreateTime"                                  json:"created_at"`
-	UpdatedAt   time.Time      `gorm:"autoUpdateTime"                                  json:"updated_at"`
-	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at;index"                         json:"-"`
+	AllowOnprem bool `gorm:"column:allow_onprem;not null;default:true" json:"allow_onprem"`
+	// AllowOpenrouter — may this pool's members reach EXTERNALLY BILLED models
+	// (OpenRouter-served ids, kimi-k3, …)?
+	//
+	// DEFAULTS FALSE, and note this is the OPPOSITE default to AllowOnprem
+	// directly above. Both encode the same rule — preserve today's behaviour
+	// when nobody has expressed an opinion — and today those behaviours differ:
+	// claude-proxy's denyExternalModelForRole currently refuses every
+	// externally-billed model to EVERY role, admin included, while on-prem is
+	// open to everyone. So on-prem defaults open and this defaults closed.
+	// Getting either backwards is a silent estate-wide change on migration, and
+	// for this one it is a change that spends real money.
+	//
+	// This flag is an opt-IN: setting it true re-opens externally-billed models
+	// for one pool without lifting the block for anybody else.
+	AllowOpenrouter bool           `gorm:"column:allow_openrouter;not null;default:false" json:"allow_openrouter"`
+	CreatedAt       time.Time      `gorm:"autoCreateTime"                                  json:"created_at"`
+	UpdatedAt       time.Time      `gorm:"autoUpdateTime"                                  json:"updated_at"`
+	DeletedAt       gorm.DeletedAt `gorm:"column:deleted_at;index"                         json:"-"`
 }
 
 func (ClaudePool) TableName() string { return "claude_pools" }

@@ -106,6 +106,11 @@ type IntrospectResponse struct {
 	// The consumer decodes it as a *bool and treats absent as allowed, so the
 	// pair only fails open when identity genuinely predates the field.
 	AllowOnprem bool `json:"allow_onprem"`
+	// AllowOpenrouter — may this identity reach EXTERNALLY BILLED models?
+	// Same non-omitempty reasoning as AllowOnprem, opposite default: the
+	// consumer treats an absent value as DENIED, because an old identity
+	// server must not be able to open a spend path.
+	AllowOpenrouter bool `json:"allow_openrouter"`
 }
 
 // Introspect — POST /oauth/introspect (form or JSON body).
@@ -194,6 +199,7 @@ func enrichClaudePolicy(resp IntrospectResponse) IntrospectResponse {
 		return resp
 	}
 	resp.AllowOnprem = ClaudeOnpremAllowedFor(resp.Sub, resp.Scopes)
+	resp.AllowOpenrouter = ClaudeOpenrouterAllowedFor(resp.Sub, resp.Scopes)
 	return resp
 }
 

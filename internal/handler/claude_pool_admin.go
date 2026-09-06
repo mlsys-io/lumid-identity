@@ -258,6 +258,26 @@ func ClaudeOnpremAllowedFor(userSub string, scopes []string) bool {
 	return p.AllowOnprem
 }
 
+// ClaudeOpenrouterAllowedFor reports whether this identity may reach the
+// externally-billed models.
+//
+// FAILS CLOSED — the opposite of ClaudeOnpremAllowedFor, deliberately. Both
+// preserve the status quo on an unknown answer, and the status quo differs:
+// on-prem costs nothing marginal and is open to all, while an externally
+// billed turn is real money and is currently refused to everyone. A DB blip
+// must not be able to open a spend path.
+func ClaudeOpenrouterAllowedFor(userSub string, scopes []string) bool {
+	if userSub == "" {
+		return false
+	}
+	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
+	var p models.ClaudePool
+	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
+		return false
+	}
+	return p.AllowOpenrouter
+}
+
 // poolModeOf reads a pool's Mode, defaulting to distributed on any lookup
 // failure (fail open: a transient DB error must not silently switch a pool
 // into concentration behavior it never asked for).
@@ -373,7 +393,7 @@ func AdminClaudePoolList(c *gin.Context) {
 // id (slug) itself is immutable — see AdminClaudePoolCreate.
 //
 // PATCH /api/v1/admin/claude-pools/:id  (RequireAdmin)
-// Body: {name?, mode?, conservative_ceiling?, allow_onprem?}
+// Body: {name?, mode?, conservative_ceiling?, allow_onprem?, allow_openrouter?}
 func AdminClaudePoolUpdate(c *gin.Context) {
 	id := strings.ToLower(strings.TrimSpace(c.Param("id")))
 	var pool models.ClaudePool
@@ -392,6 +412,9 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		// access for everyone in it — the same defect class as the is_primary
 		// demotion bug in AdminClaudePoolAddMember.
 		AllowOnprem *bool `json:"allow_onprem"`
+		// Same *bool discipline as AllowOnprem, and the stakes are higher here:
+		// the zero value would OPEN a spend path rather than close one.
+		AllowOpenrouter *bool `json:"allow_openrouter"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -431,6 +454,9 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 			onpremRevoked = true
 		}
 		updates["allow_onprem"] = *body.AllowOnprem
+	}
+	if body.AllowOpenrouter != nil {
+		updates["allow_openrouter"] = *body.AllowOpenrouter
 	}
 	if len(updates) == 0 {
 		fail(c, http.StatusBadRequest, 1400, "nothing to update")

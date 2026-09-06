@@ -87,3 +87,50 @@ func reflectGormTag(v interface{}, field string) (string, bool) {
 	}
 	return f.Tag.Get("gorm"), true
 }
+
+// The two flags default in OPPOSITE directions, and each default encodes
+// today's behaviour: on-prem is open to everyone, externally billed models are
+// refused to everyone. Flipping either is a silent estate-wide change, and for
+// openrouter it is one that spends money.
+func TestPoolFlagDefaultsAreOpposites(t *testing.T) {
+	onprem, ok := reflectGormTag(models.ClaudePool{}, "AllowOnprem")
+	if !ok {
+		t.Fatal("AllowOnprem missing")
+	}
+	if !strings.Contains(onprem, "default:true") {
+		t.Errorf("AllowOnprem tag %q must default true — on-prem is open today", onprem)
+	}
+	or, ok := reflectGormTag(models.ClaudePool{}, "AllowOpenrouter")
+	if !ok {
+		t.Fatal("AllowOpenrouter missing")
+	}
+	if !strings.Contains(or, "default:false") {
+		t.Errorf("AllowOpenrouter tag %q must default false — externally billed models are denied today", or)
+	}
+}
+
+// Both verdicts must reach the wire unconditionally. For openrouter the
+// dangerous omission is the true case going missing (access silently lost);
+// for onprem it is the false case (denial silently lost).
+func TestIntrospectAlwaysEmitsBothPoolVerdicts(t *testing.T) {
+	b, err := json.Marshal(IntrospectResponse{Active: true, Sub: "u1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, k := range []string{`"allow_onprem"`, `"allow_openrouter"`} {
+		if !strings.Contains(string(b), k) {
+			t.Errorf("%s missing from the wire: %s", k, b)
+		}
+	}
+}
+
+// A subject-less caller gets the status quo on both axes: keep the fleet,
+// no spend path.
+func TestSubjectlessIdentityGetsStatusQuoOnBothAxes(t *testing.T) {
+	if !ClaudeOnpremAllowedFor("", nil) {
+		t.Error("on-prem must fail open for a subject-less identity")
+	}
+	if ClaudeOpenrouterAllowedFor("", nil) {
+		t.Error("openrouter must fail closed for a subject-less identity")
+	}
+}

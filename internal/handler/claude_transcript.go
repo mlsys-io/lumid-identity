@@ -145,6 +145,20 @@ func InternalClaudeTranscript(c *gin.Context) {
 
 	toolCount := countToolUse(body.Response)
 
+	// Resolve the serving pool ONCE and stamp it on both rows. Derived from the
+	// account here — at write time, seconds after the lease, so it is the pool
+	// that actually served the turn — and then FROZEN, which is the whole point:
+	// re-deriving at read time reports wherever the account lives today.
+	// Best-effort: an unresolvable account leaves it empty rather than failing a
+	// transcript write, which must never cost a user their turn.
+	servingPool := ""
+	if body.Account != "" {
+		var tokRow models.ClaudeQuotaToken
+		if common.DB.Select("pool_id").Where("email = ?", body.Account).First(&tokRow).Error == nil {
+			servingPool = poolIDOrDefault(tokRow.PoolID)
+		}
+	}
+
 	turnIndex := sess.TurnCount // 0-based
 	turn := models.ClaudeSessionTurn{
 		ConvKey:       convKey,
@@ -159,6 +173,7 @@ func InternalClaudeTranscript(c *gin.Context) {
 		DurationMs:    body.DurationMs,
 		Truncated:     body.Truncated,
 		FieldBox:      body.FieldBox,
+		PoolID:        servingPool,
 		ViaRelay:      body.ViaRelay,
 		SessionID:     body.SessionID,
 		RequestBytes:  body.RequestBytes,
@@ -191,11 +206,14 @@ func InternalClaudeTranscript(c *gin.Context) {
 	// Upsert the session summary.
 	if isNew {
 		sess = models.ClaudeSession{
-			ConvKey: convKey, UserSub: body.UserSub, Account: body.Account,
+			ConvKey: convKey, UserSub: body.UserSub, Account: body.Account, PoolID: servingPool,
 			Model: req.Model, Title: firstUserText(req.Messages), FirstTs: now,
 		}
 	}
 	sess.Account = body.Account
+	if servingPool != "" {
+		sess.PoolID = servingPool
+	}
 	sess.FieldBox = body.FieldBox
 	sess.ViaRelay = body.ViaRelay
 	sess.RequestBytes += body.RequestBytes
@@ -322,6 +340,12 @@ type sessionCard struct {
 	UserSub   string `json:"user_sub,omitempty"`
 	UserEmail string `json:"user_email,omitempty"`
 	Account   string `json:"account"`
+	// PoolID = which Claude pool served this session, as recorded AT THE TIME.
+	// Not a live join against the account's current pool — see
+	// models.ClaudeSession.PoolID. Empty on sessions recorded before the column
+	// existed, which is honest: those predate the record and cannot be
+	// backfilled without re-deriving the very thing the column exists to avoid.
+	PoolID string `json:"pool_id,omitempty"`
 	// FieldBox = which field-box relay served this session's latest turn
 	// ("dublin", "chicago", …); "" = dispatched direct from the cluster.
 	FieldBox     string    `json:"field_box"`
@@ -377,7 +401,7 @@ func listSessions(c *gin.Context, userSub string) {
 	for i, s := range rows {
 		cards[i] = sessionCard{
 			ConvKey: s.ConvKey, UserSub: s.UserSub, UserEmail: subToEmail(s.UserSub),
-			Account: s.Account, FieldBox: s.FieldBox, ViaRelay: s.ViaRelay, Model: s.Model,
+			Account: s.Account, PoolID: s.PoolID, FieldBox: s.FieldBox, ViaRelay: s.ViaRelay, Model: s.Model,
 			Title: s.Title, TurnCount: s.TurnCount, InputTokens: s.InputTokens,
 			OutputTokens: s.OutputTokens, ToolUseCount: s.ToolUseCount,
 			FirstTs: s.FirstTs, LastTs: s.LastTs,
@@ -486,7 +510,7 @@ func getSession(c *gin.Context, ownerSub, convKey string) {
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok",
 		"data": gin.H{"session": sessionCard{
-			ConvKey: sess.ConvKey, UserSub: sess.UserSub, Account: sess.Account,
+			ConvKey: sess.ConvKey, UserSub: sess.UserSub, Account: sess.Account, PoolID: sess.PoolID,
 			FieldBox: sess.FieldBox, ViaRelay: sess.ViaRelay, Model: sess.Model, Title: sess.Title, TurnCount: sess.TurnCount,
 			InputTokens: sess.InputTokens, OutputTokens: sess.OutputTokens,
 			ToolUseCount: sess.ToolUseCount, FirstTs: sess.FirstTs, LastTs: sess.LastTs,

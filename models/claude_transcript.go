@@ -19,6 +19,19 @@ type ClaudeSession struct {
 	ConvKey string `gorm:"column:conv_key;size:32;primaryKey"                         json:"conv_key"`
 	UserSub string `gorm:"column:user_sub;size:36;index:idx_csess_user_last,priority:1;not null" json:"user_sub"`
 	Account string `gorm:"column:account;size:255"                                    json:"account"`
+	// PoolID — which Claude pool served this session, STAMPED AT WRITE TIME.
+	//
+	// Deliberately stored rather than derived. Pool membership of an account is
+	// mutable (ClaudeQuotaToken.PoolID moves when an operator reassigns one), so
+	// joining account -> pool at READ time silently rewrites history: sessions
+	// served while an account sat in "default" start reporting as whatever pool
+	// it lives in today. Measured 2026-09-06 — two accounts moved into "rsi"
+	// retroactively relabelled every session they had ever served.
+	//
+	// That matters now that policy is per-pool: "which pool was this served
+	// under, and under which policy" is exactly the audit question, and a
+	// derived answer cannot be trusted for any window in which an account moved.
+	PoolID string `gorm:"column:pool_id;size:64;index" json:"pool_id,omitempty"`
 	// FieldBox is the account Label of the field-box relay the MOST RECENT
 	// turn egressed through ("dublin", "chicago", …); empty = dispatched
 	// directly to Anthropic from the cluster. Session-level value is
@@ -58,6 +71,13 @@ type ClaudeSessionTurn struct {
 	// mid-conversation (account re-labeled, or lease rotated to another
 	// account on a different box).
 	FieldBox string `gorm:"column:field_box;size:64"                                   json:"field_box"`
+	// PoolID: which pool served THIS turn, stamped at write time — per-turn for
+	// the same reason FieldBox is, and one step stronger: a lease can rotate to
+	// an account in a different pool mid-conversation, and an operator can move
+	// an account between pools between two turns of one session. The session
+	// row carries last-writer-wins; this is the per-turn truth. See
+	// ClaudeSession.PoolID for why it is stored rather than derived.
+	PoolID string `gorm:"column:pool_id;size:64;index" json:"pool_id,omitempty"`
 	// ViaRelay: whether THIS turn actually took the relay hop (delivery),
 	// vs FieldBox which is only where it was meant to go (intent).
 	ViaRelay bool `gorm:"column:via_relay;not null;default:false"                     json:"via_relay"`

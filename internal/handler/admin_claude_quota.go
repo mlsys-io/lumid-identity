@@ -763,12 +763,37 @@ func refreshSnapshot(row *models.ClaudeQuotaToken, token string) (*models.Claude
 	return snap, nil
 }
 
+// poolIDOrDefault normalises a ClaudeQuotaToken's pool_id for the wire.
+//
+// The column carries a DB-level default of "default", but rows written before
+// the pool feature existed (and any raw INSERT that bypassed it) can still hold
+// "". Every reader treats "" as the default pool — the lease query's own
+// COALESCE(t.pool_id, ?) in AdminClaudeAccountUsers does exactly this — so
+// emitting the blank verbatim would make the UI's pool <select> fall back to
+// "default" by accident rather than by statement. Normalise once, here.
+func poolIDOrDefault(id string) string {
+	if id == "" {
+		return models.DefaultClaudePoolID
+	}
+	return id
+}
+
 type quotaResult struct {
 	Email string `json:"email"`
 	// Label — set when this account belongs to a field box (e.g. "dublin"),
 	// so /code can display and monitor it as such. Empty for every ordinary
 	// pooled account.
-	Label         string          `json:"label,omitempty"`
+	Label string `json:"label,omitempty"`
+	// PoolID — WHICH POOL may draw on this account, orthogonal to Label
+	// (which is egress-network routing only). Without this the /code accounts
+	// table rendered `acc.pool_id || 'default'` against an absent field, so
+	// EVERY account displayed "Default Pool" regardless of its real pool, and
+	// the pool <select>'s change handler compared against that same undefined
+	// and silently no-op'd — an account could not be moved back to default
+	// through the UI at all. Never empty on the wire: a legacy row with a
+	// blank column is normalised to DefaultClaudePoolID so the select always
+	// matches one of its options.
+	PoolID        string          `json:"pool_id"`
 	Ts            time.Time       `json:"ts"`
 	FiveHourPct   float64         `json:"five_hour_pct"`
 	SevenDayPct   float64         `json:"seven_day_pct"`
@@ -852,7 +877,7 @@ func AdminClaudeQuota(c *gin.Context) {
 		wg.Add(1)
 		go func(i int, row models.ClaudeQuotaToken) {
 			defer wg.Done()
-			res := quotaResult{Email: row.Email, Label: row.Label}
+			res := quotaResult{Email: row.Email, Label: row.Label, PoolID: poolIDOrDefault(row.PoolID)}
 			applyAccountState(&res, row, time.Now())
 
 			var snap models.ClaudeQuotaSnapshot

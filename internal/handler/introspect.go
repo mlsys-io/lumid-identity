@@ -92,6 +92,20 @@ type IntrospectResponse struct {
 	Iat       int64    `json:"iat,omitempty"`
 	Source    string   `json:"source,omitempty"` // native | legacy-lqa | legacy-runmesh
 	Reason    string   `json:"reason,omitempty"` // why active=false
+	// AllowOnprem — may this identity reach the SELF-HOSTED models (the GB10
+	// fleet behind lumid-llm)? Resolved from the caller's effective Claude
+	// pool; see ClaudeOnpremAllowedFor.
+	//
+	// Rides on introspection rather than on the lease because claude-proxy
+	// gates the model BEFORE it leases an account, and for a self-hosted model
+	// it never leases one at all.
+	//
+	// DELIBERATELY NOT omitempty. `false` is the restrictive verdict, and
+	// omitempty would drop it from the wire — leaving the consumer unable to
+	// tell "denied" from "this identity server is too old to have an opinion".
+	// The consumer decodes it as a *bool and treats absent as allowed, so the
+	// pair only fails open when identity genuinely predates the field.
+	AllowOnprem bool `json:"allow_onprem"`
 }
 
 // Introspect — POST /oauth/introspect (form or JSON body).
@@ -134,7 +148,7 @@ func Introspect(c *gin.Context) {
 		}
 	}
 
-	resp := resolveIntrospect(token)
+	resp := enrichClaudePolicy(resolveIntrospect(token))
 
 	// Cache determinate verdicts (active, or a real inactive reason like
 	// revoked/expired). Skip "unknown token" so a not-yet-provisioned token
@@ -167,6 +181,20 @@ func resolveIntrospect(token string) IntrospectResponse {
 		}
 	}
 	return IntrospectResponse{Active: false, Reason: "unknown token"}
+}
+
+// enrichClaudePolicy fills the per-identity model-access verdicts.
+//
+// Applied once here rather than in introspectLegacyLQA/Native/JWT because all
+// three build the same struct and the policy is derived purely from (sub,
+// scopes) — three copies would be three places to forget. Only for active
+// tokens: an inactive verdict carries no identity to resolve a pool for.
+func enrichClaudePolicy(resp IntrospectResponse) IntrospectResponse {
+	if !resp.Active {
+		return resp
+	}
+	resp.AllowOnprem = ClaudeOnpremAllowedFor(resp.Sub, resp.Scopes)
+	return resp
 }
 
 // extractIntrospectToken pulls the token out of form body, JSON body,

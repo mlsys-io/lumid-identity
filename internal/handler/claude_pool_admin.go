@@ -194,6 +194,70 @@ func resolveUserPool(userSub, hint string) (poolID, mode string) {
 	return models.DefaultClaudePoolID, models.ClaudePoolModeDistributed
 }
 
+// resolveUserPoolReadOnly answers the same question as resolveUserPool
+// WITHOUT its lazy default-enrollment INSERT.
+//
+// resolveUserPool is called from the lease path, which runs once per turn and
+// for which enrolling a first-time user is exactly right. This one is called
+// from INTROSPECTION — i.e. from authentication, for every service on the
+// platform, not just claude-proxy — and an auth check must not write. A user
+// who has never touched Claude would otherwise be enrolled into the default
+// pool the first time they authenticate against anything at all.
+//
+// Same precedence: a hint the caller is genuinely a member of wins, else their
+// primary, else the default pool.
+func resolveUserPoolReadOnly(userSub, hint string) string {
+	if userSub == "" {
+		return models.DefaultClaudePoolID
+	}
+	if hint != "" {
+		var m models.ClaudePoolMember
+		if common.DB.Where("pool_id = ? AND user_sub = ?", hint, userSub).First(&m).Error == nil {
+			return hint
+		}
+	}
+	var primary models.ClaudePoolMember
+	if common.DB.Where("user_sub = ? AND is_primary = ?", userSub, true).First(&primary).Error == nil {
+		return primary.PoolID
+	}
+	return models.DefaultClaudePoolID
+}
+
+// ClaudePoolHintFromScopes extracts a "claude-pool:<id>" scope from a token's
+// scope list. Mirrors claude-proxy's own claudePoolHintFromScopes: the proxy
+// forwards the hint on the LEASE call, but introspection resolves policy
+// before any lease happens, so it has to read the same scope itself or a
+// pool-scoped PAT would be judged against the user's primary pool instead of
+// the one it actually draws from.
+func ClaudePoolHintFromScopes(scopes []string) string {
+	for _, sc := range scopes {
+		if id, ok := strings.CutPrefix(sc, "claude-pool:"); ok && id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// ClaudeOnpremAllowedFor reports whether this identity may reach the
+// self-hosted models. Resolves the caller's effective pool (hint > primary >
+// default) and reads its AllowOnprem flag.
+//
+// FAILS OPEN on any lookup failure, deliberately and for the same reason
+// poolModeOf does: a transient DB error must not silently revoke access to the
+// fleet we own. The restrictive answer has to come from a row that actually
+// says so.
+func ClaudeOnpremAllowedFor(userSub string, scopes []string) bool {
+	if userSub == "" {
+		return true
+	}
+	poolID := resolveUserPoolReadOnly(userSub, ClaudePoolHintFromScopes(scopes))
+	var p models.ClaudePool
+	if common.DB.Where("id = ?", poolID).First(&p).Error != nil {
+		return true
+	}
+	return p.AllowOnprem
+}
+
 // poolModeOf reads a pool's Mode, defaulting to distributed on any lookup
 // failure (fail open: a transient DB error must not silently switch a pool
 // into concentration behavior it never asked for).
@@ -309,7 +373,7 @@ func AdminClaudePoolList(c *gin.Context) {
 // id (slug) itself is immutable — see AdminClaudePoolCreate.
 //
 // PATCH /api/v1/admin/claude-pools/:id  (RequireAdmin)
-// Body: {name?, mode?, conservative_ceiling?}
+// Body: {name?, mode?, conservative_ceiling?, allow_onprem?}
 func AdminClaudePoolUpdate(c *gin.Context) {
 	id := strings.ToLower(strings.TrimSpace(c.Param("id")))
 	var pool models.ClaudePool
@@ -321,6 +385,13 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		Name                *string `json:"name"`
 		Mode                *string `json:"mode"`
 		ConservativeCeiling *int    `json:"conservative_ceiling"`
+		// Pointer, not bool: a plain bool cannot distinguish "the caller wants
+		// this false" from "the caller did not mention it", and the JSON zero
+		// value is exactly the restrictive one. Getting this wrong is how an
+		// unrelated PATCH (renaming a pool, say) silently revokes on-prem
+		// access for everyone in it — the same defect class as the is_primary
+		// demotion bug in AdminClaudePoolAddMember.
+		AllowOnprem *bool `json:"allow_onprem"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
@@ -354,6 +425,13 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		}
 		updates["conservative_ceiling"] = *body.ConservativeCeiling
 	}
+	onpremRevoked := false
+	if body.AllowOnprem != nil {
+		if !*body.AllowOnprem && pool.AllowOnprem {
+			onpremRevoked = true
+		}
+		updates["allow_onprem"] = *body.AllowOnprem
+	}
 	if len(updates) == 0 {
 		fail(c, http.StatusBadRequest, 1400, "nothing to update")
 		return
@@ -363,6 +441,26 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		return
 	}
 	resp := gin.H{"id": id, "updated": updates}
+	// Denying on-prem to a pool holding ordinary users strands them with no
+	// model at all: claude-proxy rewrites a role=user's sonnet/haiku to
+	// deepseek-v4-flash before the gate, and pooled Sonnet is admin-only, so
+	// both doors shut at once. Warn rather than refuse — a pool of admins is a
+	// legitimate case, and this endpoint should not decide the operator's
+	// intent for them. Named, not counted, so the warning is actionable.
+	if onpremRevoked {
+		var stranded []string
+		common.DB.Raw(`SELECT u.email
+		               FROM   claude_pool_members m
+		               JOIN   users u ON u.id = m.user_sub
+		               WHERE  m.pool_id = ? AND u.role = 'user'
+		               ORDER  BY u.email
+		               LIMIT  10`, id).Scan(&stranded)
+		if len(stranded) > 0 {
+			resp["warning"] = fmt.Sprintf(
+				"on-prem denied for %d role=user member(s) (%s) — their claude-sonnet/haiku is rewritten to deepseek-v4-flash before the model gate and pooled Sonnet is admin-only, so they now have NO usable model. Raise their role, move them to another pool, or re-enable on-prem.",
+				len(stranded), strings.Join(stranded, ", "))
+		}
+	}
 	if modeChanged {
 		var accountCount int64
 		common.DB.Model(&models.ClaudeQuotaToken{}).Where("pool_id = ?", id).Count(&accountCount)

@@ -56,10 +56,32 @@ type ClaudePool struct {
 	// anti-concentration backstop. 0 = use the global default. Meaningless
 	// in distributed mode, kept unconditionally so a mode toggle back to
 	// conservative doesn't need the value re-entered.
-	ConservativeCeiling int            `gorm:"column:conservative_ceiling;not null;default:0" json:"conservative_ceiling"`
-	CreatedAt           time.Time      `gorm:"autoCreateTime"                                  json:"created_at"`
-	UpdatedAt           time.Time      `gorm:"autoUpdateTime"                                  json:"updated_at"`
-	DeletedAt           gorm.DeletedAt `gorm:"column:deleted_at;index"                         json:"-"`
+	ConservativeCeiling int `gorm:"column:conservative_ceiling;not null;default:0" json:"conservative_ceiling"`
+	// AllowOnprem — may this pool's members reach the SELF-HOSTED models
+	// (the GB10 fleet behind lumid-llm: deepseek-v4-flash et al)?
+	//
+	// Orthogonal to everything else on this struct: Mode/ConservativeCeiling
+	// govern how POOLED ANTHROPIC accounts are chosen, which has nothing to do
+	// with our own GPUs. A pool is simply the unit we already have for "who may
+	// draw on what", so on-prem access hangs here too.
+	//
+	// DEFAULTS TRUE, and the default is load bearing: on-prem is open to every
+	// role today (that is the entire point of owning the fleet — see
+	// selfHostedModels in claude-proxy), so anything other than true would be a
+	// silent estate-wide revocation on migration. AutoMigrate ADDs the column
+	// with this DB-level default, so existing rows come out true without a
+	// backfill.
+	//
+	// TRAP when setting it false: an ordinary role=user member has their
+	// claude-sonnet*/claude-haiku* rewritten to deepseek-v4-flash BEFORE the
+	// model gate (aliasClaudeForRole), so denying on-prem leaves them with NO
+	// usable model at all — pooled Sonnet is admin-only. AdminClaudePoolUpdate
+	// warns when the pool has such members; it does not refuse, because a pool
+	// of admins is a legitimate case.
+	AllowOnprem bool           `gorm:"column:allow_onprem;not null;default:true" json:"allow_onprem"`
+	CreatedAt   time.Time      `gorm:"autoCreateTime"                                  json:"created_at"`
+	UpdatedAt   time.Time      `gorm:"autoUpdateTime"                                  json:"updated_at"`
+	DeletedAt   gorm.DeletedAt `gorm:"column:deleted_at;index"                         json:"-"`
 }
 
 func (ClaudePool) TableName() string { return "claude_pools" }

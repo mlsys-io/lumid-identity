@@ -1031,6 +1031,16 @@ func readYamlLoopMeasurement(p string) map[string]loopMeasurement {
 	if err != nil {
 		return nil
 	}
+	return readYamlLoopMeasurementBytes(b)
+}
+
+// readYamlLoopMeasurementBytes — same, from raw spec bytes. /me/workflows has
+// TWO row-building paths and patching only the filesystem one left the fields
+// empty in production: a cloud-installed tenant app is not on identity's disk,
+// so its rows are built from the PUBLISHED spec fetched over HTTP. Both paths
+// must fill metric/dataset or the columns are blank for exactly the users who
+// installed the app the normal way.
+func readYamlLoopMeasurementBytes(b []byte) map[string]loopMeasurement {
 	var doc struct {
 		Loops []struct {
 			Name    string `yaml:"name"`

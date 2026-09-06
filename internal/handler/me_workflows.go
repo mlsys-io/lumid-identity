@@ -678,6 +678,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 		}
 		_ = yaml.Unmarshal(spec, &ver)
 		dsDetail := readAppDatasetsBytes(spec) // mounted dataset repos → Data tab
+		measureByLoop := readYamlLoopMeasurementBytes(spec)
 		for _, L := range loops {
 			if L.Name == "" {
 				continue
@@ -703,6 +704,10 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				StepCount:      len(L.Steps),
 				Datasets:       []string(L.Datasets),
 				DatasetsDetail: dsDetail,
+			}
+			if m, ok := measureByLoop[L.Name]; ok {
+				row.Metric = m.Metric
+				row.DatasetID = m.DatasetID
 			}
 			if len(L.Engine.Experiment) > 0 {
 				row.ExperimentIDs = append([]string(nil), L.Engine.Experiment...)

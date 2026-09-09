@@ -1284,6 +1284,35 @@ var controlIntentPatterns = []*regexp.Regexp{
 	// backtest worker code" still reaches claude-code.
 	regexp.MustCompile(`\b(run|fire|dispatch|submit|kick off|execute|queue|start|do)\b[^.?!]{0,40}\bback-?test\b`),
 	regexp.MustCompile(`\bback-?test\b[^.?!]{0,60}\b(strategy|symbol|instrument|ticker)\b`),
+
+	// Forward tests. Same lane as the backtest pair above and added for the same
+	// reason: backtest got patterns after the 2026-08-31 dead end, forward test
+	// never did, so the two halves of one workflow behaved differently. "forward
+	// test my strategy" fell through to claude-code and dead-ended while the
+	// near-identical backtest sentence worked. Same discipline as backtest: a
+	// VERB near the noun, or the noun named against a strategy/symbol. Bare
+	// "forward test" stays unmatched so "explain the forward test code" still
+	// reaches claude-code. The loop name itself always routes — an explicit
+	// instruction should, exactly like dispatch_experiment_arm above.
+	regexp.MustCompile(`\b(run|fire|dispatch|submit|kick off|execute|queue|start|do|check)\b[^.?!]{0,40}\bforward[- ]?test\b`),
+	regexp.MustCompile(`\bforward[- ]?test\b[^.?!]{0,60}\b(strategy|symbol|instrument|ticker)\b`),
+	regexp.MustCompile(`\bforward_test\b`),
+
+	// mbb-consultant's verbs. Its loops are `interview` and `case_eval`, both
+	// @trigger, and NEITHER had a cue here — the app whose whole premise is
+	// conversational was the one this router could not hear. "run the case eval"
+	// matched only by accident, via the generic workflow cue below. Bounded the
+	// same way: a verb near the noun, never the bare noun, so "prep me for an
+	// interview" and "explain the judge code" still reach claude-code.
+	regexp.MustCompile(`\b(run|start|begin|do|open|continue|resume)\b[^.?!]{0,30}\binterview\b`),
+	regexp.MustCompile(`\binterview\b[^.?!]{0,30}\b(case|casebook)\b`),
+	// The loop NAME (underscored) always routes — an explicit instruction
+	// should, exactly like forward_test and dispatch_experiment_arm. Spelled
+	// as two English words it needs a verb, or "read the case eval docs"
+	// gets stolen from claude-code (caught by the test, not by review).
+	regexp.MustCompile(`\bcase_eval\b`),
+	regexp.MustCompile(`\b(run|start|dispatch|execute|queue|kick off)\b[^.?!]{0,30}\bcase eval\b`),
+	regexp.MustCompile(`\b(score|grade|rate)\b[^.?!]{0,40}\b(my|this|that|the)\b[^.?!]{0,20}\b(answer|response|reply)\b`),
 }
 
 // controlIntentPhrases — platform-control cues. Deliberately phrase-level (e.g.
@@ -1317,6 +1346,11 @@ var controlIntentPhrases = []string{
 	"run the experiment", "run this experiment", "run the baseline arm",
 	"experiment arm", "run the variant", "run this variant",
 	"compare the arms", "run both arms",
+	// mbb-consultant, verb-first shapes the bounded regexes above cannot reach
+	// ("interview me" has no verb BEFORE the noun). Phrase-level and specific, so
+	// ordinary uses of the word are untouched.
+	"interview me", "interview me on", "start the interview", "next case",
+	"score my answer", "score that answer", "grade my answer",
 	// app surface / config authoring
 	"edit the app ui", "edit the page", "edit the ui", "edit the config",
 	"edit the app config", "update the config", "update the app config",
@@ -3888,7 +3922,14 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if dir == "" {
 			return map[string]any{"error": "app not installed"}, false
 		}
-		exps := loadAppExperiments(dir)
+		// Identity-aware variant. The bare loadAppExperiments passes no
+		// user/app, so readExpStateFor skips the DB fallback and returns the
+		// DISK view only — and for a tenant install identity's disk holds the
+		// materialised published bundle, i.e. the DECLARATION and never the
+		// results. So this tool reported every experiment as n=0 while the
+		// Experiments panel, which does pass identity, showed the real numbers.
+		// The chat is the control plane; it must not be the blind half of it.
+		exps := loadAppExperimentsFor(userID, app, dir)
 		return map[string]any{"experiments": exps, "count": len(exps)}, true
 
 	case "experiment_status":
@@ -3901,7 +3942,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if dir == "" {
 			return map[string]any{"error": "app not installed"}, false
 		}
-		detail, found := loadExperimentDetail(dir, id)
+		detail, found := loadExperimentDetailFor(userID, app, dir, id)
 		if !found {
 			return map[string]any{"error": "experiment not found"}, false
 		}

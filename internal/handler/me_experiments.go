@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -286,6 +287,8 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			// render a winner in that case.
 			"comparable", "instruments", "compare_within",
 			"dataset_version", "dataset_versions_seen",
+			// When the state was computed — see storedExpState.
+			"state_updated_at",
 		} {
 			if v, ok := st[k]; ok && v != nil {
 				if k == "metric" {
@@ -776,6 +779,17 @@ func storedExpState(userSub, app, experimentID string) map[string]any {
 	var st map[string]any
 	if json.Unmarshal([]byte(row.State), &st) != nil {
 		return nil
+	}
+	// WHEN this was computed, not just what it says. The bridge only fires from
+	// refresh_for_cycle, i.e. once per loop RUN, so a quiet experiment serves a
+	// number that is arbitrarily old with nothing to say so. Measured 2026-09-09
+	// for a3f48236: judge_panel_parity held 52 rows on the scheduler volume
+	// against n=17 here, and kol_alpha 12 against 2 — both last pushed
+	// 2026-09-05. The panel and the chat both quoted the stale figure as
+	// current. Serving the timestamp lets a reader (and `list_experiments`)
+	// tell "no results" from "no results SINCE".
+	if st != nil && !row.UpdatedAt.IsZero() {
+		st["state_updated_at"] = row.UpdatedAt.UTC().Format(time.RFC3339)
 	}
 	return st
 }

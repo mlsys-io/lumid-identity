@@ -168,3 +168,27 @@ func TestNonModelKeysAreIgnored(t *testing.T) {
 		t.Fatalf("an arm that names no model declares no model: %v", warnings)
 	}
 }
+
+// The default must point at the Service that exists. v0.5.357 defaulted to
+// :8080 while lumid-llm listens on :8088, so every gateway check in production
+// returned "could not reach" — the guard was live and checking nothing.
+func TestGatewayDefaultMatchesTheService(t *testing.T) {
+	src, err := os.ReadFile("me_experiment_write.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), `"http://lumid-llm:8088"`) {
+		t.Fatal("default gateway URL is not the in-cluster Service lumid-llm:8088")
+	}
+	if strings.Contains(string(src), `"http://lumid-llm:8080"`) {
+		t.Fatal("the wrong port is back")
+	}
+}
+
+func TestSchedulersEnvVarIsAlsoAccepted(t *testing.T) {
+	src, _ := os.ReadFile("me_experiment_write.go")
+	if !strings.Contains(string(src), "LUMID_LLM_GATEWAY_URL") {
+		t.Fatal("the scheduler configures its guard with LUMID_LLM_GATEWAY_URL; " +
+			"identity must not need a second variable for the same thing")
+	}
+}

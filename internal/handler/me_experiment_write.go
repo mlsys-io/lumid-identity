@@ -127,9 +127,17 @@ func gatewayModels() (map[string]bool, bool) {
 	if gatewayModelsList != nil && time.Since(gatewayModelsAt) < time.Minute {
 		return gatewayModelsList, true
 	}
+	// LUMID_LLM_GATEWAY_URL is the name the scheduler's _model_warnings reads;
+	// accepting both keeps one variable from configuring half the estate.
+	// The in-cluster Service is lumid-llm:8088 — :8080 was wrong and the guard
+	// duly reported "could not reach the LLM gateway" instead of passing
+	// silently, which is the only reason the mistake was visible at all.
 	base := strings.TrimRight(os.Getenv("LUMID_LLM_URL"), "/")
 	if base == "" {
-		base = "http://lumid-llm:8080"
+		base = strings.TrimRight(os.Getenv("LUMID_LLM_GATEWAY_URL"), "/")
+	}
+	if base == "" {
+		base = "http://lumid-llm:8088"
 	}
 	req, err := http.NewRequest("GET", base+"/v1/models", nil)
 	if err != nil {

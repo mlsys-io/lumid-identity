@@ -73,6 +73,11 @@ func TestExistingExperimentIntentsStillRoute(t *testing.T) {
 		"run the median-panel arm",
 		"make case_eval an experiment measuring avg_question_score over cases_v1",
 		"add an arm with deepseek as judge",
+		// Editing is the SAME verb — an existing id replaces. This phrasing fell
+		// through minutes after adding was made reachable, so correcting a
+		// model on an arm was impossible from chat.
+		"replace the qwen14b_local arm so it uses the AWQ build",
+		"change the arm to use a quantized model",
 	} {
 		if !routes(q) {
 			t.Errorf("regression — previously routed: %q", q)

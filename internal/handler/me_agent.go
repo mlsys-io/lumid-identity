@@ -1285,6 +1285,11 @@ var controlIntentPatterns = []*regexp.Regexp{
 	// through — the verb was reachable only by someone who already knew the
 	// tool's name, which is nobody the control plane is for.
 	regexp.MustCompile(`\b(add|create|make|try|compare|set ?up)\b[^.?!]{0,50}\barms?\b`),
+	// EDITING an arm is the same verb (an existing id replaces), and "replace
+	// the qwen14b_local arm ..." fell through — so correcting a model on an arm
+	// was unreachable minutes after adding one became reachable. The add/edit
+	// distinction is invisible to a user and should be invisible to the router.
+	regexp.MustCompile(`\b(replace|update|change|edit|fix|switch|point|swap)\b[^.?!]{0,50}\barms?\b`),
 	regexp.MustCompile(`\barms?\b[^.?!]{0,40}\b(as|with|using)\b[^.?!]{0,40}\b(judge|analyst|model|panel|prompt)\b`),
 	// Defining/measuring. `define_experiment` is useless if the router cannot
 	// hear a request to create one, and "make X an experiment" / "measure Y over

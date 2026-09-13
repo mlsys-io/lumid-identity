@@ -67,3 +67,54 @@ func TestControlIntentLeavesCodeTurnsAlone(t *testing.T) {
 		}
 	}
 }
+
+// Defining an experiment must reach the platform toolset.
+//
+// define_experiment is unreachable if the router cannot hear a request to
+// create one -- a miss falls through to claude-code, which cannot see the app
+// registry and answers that it has no such tool. That is not a hypothetical:
+// it is exactly how "backtest this strategy" dead-ended before it was given
+// patterns, and how every mbb-consultant verb was unreachable until 7f5fffa.
+func TestControlIntentRecognisesExperimentDefinition(t *testing.T) {
+	yes := []string{
+		"make case_eval an experiment measuring avg_question_score over cases_v1",
+		"turn this workflow into an experiment",
+		"define an experiment on the backtest loop",
+		"create an experiment for kol_strategy",
+		"promote it to an experiment",
+		"make it an experiment",
+		"set the metric to real_tape",
+		"add a metric to this workflow",
+		"measure avg_question_score over the casebook",
+		"track the score across cases",
+		"use define_experiment",
+	}
+	for _, m := range yes {
+		if !controlIntent(userMsg(m)) {
+			t.Errorf("experiment definition not routed to a tool-capable provider: %q", m)
+		}
+	}
+}
+
+// The bare noun must NOT route: a super_admin asking a conceptual or code
+// question still belongs on claude-code.
+func TestControlIntentLeavesExperimentTalkAlone(t *testing.T) {
+	// NOT included: "what is an experiment in this platform?". It DOES route,
+	// via the pre-existing `(list|show|what) … experiments?` pattern whose own
+	// comment explains the trade -- "asking to see them is also a registry
+	// need: claude-code has no catalog, so an experiment READ must re-route too
+	// or it answers from nothing." A conceptual "what is" is collateral of
+	// that, it predates this change, and narrowing it would break "what
+	// experiments do I have". Recorded here so the next person does not
+	// rediscover it as a bug.
+	no := []string{
+		"explain how experiments are evaluated",
+		"where is the experiment code?",
+		"read the metric documentation",
+	}
+	for _, m := range no {
+		if controlIntent(userMsg(m)) {
+			t.Errorf("conceptual question wrongly routed away from claude-code: %q", m)
+		}
+	}
+}

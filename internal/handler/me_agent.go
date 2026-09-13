@@ -1267,6 +1267,15 @@ var controlIntentPatterns = []*regexp.Regexp{
 	// the tool by name — an explicit instruction should always route.
 	regexp.MustCompile(`\bdispatch_experiment_arm\b`),
 	regexp.MustCompile(`\blist_experiments\b`),
+	regexp.MustCompile(`\bdefine_experiment\b`),
+	// Defining/measuring. `define_experiment` is useless if the router cannot
+	// hear a request to create one, and "make X an experiment" / "measure Y over
+	// Z" is how people actually ask. Bounded like the rest: a VERB near the noun,
+	// so "what is an experiment?" still reaches claude-code.
+	regexp.MustCompile(`\b(make|turn|define|create|set ?up|promote)\b[^.?!]{0,50}\ban experiment\b`),
+	regexp.MustCompile(`\b(measure|track|score)\b[^.?!]{0,40}\b(over|across|on)\b[^.?!]{0,40}\b(cases?|dataset|casebook)\b`),
+	regexp.MustCompile(`\bset\b[^.?!]{0,30}\bmetric\b`),
+	regexp.MustCompile(`\bmetric\b[^.?!]{0,30}\b(for|on)\b[^.?!]{0,30}\b(experiment|workflow|loop)\b`),
 
 	// Firing a named workflow. "run the workflow" is already a literal phrase,
 	// but nobody says it that way — they name the thing: "run quant-research's
@@ -1346,6 +1355,9 @@ var controlIntentPhrases = []string{
 	"run the experiment", "run this experiment", "run the baseline arm",
 	"experiment arm", "run the variant", "run this variant",
 	"compare the arms", "run both arms",
+	// promote a workflow -> experiment
+	"make it an experiment", "define an experiment", "create an experiment",
+	"add a metric", "set the metric", "what should i measure",
 	// mbb-consultant, verb-first shapes the bounded regexes above cannot reach
 	// ("interview me" has no verb BEFORE the noun). Phrase-level and specific, so
 	// ordinary uses of the word are untouched.
@@ -2289,7 +2301,7 @@ var simpleModeTools = map[string]bool{
 	// the user's own apps + workflows (read + run, not authoring)
 	"list_workflows": true, "workflow_detail": true, "loops_health": true,
 	"list_runs": true, "run_detail": true, "run_loop_now": true, "pause_workflow": true,
-	"dispatch_experiment_arm": true, "list_experiments": true,
+	"dispatch_experiment_arm": true, "list_experiments": true, "define_experiment": true,
 	"agent_list": true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
 	"agent_marketplace": true, "search_marketplace": true,
 	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
@@ -2681,6 +2693,27 @@ func buildToolDefs() []map[string]any {
 					},
 				},
 				"required": []string{"app", "loop"},
+			},
+		},
+		{
+			"name":        "define_experiment",
+			"description": "Create or replace an experiment on a loop — the way to turn a plain WORKFLOW into a measured one. An experiment is a loop plus a METRIC plus a SCOPE; a loop with neither is a workflow, which is a perfectly valid thing to leave alone. Use when the user wants to start measuring something (\"make case_eval an experiment measuring avg_question_score over cases_v1\", \"track PnL on this workflow\"), or to correct an existing definition. This is a FULL definition, not a patch: call list_experiments first and resend the fields you want to keep. The metric name must be a key the loop's command actually emits — if it is not, the experiment will aggregate nothing and report n=0 forever, so check the loop's recent results or ask rather than guessing a plausible name.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":              map[string]any{"type": "string"},
+					"experiment":       map[string]any{"type": "string", "description": "id, slug-shaped (e.g. judge_panel_parity). An existing id replaces that experiment."},
+					"loop":             map[string]any{"type": "string", "description": "the loop this attaches to — it is what gets dispatched"},
+					"metric":           map[string]any{"type": "string", "description": "REQUIRED. The metric key to aggregate, e.g. avg_question_score. Must be a key the loop emits."},
+					"higher_is_better": map[string]any{"type": "boolean", "description": "default true"},
+					"dataset_id":       map[string]any{"type": "string", "description": "scope: a declared dataset id (e.g. cases_v1). Give this OR cases."},
+					"cases":            map[string]any{"type": "string", "description": "scope: comma-separated case ids (e.g. 'Case_002,Case_019'). Give this OR dataset_id."},
+					"hypothesis":       map[string]any{"type": "string"},
+					"description":      map[string]any{"type": "string"},
+					"success_criteria": map[string]any{"type": "string", "description": "e.g. 'best_n >= 20 and delta_pp > 10'"},
+					"min_samples":      map[string]any{"type": "integer"},
+				},
+				"required": []string{"app", "experiment", "loop", "metric"},
 			},
 		},
 		{
@@ -4023,6 +4056,75 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		}
 		return map[string]any{"upstream": upstream, "pull": resp["pr"],
 			"pulls_url": "https://xp.io/" + upstream + "/pulls"}, true
+
+	case "define_experiment":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		eid := strVal(args, "experiment")
+		loop := strVal(args, "loop")
+		metric := strVal(args, "metric")
+		if app == "" || eid == "" || loop == "" {
+			return map[string]any{"error": "app, experiment and loop are required"}, false
+		}
+		if metric == "" {
+			// Stated as the rule, not as a missing field: the agent should
+			// understand that a metric-less loop is a WORKFLOW and leaving it
+			// that way is a legitimate answer, not an incomplete call.
+			return map[string]any{"error": "a metric is required — a loop without one is a " +
+				"workflow, not an experiment. Ask the user what to measure, or leave it as a workflow."}, false
+		}
+		ds := strVal(args, "dataset_id")
+		var caseList []string
+		for _, c0 := range strings.Split(strVal(args, "cases"), ",") {
+			if t := strings.TrimSpace(c0); t != "" {
+				caseList = append(caseList, t)
+			}
+		}
+		if ds == "" && len(caseList) == 0 {
+			return map[string]any{"error": "a scope is required — give dataset_id or cases. " +
+				"A threshold counted over an undefined population cannot be interpreted."}, false
+		}
+		hib := true
+		if v, ok := args["higher_is_better"].(bool); ok {
+			hib = v
+		}
+		body := map[string]any{
+			"id": eid, "loop": loop,
+			"metric": map[string]any{"name": metric, "higher_is_better": hib},
+		}
+		if ds != "" {
+			body["dataset_id"] = ds
+		}
+		if len(caseList) > 0 {
+			body["cases"] = caseList
+		}
+		for _, k := range []string{"hypothesis", "description", "success_criteria"} {
+			if v := strVal(args, k); v != "" {
+				body[k] = v
+			}
+		}
+		if n, ok := args["min_samples"].(float64); ok && n > 0 {
+			body["min_samples"] = int(n)
+		}
+		// Same queue the surface uses. Identity mounts no tenant volume, so the
+		// scheduler applies the edit; report the intent rather than claiming the
+		// definition landed.
+		id := writeIntent(c, "patch_experiment", userID, map[string]any{
+			"app": app, "experiment": eid, "loop": loop,
+			"metric":     body["metric"],
+			"dataset_id": ds, "cases": caseList,
+			"hypothesis": body["hypothesis"], "description": body["description"],
+			"success_criteria": body["success_criteria"], "min_samples": body["min_samples"],
+		})
+		if id == "" {
+			return map[string]any{"error": "could not queue the definition"}, false
+		}
+		return map[string]any{"ok": true, "intent_id": id, "app": app,
+			"experiment": eid, "loop": loop, "metric": metric,
+			"scope": map[string]any{"dataset_id": ds, "cases": caseList},
+			"note":  "queued — the scheduler applies it; poll the intent for the result and any model warnings"}, true
 
 	case "dispatch_experiment_arm":
 		// Runs a DECLARED arm. Resolves it against the app's own manifest first,

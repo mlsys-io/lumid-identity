@@ -475,6 +475,10 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/case-report", MeCaseReport)
 			// Live execution feed — tail journal.jsonl for a running cycle.
 			me.GET("/apps/:app/cycle-log", MeCycleLog)
+			// DB-backed, unlike cycle-log/runs/cycles above: identity has no
+			// tenant disk, so this is the only path by which the Outputs tier
+			// can see anything at all.
+			me.GET("/apps/:app/latest-output", MeAppLatestOutput)
 			// Variant trajectory tree (baseline → per-cycle variants → champion trunk).
 			me.GET("/apps/:app/trajectory", MeTrajectory)
 			// Trajectory control-signal channel (right-click "branch from here").

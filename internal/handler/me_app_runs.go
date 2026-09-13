@@ -30,6 +30,7 @@ type appRunBody struct {
 	DurationS *float64       `json:"duration_s"`
 	Metrics   map[string]any `json:"metrics"` // the cycle's own summary — any shape
 	Source    string         `json:"source"`
+	Outputs   any            `json:"outputs"`
 }
 
 // InternalAppRunRecord — POST /api/v1/internal/app-runs (X-Bridge-Secret).
@@ -48,6 +49,19 @@ func InternalAppRunRecord(c *gin.Context) {
 	if src == "" {
 		src = "self_report"
 	}
+	oj := ""
+	if b.Outputs != nil {
+		if raw, err := json.Marshal(b.Outputs); err == nil {
+			// 64 KiB ceiling. Truncating to a marker beats storing a
+			// half-written JSON fragment that every reader would then fail to
+			// parse, and beats refusing the whole run report over its artifact.
+			if len(raw) <= 64*1024 {
+				oj = string(raw)
+			} else {
+				oj = `{"_truncated":true,"_bytes":` + strconv.Itoa(len(raw)) + `}`
+			}
+		}
+	}
 	mj := "{}"
 	if b.Metrics != nil {
 		if raw, err := json.Marshal(b.Metrics); err == nil {
@@ -57,6 +71,12 @@ func InternalAppRunRecord(c *gin.Context) {
 	row := models.MeAppRun{
 		UserSub: b.UserSub, App: b.App, Loop: b.Loop, RunTs: b.RunTs,
 		Model: b.Model, Ok: b.Ok, DurationS: b.DurationS, Metrics: mj, Source: src,
+	}
+	// Assign() would overwrite a stored artifact with "" on a later report that
+	// carries none (a re-report, a backfill). An artifact is append-only from
+	// the store's point of view: only a NEW one replaces it.
+	if oj != "" {
+		row.Outputs = oj
 	}
 	// `loop` is a MySQL reserved word — must be backtick-quoted in raw SQL.
 	res := common.DB.Where("user_sub = ? AND app = ? AND `loop` = ? AND run_ts = ?",

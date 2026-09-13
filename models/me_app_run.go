@@ -25,6 +25,18 @@ type MeAppRun struct {
 	Ok        bool      `gorm:"column:ok"                        json:"ok"`
 	DurationS *float64  `gorm:"column:duration_s"                json:"duration_s,omitempty"`
 	Metrics   string    `gorm:"column:metrics;type:text"         json:"-"`                // opaque JSON — the cycle's own summary
+	// The cycle's final ARTIFACT, in its own column rather than inside Metrics.
+	// metricFromBlob walks the metrics JSON recursively and returns the first
+	// key match at ANY depth, so an artifact nested there could answer a metric
+	// lookup from the wrong place — a `score` in some payload satisfying a
+	// declared metric named `score`. Separate column, no such collision.
+	//
+	// This exists because identity mounts no tenant volume: MeCycleLog and
+	// MeCycleDetail read data/cycles/ off disk, which on identity is empty for
+	// every app and every user, so the Outputs tier shipped with no reachable
+	// source at all. Same problem MeAppExperiment solves for experiment state,
+	// same answer.
+	Outputs   string    `gorm:"column:outputs;type:text"         json:"-"`
 	Source    string    `gorm:"column:source;size:24"            json:"source,omitempty"` // self_report | backfill
 	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
 }

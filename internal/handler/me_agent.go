@@ -4145,6 +4145,38 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if n, ok := args["min_samples"].(float64); ok && n > 0 {
 			body["min_samples"] = int(n)
 		}
+		// ── Carry forward what this tool CANNOT express ──
+		//
+		// patch_experiment replaces the whole experiments[] entry, and this
+		// tool's schema has no way to set arms, dispatch, baseline, kind,
+		// benchmark_id or status. So omitting them is not a choice the caller
+		// made — it is a choice they had no way to avoid, and the result is
+		// silent data loss.
+		//
+		// Measured 2026-09-13: asked to add an arm, the platform agent noticed
+		// the experiment was attached to no loop, called define_experiment to
+		// re-bind it, and ERASED both arms of a finished 52-row experiment. The
+		// description already said "resend the fields you want to keep"; a
+		// contract that depends on the caller remembering will meet a caller who
+		// does not, and here that caller was this platform's own agent, within a
+		// minute of a reasonable question.
+		//
+		// Fields the schema CAN set stay caller-authoritative — omitting `cases`
+		// still clears them, because the caller can see and resend that.
+		carried := map[string]any{}
+		if dir := resolveAppDir(userID, app); dir != "" {
+			for _, e := range loadAppExperimentsFor(userID, app, dir) {
+				if got, _ := e["id"].(string); got != eid {
+					continue
+				}
+				for _, k := range []string{"arms", "dispatch", "baseline", "kind", "benchmark_id", "status"} {
+					if v, ok := e[k]; ok && v != nil {
+						carried[k] = v
+					}
+				}
+			}
+		}
+
 		// Same queue the surface uses. Identity mounts no tenant volume, so the
 		// scheduler applies the edit; report the intent rather than claiming the
 		// definition landed.
@@ -4154,6 +4186,9 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			"dataset_id": ds, "cases": caseList,
 			"hypothesis": body["hypothesis"], "description": body["description"],
 			"success_criteria": body["success_criteria"], "min_samples": body["min_samples"],
+			"arms": carried["arms"], "dispatch": carried["dispatch"],
+			"baseline": carried["baseline"], "kind": carried["kind"],
+			"benchmark_id": carried["benchmark_id"], "status": carried["status"],
 		})
 		if id == "" {
 			return map[string]any{"error": "could not queue the definition"}, false
@@ -4263,11 +4298,22 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		// through, so a seat that would abstain is reported here too.
 		_, modelWarnings := validateExperimentModels(&experimentWriteBody{Arms: arms})
 
+		// TWO linkage conventions exist and both are legitimate:
+		// loops[].engine.experiment (what expLoops reads, surfaced as `loops`)
+		// and experiments[].dispatch.loop (what an app declares when several
+		// loops feed one experiment and only one is dispatchable). Knowing only
+		// the first made this verb refuse analyst_local_gpu — an experiment with
+		// 52 rows and a published verdict — as "attached to no loop".
 		loop := ""
 		if ls, ok := decl["loops"].([]string); ok && len(ls) > 0 {
 			loop = ls[0]
 		} else if ls, ok := decl["loops"].([]any); ok && len(ls) > 0 {
 			loop, _ = ls[0].(string)
+		}
+		if loop == "" {
+			if dsp, ok := decl["dispatch"].(map[string]any); ok {
+				loop, _ = dsp["loop"].(string)
+			}
 		}
 		if loop == "" {
 			return map[string]any{"error": "experiment " + eid + " is attached to no loop, " +

@@ -1264,11 +1264,28 @@ var controlIntentPatterns = []*regexp.Regexp{
 	// asking to see them is also a registry need: claude-code has no catalog,
 	// so an experiment READ must re-route too or it answers from nothing.
 	regexp.MustCompile(`\b(list|show|what)\b[^.?!]{0,40}\bexperiments?\b`),
+	// INSPECTING A RESULT. The loop this control plane exists to serve is
+	// "define -> run -> INSPECT -> discuss -> dispatch the next arm", and the
+	// middle step had no pattern: define/list/dispatch were all covered, while
+	// "how did the analyst_local_gpu experiment turn out?" fell through to
+	// claude-code — which cannot see the experiment registry and correctly
+	// answered that it had no numbers. A control plane that can start a
+	// measurement and not read it back is half a control plane.
+	regexp.MustCompile(`\bexperiments?\b[^.?!]{0,50}\b(result|outcome|turn(ed)? out|going|doing|verdict|winner|conclusion|score[sd]?|finish(ed)?|done)\b`),
+	regexp.MustCompile(`\b(result|outcome|verdict|winner|conclusion)s?\b[^.?!]{0,50}\bexperiments?\b`),
+	regexp.MustCompile(`\b(how|did|is|has)\b[^.?!]{0,40}\b(experiment|arm)\b[^.?!]{0,40}\b(go|going|do|doing|turn|end|perform|fare)\b`),
+	regexp.MustCompile(`\bexperiment_status\b`),
 	// the tool by name — an explicit instruction should always route.
 	regexp.MustCompile(`\bdispatch_experiment_arm\b`),
 	regexp.MustCompile(`\blist_experiments\b`),
 	regexp.MustCompile(`\bdefine_experiment\b`),
 	regexp.MustCompile(`\badd_experiment_arm\b`),
+	// ADDING an arm, in words. add_experiment_arm shipped with only its literal
+	// tool name as a pattern, so "add an arm with deepseek as judge" fell
+	// through — the verb was reachable only by someone who already knew the
+	// tool's name, which is nobody the control plane is for.
+	regexp.MustCompile(`\b(add|create|make|try|compare|set ?up)\b[^.?!]{0,50}\barms?\b`),
+	regexp.MustCompile(`\barms?\b[^.?!]{0,40}\b(as|with|using)\b[^.?!]{0,40}\b(judge|analyst|model|panel|prompt)\b`),
 	// Defining/measuring. `define_experiment` is useless if the router cannot
 	// hear a request to create one, and "make X an experiment" / "measure Y over
 	// Z" is how people actually ask. Bounded like the rest: a VERB near the noun,

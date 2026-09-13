@@ -25,7 +25,6 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -127,25 +126,21 @@ func gatewayModels() (map[string]bool, bool) {
 	if gatewayModelsList != nil && time.Since(gatewayModelsAt) < time.Minute {
 		return gatewayModelsList, true
 	}
-	// LUMID_LLM_GATEWAY_URL is the name the scheduler's _model_warnings reads;
-	// accepting both keeps one variable from configuring half the estate.
-	// The in-cluster Service is lumid-llm:8088 — :8080 was wrong and the guard
-	// duly reported "could not reach the LLM gateway" instead of passing
-	// silently, which is the only reason the mistake was visible at all.
-	base := strings.TrimRight(os.Getenv("LUMID_LLM_URL"), "/")
-	if base == "" {
-		base = strings.TrimRight(os.Getenv("LUMID_LLM_GATEWAY_URL"), "/")
-	}
-	if base == "" {
-		base = "http://lumid-llm:8088"
-	}
-	req, err := http.NewRequest("GET", base+"/v1/models", nil)
+	// Reuse identity's OWN resolver and key function rather than reading the
+	// environment again here. The first version invented both and got both
+	// wrong: it defaulted to :8080 (the Service listens on :8088) and sent no
+	// credential (the gateway answers 401), so the guard shipped, went live,
+	// and checked nothing. lumidLLMBase() and kvrunPAT() are what every other
+	// caller in this package already uses and are configured in identity-env.
+	req, err := http.NewRequest("GET", lumidLLMBase()+"/v1/models", nil)
 	if err != nil {
 		return nil, false
 	}
-	if tok := os.Getenv("LUMID_LLM_GATEWAY_TOKEN"); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
+	key, err := kvrunPAT()
+	if err != nil {
+		return nil, false // no credential -> "could not check", never a false alarm
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(req)
 	if err != nil {
 		return nil, false

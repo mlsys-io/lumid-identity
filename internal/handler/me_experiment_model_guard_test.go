@@ -34,18 +34,29 @@ func stubGateway(t *testing.T, body string, status int) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		// The real gateway answers 401 without a bearer. Mirroring that here is
+		// what makes "the guard sends no credential" a FAILING test rather than
+		// something only production notices.
+		if r.Header.Get("Authorization") == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
 	}))
-	prev := os.Getenv("LUMID_LLM_URL")
-	os.Setenv("LUMID_LLM_URL", srv.URL)
+	// LUMID_LLM_BASE + KVRUN_LLM_TOKEN are what lumidLLMBase()/kvrunPAT() read —
+	// the same variables identity-env carries in the cluster.
+	prev, prevKey := os.Getenv("LUMID_LLM_BASE"), os.Getenv("KVRUN_LLM_TOKEN")
+	os.Setenv("LUMID_LLM_BASE", srv.URL)
+	os.Setenv("KVRUN_LLM_TOKEN", "test-token")
 	gatewayModelsMu.Lock()
 	gatewayModelsList = nil
 	gatewayModelsMu.Unlock()
 	t.Cleanup(func() {
 		srv.Close()
-		os.Setenv("LUMID_LLM_URL", prev)
+		os.Setenv("LUMID_LLM_BASE", prev)
+		os.Setenv("KVRUN_LLM_TOKEN", prevKey)
 		gatewayModelsMu.Lock()
 		gatewayModelsList = nil
 		gatewayModelsMu.Unlock()
@@ -172,23 +183,23 @@ func TestNonModelKeysAreIgnored(t *testing.T) {
 // The default must point at the Service that exists. v0.5.357 defaulted to
 // :8080 while lumid-llm listens on :8088, so every gateway check in production
 // returned "could not reach" — the guard was live and checking nothing.
-func TestGatewayDefaultMatchesTheService(t *testing.T) {
+// The guard must use identity's OWN resolver and key function. Inventing a
+// second base URL got the port wrong (:8080 vs the Service's :8088) and
+// inventing a second token meant sending none at all (the gateway answers 401),
+// so the guard was deployed, live, and checking nothing for two releases.
+func TestGuardUsesTheSharedGatewayHelpers(t *testing.T) {
 	src, err := os.ReadFile("me_experiment_write.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), `"http://lumid-llm:8088"`) {
-		t.Fatal("default gateway URL is not the in-cluster Service lumid-llm:8088")
+	for _, want := range []string{"lumidLLMBase()", "kvrunPAT()"} {
+		if !strings.Contains(string(src), want) {
+			t.Fatalf("guard does not use %s; a second copy of this plumbing drifts from the first", want)
+		}
 	}
-	if strings.Contains(string(src), `"http://lumid-llm:8080"`) {
-		t.Fatal("the wrong port is back")
-	}
-}
-
-func TestSchedulersEnvVarIsAlsoAccepted(t *testing.T) {
-	src, _ := os.ReadFile("me_experiment_write.go")
-	if !strings.Contains(string(src), "LUMID_LLM_GATEWAY_URL") {
-		t.Fatal("the scheduler configures its guard with LUMID_LLM_GATEWAY_URL; " +
-			"identity must not need a second variable for the same thing")
+	for _, bad := range []string{`"http://lumid-llm:8080"`, "LUMID_LLM_GATEWAY_TOKEN", `os.Getenv("LUMID_LLM_URL")`} {
+		if strings.Contains(string(src), bad) {
+			t.Fatalf("hand-rolled gateway plumbing is back: %s", bad)
+		}
 	}
 }

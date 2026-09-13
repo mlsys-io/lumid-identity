@@ -21,10 +21,10 @@ type MeAppRun struct {
 	Loop    string `gorm:"column:loop;size:128;not null;uniqueIndex:uq_apprun,priority:3"    json:"loop"`
 	RunTs   int64  `gorm:"column:run_ts;not null;uniqueIndex:uq_apprun,priority:4"           json:"run_ts"`
 
-	Model     string    `gorm:"column:model;size:64"             json:"model,omitempty"`
-	Ok        bool      `gorm:"column:ok"                        json:"ok"`
-	DurationS *float64  `gorm:"column:duration_s"                json:"duration_s,omitempty"`
-	Metrics   string    `gorm:"column:metrics;type:text"         json:"-"`                // opaque JSON — the cycle's own summary
+	Model     string   `gorm:"column:model;size:64"             json:"model,omitempty"`
+	Ok        bool     `gorm:"column:ok"                        json:"ok"`
+	DurationS *float64 `gorm:"column:duration_s"                json:"duration_s,omitempty"`
+	Metrics   string   `gorm:"column:metrics;type:text"         json:"-"` // opaque JSON — the cycle's own summary
 	// The cycle's final ARTIFACT, in its own column rather than inside Metrics.
 	// metricFromBlob walks the metrics JSON recursively and returns the first
 	// key match at ANY depth, so an artifact nested there could answer a metric

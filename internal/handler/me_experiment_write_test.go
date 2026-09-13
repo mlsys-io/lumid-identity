@@ -76,3 +76,26 @@ func TestExperimentShapeRequiresMetricAndScope(t *testing.T) {
 		}
 	}
 }
+
+// Lumilake's scope strings must be mintable, and must stay opaque.
+//
+// Lumilake enforces the literal "lumilake:jobs:read"/"write". parseScope splits
+// on the FIRST colon, so those read as level "jobs:read" -- not a valid level --
+// and canGrant's `svc == ""` return sits above the admin bypass. Before they were
+// added to capabilityScopes, NOBODY could mint them, super_admin included, and
+// every credential in the estate got 403 from Lumilake at all three sites.
+func TestLumilakeScopesAreGrantableCapabilityTags(t *testing.T) {
+	for _, s := range []string{"lumilake:jobs:read", "lumilake:jobs:write"} {
+		if !isCapabilityScope(s) {
+			t.Errorf("%s must be a grantable capability tag", s)
+		}
+		// Opaque: it must confer NO platform access, exactly like lqt:strategy.
+		if svc, lvl := parseScope(s); svc != "" || lvl != "" {
+			t.Errorf("%s must stay invisible to parseScope, got svc=%q lvl=%q", s, svc, lvl)
+		}
+	}
+	// Not a wildcard smuggled in: the bare service scope is still matrix-gated.
+	if isCapabilityScope("lumilake:write") {
+		t.Error("lumilake:write must remain a matrix-gated service scope, not a capability tag")
+	}
+}

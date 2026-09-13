@@ -619,6 +619,25 @@ var capabilityScopes = map[string]bool{
 	// Code requests through the pooled org accounts; it confers no platform
 	// access here.
 	"claude:proxy": true,
+	// Lumilake jobs — authorizes submitting and reading HALO-optimised jobs on
+	// the Lumilake control planes (cloud, home, office; per-site via /ll/<site>/).
+	//
+	// These are the LITERAL strings Lumilake enforces, and they have to be
+	// capability tags because parseScope cannot express them: it splits on the
+	// FIRST colon, so "lumilake:jobs:read" reads as service "lumilake", level
+	// "jobs:read" -- not a valid level -- and returns ("",""). canGrant's
+	// `svc == ""` return sits ABOVE the admin bypass, so before this entry NOBODY
+	// could mint them, super_admin included. Measured 2026-09-13: Lumilake at all
+	// three sites answered 403 "kind-level write on job requires
+	// 'lumilake:jobs:write'" to every credential in the estate, and the platform
+	// had no way to issue one.
+	//
+	// Same shape as lqt:strategy above: opaque here (parseScope ignores it, so
+	// computeAccess is unchanged), no platform access, no admin implication, and
+	// entitlement still enforced downstream by Lumilake itself. Two entries
+	// rather than one wildcard, so read and write stay separable.
+	"lumilake:jobs:read":  true,
+	"lumilake:jobs:write": true,
 }
 
 // isCapabilityScope reports whether a raw scope is an opaque LQT-style

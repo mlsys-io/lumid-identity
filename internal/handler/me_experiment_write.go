@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,20 +165,33 @@ func gatewayModels() (map[string]bool, bool) {
 // armModelNames pulls every declared model out of one arm: the singular fields and
 // each seat of a judge panel. The panel is the half that actually broke — a missing
 // seat changes the instrument without changing any number on screen.
+// Arm keys are APP-SPECIFIC — mbb-consultant uses analyst_model/judge_model/
+// judge_panel, quant-research names no models at all — so there is no platform
+// contract to check against. The `*_model` / `*_panel` suffix convention is the
+// same heuristic the scheduler applies (_model_warnings in me_intent_picker.py);
+// matching it exactly matters more than being clever, because two guards that
+// disagree about what counts as a model is how a definition passes one reader
+// and fails the other.
 func armModelNames(a map[string]any) []string {
 	var out []string
-	for _, k := range []string{"model", "judge_model", "analyst_model"} {
-		if s, _ := a[k].(string); strings.TrimSpace(s) != "" {
-			out = append(out, strings.TrimSpace(s))
+	for k, v := range a {
+		if !strings.HasSuffix(k, "_model") && !strings.HasSuffix(k, "_panel") && k != "model" {
+			continue
 		}
-	}
-	if panel, ok := a["judge_panel"].([]any); ok {
-		for _, seat := range panel {
-			if s, _ := seat.(string); strings.TrimSpace(s) != "" {
-				out = append(out, strings.TrimSpace(s))
+		switch t := v.(type) {
+		case string:
+			if strings.TrimSpace(t) != "" {
+				out = append(out, strings.TrimSpace(t))
+			}
+		case []any:
+			for _, seat := range t {
+				if s, _ := seat.(string); strings.TrimSpace(s) != "" {
+					out = append(out, strings.TrimSpace(s))
+				}
 			}
 		}
 	}
+	sort.Strings(out) // map iteration is random; a stable message is testable
 	return out
 }
 
@@ -188,6 +202,12 @@ func armModelNames(a map[string]any) []string {
 // to define an experiment because a sidecar is down would be worse than the bug,
 // but pretending the check ran would be worse still — so it is reported.
 func validateExperimentModels(b *experimentWriteBody) (problems []string, warnings []string) {
+	// Everything below is ADVISORY. The scheduler's _model_warnings reached the
+	// same conclusion first and for a stated reason: arm keys are app-specific,
+	// so this is a heuristic, and a heuristic must not be able to refuse a
+	// legitimate definition. What identity adds is WHERE the warning lands —
+	// back in the caller's 202 at define time, instead of only in a scheduler
+	// log nobody reads until the run is already wrong.
 	var names []string
 	for _, a := range b.Arms {
 		names = append(names, armModelNames(a)...)
@@ -202,9 +222,9 @@ func validateExperimentModels(b *experimentWriteBody) (problems []string, warnin
 			// but does have slashes.
 			parts := strings.SplitN(n, ":", 3)
 			if len(parts) != 3 || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
-				problems = append(problems, "`"+n+"` is not a valid Lumilake model: expected lumilake:<site>:<huggingface-id>")
+				warnings = append(warnings, "`"+n+"` is not a valid Lumilake model: expected lumilake:<site>:<huggingface-id>")
 			} else if !strings.Contains(parts[2], "/") {
-				problems = append(problems, "`"+n+"` does not look like a HuggingFace id (expected <org>/<model>); the gateway's mesh aliases are rejected by vLLM")
+				warnings = append(warnings, "`"+n+"` does not look like a HuggingFace id (expected <org>/<model>); the gateway's mesh aliases are rejected by vLLM")
 			}
 			continue
 		}
@@ -220,7 +240,7 @@ func validateExperimentModels(b *experimentWriteBody) (problems []string, warnin
 	}
 	for _, n := range gatewayNames {
 		if !known[strings.ToLower(n)] {
-			problems = append(problems, "the gateway does not serve `"+n+
+			warnings = append(warnings, "the gateway does not serve `"+n+
 				"` — it would not error, it would ABSTAIN, silently shrinking the panel (this is the gemma4 failure)")
 		}
 	}
@@ -255,8 +275,7 @@ func MeAppExperimentUpsert(c *gin.Context) {
 		body.ID = pid
 	}
 	problems := validateExperimentShape(&body)
-	modelProblems, modelWarnings := validateExperimentModels(&body)
-	problems = append(problems, modelProblems...)
+	_, modelWarnings := validateExperimentModels(&body)
 	if len(problems) > 0 {
 		fail(c, http.StatusUnprocessableEntity, 1422,
 			"not a valid experiment: "+strings.Join(problems, "; "))

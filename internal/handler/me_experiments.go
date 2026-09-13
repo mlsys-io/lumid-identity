@@ -287,6 +287,13 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			// render a winner in that case.
 			"comparable", "instruments", "compare_within",
 			"dataset_version", "dataset_versions_seen",
+			// The metric keys the rows ACTUALLY carry, and why n is zero when
+			// it is. Without these, `n_results: 0` reads identically whether
+			// the loop has never run or the declared name matches nothing it
+			// emits -- the shape that hid `real_tape_rate` for 19 runs. The
+			// client needs them to offer real keys at define-time instead of
+			// asking for a name typed from memory.
+			"metric_keys_seen", "n_zero_reason",
 			// When the state was computed — see storedExpState.
 			"state_updated_at",
 		} {

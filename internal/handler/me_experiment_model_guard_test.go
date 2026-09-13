@@ -10,6 +10,12 @@ package handler
 // These tests drive the real validateExperimentModels against a stub gateway.
 // The panel cases matter most: a missing SEAT changes the instrument without
 // changing any visible value.
+//
+// Findings are WARNINGS, not rejections. The scheduler's _model_warnings got
+// there first and said why: arm keys are app-specific, so the *_model/*_panel
+// convention is a heuristic, and a heuristic must never refuse a legitimate
+// definition. What identity adds is delivering the warning to the CALLER at
+// define time rather than to a scheduler log read after the run is wrong.
 
 import (
 	"net/http"
@@ -56,53 +62,56 @@ func TestUnservedModelIsRejected(t *testing.T) {
 	stubGateway(t, servedModels, http.StatusOK)
 	problems, warnings := validateExperimentModels(armsOf(
 		map[string]any{"id": "a", "judge_model": "gemma4"}))
-	if len(problems) != 1 {
-		t.Fatalf("expected gemma4 to be rejected, got problems=%v warnings=%v", problems, warnings)
+	if len(problems) != 0 {
+		t.Fatalf("a heuristic must not BLOCK a definition: %v", problems)
 	}
-	if !strings.Contains(problems[0], "gemma4") || !strings.Contains(problems[0], "ABSTAIN") {
-		t.Fatalf("problem should name the model and the failure mode: %q", problems[0])
+	if len(warnings) != 1 {
+		t.Fatalf("expected one warning about gemma4, got %v", warnings)
+	}
+	if !strings.Contains(warnings[0], "gemma4") || !strings.Contains(warnings[0], "ABSTAIN") {
+		t.Fatalf("warning should name the model and the failure mode: %q", warnings[0])
 	}
 }
 
 func TestServedModelPasses(t *testing.T) {
 	stubGateway(t, servedModels, http.StatusOK)
-	problems, _ := validateExperimentModels(armsOf(
+	problems, warnings := validateExperimentModels(armsOf(
 		map[string]any{"id": "a", "judge_model": "deepseek-v4-flash"}))
-	if len(problems) != 0 {
-		t.Fatalf("a served model must pass: %v", problems)
+	if len(problems) != 0 || len(warnings) != 0 {
+		t.Fatalf("a served model must pass silently: %v %v", problems, warnings)
 	}
 }
 
 // The exact mbb-ai shape: the singular field is fine, one PANEL SEAT is not.
 func TestUnservedPanelSeatIsRejected(t *testing.T) {
 	stubGateway(t, servedModels, http.StatusOK)
-	problems, _ := validateExperimentModels(armsOf(map[string]any{
+	_, warnings := validateExperimentModels(armsOf(map[string]any{
 		"id":          "panel_median3",
 		"judge_model": "deepseek-v4-flash",
 		"judge_panel": []any{"deepseek-v4-flash", "qwen3.8-27b", "gemma4"},
 	}))
-	if len(problems) != 1 || !strings.Contains(problems[0], "gemma4") {
-		t.Fatalf("a dead panel seat must be caught: %v", problems)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "gemma4") {
+		t.Fatalf("a dead panel seat must be caught: %v", warnings)
 	}
 }
 
 func TestLumilakeIdsAreCheckedInTheirOwnNamespace(t *testing.T) {
 	stubGateway(t, servedModels, http.StatusOK)
 	// A HuggingFace id is NOT in the gateway list and must not be judged against it.
-	problems, _ := validateExperimentModels(armsOf(map[string]any{
+	problems, warnings := validateExperimentModels(armsOf(map[string]any{
 		"id": "a", "analyst_model": "lumilake:home:google/gemma-4-12B-it-qat-w4a16-ct"}))
-	if len(problems) != 0 {
-		t.Fatalf("a valid lumilake id must not be tested against the gateway: %v", problems)
+	if len(problems) != 0 || len(warnings) != 0 {
+		t.Fatalf("a valid lumilake id must not be tested against the gateway: %v %v", problems, warnings)
 	}
 }
 
 func TestGatewayAliasInTheLumilakeLaneIsRejected(t *testing.T) {
 	stubGateway(t, servedModels, http.StatusOK)
 	// vLLM answers "not a valid model identifier on huggingface.co" at RUN time.
-	problems, _ := validateExperimentModels(armsOf(map[string]any{
+	_, warnings := validateExperimentModels(armsOf(map[string]any{
 		"id": "a", "analyst_model": "lumilake:home:gemma4"}))
-	if len(problems) != 1 || !strings.Contains(problems[0], "HuggingFace") {
-		t.Fatalf("an alias in the lumilake lane must be caught: %v", problems)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "HuggingFace") {
+		t.Fatalf("an alias in the lumilake lane must be caught: %v", warnings)
 	}
 }
 
@@ -110,10 +119,10 @@ func TestLumilakeWithoutASiteIsRejected(t *testing.T) {
 	stubGateway(t, servedModels, http.StatusOK)
 	// An un-sited /ll/ POST proxies to cloud, which has no workers, so the job
 	// QUEUES FOREVER instead of failing.
-	problems, _ := validateExperimentModels(armsOf(map[string]any{
+	_, warnings := validateExperimentModels(armsOf(map[string]any{
 		"id": "a", "analyst_model": "lumilake:google/gemma-4-12B-it"}))
-	if len(problems) != 1 {
-		t.Fatalf("a site-less lumilake id must be caught: %v", problems)
+	if len(warnings) != 1 {
+		t.Fatalf("a site-less lumilake id must be caught: %v", warnings)
 	}
 }
 
@@ -136,5 +145,26 @@ func TestNoArmsIsNotAnError(t *testing.T) {
 	problems, warnings := validateExperimentModels(&experimentWriteBody{})
 	if len(problems) != 0 || len(warnings) != 0 {
 		t.Fatalf("an experiment with no arms declares no models: %v %v", problems, warnings)
+	}
+}
+
+// The suffix convention must match the scheduler's, or a definition passes one
+// reader and fails the other — the two-implementations failure the codebase
+// already records for metrics.
+func TestAnySuffixedKeyIsScanned(t *testing.T) {
+	stubGateway(t, servedModels, http.StatusOK)
+	_, warnings := validateExperimentModels(armsOf(map[string]any{
+		"id": "a", "critic_model": "gemma4", "reviewer_panel": []any{"also-dead"}}))
+	if len(warnings) != 2 {
+		t.Fatalf("both *_model and *_panel keys must be scanned, got %v", warnings)
+	}
+}
+
+func TestNonModelKeysAreIgnored(t *testing.T) {
+	stubGateway(t, servedModels, http.StatusOK)
+	_, warnings := validateExperimentModels(armsOf(map[string]any{
+		"id": "a", "prompt_variant": "cards_v2", "temperature": 0.0}))
+	if len(warnings) != 0 {
+		t.Fatalf("an arm that names no model declares no model: %v", warnings)
 	}
 }

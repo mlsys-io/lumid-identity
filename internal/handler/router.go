@@ -263,6 +263,12 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/experiments", MeAppExperiments)
 			me.GET("/apps/:app/experiments/:id", MeAppExperiment)
 			me.GET("/apps/:app/experiments/:id/case/:caseId", MeAppExperimentCase)
+			// WRITE path (W1). Until this existed nothing could create an
+			// experiment or define its metric/scope — the only writer was the
+			// machine-only internal bridge below. Queues a patch_experiment
+			// intent; the scheduler holds the PVC and does the edit.
+			me.POST("/apps/:app/experiments", MeAppExperimentUpsert)
+			me.PATCH("/apps/:app/experiments/:id", MeAppExperimentUpsert)
 			// FinData SQL — self-service warehouse credentials. The role is an
 			// entitlement provisioned by an operator; minting is what makes it
 			// usable, and the password is shown exactly once.

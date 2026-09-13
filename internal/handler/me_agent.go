@@ -1268,6 +1268,7 @@ var controlIntentPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bdispatch_experiment_arm\b`),
 	regexp.MustCompile(`\blist_experiments\b`),
 	regexp.MustCompile(`\bdefine_experiment\b`),
+	regexp.MustCompile(`\badd_experiment_arm\b`),
 	// Defining/measuring. `define_experiment` is useless if the router cannot
 	// hear a request to create one, and "make X an experiment" / "measure Y over
 	// Z" is how people actually ask. Bounded like the rest: a VERB near the noun,
@@ -2302,7 +2303,8 @@ var simpleModeTools = map[string]bool{
 	"list_workflows": true, "workflow_detail": true, "loops_health": true,
 	"list_runs": true, "run_detail": true, "run_loop_now": true, "pause_workflow": true,
 	"dispatch_experiment_arm": true, "list_experiments": true, "define_experiment": true,
-	"agent_list": true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
+	"add_experiment_arm": true,
+	"agent_list":         true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
 	"agent_marketplace": true, "search_marketplace": true,
 	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
 	"show_app_surface": true, "give_feedback": true,
@@ -2714,6 +2716,24 @@ func buildToolDefs() []map[string]any {
 					"min_samples":      map[string]any{"type": "integer"},
 				},
 				"required": []string{"app", "experiment", "loop", "metric"},
+			},
+		},
+		{
+			"name":        "add_experiment_arm",
+			"description": "Add (or replace) ONE ARM on an existing experiment — a variant to compare against the baseline. Use when the user wants to try a change measurably (\"add an arm with deepseek as judge\", \"try the median-3 panel\", \"compare gemma4 as the analyst\"). An experiment with one arm can only report a level; arms are what make it a COMPARISON, and define_experiment cannot add them. Call list_experiments first to see which arms exist — passing an existing arm id replaces that arm, any other id appends. Arm keys are app-specific: pass judge_model/analyst_model/judge_panel for mbb-consultant-style apps, or config for anything else. Model names are checked and you are told when one would silently abstain. To RUN an arm afterwards, use dispatch_experiment_arm.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":           map[string]any{"type": "string"},
+					"experiment":    map[string]any{"type": "string", "description": "id of an EXISTING experiment (list_experiments shows them)"},
+					"arm":           map[string]any{"type": "string", "description": "arm id, slug-shaped (e.g. panel_median3). An existing id REPLACES that arm."},
+					"description":   map[string]any{"type": "string", "description": "what this arm changes, in one line"},
+					"analyst_model": map[string]any{"type": "string", "description": "model that PRODUCES the answer. A gateway alias (deepseek-v4-flash), or lumilake:<site>:<huggingface-id> to run it on a GPU site."},
+					"judge_model":   map[string]any{"type": "string", "description": "model that SCORES it"},
+					"judge_panel":   map[string]any{"type": "string", "description": "comma-separated judge seats, e.g. 'deepseek-v4-flash,qwen3.8-27b'. The panel is the instrument — changing it between arms makes them incomparable."},
+					"config":        map[string]any{"type": "string", "description": "JSON object of any other arm keys, for apps that are not model-shaped (e.g. {\"prompt_variant\": \"cards_v2\"})"},
+				},
+				"required": []string{"app", "experiment", "arm"},
 			},
 		},
 		{
@@ -4125,6 +4145,147 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			"experiment": eid, "loop": loop, "metric": metric,
 			"scope": map[string]any{"dataset_id": ds, "cases": caseList},
 			"note":  "queued — the scheduler applies it; poll the intent for the result and any model warnings"}, true
+
+	case "add_experiment_arm":
+		// WHY THIS READS BEFORE IT WRITES. patch_experiment replaces the whole
+		// experiments[] entry — there is no merge on the scheduler side, by
+		// design (a textual edit that tried to splice one key into an existing
+		// block is exactly how comments get eaten). So the arm is merged HERE,
+		// against the experiment as it currently stands, and the complete
+		// definition is resent. Sending only the new arm would silently delete
+		// the baseline, which is worse than refusing.
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		eid := strVal(args, "experiment")
+		armID := strVal(args, "arm")
+		if app == "" || eid == "" || armID == "" {
+			return map[string]any{"error": "app, experiment and arm are required"}, false
+		}
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not installed"}, false
+		}
+		var decl map[string]any
+		for _, e := range loadAppExperimentsFor(userID, app, dir) {
+			if id, _ := e["id"].(string); id == eid {
+				decl = e
+				break
+			}
+		}
+		if decl == nil {
+			return map[string]any{"error": "experiment " + eid + " not found — " +
+				"add_experiment_arm extends an EXISTING experiment; use define_experiment to create one"}, false
+		}
+
+		arm := map[string]any{"id": armID}
+		if v := strVal(args, "config"); v != "" {
+			// Free-form keys for apps that are not model-shaped. Parsed, not
+			// forwarded as a string, so a malformed object fails here rather
+			// than landing in the spec as an unusable scalar.
+			var extra map[string]any
+			if err := json.Unmarshal([]byte(v), &extra); err != nil {
+				return map[string]any{"error": "config must be a JSON object: " + err.Error()}, false
+			}
+			for k, val := range extra {
+				if k != "id" {
+					arm[k] = val
+				}
+			}
+		}
+		for _, k := range []string{"description", "analyst_model", "judge_model"} {
+			if v := strVal(args, k); v != "" {
+				arm[k] = v
+			}
+		}
+		if v := strVal(args, "judge_panel"); v != "" {
+			var seats []any
+			for _, seat := range strings.Split(v, ",") {
+				if t := strings.TrimSpace(seat); t != "" {
+					seats = append(seats, t)
+				}
+			}
+			if len(seats) > 0 {
+				arm["judge_panel"] = seats
+			}
+		}
+
+		// Replace by id, else append — "add" twice with the same id must be an
+		// edit, not a duplicate the aggregator would then average together.
+		var arms []map[string]any
+		replaced := false
+		if existing, ok := decl["arms"].([]map[string]any); ok {
+			for _, a := range existing {
+				if id, _ := a["id"].(string); id == armID {
+					arms = append(arms, arm)
+					replaced = true
+					continue
+				}
+				arms = append(arms, a)
+			}
+		} else if raw, ok := decl["arms"].([]any); ok {
+			for _, a0 := range raw {
+				a, _ := a0.(map[string]any)
+				if a == nil {
+					continue
+				}
+				if id, _ := a["id"].(string); id == armID {
+					arms = append(arms, arm)
+					replaced = true
+					continue
+				}
+				arms = append(arms, a)
+			}
+		}
+		if !replaced {
+			arms = append(arms, arm)
+		}
+
+		// Model names are advisory-checked on the same path a define goes
+		// through, so a seat that would abstain is reported here too.
+		_, modelWarnings := validateExperimentModels(&experimentWriteBody{Arms: arms})
+
+		loop := ""
+		if ls, ok := decl["loops"].([]string); ok && len(ls) > 0 {
+			loop = ls[0]
+		} else if ls, ok := decl["loops"].([]any); ok && len(ls) > 0 {
+			loop, _ = ls[0].(string)
+		}
+		if loop == "" {
+			return map[string]any{"error": "experiment " + eid + " is attached to no loop, " +
+				"so an arm on it could never be dispatched"}, false
+		}
+		payload := map[string]any{
+			"app": app, "experiment": eid, "loop": loop,
+			"metric": decl["metric"], "arms": arms,
+		}
+		for _, k := range []string{"dataset_id", "success_criteria", "hypothesis", "description", "kind"} {
+			if v, _ := decl[k].(string); v != "" {
+				payload[k] = v
+			}
+		}
+		if cs, ok := decl["cases"].([]any); ok && len(cs) > 0 {
+			payload["cases"] = cs
+		}
+		if n, ok := decl["min_samples"].(float64); ok && n > 0 {
+			payload["min_samples"] = int(n)
+		}
+		if b, ok := decl["baseline"]; ok && b != nil {
+			payload["baseline"] = b
+		}
+		iid := writeIntent(c, "patch_experiment", userID, payload)
+		if iid == "" {
+			return map[string]any{"error": "could not queue the arm"}, false
+		}
+		action := "added"
+		if replaced {
+			action = "replaced"
+		}
+		return map[string]any{"ok": true, "intent_id": iid, "app": app, "experiment": eid,
+			"arm": armID, "action": action, "arms_now": len(arms),
+			"warnings": modelWarnings,
+			"note":     "queued — the scheduler applies it. Run it with dispatch_experiment_arm."}, true
 
 	case "dispatch_experiment_arm":
 		// Runs a DECLARED arm. Resolves it against the app's own manifest first,

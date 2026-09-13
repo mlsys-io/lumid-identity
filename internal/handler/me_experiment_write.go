@@ -23,9 +23,13 @@ package handler
 // and lets the scheduler own INSTALLATION, exactly as run_loop does.
 
 import (
+	"encoding/json"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -92,6 +96,137 @@ func validateExperimentShape(b *experimentWriteBody) []string {
 	return problems
 }
 
+// ── The model guard ───────────────────────────────────────────────────────────
+//
+// A model name that resolves NOWHERE does not error. It abstains. mbb-ai declared
+// `judge_model: gemma4`, the gateway had already retired Gemma-4 (upstream moved
+// Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash), and the seat simply never scored:
+// a "median of 3" panel quietly became a panel of one, and an n=300 verdict was
+// published off an instrument nobody had checked.
+//
+// Two namespaces exist and they are NOT interchangeable. The gateway serves mesh
+// aliases and rejects HuggingFace ids; Lumilake loads HuggingFace ids into vLLM and
+// rejects aliases ("not a valid model identifier on huggingface.co"). So each name
+// is validated against the namespace it declares, never against both.
+//
+// Measured 2026-09-13: six distinct model-identity failures in one day, every one
+// of them found by burning a run rather than at define-time.
+var (
+	gatewayModelsMu   sync.Mutex
+	gatewayModelsAt   time.Time
+	gatewayModelsList map[string]bool
+)
+
+// gatewayModels returns the set of model ids the gateway serves, or ok=false when
+// the list could not be fetched. Cached for a minute: define-time is interactive
+// and the served set changes on deploys, not on requests.
+func gatewayModels() (map[string]bool, bool) {
+	gatewayModelsMu.Lock()
+	defer gatewayModelsMu.Unlock()
+	if gatewayModelsList != nil && time.Since(gatewayModelsAt) < time.Minute {
+		return gatewayModelsList, true
+	}
+	base := strings.TrimRight(os.Getenv("LUMID_LLM_URL"), "/")
+	if base == "" {
+		base = "http://lumid-llm:8080"
+	}
+	req, err := http.NewRequest("GET", base+"/v1/models", nil)
+	if err != nil {
+		return nil, false
+	}
+	if tok := os.Getenv("LUMID_LLM_GATEWAY_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	var out struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out.Data) == 0 {
+		return nil, false
+	}
+	set := make(map[string]bool, len(out.Data))
+	for _, m := range out.Data {
+		set[strings.ToLower(strings.TrimSpace(m.ID))] = true
+	}
+	gatewayModelsList, gatewayModelsAt = set, time.Now()
+	return set, true
+}
+
+// armModelNames pulls every declared model out of one arm: the singular fields and
+// each seat of a judge panel. The panel is the half that actually broke — a missing
+// seat changes the instrument without changing any number on screen.
+func armModelNames(a map[string]any) []string {
+	var out []string
+	for _, k := range []string{"model", "judge_model", "analyst_model"} {
+		if s, _ := a[k].(string); strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	if panel, ok := a["judge_panel"].([]any); ok {
+		for _, seat := range panel {
+			if s, _ := seat.(string); strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+	}
+	return out
+}
+
+// validateExperimentModels returns hard problems and soft warnings.
+//
+// A name the gateway does not serve is a PROBLEM: it is the gemma4 shape and it
+// silently produces a smaller panel. An unreachable gateway is a WARNING: refusing
+// to define an experiment because a sidecar is down would be worse than the bug,
+// but pretending the check ran would be worse still — so it is reported.
+func validateExperimentModels(b *experimentWriteBody) (problems []string, warnings []string) {
+	var names []string
+	for _, a := range b.Arms {
+		names = append(names, armModelNames(a)...)
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	var gatewayNames []string
+	for _, n := range names {
+		if strings.HasPrefix(strings.ToLower(n), "lumilake:") {
+			// lumilake:<site>:<hf-id>. SplitN(3) because an HF id has no colon
+			// but does have slashes.
+			parts := strings.SplitN(n, ":", 3)
+			if len(parts) != 3 || strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "" {
+				problems = append(problems, "`"+n+"` is not a valid Lumilake model: expected lumilake:<site>:<huggingface-id>")
+			} else if !strings.Contains(parts[2], "/") {
+				problems = append(problems, "`"+n+"` does not look like a HuggingFace id (expected <org>/<model>); the gateway's mesh aliases are rejected by vLLM")
+			}
+			continue
+		}
+		gatewayNames = append(gatewayNames, n)
+	}
+	if len(gatewayNames) == 0 {
+		return problems, warnings
+	}
+	known, ok := gatewayModels()
+	if !ok {
+		return problems, append(warnings,
+			"could not reach the LLM gateway, so model names were NOT checked; a name it does not serve will abstain silently rather than error")
+	}
+	for _, n := range gatewayNames {
+		if !known[strings.ToLower(n)] {
+			problems = append(problems, "the gateway does not serve `"+n+
+				"` — it would not error, it would ABSTAIN, silently shrinking the panel (this is the gemma4 failure)")
+		}
+	}
+	return problems, warnings
+}
+
 // MeAppExperimentUpsert — POST /me/apps/:app/experiments (create)
 //
 //	PATCH /me/apps/:app/experiments/:id (edit)
@@ -119,7 +254,10 @@ func MeAppExperimentUpsert(c *gin.Context) {
 	if pid := c.Param("id"); pid != "" {
 		body.ID = pid
 	}
-	if problems := validateExperimentShape(&body); len(problems) > 0 {
+	problems := validateExperimentShape(&body)
+	modelProblems, modelWarnings := validateExperimentModels(&body)
+	problems = append(problems, modelProblems...)
+	if len(problems) > 0 {
 		fail(c, http.StatusUnprocessableEntity, 1422,
 			"not a valid experiment: "+strings.Join(problems, "; "))
 		return
@@ -163,6 +301,9 @@ func MeAppExperimentUpsert(c *gin.Context) {
 	// Callers poll the intent (waitForIntent) exactly as they do for install.
 	c.JSON(http.StatusAccepted, gin.H{
 		"ret_code": 0, "message": "experiment queued",
-		"data": gin.H{"intent_id": id, "app": app, "experiment": body.ID, "status": "pending"},
+		"data": gin.H{"intent_id": id, "app": app, "experiment": body.ID, "status": "pending",
+			// Non-empty when a guard could not run. Silence here means the
+			// check ran and passed; it never means "no check exists".
+			"warnings": modelWarnings},
 	})
 }

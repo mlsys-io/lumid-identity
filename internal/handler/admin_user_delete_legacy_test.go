@@ -96,6 +96,7 @@ func setupLegacyDeleteDBs(t *testing.T) (*gorm.DB, *gorm.DB) {
 		t.Fatalf("create tbl_rm_personal_access_token: %v", err)
 	}
 
+	prevDB := common.DB
 	common.DB, common.LegacyDB = idb, ldb
 	// config.G is a *Config populated at startup from YAML; it is nil in tests.
 	prevCfg := config.G
@@ -105,6 +106,10 @@ func setupLegacyDeleteDBs(t *testing.T) (*gorm.DB, *gorm.DB) {
 	t.Cleanup(func() {
 		admin.Exec("DROP DATABASE IF EXISTS " + legacyTestIdentityDB)
 		admin.Exec("DROP DATABASE IF EXISTS " + legacyTestLQADB)
+		// Restore the package-global DB too: these fixtures DROP their
+		// schemas, so leaving common.DB pointing at a dropped database
+		// breaks every later test in the package.
+		common.DB = prevDB
 		common.LegacyDB = nil
 		config.G = prevCfg
 	})

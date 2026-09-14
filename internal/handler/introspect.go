@@ -3,6 +3,7 @@ package handler
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -316,14 +317,27 @@ func introspectLegacyLQA(token string) *IntrospectResponse {
 		return &IntrospectResponse{Active: false, Reason: "expired"}
 	}
 
-	// Pull the LQA user so downstream gets a useful sub + email + role.
+	// Pull the LQA user. This is an AUTHORIZATION step, not just enrichment:
+	// the query keys on token_hash alone, so without it a legacy PAT stays
+	// Active after its owner is deleted -- a live credential with an empty
+	// role. Measured 2026-09-14; see admin_users.go deleteLegacyUser, which
+	// closes the delete path while this closes every other orphaning route.
 	var u struct {
 		ID       int64  `gorm:"column:id"`
 		Email    string `gorm:"column:email"`
 		Username string `gorm:"column:username"`
 		Role     string `gorm:"column:role"`
+		Status   string `gorm:"column:status"`
 	}
-	common.LegacyDB.Raw(`SELECT id, email, username, role FROM tbl_user WHERE id = ? LIMIT 1`, row.UserID).Scan(&u)
+	common.LegacyDB.Raw(`SELECT id, email, username, role, status FROM tbl_user WHERE id = ? LIMIT 1`,
+		row.UserID).Scan(&u)
+	if reason, ok := ownerRejection(u.ID == 0, u.Status); ok {
+		if u.ID == 0 {
+			log.Printf("[introspect] legacy PAT %q rejected: owner user_id=%d no longer exists",
+				row.Name, row.UserID)
+		}
+		return &IntrospectResponse{Active: false, Reason: reason}
+	}
 
 	// LQA stores scopes comma-separated; Runmesh stores space-separated.
 	// Accept either and normalize so downstream consumers see a clean array.
@@ -375,13 +389,29 @@ func introspectNative(token string) *IntrospectResponse {
 		go common.DB.Exec(`UPDATE tokens SET last_used_at = ? WHERE id = ?`, now, row.ID)
 	}
 
-	// Enrich with email/name for downstream ergonomics.
+	// Look up the OWNER -- not just for enrichment. A token is a claim about
+	// a principal, so a token whose principal is gone or suspended must not
+	// authenticate. This lookup already happened for email/name; it now also
+	// decides.
 	var u struct {
-		Email string
-		Name  string
-		Role  string
+		ID     string
+		Email  string
+		Name   string
+		Role   string
+		Status string
 	}
-	common.DB.Raw(`SELECT email, name, role FROM users WHERE id = ? LIMIT 1`, row.UserID).Scan(&u)
+	common.DB.Raw(`SELECT id, email, name, role, status FROM users WHERE id = ? LIMIT 1`,
+		row.UserID).Scan(&u)
+	if reason, ok := ownerRejection(u.ID == "", u.Status); ok {
+		// Orphans should be rare -- AdminUsersDelete removes a user's tokens in
+		// the same transaction -- so log it: a steady trickle here means some
+		// other path is deleting users without their tokens.
+		if u.ID == "" {
+			log.Printf("[introspect] native token %s rejected: owner %s no longer exists",
+				row.ID, row.UserID)
+		}
+		return &IntrospectResponse{Active: false, Reason: reason}
+	}
 
 	// Expand flowmesh:read/write shortcuts to the fine-grained vocab
 	// FlowMesh's plugin v0.2.0+ requires. See common/scopes.go.
@@ -510,4 +540,26 @@ func itoa(i int64) string {
 		buf[n] = '-'
 	}
 	return string(buf[n:])
+}
+
+// ownerRejection decides whether a token must be refused because of the state
+// of the principal behind it, and returns the introspection `reason`.
+//
+// Deliberately mirrors the LOGIN gate (auth.go: `if u.Status == "suspended"`)
+// rather than demanding status == "active". `status` is active | suspended |
+// pending, and a pending user can log in -- so rejecting everything non-active
+// here would cut off API access that the interactive path still allows, which
+// is a behaviour change nobody asked for. Empty status is treated as active,
+// matching findUserOrMirror's firstNonEmpty(legacy.Status, "active").
+//
+// Missing owner is unconditional: a token is a claim about a principal, and
+// there is no principal.
+func ownerRejection(missing bool, status string) (string, bool) {
+	if missing {
+		return "user not found", true
+	}
+	if status == "suspended" {
+		return "user suspended", true
+	}
+	return "", false
 }

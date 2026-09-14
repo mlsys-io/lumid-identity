@@ -14,6 +14,7 @@ import (
 	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
+	"lumid_identity/internal/config"
 	"lumid_identity/models"
 )
 
@@ -286,6 +287,25 @@ func AdminUsersDelete(c *gin.Context) {
 		}
 	}
 
+	// Legacy FIRST, deliberately. The two stores cannot share a transaction
+	// (separate databases), so one leg can fail after the other committed --
+	// and the two orderings fail very differently:
+	//
+	//   legacy-then-identity: legacy gone, identity row survives -> the user
+	//     still logs in. Not deleted, but nothing is silently resurrected and
+	//     no credential outlives its owner. Retry is safe and idempotent.
+	//   identity-then-legacy: identity gone, legacy row survives -> the next
+	//     login REVIVES the account under a new sub. That is the bug.
+	//
+	// So the unsafe partial state is the one we refuse to create.
+	legacyUsers, legacyTokens, lerr := deleteLegacyUser(u.Email)
+	if lerr != nil {
+		// Report the failure rather than claiming a deletion that did not
+		// happen -- the whole point of this fix.
+		fail(c, http.StatusInternalServerError, 1500, "delete (legacy mirror): "+lerr.Error())
+		return
+	}
+
 	err := common.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("user_id = ?", id).Delete(&models.Session{}).Error; err != nil {
 			return err
@@ -316,7 +336,8 @@ func AdminUsersDelete(c *gin.Context) {
 	}
 
 	writeAudit(c, adminID, id, "admin:user:delete",
-		fmt.Sprintf("email=%s role=%s", u.Email, u.Role))
+		fmt.Sprintf("email=%s role=%s legacy_users=%d legacy_pats=%d",
+			u.Email, u.Role, legacyUsers, legacyTokens))
 	ok(c, "deleted", gin.H{"id": id})
 }
 
@@ -1027,4 +1048,75 @@ func lastLoginByUserID(userIDs []string) map[string]*time.Time {
 		out[r.UserID] = &t
 	}
 	return out
+}
+
+// deleteLegacyUser removes the QuantArena-side mirror of a user.
+//
+// Signup DUAL-WRITES into legacy `tbl_user` (Signup, oauth_google.go,
+// user.go) but deletion used to be single-store, so an account deleted
+// here came back on the user's next login: findUserOrMirror re-creates it
+// from the surviving legacy row with status=active, the old password hash
+// and a *different* sub (uuid5("lqa:<legacy id>")). The 200 "deleted" and
+// its audit row were both untrue. Measured 2026-09-14.
+//
+// Two tables matter, and the second is the sharper edge:
+//
+//   - tbl_user                        — the revival source.
+//   - tbl_rm_personal_access_token    — legacy PATs. introspectLegacyLQA
+//     keys ONLY on token_hash and treats the tbl_user lookup as
+//     enrichment, so it answers Active:true with the token's scopes
+//     intact even when the owning user is gone. Deleting the user
+//     without these leaves live credentials behind with an empty role.
+//
+// Returns the number of legacy rows removed so the audit entry can record
+// whether the legacy leg actually ran. A disabled shadow is not an error:
+// there is simply nothing to mirror.
+func deleteLegacyUser(email string) (users int64, tokens int64, err error) {
+	if !config.G.Legacy.Enabled || common.LegacyDB == nil {
+		return 0, 0, nil
+	}
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return 0, 0, nil
+	}
+
+	// Collect every legacy id for this email. LQA has no unique constraint
+	// on email, so a duplicate row would otherwise survive and revive the
+	// account on its own.
+	// Scan into an explicit struct slice rather than []int64: gorm's
+	// primitive-slice Scan is version-dependent, and this file's other
+	// legacy queries already use the tagged-struct form.
+	var rows []struct {
+		ID int64 `gorm:"column:id"`
+	}
+	if err := common.LegacyDB.Raw(
+		`SELECT id FROM tbl_user WHERE email = ?`, email).Scan(&rows).Error; err != nil {
+		return 0, 0, err
+	}
+	if len(rows) == 0 {
+		return 0, 0, nil
+	}
+	ids := make([]int64, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r.ID)
+	}
+
+	err = common.LegacyDB.Transaction(func(tx *gorm.DB) error {
+		r := tx.Exec(`DELETE FROM tbl_rm_personal_access_token WHERE user_id IN ?`, ids)
+		if r.Error != nil {
+			return r.Error
+		}
+		tokens = r.RowsAffected
+
+		r = tx.Exec(`DELETE FROM tbl_user WHERE id IN ?`, ids)
+		if r.Error != nil {
+			return r.Error
+		}
+		users = r.RowsAffected
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return users, tokens, nil
 }

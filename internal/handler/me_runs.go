@@ -309,6 +309,14 @@ func collectRuns(c *gin.Context, userID string, since, until time.Time) []RunRow
 	scan(tenantAppsDir(userID))
 	scan(filepath.Join(operatorHome(), ".xp", "apps"))
 
+	// 1b. The RUN STORE. On a cloud pod neither path above exists — identity
+	// mounts no tenant volume — so the only source this function had was the
+	// n8n API below, and the endpoint could return VISUAL runs and nothing
+	// else. Merged, not substituted: an operator install on the scheduler's own
+	// volume is readable here and its journal carries a cycle_dir the store
+	// does not.
+	out = mergeRunRows(out, runRowsFromDB(userID, since, until))
+
 	// 2. Visual — n8n executions. Soft-fail on auth.
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
 	defer cancel()

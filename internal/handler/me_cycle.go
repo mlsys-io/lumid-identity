@@ -134,6 +134,12 @@ func MeCyclesList(c *gin.Context) {
 			}
 		}
 	}
+	// The run store carries the same cycles, and on a cloud pod it is the ONLY
+	// source: identity mounts no tenant volume, so the walk above yields nothing
+	// for every app and every user. Merged rather than substituted — an operator
+	// install on the scheduler's own volume is genuinely readable here and
+	// carries step counts and in-flight state the store does not have.
+	rows = mergeCycleRows(rows, cycleRowsFromDB(userID, appFilter, loopFilter))
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Ts != rows[j].Ts {
 			return rows[i].Ts > rows[j].Ts

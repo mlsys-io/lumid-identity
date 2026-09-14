@@ -35,6 +35,12 @@ func TestLoopControlsGoThroughAnIntent(t *testing.T) {
 	for _, c := range []struct{ file, fn, marker string }{
 		{"me_loops.go", "MeLoopPatch", `writeIntent(c, "patch_loop"`},
 		{"me_agent_tools.go", "toolPatchLoop", `writeIntentDirect(userID, "patch_loop"`},
+		// MeLoopStop never 404'd — resolveAppDir hands it the materialised
+		// bundle cache — so it wrote the stop signal, the journal line and the
+		// interrupted cycle.json into a pod-local copy of the PUBLISHED tree
+		// and returned 200 "stop requested". A control that reports success
+		// without acting is worse than one that errors.
+		{"me_loops.go", "MeLoopStop", `writeIntent(c, "stop_loop"`},
 	} {
 		src := loopPatchSrc(t, c.file)
 		i := strings.Index(src, "func "+c.fn+"(")
@@ -50,7 +56,8 @@ func TestLoopControlsGoThroughAnIntent(t *testing.T) {
 				"writing the file itself it will fail for every user, because identity "+
 				"mounts no tenant volume", c.fn)
 		}
-		for _, forbidden := range []string{"tenantAppsDir(", "writeSimpleOverrides(", "os.MkdirAll("} {
+		for _, forbidden := range []string{"tenantAppsDir(", "writeSimpleOverrides(",
+			"os.MkdirAll(", "os.WriteFile(", "resolveAppDir("} {
 			if strings.Contains(block, forbidden) {
 				t.Errorf("%s reaches for %s — that disk does not exist in this pod", c.fn, forbidden)
 			}
@@ -89,17 +96,22 @@ func TestPatchLoopReportsTheQueueNotTheOutcome(t *testing.T) {
 }
 
 // 202, not 200 — the same contract install and patch_experiment use.
-func TestMeLoopPatchReturns202(t *testing.T) {
+func TestLoopWritesReturn202(t *testing.T) {
 	src := loopPatchSrc(t, "me_loops.go")
-	i := strings.Index(src, "func MeLoopPatch(")
-	block := src[i:]
-	if j := strings.Index(block[1:], "\nfunc "); j > 0 {
-		block = block[:j]
-	}
-	if !strings.Contains(block, "http.StatusAccepted") {
-		t.Error("MeLoopPatch does not return 202; identity queues, the scheduler applies")
-	}
-	if strings.Contains(block, "http.StatusOK") {
-		t.Error("MeLoopPatch still returns 200 somewhere — that would claim the write landed")
+	for _, fn := range []string{"MeLoopPatch", "MeLoopStop"} {
+		i := strings.Index(src, "func "+fn+"(")
+		if i < 0 {
+			t.Fatalf("%s not found", fn)
+		}
+		block := src[i:]
+		if j := strings.Index(block[1:], "\nfunc "); j > 0 {
+			block = block[:j]
+		}
+		if !strings.Contains(block, "http.StatusAccepted") {
+			t.Errorf("%s does not return 202; identity queues, the scheduler applies", fn)
+		}
+		if strings.Contains(block, "http.StatusOK") {
+			t.Errorf("%s still returns 200 somewhere — that would claim the write landed", fn)
+		}
 	}
 }

@@ -23,12 +23,9 @@ package handler
 //         filtering lands when cloud runtime stands up (P2).
 
 import (
-	"encoding/json"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -281,65 +278,25 @@ func MeLoopStop(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app/loop name")
 		return
 	}
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
-		return
+	// ── An INTENT, for the same reason the patch is ──
+	//
+	// This handler resolved its app dir through resolveAppDir, which on a pod
+	// returns the MATERIALISED BUNDLE CACHE — a copy of the published tree. So
+	// it never 404'd, and all three of its effects (the stop signal, the journal
+	// line, the interrupted cycle.json) were written into a pod-local directory
+	// the runner never reads, and it returned 200 "stop requested". A control
+	// that reports success without acting is worse than one that errors.
+	//
+	// The scheduler owns the volume the runner watches, so the stop goes there.
+	// It costs one drain tick of latency; a late stop beats one that never
+	// arrives.
+	id := writeIntent(c, "stop_loop", userID, map[string]any{"app": app, "loop": loop})
+	if id == "" {
+		return // writeIntent already wrote the error response
 	}
-	// 1. Write the cooperative stop signal where the runner WATCHES it. The runner
-	//    resolves data/control → .lumid/control (the runtime dir) and exposes that
-	//    via LUMID_CYCLE_STOP_FILE, so writing only data/control was never seen.
-	//    Write BOTH to cover the dual read/write layout.
-	sig := map[string]any{"loop": loop, "by": userID, "at": time.Now().UTC().Format(time.RFC3339)}
-	sigBytes, _ := json.Marshal(sig)
-	for _, base := range []string{filepath.Join(appDir, ".lumid", "control"), filepath.Join(appDir, "data", "control")} {
-		_ = os.MkdirAll(base, 0o755)
-		_ = os.WriteFile(filepath.Join(base, "stop."+loop+".signal"), sigBytes, 0o644)
-	}
-	// 2. Append a journal event so the live session shows "stopped by user".
-	jrow := map[string]any{
-		"ts": time.Now().UTC().Format(time.RFC3339), "loop": loop,
-		"event": "control", "stage": "stopped", "status": "stopped",
-		"ok": false, "outcome": "interrupted", "note": "stopped by user",
-	}
-	if b, err := json.Marshal(jrow); err == nil {
-		if f, e := os.OpenFile(filepath.Join(appDir, "data", "journal.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
-			_, _ = f.Write(append(b, '\n'))
-			_ = f.Close()
-		}
-	}
-	// 3. Stamp the newest in-flight cycle dir (no cycle.json yet) as interrupted.
-	//    Resolve the RUNTIME cycles dir (.lumid/cycles) — that's where the runner
-	//    creates the in-flight cycle, so data/cycles would miss it.
-	stopped := ""
-	cyclesRoot, _ := ResolveRuntimeReadPath(appDir, "data/cycles")
-	cyclesDir := filepath.Join(cyclesRoot, loop)
-	if entries, err := os.ReadDir(cyclesDir); err == nil {
-		newest := ""
-		for _, e := range entries {
-			if e.IsDir() && e.Name() > newest {
-				if _, err := os.Stat(filepath.Join(cyclesDir, e.Name(), "cycle.json")); err != nil {
-					newest = e.Name() // in-flight (no cycle.json)
-				}
-			}
-		}
-		if newest != "" {
-			cj := map[string]any{
-				"ok": false, "app": app, "loop": loop, "status": "interrupted",
-				"outcome": "interrupted", "reason": "user_stopped",
-				"cycle_dir":   filepath.Join(cyclesDir, newest),
-				"stopped_at":  time.Now().UTC().Format(time.RFC3339),
-				"interrupted": true,
-			}
-			if b, err := json.MarshalIndent(cj, "", "  "); err == nil {
-				_ = os.WriteFile(filepath.Join(cyclesDir, newest, "cycle.json"), b, 0o644)
-				stopped = newest
-			}
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "stop requested",
-		"data": gin.H{"loop": loop, "stopped_cycle": stopped},
+	c.JSON(http.StatusAccepted, gin.H{
+		"ret_code": 0, "message": "stop queued",
+		"data": gin.H{"app": app, "loop": loop, "intent_id": id, "status": "pending"},
 	})
 }
 

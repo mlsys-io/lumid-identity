@@ -177,16 +177,51 @@ func readExpStateFor(userSub, app, appDir, id string) map[string]any {
 	p, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "experiments", id, "state.json"))
 	if b, err := os.ReadFile(p); err == nil {
 		_ = json.Unmarshal(b, &st)
+		// The DISK path carried no staleness marker at all, so exactly the
+		// installs identity CAN read served a number with no way to tell how old
+		// it was. Both sides now say when they were computed.
+		if _, has := st["state_updated_at"]; !has {
+			if u, ok := st["updated_at"].(string); ok && u != "" {
+				st["state_updated_at"] = u
+			}
+		}
 	}
-	// "Has something" means it actually carries results — an empty or
-	// zero-result state.json must not mask a real self-reported one.
-	if n, ok := st["n_results"].(float64); ok && n > 0 {
+	diskN, _ := st["n_results"].(float64)
+	if userSub == "" || app == "" {
+		return st // caller has only a directory; there is no DB row to prefer
+	}
+	stored := storedExpState(userSub, app, id)
+	if stored == nil {
 		return st
 	}
-	if userSub != "" && app != "" {
-		if stored := storedExpState(userSub, app, id); stored != nil {
-			return stored
+	// NEWER WINS, not "disk wins if it has anything".
+	//
+	// The old rule returned the on-disk blob whenever it carried n_results > 0,
+	// so a stale materialised copy beat a fresh DB row — which is the wrong way
+	// round for the case that actually occurs: evaluate() runs on the SCHEDULER's
+	// volume and bridges its result here, so the DB is the side that moves.
+	// Measured 2026-09-09 for a3f48236: judge_panel_parity held 52 rows against
+	// n=17 served, and kol_alpha 12 against 2.
+	//
+	// Compare the two blobs' OWN `updated_at` — both are written by evaluate(),
+	// so it is one clock on both sides. The DB row's transport timestamp is not
+	// comparable to it and is not used here.
+	diskWhen, _ := st["updated_at"].(string)
+	dbWhen, _ := stored["updated_at"].(string)
+	if diskWhen != "" && dbWhen != "" {
+		if diskWhen > dbWhen { // RFC3339 sorts lexically
+			return st
 		}
+		return stored
+	}
+	// One side (or neither) is undated: fall back to "more results wins", which
+	// is the old rule's intent without its assumption that disk is authoritative.
+	dbN, _ := stored["n_results"].(float64)
+	if diskN > dbN {
+		return st
+	}
+	if dbN > 0 || diskN == 0 {
+		return stored
 	}
 	return st
 }

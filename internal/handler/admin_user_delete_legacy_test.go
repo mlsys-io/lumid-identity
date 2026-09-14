@@ -254,11 +254,36 @@ func TestAdminUserDeleteLegacyFailureRefuses(t *testing.T) {
 	}
 }
 
-// TestAdminUserDeleteLegacyDisabled: with shadow off there is nothing to
-// mirror, so delete must still succeed and touch nothing legacy-side.
+// TestAdminUserDeleteLegacyFlagOffStillCleansPATs pins the gate asymmetry:
+// introspectLegacyLQA checks only that the legacy DB is configured, so with
+// Legacy.Enabled=false a legacy PAT still authenticates. Cleanup must follow
+// the enforcement surface, not the flag, or deleting a user leaves a live
+// credential behind in exactly the state operators think is "shadow off".
+func TestAdminUserDeleteLegacyFlagOffStillCleansPATs(t *testing.T) {
+	idb, ldb := setupLegacyDeleteDBs(t)
+	const id, email = "55555555-5555-5555-5555-555555555555", "flag-off@yao.lu"
+	seedBothStores(t, idb, ldb, id, email)
+	config.G.Legacy.Enabled = false // shadow "off", DB still wired
+
+	if w := doDelete(t, id); w.Code != http.StatusOK {
+		t.Fatalf("delete: want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var pats, users int64
+	ldb.Raw(`SELECT COUNT(*) FROM tbl_rm_personal_access_token`).Scan(&pats)
+	ldb.Raw(`SELECT COUNT(*) FROM tbl_user WHERE email = ?`, email).Scan(&users)
+	if pats != 0 {
+		t.Errorf("legacy PAT survived with shadow off, but introspect still honours it: %d", pats)
+	}
+	if users != 0 {
+		t.Errorf("legacy user row survived with shadow off (revives if the flag flips back): %d", users)
+	}
+}
+
+// TestAdminUserDeleteLegacyDisabled: with no legacy DB wired at all there is
+// nothing to mirror, so delete must still succeed and touch nothing.
 func TestAdminUserDeleteLegacyDisabled(t *testing.T) {
 	idb, _ := setupLegacyDeleteDBs(t)
-	config.G.Legacy.Enabled = false
+	common.LegacyDB = nil
 	const id, email = "44444444-4444-4444-4444-444444444444", "no-shadow@yao.lu"
 	if err := idb.Create(&models.User{
 		ID: id, Email: email, Name: email, Role: "user", Status: "active",
@@ -275,7 +300,7 @@ func TestAdminUserDeleteLegacyDisabled(t *testing.T) {
 	}
 	users, tokens, err := deleteLegacyUser(email)
 	if err != nil || users != 0 || tokens != 0 {
-		t.Errorf("disabled shadow should be a no-op, got users=%d tokens=%d err=%v", users, tokens, err)
+		t.Errorf("no legacy DB should be a no-op, got users=%d tokens=%d err=%v", users, tokens, err)
 	}
 	_ = fmt.Sprint()
 }

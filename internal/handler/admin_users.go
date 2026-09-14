@@ -14,7 +14,6 @@ import (
 	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
-	"lumid_identity/internal/config"
 	"lumid_identity/models"
 )
 
@@ -1072,7 +1071,15 @@ func lastLoginByUserID(userIDs []string) map[string]*time.Time {
 // whether the legacy leg actually ran. A disabled shadow is not an error:
 // there is simply nothing to mirror.
 func deleteLegacyUser(email string) (users int64, tokens int64, err error) {
-	if !config.G.Legacy.Enabled || common.LegacyDB == nil {
+	// Gate on the CONNECTION, not on Legacy.Enabled -- the two legacy gates
+	// in this codebase are deliberately different and the flag is the weaker
+	// one. introspectLegacyLQA checks only `common.LegacyDB == nil`, so legacy
+	// PATs keep validating whenever the legacy DB is configured, even with
+	// shadow disabled; findUserOrMirror additionally checks the flag. Cleaning
+	// up only when the flag is on would leave live credentials behind in the
+	// flag-off state, which is exactly the leak this function exists to close.
+	// If the legacy DB is reachable at all, its rows are load-bearing.
+	if common.LegacyDB == nil {
 		return 0, 0, nil
 	}
 	email = strings.ToLower(strings.TrimSpace(email))

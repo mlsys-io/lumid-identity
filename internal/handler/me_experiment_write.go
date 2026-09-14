@@ -375,3 +375,80 @@ func MeAppExperimentUpsert(c *gin.Context) {
 			"warnings": modelWarnings},
 	})
 }
+
+// MeAppExperimentControl — POST /me/apps/:app/experiments/:id/control
+//
+// The lifecycle verbs, for the SURFACE. They existed only in chat: the card
+// could read `status: concluded|archived` and nothing could write it, so an
+// experiment that was finished stayed "collecting" forever — while the cycle
+// hook emitted an offer saying "Consider promoting the winning variant or
+// concluding the experiment", naming an action no button could reach.
+//
+// Queued like every other tenant-affecting write; identity mounts no tenant
+// volume and the scheduler owns the spec.
+func MeAppExperimentControl(c *gin.Context) {
+	userID, okk := currentUserID(c)
+	if !okk {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app, id := c.Param("app"), c.Param("id")
+	if !slugRe.MatchString(app) || !slugRe.MatchString(id) {
+		fail(c, http.StatusBadRequest, 1400, "invalid app or experiment")
+		return
+	}
+	var body struct {
+		Op             string `json:"op"`
+		Reason         string `json:"reason,omitempty"`
+		NewID          string `json:"new_id,omitempty"`
+		Arm            string `json:"arm,omitempty"`
+		DatasetVersion string `json:"dataset_version,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
+		return
+	}
+	switch body.Op {
+	case "conclude", "archive", "reopen", "checkpoint", "fork", "remove_arm", "delete", "revert":
+	default:
+		fail(c, http.StatusBadRequest, 1400,
+			"op must be one of conclude|archive|reopen|checkpoint|fork|remove_arm|delete|revert")
+		return
+	}
+	// The same three refusals the chat tool makes, stated as rules. A checkpoint
+	// fences every row measured so far out of the comparison; one whose motive
+	// nobody recorded cannot be read six weeks later, which is what the
+	// paragraphs of YAML comments in the live specs exist to compensate for.
+	if body.Op == "checkpoint" && strings.TrimSpace(body.Reason) == "" {
+		fail(c, http.StatusBadRequest, 1400,
+			"a checkpoint needs a reason — it fences every row measured so far out of the "+
+				"comparison, and a fence with no recorded motive cannot be read later")
+		return
+	}
+	if body.Op == "fork" && !slugRe.MatchString(body.NewID) {
+		fail(c, http.StatusBadRequest, 1400, "fork needs new_id (a slug)")
+		return
+	}
+	if body.Op == "remove_arm" && strings.TrimSpace(body.Arm) == "" {
+		fail(c, http.StatusBadRequest, 1400, "remove_arm needs arm")
+		return
+	}
+	payload := map[string]any{"app": app, "experiment": id, "op": body.Op}
+	for k, v := range map[string]string{
+		"reason": body.Reason, "new_id": body.NewID,
+		"arm": body.Arm, "dataset_version": body.DatasetVersion,
+	} {
+		if v != "" {
+			payload[k] = v
+		}
+	}
+	iid := writeIntent(c, "experiment_control", userID, payload)
+	if iid == "" {
+		return // writeIntent already wrote the error response
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"ret_code": 0, "message": body.Op + " queued",
+		"data": gin.H{"app": app, "experiment": id, "op": body.Op,
+			"intent_id": iid, "status": "pending"},
+	})
+}

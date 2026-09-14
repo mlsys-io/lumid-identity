@@ -677,6 +677,25 @@ var capabilityScopes = map[string]bool{
 	// each is its own decision, not a set to be added wholesale.
 	"flowmesh:workers:read": true,
 	"flowmesh:nodes:read":   true,
+	// The rest of the aud=flowmesh SESSION-BEARER's set, minted for EVERY signed-in
+	// user by user.go's `case "flowmesh"`. Making them PAT-mintable changes the
+	// CREDENTIAL TYPE, not who may do what: the same person already holds all of
+	// these the moment they log in. Without them a PAT cannot run a job end to end —
+	// Lumilake forwards the CALLER's bearer to FlowMesh, so a submit that clears
+	// Lumilake's own gate then dies on
+	//   403 "kind-level write on workflow requires 'flowmesh:workflows:write'"
+	// (measured 2026-09-14 with a real role=user, after the object-prefix gate was
+	// fixed). The wildcard `flowmesh:*` was the only mintable alternative, which is
+	// strictly more privilege than running one job needs.
+	//
+	// Still NOT here, and each its own decision: workers:write, nodes:write,
+	// results:write, system:read. Those are not in the session-bearer set either,
+	// so adding them WOULD widen what a signed-in user can do.
+	"flowmesh:workflows:write": true,
+	"flowmesh:workflows:read":  true,
+	"flowmesh:tasks:read":      true,
+	"flowmesh:results:read":    true,
+	"flowmesh:ssh":             true,
 }
 
 // isCapabilityScope reports whether a raw scope is an opaque LQT-style

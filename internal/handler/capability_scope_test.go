@@ -139,14 +139,18 @@ func TestFlowmeshFleetReadScopesGrantable(t *testing.T) {
 		}
 	}
 
-	// The mutating and adjacent FlowMesh scopes are NOT part of this change and
-	// must stay un-grantable for a plain user. `flowmesh:*` remains admin-only via
-	// the matrix, not via this allowlist.
+	// Scopes outside the session-bearer set must stay un-grantable for a plain user.
+	// `flowmesh:*` remains admin-only via the matrix, not via this allowlist.
+	//
+	// NARROWED 2026-09-14: this list used to include flowmesh:workflows:write and
+	// flowmesh:tasks:read. Both are now deliberately grantable — see
+	// TestFlowmeshSessionBearerParity. They are in the aud=flowmesh session-bearer
+	// that every signed-in user already receives, so refusing them on a PAT bought
+	// no safety and forced callers onto the `flowmesh:*` WILDCARD to run one job.
+	// The remaining entries are NOT in that set, so they would be a real widening.
 	for _, bad := range []string{
 		"flowmesh:workers:write",
 		"flowmesh:nodes:write",
-		"flowmesh:workflows:write",
-		"flowmesh:tasks:read",
 		"flowmesh:results:write",
 		"flowmesh:system:read",
 		"flowmesh:workers",
@@ -154,6 +158,56 @@ func TestFlowmeshFleetReadScopesGrantable(t *testing.T) {
 	} {
 		if canGrant(user, nil, bad) {
 			t.Fatalf("%q must not be grantable by a plain user", bad)
+		}
+	}
+}
+
+// TestFlowmeshSessionBearerParity pins the rule that decides this list: a PAT may
+// carry exactly what the aud=flowmesh SESSION-BEARER already mints for every
+// signed-in user (user.go, `case "flowmesh"`), and nothing more. That is a
+// credential-type change, not a privilege change — the same person holds these the
+// moment they log in.
+//
+// The mutating scopes that are NOT in the session-bearer set must stay
+// un-grantable, so widening shows up here as a failure rather than as a PAT that
+// can do more than a login.
+func TestFlowmeshSessionBearerParity(t *testing.T) {
+	user := models.User{Role: "user", Status: "active"}
+	suspended := models.User{Role: "user", Status: "suspended"}
+
+	// Exactly the set user.go mints for aud=flowmesh.
+	sessionBearerSet := []string{
+		"flowmesh:ssh",
+		"flowmesh:workflows:write",
+		"flowmesh:workflows:read",
+		"flowmesh:tasks:read",
+		"flowmesh:results:read",
+		"flowmesh:workers:read",
+		"flowmesh:nodes:read",
+	}
+	for _, s := range sessionBearerSet {
+		if !canGrant(user, nil, s) {
+			t.Fatalf("session-bearer scope %q must be PAT-mintable (credential parity)", s)
+		}
+		if canGrant(suspended, nil, s) {
+			t.Fatalf("suspended user must not be able to mint %q", s)
+		}
+		if svc, _ := parseScope(s); svc != "" {
+			t.Fatalf("%q must stay opaque to parseScope, got service %q", s, svc)
+		}
+	}
+
+	// NOT in the session-bearer set => must NOT be grantable. Adding any of these
+	// would let a PAT exceed what its owner gets by logging in.
+	for _, bad := range []string{
+		"flowmesh:workers:write",
+		"flowmesh:nodes:write",
+		"flowmesh:results:write",
+		"flowmesh:system:read",
+		"flowmesh:workflows:cancel",
+	} {
+		if canGrant(user, nil, bad) {
+			t.Fatalf("%q is not in the session-bearer set and must not be grantable", bad)
 		}
 	}
 }

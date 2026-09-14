@@ -98,12 +98,29 @@ func SessionBearerHandler(c *gin.Context) {
 		// 'flowmesh:workflows:write'") for every non-`*` user — the app
 		// wasn't saying which capability it exercises (2026-06-12).
 		// Session-bearer only, 10-min TTL; not PAT-mintable.
+		// workers:read / nodes:read added 2026-09-14 — the SAME failure as the
+		// 2026-06-12 note above, one scope later. Studio's Research Fleet tab
+		// lists workers and nodes, and the lumid plugin maps (WORKER, READ) ->
+		// "flowmesh:workers:read" and (NODE, READ) -> "flowmesh:nodes:read"
+		// (lumid_flowmesh_plugin/permissions.py). Without them the plugin
+		// refuses the read and the API answers 200 [] rather than 403 — so a
+		// healthy fleet renders as an EMPTY one, with nothing anywhere saying
+		// why.
+		//
+		// That cost most of a day: office was diagnosed as having no workers
+		// and chased through Redis, the registry index, heartbeats and the ACL
+		// store, all of which were correct. Twelve workers were registered,
+		// heartbeating and ACL-granted the entire time; only the bearer could
+		// not see them. Enforcement arrived with the 0.1.9 host, which is why
+		// an 0.1.8 site kept answering normally with the identical token.
 		scopes = []string{
 			"flowmesh:ssh",
 			"flowmesh:workflows:write",
 			"flowmesh:workflows:read",
 			"flowmesh:tasks:read",
 			"flowmesh:results:read",
+			"flowmesh:workers:read",
+			"flowmesh:nodes:read",
 		}
 	case "lqt":
 		// LQT read surfaces (lum.id/lqt/inspect/*, served by its own ingress

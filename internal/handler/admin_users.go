@@ -638,6 +638,24 @@ var capabilityScopes = map[string]bool{
 	// rather than one wildcard, so read and write stay separable.
 	"lumilake:jobs:read":  true,
 	"lumilake:jobs:write": true,
+	// Cancel completes the jobs triad. The plugin policy has mapped
+	// (JOB, CANCEL) -> "lumilake:jobs:cancel" since it was written, but the tag
+	// was never added here, so it was ungrantable for exactly the same reason as
+	// read/write were before 2026-09-13 -- nobody could cancel a Lumilake job
+	// through the platform. Found 2026-09-14 while auditing the policy against
+	// this list; separable from write on purpose.
+	"lumilake:jobs:cancel": true,
+	// Lumilake worker listing -- routes/workers.py enumerates the FlowMesh fleet
+	// through Lumilake and requires this exact string (lumid.plugins v0.2.5,
+	// where WORKER is also a `fleet_kind`, so holding the scope returns the whole
+	// fleet rather than an ownership-filtered empty list).
+	//
+	// SHIPPING THE PLUGIN SCOPE WITHOUT THIS ENTRY MAKES THE SCOPE UNOBTAINABLE.
+	// Measured 2026-09-14: PAT mint answered 403 "scope not grantable:
+	// lumilake:workers:read" to super_admin, so the 403 Lumilake returns for a
+	// caller lacking it was correct in form and impossible to satisfy. Same
+	// first-colon parseScope limitation described above.
+	"lumilake:workers:read": true,
 }
 
 // isCapabilityScope reports whether a raw scope is an opaque LQT-style

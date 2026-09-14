@@ -60,3 +60,54 @@ func TestCapabilityScopeGrantable(t *testing.T) {
 		}
 	}
 }
+
+// TestLumilakeCapabilityScopesGrantable pins the Lumilake tags. Every scope the
+// lumid plugin's policy names must be mintable here, or it is enforceable and
+// unobtainable at the same time: Lumilake answers 403 naming a scope the platform
+// refuses to issue. That is exactly what happened twice — jobs:read/write before
+// 2026-09-13, then workers:read on 2026-09-14, where a PAT mint told super_admin
+// "scope not grantable: lumilake:workers:read".
+//
+// These must remain CAPABILITY tags rather than service scopes: parseScope splits
+// on the FIRST colon, so "lumilake:workers:read" reads as level "workers:read",
+// which is not a level, and canGrant's `svc == ""` return sits ABOVE the admin
+// bypass — so without the allowlist entry not even super_admin can mint one.
+func TestLumilakeCapabilityScopesGrantable(t *testing.T) {
+	user := models.User{Role: "user", Status: "active"}
+	suspended := models.User{Role: "user", Status: "suspended"}
+	super := models.User{Role: "super_admin", Status: "active"}
+
+	for _, s := range []string{
+		"lumilake:jobs:read",
+		"lumilake:jobs:write",
+		"lumilake:jobs:cancel",
+		"lumilake:workers:read",
+	} {
+		if !canGrant(user, nil, s) {
+			t.Fatalf("active role=user must be able to mint %q", s)
+		}
+		if !canGrant(super, nil, s) {
+			t.Fatalf("super_admin must be able to mint %q", s)
+		}
+		if canGrant(suspended, nil, s) {
+			t.Fatalf("suspended user must not be able to mint %q", s)
+		}
+		// The tag must stay OPAQUE: it confers no platform access, so parseScope
+		// must still refuse to read it as a service/level pair.
+		if svc, _ := parseScope(s); svc != "" {
+			t.Fatalf("%q must stay opaque to parseScope, got service %q", s, svc)
+		}
+	}
+
+	// Least-privilege: near-miss strings are not grantable, no prefix/wildcard rule.
+	for _, bad := range []string{
+		"lumilake:workers:write",
+		"lumilake:workers",
+		"lumilake:workers:read:extra",
+		"lumilake:nodes:read",
+	} {
+		if canGrant(user, nil, bad) {
+			t.Fatalf("%q must not be grantable by a plain user", bad)
+		}
+	}
+}

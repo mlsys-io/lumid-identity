@@ -262,6 +262,19 @@ func MeRunDetail(c *gin.Context) {
 
 	cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
 	if cycleDir == "" {
+		// "cycle not found" is true and useless: resolveCycleDir scans a disk
+		// this pod does not mount, so it finds nothing for every run that has
+		// ever happened. The run LIST is rebuilt from the run store; the
+		// per-step detail behind it is not reconstructible, and saying which is
+		// which is the difference between a missing run and an unmountable
+		// volume.
+		if why := unavailableReason(resolveAppDir(userID, app), "per-run step detail"); why != "" {
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+				"run_id": runID, "kind": "scheduled", "app": app, "loop": loop, "ts": ts,
+				"steps": []any{}, "unavailable": why,
+			}})
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "cycle not found")
 		return
 	}

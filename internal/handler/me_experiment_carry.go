@@ -1,6 +1,13 @@
 package handler
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+	"time"
+
+	"lumid_identity/internal/common"
+	"lumid_identity/models"
+)
 
 // experimentCarryKeys — the experiments[] keys a partial write must put back.
 //
@@ -216,5 +223,52 @@ func hydratePatchBody(b *experimentWriteBody, decl map[string]any) {
 		if d, ok := decl["dispatch"].(map[string]any); ok {
 			b.Dispatch = d
 		}
+	}
+}
+
+// waitIntentWarnings polls one intent briefly and returns the warnings its
+// result carries, plus whether it completed.
+//
+// WHY A CHAT TOOL WAITS AT ALL. The model guard is the whole reason
+// define_experiment has a guard: a model name that resolves nowhere does not
+// error, it ABSTAINS, and a "median of three" panel quietly becomes a panel of
+// one while every number on screen still looks healthy. The scheduler produces
+// that warning — and produces it AFTER writing the spec, returned in the intent
+// result. The tool's answer said "poll the intent for the result and any model
+// warnings", and nothing polls: the assistant reports success and the warning
+// is never spoken.
+//
+// Bounded hard. A chat turn cannot stall on a queue, so this waits seconds, not
+// the 90 the UI can afford, and says plainly when it gave up rather than
+// implying there was nothing to report.
+func waitIntentWarnings(userSub, intentID string, budget time.Duration) ([]string, bool) {
+	if intentID == "" || common.DB == nil {
+		return nil, false
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		var row models.MeAppIntent
+		if err := common.DB.Where("id = ? AND user_sub = ?", intentID, userSub).
+			First(&row).Error; err != nil {
+			return nil, false
+		}
+		if row.Status == "completed" || row.Status == "failed" {
+			var res struct {
+				Warnings []string `json:"warnings"`
+				Error    string   `json:"error"`
+			}
+			if row.Result != "" {
+				_ = json.Unmarshal([]byte(row.Result), &res)
+			}
+			out := res.Warnings
+			if res.Error != "" {
+				out = append(out, res.Error)
+			}
+			return out, true
+		}
+		if time.Now().After(deadline) {
+			return nil, false
+		}
+		time.Sleep(400 * time.Millisecond)
 	}
 }

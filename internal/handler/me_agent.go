@@ -4274,10 +4274,32 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if id == "" {
 			return map[string]any{"error": "could not queue the definition"}, false
 		}
-		return map[string]any{"ok": true, "intent_id": id, "app": app,
+		// WAIT, BRIEFLY, FOR THE WARNINGS. The guard that matters here is the
+		// model check: a name that resolves nowhere does not error, it
+		// ABSTAINS, and a "median of three" panel quietly becomes a panel of
+		// one while every number on screen still looks healthy. The scheduler
+		// emits that warning in the intent result — and this tool used to
+		// return "poll the intent for any model warnings" with nothing
+		// polling, so the assistant reported success and the warning was never
+		// spoken.
+		out := map[string]any{"ok": true, "intent_id": id, "app": app,
 			"experiment": eid, "loop": loop, "metric": metric,
-			"scope": map[string]any{"dataset_id": ds, "cases": caseList},
-			"note":  "queued — the scheduler applies it; poll the intent for the result and any model warnings"}, true
+			"scope": map[string]any{"dataset_id": ds, "cases": caseList}}
+		if warns, done := waitIntentWarnings(userID, id, 6*time.Second); done {
+			out["applied"] = true
+			if len(warns) > 0 {
+				out["warnings"] = warns
+				out["note"] = "applied, WITH WARNINGS — read them out; a model that " +
+					"resolves nowhere does not error, it abstains, and the panel shrinks silently"
+			} else {
+				out["note"] = "applied"
+			}
+		} else {
+			out["applied"] = false
+			out["note"] = "queued — still applying. Poll the intent for the result and any " +
+				"model warnings; do not report it as done yet."
+		}
+		return out, true
 
 	case "add_experiment_arm":
 		// WHY THIS READS BEFORE IT WRITES. patch_experiment replaces the whole

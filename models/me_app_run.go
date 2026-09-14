@@ -36,7 +36,18 @@ type MeAppRun struct {
 	// every app and every user, so the Outputs tier shipped with no reachable
 	// source at all. Same problem MeAppExperiment solves for experiment state,
 	// same answer.
-	Outputs   string    `gorm:"column:outputs;type:text"         json:"-"`
+	Outputs string `gorm:"column:outputs;type:text"         json:"-"`
+	// `events` — what the run SAID, as opposed to what it measured.
+	//
+	// Offers (the cycle's "criteria met, conclude or promote" prompt) and
+	// step_errors both existed only in the cycle dir, on a volume this service
+	// does not mount. So the one proactive signal the platform produces reached
+	// nobody, and FailureCard could render a failed run with no error text.
+	//
+	// Its own column, not folded into `outputs`: that field is the cycle's final
+	// ARTIFACT and MeAppLatestOutput serves it straight to the Outputs tier,
+	// where run events would render as artifact keys.
+	Events    *string   `gorm:"column:events;type:text"                json:"events,omitempty"`
 	Source    string    `gorm:"column:source;size:24"            json:"source,omitempty"` // self_report | backfill
 	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
 }

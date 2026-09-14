@@ -31,6 +31,8 @@ type appRunBody struct {
 	Metrics   map[string]any `json:"metrics"` // the cycle's own summary — any shape
 	Source    string         `json:"source"`
 	Outputs   any            `json:"outputs"`
+	// Offers + step_errors — what the run SAID. See models.MeAppRun.Events.
+	Events any `json:"events"`
 }
 
 // InternalAppRunRecord — POST /api/v1/internal/app-runs (X-Bridge-Secret).
@@ -68,9 +70,27 @@ func InternalAppRunRecord(c *gin.Context) {
 			mj = string(raw)
 		}
 	}
+	// Run EVENTS — the offer the cycle emitted, and the step errors behind a
+	// failure. Marshalled like outputs and bounded the same way: a run that
+	// says something must not be able to say 64 KiB of it.
+	var ej *string
+	if b.Events != nil {
+		if raw, err := json.Marshal(b.Events); err == nil && len(raw) > 2 {
+			e := string(raw)
+			if len(e) > 16*1024 {
+				e = `{"_truncated":true,"_bytes":` + strconv.Itoa(len(raw)) + `}`
+			}
+			ej = &e
+		}
+	}
 	row := models.MeAppRun{
 		UserSub: b.UserSub, App: b.App, Loop: b.Loop, RunTs: b.RunTs,
 		Model: b.Model, Ok: b.Ok, DurationS: b.DurationS, Metrics: mj, Source: src,
+	}
+	// Same append-only reasoning as outputs: a later report carrying none must
+	// not blank what an earlier one said.
+	if ej != nil {
+		row.Events = ej
 	}
 	// Assign() would overwrite a stored artifact with "" on a later report that
 	// carries none (a re-report, a backfill). An artifact is append-only from

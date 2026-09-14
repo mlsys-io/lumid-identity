@@ -191,6 +191,25 @@ func runRowFromStore(r models.MeAppRun) (RunRow, bool) {
 		// except the Home rail.
 		row.State = "failed"
 	}
+	// The error text behind the failure, so FailureCard has something to render.
+	// Without it a failed run states only that it failed — which is where the
+	// reader was already.
+	if r.Events != nil && *r.Events != "" {
+		var ev struct {
+			StepErrors []string `json:"step_errors"`
+			Outcome    string   `json:"outcome"`
+			Reason     string   `json:"reason"`
+		}
+		if json.Unmarshal([]byte(*r.Events), &ev) == nil {
+			if len(ev.StepErrors) > 0 {
+				row.Reason = ev.StepErrors[0]
+			} else if ev.Reason != "" {
+				row.Reason = ev.Reason
+			} else if ev.Outcome != "" {
+				row.Reason = ev.Outcome
+			}
+		}
+	}
 	if r.DurationS != nil {
 		row.DurationSec = *r.DurationS
 	}

@@ -194,11 +194,37 @@ func meRunMark(c *gin.Context, verb string) {
 		args = append(args, "--loop", loop)
 	}
 	obj, err, status := runTrajectoryCLI(userSub, args...)
-	if err != nil {
-		fail(c, status, 1502, err.Error())
+	if err == nil {
+		ok(c, verb+"d", obj)
 		return
 	}
-	ok(c, verb+"d", obj)
+	// ── The CLI is not in this image, and never was ──
+	//
+	// promote-to-champion and discard shell out to a `trajectory` binary that
+	// the identity container does not ship, so every click returned 503 and a
+	// red toast. The error is honest and the outcome is not: two controls the
+	// run tree offers have never worked for anyone.
+	//
+	// Fall through to an intent, the way every other tenant-affecting write in
+	// this service does. The scheduler owns the volume the marker lands on;
+	// this process was never going to be able to write it. The CLI path stays
+	// first because an operator install that DOES have the binary gets the
+	// synchronous answer it always got.
+	if status == http.StatusServiceUnavailable {
+		payload := map[string]any{"app": app, "ts": ts, "op": verb}
+		if loop := c.Query("loop"); loop != "" {
+			payload["loop"] = loop
+		}
+		if id := writeIntent(c, "mark_run", userSub, payload); id != "" {
+			c.JSON(http.StatusAccepted, gin.H{
+				"ret_code": 0, "message": verb + " queued",
+				"data": gin.H{"app": app, "ts": ts, "op": verb,
+					"intent_id": id, "status": "pending"},
+			})
+		}
+		return
+	}
+	fail(c, status, 1502, err.Error())
 }
 
 // meLoopEnqueueBody — fan-out a batch of variants into the trajectory queue.

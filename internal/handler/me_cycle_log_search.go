@@ -71,11 +71,20 @@ func MeCycleLogSearch(c *gin.Context) {
 	}
 
 	matches, capped := searchCycleLog(appDir, loop, ts, q, kind)
-	ok(c, "ok", gin.H{
+	resp := gin.H{
 		"app": app, "loop": loop, "ts": ts,
 		"q": q, "type": kind,
 		"matches": matches, "count": len(matches), "capped": capped,
-	})
+	}
+	if len(matches) == 0 {
+		// "no matches" and "the transcript is unreachable" are opposite answers
+		// and looked identical: one means your term is not there, the other
+		// means nothing was searched.
+		if why := unavailableReason(appDir, "the cycle transcript this searches"); why != "" {
+			resp["unavailable"] = why
+		}
+	}
+	ok(c, "ok", resp)
 }
 
 // searchCycleLog greps one cycle's transcript + journal + step errors for q

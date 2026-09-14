@@ -185,6 +185,18 @@ func MeCycleDetail(c *gin.Context) {
 	}
 	data, found := cycleDetailForUser(userID, app, loop, ts)
 	if !found {
+		// "cycle not found" is true and useless: cycleDetailForUser scans
+		// tenantAppsDir and operatorHome DIRECTLY (not even resolveAppDir's
+		// materialised cache), so on this pod it finds nothing for every cycle
+		// that has ever run. Name the cause, or the drill-down reads as a
+		// missing run rather than an unmountable volume.
+		if why := unavailableReason(resolveAppDir(userID, app), "per-step cycle detail"); why != "" {
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+				"app": app, "loop": loop, "ts": ts, "steps": []any{},
+				"unavailable": why,
+			}})
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "cycle not found")
 		return
 	}

@@ -700,9 +700,17 @@ func MeAppExperimentCase(c *gin.Context) {
 			latestByQ[q] = gin.H{"ts": r.TS, "metrics": r.Metrics}
 		}
 	}
-	ok(c, "ok", gin.H{
-		"case_id": caseID, "rows": caseRows, "latest_by_question": latestByQ,
-	})
+	resp := gin.H{"case_id": caseID, "rows": caseRows, "latest_by_question": latestByQ}
+	if len(caseRows) == 0 {
+		// The per-case drill reads results.jsonl off disk with no DB fallback —
+		// the aggregate state comes from the bridge, the ROWS do not. So an
+		// empty answer here means "unreadable", not "this case was never
+		// scored", and the two look the same.
+		if why := unavailableReason(appDir, "per-case experiment rows"); why != "" {
+			resp["unavailable"] = why
+		}
+	}
+	ok(c, "ok", resp)
 }
 
 // ── arm resolution for dispatch ──────────────────────────────────────────────

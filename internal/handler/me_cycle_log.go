@@ -122,7 +122,16 @@ func MeCycleLog(c *gin.Context) {
 				}
 			}
 		}
-		ok(c, "ok", gin.H{"app": app, "loop": loop, "ts": ts, "rows": conv, "running": running, "conversation": true})
+		resp := gin.H{"app": app, "loop": loop, "ts": ts, "rows": conv,
+			"running": running, "conversation": true}
+		if len(conv) == 0 {
+			// Empty because the transcript is unreachable, or empty because
+			// nothing was said? They mean opposite things and read identically.
+			if why := unavailableReason(appDir, "this cycle's LLM transcript"); why != "" {
+				resp["unavailable"] = why
+			}
+		}
+		ok(c, "ok", resp)
 		return
 	}
 
@@ -165,7 +174,13 @@ func MeCycleLog(c *gin.Context) {
 	if len(rows) > cycleLogTailCap {
 		rows = rows[len(rows)-cycleLogTailCap:]
 	}
-	ok(c, "ok", gin.H{"app": app, "loop": loop, "rows": rows, "total": total})
+	resp := gin.H{"app": app, "loop": loop, "rows": rows, "total": total}
+	if total == 0 {
+		if why := unavailableReason(appDir, "this app's cycle log"); why != "" {
+			resp["unavailable"] = why
+		}
+	}
+	ok(c, "ok", resp)
 }
 
 // cycleConversation builds one cycle's session timeline: its LLM turns

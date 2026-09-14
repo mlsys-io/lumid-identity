@@ -1323,7 +1323,20 @@ var controlIntentPatterns = []*regexp.Regexp{
 	// snake_case and unambiguous; "casebook" is also an ordinary English word,
 	// and listing it here captured "what is a casebook in consulting" — a
 	// question about the concept, which belongs on the general assistant.
-	regexp.MustCompile(`\b(experiment_case|loop_metric_series)\b`),
+	regexp.MustCompile(`\b(experiment_case|loop_metric_series|experiment_control)\b`),
+
+	// LIFECYCLE. The platform's own cycle hook emits "Consider promoting the
+	// winning variant or concluding the experiment" — so the word it uses has
+	// to reach the verb it names.
+	// The DEFINITE ARTICLE is what separates the action from the concept:
+	// "conclude THE experiment" is a request, "conclude AN experiment" is a
+	// question about what that means, and the second belongs on the general
+	// assistant. Same distinction the casebook patterns needed.
+	regexp.MustCompile(`\b(conclude|archive|reopen|fork|checkpoint)\b[^.?!]{0,16}\b(the|this|that|its)\b[^.?!]{0,30}\bexperiment\b`),
+	regexp.MustCompile(`\bexperiment\b[^.?!]{0,40}\b(conclude[dr]?|archive[dr]?|finished|done with)\b`),
+	regexp.MustCompile(`\b(start|measure)\b[^.?!]{0,20}\b(fresh|over|again)\b[^.?!]{0,30}\b(experiment|arm|metric|rubric)\b`),
+	regexp.MustCompile(`\b(remove|drop|delete)\b[^.?!]{0,30}\barms?\b`),
+	regexp.MustCompile(`\b(revert|undo|roll ?back)\b[^.?!]{0,40}\b(experiment|arm|definition)\b`),
 
 	// Firing a named workflow. "run the workflow" is already a literal phrase,
 	// but nobody says it that way — they name the thing: "run quant-research's
@@ -1421,6 +1434,11 @@ var controlIntentPhrases = []string{
 	// trading / quantarena
 	"place a trade", "register the strategy", "register a strategy",
 	"join the competition", "join competition",
+	// experiment lifecycle — what you say when a study is finished
+	"conclude the experiment", "conclude this experiment", "archive the experiment",
+	"we're done with this experiment", "were done with this experiment",
+	"fork the experiment", "fork this experiment", "checkpoint the experiment",
+	"start a fresh cohort", "remove the arm", "remove that arm", "undo that change",
 	// experiment drill-in — the question that follows a verdict
 	"which cases", "what cases", "per case", "case by case", "show the casebook",
 	"the casebook", "metric over time", "score over time", "the metric series",
@@ -2358,7 +2376,7 @@ var simpleModeTools = map[string]bool{
 	// experiment, add an arm and dispatch it, and then not read the result
 	// back — "how did it turn out" fell through to list_experiments' summary
 	// projection with no way to drill into one study or one case.
-	"experiment_status": true, "experiment_case": true,
+	"experiment_status": true, "experiment_case": true, "experiment_control": true,
 	"agent_list": true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
 	"agent_marketplace": true, "search_marketplace": true,
 	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
@@ -2789,6 +2807,31 @@ func buildToolDefs() []map[string]any {
 					"config":        map[string]any{"type": "string", "description": "JSON object of any other arm keys, for apps that are not model-shaped (e.g. {\"prompt_variant\": \"cards_v2\"})"},
 				},
 				"required": []string{"app", "experiment", "arm"},
+			},
+		},
+		{
+			// The LIFECYCLE verbs. `status: concluded|archived` has always been
+			// READ by the surface (VerdictChip) and nothing could write it, so an
+			// experiment that was finished stayed "collecting" forever — while
+			// the platform's own cycle hook emitted an offer saying "Consider
+			// promoting the winning variant or concluding the experiment",
+			// naming an action that did not exist anywhere.
+			"name":        "experiment_control",
+			"description": "Conclude, archive, reopen, CHECKPOINT, fork or revert an experiment, or remove one of its arms. Use when the user is done with a study (\"we're finished with this\", \"archive it\"), wants to stop earlier rows diluting a comparison (\"start fresh\", \"the rubric changed\"), or wants to try a new question without disturbing a running one. `checkpoint` bumps dataset_version so prior rows are FENCED OFF rather than deleted — evaluate() reads only the newest cohort — and REQUIRES a reason, because a fence with no recorded motive is unreadable later. `fork` clones the metric and scope under a new id with fresh arms and leaves the original untouched; prefer it to editing a running experiment, which is how a finished 52-row study once lost both its arms. `revert` restores the definition saved before the last control op. Removing an arm does NOT delete its rows; they stay and are reported as undeclared.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"app":        map[string]any{"type": "string"},
+					"experiment": map[string]any{"type": "string", "description": "id of an EXISTING experiment"},
+					"op": map[string]any{"type": "string",
+						"enum":        []string{"conclude", "archive", "reopen", "checkpoint", "fork", "remove_arm", "delete", "revert"},
+						"description": "the control operation"},
+					"reason":          map[string]any{"type": "string", "description": "why. REQUIRED for checkpoint; recorded as the conclusion for conclude."},
+					"new_id":          map[string]any{"type": "string", "description": "fork: the new experiment id"},
+					"arm":             map[string]any{"type": "string", "description": "remove_arm: which arm"},
+					"dataset_version": map[string]any{"type": "string", "description": "checkpoint: an explicit label (defaults to a timestamped one)"},
+				},
+				"required": []string{"experiment", "op"},
 			},
 		},
 		{
@@ -4377,6 +4420,44 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			"arm": armID, "action": action, "arms_now": len(arms),
 			"warnings": modelWarnings,
 			"note":     "queued — the scheduler applies it. Run it with dispatch_experiment_arm."}, true
+
+	case "experiment_control":
+		app := strVal(args, "app")
+		if app == "" {
+			app = groundedApp(c)
+		}
+		eid := strVal(args, "experiment")
+		op := strVal(args, "op")
+		if app == "" || eid == "" || op == "" {
+			return map[string]any{"error": "app, experiment and op are required"}, false
+		}
+		if op == "checkpoint" && strVal(args, "reason") == "" {
+			// Stated as the rule, not as a missing field: a fence whose motive
+			// nobody recorded is exactly what the hand-written comment blocks in
+			// the live specs exist to compensate for.
+			return map[string]any{"error": "a checkpoint needs a reason — it fences every " +
+				"row measured so far out of the comparison, and a fence with no recorded " +
+				"motive cannot be read later. Ask the user what changed."}, false
+		}
+		if op == "fork" && strVal(args, "new_id") == "" {
+			return map[string]any{"error": "fork needs new_id — the id for the new experiment"}, false
+		}
+		if op == "remove_arm" && strVal(args, "arm") == "" {
+			return map[string]any{"error": "remove_arm needs arm"}, false
+		}
+		payload := map[string]any{"app": app, "experiment": eid, "op": op}
+		for _, k := range []string{"reason", "new_id", "arm", "dataset_version"} {
+			if v := strVal(args, k); v != "" {
+				payload[k] = v
+			}
+		}
+		iid := writeIntent(c, "experiment_control", userID, payload)
+		if iid == "" {
+			return map[string]any{"error": "could not queue the change"}, false
+		}
+		return map[string]any{"ok": true, "intent_id": iid, "app": app, "experiment": eid,
+			"op": op, "state": "queued",
+			"note": "queued — the scheduler applies it; poll the intent for the result"}, true
 
 	case "dispatch_experiment_arm":
 		// Runs a DECLARED arm. Resolves it against the app's own manifest first,

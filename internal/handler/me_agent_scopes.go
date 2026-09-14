@@ -26,6 +26,8 @@ var toolDataScopes = map[string][]string{
 	// to a loop, which changes the workflow row's Metric & arms block.
 	"define_experiment":  {"experiments", "workflows", "apps"},
 	"add_experiment_arm": {"experiments", "workflows"},
+	// conclude/checkpoint/fork/revert all rewrite the declaration.
+	"experiment_control": {"experiments", "workflows", "apps"},
 	"stop_loop":          {"runs", "cycles", "loops", "workflows"},
 	"patch_loop":         {"loops", "workflows"},
 	"pause_workflow":     {"loops", "workflows"},

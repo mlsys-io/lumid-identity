@@ -103,16 +103,28 @@ func SessionBearerHandler(c *gin.Context) {
 		// lists workers and nodes, and the lumid plugin maps (WORKER, READ) ->
 		// "flowmesh:workers:read" and (NODE, READ) -> "flowmesh:nodes:read"
 		// (lumid_flowmesh_plugin/permissions.py). Without them the plugin
-		// refuses the read and the API answers 200 [] rather than 403 — so a
-		// healthy fleet renders as an EMPTY one, with nothing anywhere saying
-		// why.
+		// refuses the read outright with a 403.
 		//
-		// That cost most of a day: office was diagnosed as having no workers
-		// and chased through Redis, the registry index, heartbeats and the ACL
-		// store, all of which were correct. Twelve workers were registered,
-		// heartbeating and ACL-granted the entire time; only the bearer could
-		// not see them. Enforcement arrived with the 0.1.9 host, which is why
-		// an 0.1.8 site kept answering normally with the identical token.
+		// CORRECTED 2026-09-14, same day: these scopes are NECESSARY but were
+		// NOT what made office's fleet look empty, and the first version of
+		// this note said they were. A list endpoint authorizes in two stages
+		// and only the first raises — `require()` is the gate these scopes
+		// satisfy, while `accessible_ids()` then silently filters the ROWS and
+		// reads only admin scopes or per-id ACL grants. It never looks at a
+		// kind-level scope, so no scope added here could have fixed the empty
+		// list. Workers register under the fleet's own credential, so their
+		// grants name `admin` and never a human principal: every row was
+		// filtered away and the API answered 200 [].
+		//
+		// Fixed in lumid.plugins v0.2.4 — WORKER and NODE are `fleet_kinds`,
+		// for which the kind-level scope IS the authorization. That is what
+		// these scopes now carry, so they became load-bearing for the list too.
+		//
+		// That cost most of a day: office was chased through Redis, the
+		// registry index, heartbeats and the ACL store, all of which were
+		// correct. Enforcement arrives with the 0.1.9 host, which is why an
+		// 0.1.8 site kept answering normally with the identical token — so when
+		// two sites disagree on one bearer, diff the HOST VERSIONS first.
 		scopes = []string{
 			"flowmesh:ssh",
 			"flowmesh:workflows:write",

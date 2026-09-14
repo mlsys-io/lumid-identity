@@ -656,6 +656,27 @@ var capabilityScopes = map[string]bool{
 	// caller lacking it was correct in form and impossible to satisfy. Same
 	// first-colon parseScope limitation described above.
 	"lumilake:workers:read": true,
+	// FlowMesh fleet reads — the exact strings the lumid plugin's policy maps for
+	// (WORKER, READ) and (NODE, READ), and the two it declares `fleet_kinds`, so
+	// holding one returns the whole fleet rather than an ownership-filtered empty
+	// list (lumid.plugins v0.2.4+).
+	//
+	// Studio already receives these on the aud=flowmesh SESSION-BEARER, which is
+	// minted directly and never passes through canGrant — so nothing was broken.
+	// What was impossible is carrying them on a PAT: parseScope splits on the FIRST
+	// colon, reads the level as "workers:read", and returns ("",""), and canGrant's
+	// `svc == ""` sits ABOVE the admin bypass. Measured 2026-09-14 while verifying
+	// the Lumilake tags: reading workers through /ll/<site>/ forwards the CALLER's
+	// bearer to FlowMesh, so a PAT needed a flowmesh worker-read capability and the
+	// only mintable option was the `flowmesh:*` wildcard — strictly more privilege
+	// than the job needs. These two entries make least-privilege expressible.
+	//
+	// READ ONLY, deliberately. The write/cancel counterparts (workers:write,
+	// nodes:write, workflows:*, tasks:read, results:*, system:read, ssh) share the
+	// same parseScope limitation and stay un-grantable until someone needs them;
+	// each is its own decision, not a set to be added wholesale.
+	"flowmesh:workers:read": true,
+	"flowmesh:nodes:read":   true,
 }
 
 // isCapabilityScope reports whether a raw scope is an opaque LQT-style

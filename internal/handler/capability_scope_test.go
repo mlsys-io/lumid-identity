@@ -111,3 +111,49 @@ func TestLumilakeCapabilityScopesGrantable(t *testing.T) {
 		}
 	}
 }
+
+// TestFlowmeshFleetReadScopesGrantable pins the FlowMesh fleet-read tags. These
+// are the strings the lumid plugin maps for (WORKER, READ) and (NODE, READ) and
+// declares as `fleet_kinds`. Studio gets them on the aud=flowmesh session-bearer,
+// which bypasses canGrant entirely — so the gap was PAT-only, and the practical
+// cost was that least-privilege could not be expressed: reading workers through
+// /ll/<site>/ forwards the caller's bearer to FlowMesh, and the only mintable
+// option was the `flowmesh:*` wildcard.
+//
+// READ ONLY is the whole point. The write counterparts must stay un-grantable, so
+// a mistake here shows up as a test failure rather than as a PAT that can mutate
+// the fleet.
+func TestFlowmeshFleetReadScopesGrantable(t *testing.T) {
+	user := models.User{Role: "user", Status: "active"}
+	suspended := models.User{Role: "user", Status: "suspended"}
+
+	for _, s := range []string{"flowmesh:workers:read", "flowmesh:nodes:read"} {
+		if !canGrant(user, nil, s) {
+			t.Fatalf("active role=user must be able to mint %q", s)
+		}
+		if canGrant(suspended, nil, s) {
+			t.Fatalf("suspended user must not be able to mint %q", s)
+		}
+		if svc, _ := parseScope(s); svc != "" {
+			t.Fatalf("%q must stay opaque to parseScope, got service %q", s, svc)
+		}
+	}
+
+	// The mutating and adjacent FlowMesh scopes are NOT part of this change and
+	// must stay un-grantable for a plain user. `flowmesh:*` remains admin-only via
+	// the matrix, not via this allowlist.
+	for _, bad := range []string{
+		"flowmesh:workers:write",
+		"flowmesh:nodes:write",
+		"flowmesh:workflows:write",
+		"flowmesh:tasks:read",
+		"flowmesh:results:write",
+		"flowmesh:system:read",
+		"flowmesh:workers",
+		"flowmesh:workers:read:extra",
+	} {
+		if canGrant(user, nil, bad) {
+			t.Fatalf("%q must not be grantable by a plain user", bad)
+		}
+	}
+}

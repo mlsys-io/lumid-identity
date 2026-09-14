@@ -218,13 +218,31 @@ func (r *expRow) normalize() {
 
 // readExpRows returns up to the LAST `cap` rows of the results ledger.
 func readExpRows(appDir, id string, capN int) []expRow {
+	rows, _ := readExpRowsCounted(appDir, id, capN)
+	return rows
+}
+
+// readExpRowsCounted is readExpRows plus the TRUE number of rows in the ledger.
+//
+// The cap was applied after parsing the whole file and reported nowhere, so a
+// long experiment served `n_results: 3000` (computed by evaluate() over every
+// row) beside a 500-point series — two views of one experiment disagreeing by
+// construction, with nothing on screen saying the second was a window. The
+// per-case drill and the chat tool were clipped the same way.
+//
+// It also saved nothing: every line was still scanned and unmarshalled before
+// being thrown away. Now the scan counts, and only the tail is unmarshalled.
+func readExpRowsCounted(appDir, id string, capN int) ([]expRow, int) {
 	p, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "experiments", id, "results.jsonl"))
 	f, err := os.Open(p)
 	if err != nil {
-		return nil
+		return nil, 0
 	}
 	defer f.Close()
-	rows := make([]expRow, 0, 64)
+	// Pass 1: keep only the last capN LINES. Cheap — no JSON parsing — and it
+	// is what bounds the work, which slicing after the fact never did.
+	ring := make([]string, 0, capN+1)
+	total := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -232,6 +250,19 @@ func readExpRows(appDir, id string, capN int) []expRow {
 		if line == "" {
 			continue
 		}
+		total++
+		if capN > 0 {
+			ring = append(ring, line)
+			if len(ring) > capN {
+				ring = ring[1:]
+			}
+		} else {
+			ring = append(ring, line)
+		}
+	}
+	// Pass 2: parse only what survived.
+	rows := make([]expRow, 0, len(ring))
+	for _, line := range ring {
 		var r expRow
 		if json.Unmarshal([]byte(line), &r) == nil {
 			r.normalize()
@@ -240,10 +271,7 @@ func readExpRows(appDir, id string, capN int) []expRow {
 			}
 		}
 	}
-	if len(rows) > capN {
-		rows = rows[len(rows)-capN:]
-	}
-	return rows
+	return rows, total
 }
 
 // loadAppExperiments — declarations merged with ledger state. Shared with
@@ -370,7 +398,7 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		return nil, false
 	}
 	st := readExpStateFor(userSub, app, appDir, id)
-	rows := readExpRows(appDir, id, expResultsTailCap)
+	rows, rowsTotal := readExpRowsCounted(appDir, id, expResultsTailCap)
 	metricName, _ := st["metric"].(string)
 	if metricName == "" {
 		if mm, ok := decl.Metric["name"].(string); ok {
@@ -456,6 +484,13 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		"results": rows,
 		"series":  series,
 		"cases":   cases,
+		// The ledger is served as a TAIL. Say so, and say how big the real
+		// thing is: state.n_results is computed by evaluate() over every row,
+		// so without this a long experiment shows `n_results: 3000` beside a
+		// 500-point series and nothing explains the disagreement.
+		"results_total":     rowsTotal,
+		"results_truncated": rowsTotal > len(rows),
+		"results_cap":       expResultsTailCap,
 	}
 	return detail, true
 }

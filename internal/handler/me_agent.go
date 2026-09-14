@@ -1300,6 +1300,31 @@ var controlIntentPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bset\b[^.?!]{0,30}\bmetric\b`),
 	regexp.MustCompile(`\bmetric\b[^.?!]{0,30}\b(for|on)\b[^.?!]{0,30}\b(experiment|workflow|loop)\b`),
 
+	// Reading ONE case, the casebook, or a metric series. These three tools were
+	// reachable only by accident: experiment_case rode the broad
+	// `experiments?.*score[sd]?` pattern above, and casebook and
+	// loop_metric_series had no pattern and no phrase at all, so "what cases is
+	// this scored on" and "show me the metric over time" fell through to
+	// claude-code — which cannot see this registry. A drill-in is the natural
+	// next question after a verdict, so the front door has to hear it.
+	// `case[s_]?\w*` and not `\bcases?\b`: an underscore is a word character, so
+	// \bcase\b does not match inside "Case_019" — which is how every case in the
+	// casebook is actually named, and therefore how every real question names one.
+	regexp.MustCompile(`\bcase[s_]?\w*\b[^.?!]{0,40}\b(score[sd]?|result|history|breakdown|detail)\b`),
+	regexp.MustCompile(`\b(score[sd]?|result|history|breakdown|detail)\b[^.?!]{0,40}\bcase[_ ]?\w*\b`),
+	// Deliberately NOT a bare `\bcasebook\b`, and not `(what|show|list) … case`:
+	// both capture "what is a casebook in consulting", which is a conversation
+	// about the concept and belongs on the general assistant. The definite
+	// article is what separates the two — "THE casebook" is this app's, "A
+	// casebook" is the idea — so that half lives in controlIntentPhrases.
+	regexp.MustCompile(`\bmetric\b[^.?!]{0,30}\b(over time|series|trend|history|by cycle)\b`),
+	regexp.MustCompile(`\b(trend|series|over time)\b[^.?!]{0,30}\b(metric|score)\b`),
+	// `casebook` is NOT in this alternation. The other literal tool names are
+	// snake_case and unambiguous; "casebook" is also an ordinary English word,
+	// and listing it here captured "what is a casebook in consulting" — a
+	// question about the concept, which belongs on the general assistant.
+	regexp.MustCompile(`\b(experiment_case|loop_metric_series)\b`),
+
 	// Firing a named workflow. "run the workflow" is already a literal phrase,
 	// but nobody says it that way — they name the thing: "run quant-research's
 	// backtest workflow", "trigger the harvest loop".
@@ -1396,6 +1421,9 @@ var controlIntentPhrases = []string{
 	// trading / quantarena
 	"place a trade", "register the strategy", "register a strategy",
 	"join the competition", "join competition",
+	// experiment drill-in — the question that follows a verdict
+	"which cases", "what cases", "per case", "case by case", "show the casebook",
+	"the casebook", "metric over time", "score over time", "the metric series",
 	// account / admin
 	"set my profile", "remember that i", "set the role", "set user role",
 	"grant access", "suspend the user", "suspend user",
@@ -2326,7 +2354,12 @@ var simpleModeTools = map[string]bool{
 	"list_runs": true, "run_detail": true, "run_loop_now": true, "pause_workflow": true,
 	"dispatch_experiment_arm": true, "list_experiments": true, "define_experiment": true,
 	"add_experiment_arm": true,
-	"agent_list":         true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
+	// Simple mode is the DEFAULT surface. Without these it could define an
+	// experiment, add an arm and dispatch it, and then not read the result
+	// back — "how did it turn out" fell through to list_experiments' summary
+	// projection with no way to drill into one study or one case.
+	"experiment_status": true, "experiment_case": true,
+	"agent_list": true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
 	"agent_marketplace": true, "search_marketplace": true,
 	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
 	"show_app_surface": true, "give_feedback": true,
@@ -4174,7 +4207,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 				if got, _ := e["id"].(string); got != eid {
 					continue
 				}
-				for _, k := range []string{"arms", "dispatch", "baseline", "kind", "benchmark_id", "status"} {
+				for _, k := range experimentCarryKeys {
 					if v, ok := e[k]; ok && v != nil {
 						carried[k] = v
 					}
@@ -4303,45 +4336,35 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		// through, so a seat that would abstain is reported here too.
 		_, modelWarnings := validateExperimentModels(&experimentWriteBody{Arms: arms})
 
-		// TWO linkage conventions exist and both are legitimate:
-		// loops[].engine.experiment (what expLoops reads, surfaced as `loops`)
-		// and experiments[].dispatch.loop (what an app declares when several
-		// loops feed one experiment and only one is dispatchable). Knowing only
-		// the first made this verb refuse analyst_local_gpu — an experiment with
-		// 52 rows and a published verdict — as "attached to no loop".
-		loop := ""
-		if ls, ok := decl["loops"].([]string); ok && len(ls) > 0 {
-			loop = ls[0]
-		} else if ls, ok := decl["loops"].([]any); ok && len(ls) > 0 {
-			loop, _ = ls[0].(string)
-		}
-		if loop == "" {
-			if dsp, ok := decl["dispatch"].(map[string]any); ok {
-				loop, _ = dsp["loop"].(string)
-			}
-		}
+		// declLoop reads BOTH linkage conventions; see its comment. Shared with
+		// the HTTP write path so the two cannot disagree about what "attached"
+		// means — knowing only loops[] made this verb refuse analyst_local_gpu,
+		// an experiment with 52 rows and a published verdict.
+		loop := declLoop(decl)
 		if loop == "" {
 			return map[string]any{"error": "experiment " + eid + " is attached to no loop, " +
 				"so an arm on it could never be dispatched"}, false
 		}
+		// This verb expresses ONE arm; patch_experiment replaces the whole
+		// entry. So every other key is one the caller had no way to preserve,
+		// and experimentCarryOnto puts all of them back. The hand-rolled version
+		// this replaces dropped six of them, three of them invisibly:
+		//   dispatch      — never on the row, so adding an arm to
+		//                   backtest_evidence deleted the `dispatch.ask` that
+		//                   makes its arms dispatchable at all;
+		//   cases         — never on the row AND never parsed, so an experiment
+		//                   scoped by cases with no dataset_id had its patch
+		//                   REFUSED by the scheduler's scope guard;
+		//   description   — never on the row;
+		//   min_samples   — on the row as an int, tested as a float64, so the
+		//                   assertion never fired and the threshold was erased
+		//                   on every arm add (floor falls back to 1);
+		//   benchmark_id, status — on the row, simply not copied.
 		payload := map[string]any{
 			"app": app, "experiment": eid, "loop": loop,
 			"metric": decl["metric"], "arms": arms,
 		}
-		for _, k := range []string{"dataset_id", "success_criteria", "hypothesis", "description", "kind"} {
-			if v, _ := decl[k].(string); v != "" {
-				payload[k] = v
-			}
-		}
-		if cs, ok := decl["cases"].([]any); ok && len(cs) > 0 {
-			payload["cases"] = cs
-		}
-		if n, ok := decl["min_samples"].(float64); ok && n > 0 {
-			payload["min_samples"] = int(n)
-		}
-		if b, ok := decl["baseline"]; ok && b != nil {
-			payload["baseline"] = b
-		}
+		experimentCarryOnto(payload, decl, "arms")
 		iid := writeIntent(c, "patch_experiment", userID, payload)
 		if iid == "" {
 			return map[string]any{"error": "could not queue the arm"}, false

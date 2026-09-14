@@ -163,42 +163,84 @@ func appRunsFor(userSub, app, loop string) []models.MeAppRun {
 	return rows
 }
 
-// metricFromBlob recursively finds `name` in a run's metrics JSON and returns it
-// as a float. App-agnostic: the caller passes the app's OWN declared metric name
+// metricFromBlob finds `name` in a run's metrics JSON and returns it as a
+// float. App-agnostic: the caller passes the app's OWN declared metric name
 // (experiments[].metric.name), so e.g. "exact_recall" is found wherever the app
 // nested it. Returns nil if absent/non-numeric.
+//
+// TIES BREAK BY SORTED KEY, and the search is breadth-first so the preference
+// is explicit rather than emergent: a top-level `score` is the run's own metric,
+// one buried inside some payload is somebody else's. models/me_app_run.go:29-33
+// records that collision as the reason the run artifact got its own `outputs`
+// column instead of living inside `metrics`.
+//
+// The BUG this replaces was the tie-break, not the depth order. The previous
+// walk reached siblings by ranging a Go map, and Go randomises map iteration —
+// so when two sibling subtrees both carried the key, WHICH ONE ANSWERED CHANGED
+// BETWEEN CALLS. The same stored run could report two different scores on two
+// refreshes, with nothing in the output naming where the number came from, and
+// that value feeds trajNode.Score and expStateFromRuns' criteria_met.
 func metricFromBlob(metricsJSON, name string) *float64 {
+	v, _ := metricFromBlobPath(metricsJSON, name)
+	return v
+}
+
+// metricFromBlobPath is metricFromBlob plus the dotted path the value was found
+// at ("" when not found) — so a caller can say WHERE a number came from instead
+// of asserting it.
+func metricFromBlobPath(metricsJSON, name string) (*float64, string) {
 	if name == "" || metricsJSON == "" {
-		return nil
+		return nil, ""
 	}
 	var doc any
 	if json.Unmarshal([]byte(metricsJSON), &doc) != nil {
-		return nil
+		return nil, ""
 	}
-	var walk func(v any) *float64
-	walk = func(v any) *float64 {
-		switch t := v.(type) {
-		case map[string]any:
-			if hit, ok := t[name]; ok {
-				if f, ok := hit.(float64); ok {
-					return &f
+	type node struct {
+		v    any
+		path string
+	}
+	// Depth-bounded so a pathological blob cannot walk forever; 12 is far past
+	// anything an app writes and still terminates on a cyclic-looking structure
+	// produced by a bad encoder.
+	const maxDepth = 12
+	level := []node{{v: doc, path: ""}}
+	for depth := 0; depth < maxDepth && len(level) > 0; depth++ {
+		var next []node
+		for _, n := range level {
+			switch t := n.v.(type) {
+			case map[string]any:
+				// This level first: an exact hit here outranks anything deeper.
+				if hit, ok := t[name]; ok {
+					if f, ok := hit.(float64); ok {
+						return &f, joinPath(n.path, name)
+					}
 				}
-			}
-			for _, sub := range t {
-				if r := walk(sub); r != nil {
-					return r
+				// Descend in sorted key order so the choice is reproducible.
+				keys := make([]string, 0, len(t))
+				for k := range t {
+					keys = append(keys, k)
 				}
-			}
-		case []any:
-			for _, sub := range t {
-				if r := walk(sub); r != nil {
-					return r
+				sort.Strings(keys)
+				for _, k := range keys {
+					next = append(next, node{v: t[k], path: joinPath(n.path, k)})
+				}
+			case []any:
+				for i, sub := range t {
+					next = append(next, node{v: sub, path: n.path + "[" + strconv.Itoa(i) + "]"})
 				}
 			}
 		}
-		return nil
+		level = next
 	}
-	return walk(doc)
+	return nil, ""
+}
+
+func joinPath(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+	return prefix + "." + key
 }
 
 // trajNodesFromRuns synthesizes the trajectory (nodes + cycles) from run-store

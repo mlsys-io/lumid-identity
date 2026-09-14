@@ -19,10 +19,17 @@ var toolDataScopes = map[string][]string{
 	// A dispatched arm produces a run AND moves the experiment ledger, so the
 	// experiments panel must refetch too or it shows a stale "no results yet".
 	"dispatch_experiment_arm": {"experiments", "runs", "cycles", "workflows"},
-	"stop_loop":               {"runs", "cycles", "loops", "workflows"},
-	"patch_loop":              {"loops", "workflows"},
-	"pause_workflow":          {"loops", "workflows"},
-	"delete_loop":             {"loops", "workflows", "apps"},
+	// Both of these MUTATE the declaration (via a patch_experiment intent) and
+	// neither was listed, so the panel kept serving its pre-write copy — the
+	// exact "forgot to wire the tool → stale UI" class this map exists to
+	// close. `workflows` is in the set because a define attaches the experiment
+	// to a loop, which changes the workflow row's Metric & arms block.
+	"define_experiment":  {"experiments", "workflows", "apps"},
+	"add_experiment_arm": {"experiments", "workflows"},
+	"stop_loop":          {"runs", "cycles", "loops", "workflows"},
+	"patch_loop":         {"loops", "workflows"},
+	"pause_workflow":     {"loops", "workflows"},
+	"delete_loop":        {"loops", "workflows", "apps"},
 	// app lifecycle
 	"install_app":           {"apps", "workflows", "loops"},
 	"uninstall_app":         {"apps", "workflows", "loops"},

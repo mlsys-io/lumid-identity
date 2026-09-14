@@ -44,6 +44,13 @@ type expDecl struct {
 	Criteria   string           `yaml:"success_criteria" json:"success_criteria,omitempty"`
 	MinSamples int              `yaml:"min_samples" json:"min_samples,omitempty"`
 	Status     string           `yaml:"status" json:"status,omitempty"`
+	// Cases/Description are WRITTEN into the spec by patch_experiment and were
+	// never parsed back, so every read-then-rewrite verb (add_experiment_arm)
+	// silently dropped them. For an experiment scoped by `cases` with no
+	// `dataset_id` that is not even silent: the scheduler refuses a patch with
+	// no scope, so adding an arm failed outright.
+	Cases       []string `yaml:"cases" json:"cases,omitempty"`
+	Description string   `yaml:"description" json:"description,omitempty"`
 	// Dispatch — app-authored routing for "run this arm":
 	//   loop: which attached loop a dispatch should use (defaults to the
 	//         first attached loop; matters when several loops feed one
@@ -265,6 +272,10 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			"success_criteria": d.Criteria, "min_samples": d.MinSamples,
 			"status": strOr(d.Status, "active"),
 			"loops":  loops[d.ID],
+			// Carried for the same reason `arms` is: a verb that reads this row
+			// and rewrites the whole experiments[] entry must be able to put
+			// back everything it did not mean to change.
+			"dispatch": d.Dispatch, "cases": d.Cases, "description": d.Description,
 			// The DECLARED arms. expDecl has parsed these since it was written
 			// and the row dropped them, so the only arms any client could see
 			// were the ones already OBSERVED in state.variants — i.e. a
@@ -476,7 +487,15 @@ func MeExperiments(c *gin.Context) {
 				continue
 			}
 			seen[e.Name()] = true
-			exps := loadAppExperiments(filepath.Join(root, e.Name()))
+			// loadAppExperimentsFor, not loadAppExperiments: the identity-less
+			// variant passes "" for userSub, which skips readExpStateFor's
+			// Postgres fallback entirely. Identity mounts no tenant volume, so
+			// the ledger is unreadable here and the fallback is the ONLY source
+			// of n_results/variants/verdict -- this endpoint reported
+			// `n_results: 0` for every tenant experiment while the DB held real
+			// state, which is why /studio/experiments is numberless. Same fix
+			// already applied to the chat tool (me_agent.go, list_experiments).
+			exps := loadAppExperimentsFor(userID, e.Name(), filepath.Join(root, e.Name()))
 			for _, exp := range exps {
 				exp["app"] = e.Name()
 				all = append(all, exp)

@@ -74,11 +74,16 @@ func TestAddArmAcceptsDispatchLoop(t *testing.T) {
 		t.Fatal("add_experiment_arm handler missing")
 	}
 	block := src[i : i+6000]
-	if !strings.Contains(block, `decl["dispatch"]`) {
-		t.Fatal("add_experiment_arm still reads only loops[]; it will refuse an " +
-			"experiment declared with dispatch.loop, as analyst_local_gpu is")
+	// The resolution moved into declLoop, shared with the HTTP write path so the
+	// two cannot disagree about what "attached" means. What this test still owns
+	// is that the handler USES it; that declLoop reads both conventions is
+	// pinned behaviourally by TestDeclLoopReadsBothLinkageConventions.
+	if !strings.Contains(block, "declLoop(decl)") {
+		t.Fatal("add_experiment_arm does not resolve its loop through declLoop; if it has " +
+			"gone back to reading loops[] alone it will refuse an experiment declared " +
+			"with dispatch.loop, as analyst_local_gpu is")
 	}
-	if !strings.Contains(block, `dsp["loop"]`) {
-		t.Fatal("dispatch is read but its loop is not")
+	if got := declLoop(map[string]any{"dispatch": map[string]any{"loop": "case_eval"}}); got != "case_eval" {
+		t.Fatalf("declLoop ignores dispatch.loop: %q", got)
 	}
 }

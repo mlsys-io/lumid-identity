@@ -277,6 +277,24 @@ func MeAppExperimentUpsert(c *gin.Context) {
 	if pid := c.Param("id"); pid != "" {
 		body.ID = pid
 	}
+	// Read the existing declaration BEFORE validating: on PATCH the guard must
+	// judge the experiment this write RESULTS IN, not the request that carries
+	// it. Identity mounts no tenant volume, so this is the materialised bundle
+	// plus the self-reported state — the same view every read surface gets.
+	var decl map[string]any
+	if dir := resolveAppDir(userID, app); dir != "" {
+		for _, e := range loadAppExperimentsFor(userID, app, dir) {
+			if got, _ := e["id"].(string); got == body.ID {
+				decl = e
+				break
+			}
+		}
+	}
+	isPatch := c.Request.Method == http.MethodPatch
+	if isPatch {
+		hydratePatchBody(&body, decl)
+	}
+
 	problems := validateExperimentShape(&body)
 	_, modelWarnings := validateExperimentModels(&body)
 	if len(problems) > 0 {
@@ -313,6 +331,34 @@ func MeAppExperimentUpsert(c *gin.Context) {
 	}
 	if len(body.Dispatch) > 0 {
 		payload["dispatch"] = body.Dispatch
+	}
+
+	// ── What the body did not say ──
+	//
+	// patch_experiment REPLACES the whole experiments[] entry, so until now this
+	// handler was pure replace under both verbs: a PATCH that omitted `arms`
+	// erased them. That is the HTTP twin of the 2026-09-13 incident in which the
+	// chat path erased both arms of a finished 52-row experiment, and the chat
+	// path has carried forward since — this one never did, and the SPA's only
+	// write goes through here.
+	//
+	// The two verbs mean different things and now behave differently:
+	//   PATCH — partial. Everything the body did not set is carried from the
+	//           existing declaration.
+	//   POST  — full definition. experimentWriteBody can express every key
+	//           (unlike define_experiment's schema), so a caller CAN mean
+	//           "clear the arms" — but not by accident, hence the guard below.
+	if isPatch {
+		experimentCarryOnto(payload, decl)
+	} else if decl != nil && len(body.Arms) == 0 {
+		if existing, _ := decl["arms"].([]map[string]any); len(existing) > 0 {
+			fail(c, http.StatusConflict, 1409,
+				"experiment "+body.ID+" already declares "+strconv.Itoa(len(existing))+
+					" arm(s) and this POST carries none — a POST replaces the whole "+
+					"definition, so it would delete them. Use PATCH to change part of an "+
+					"experiment, or resend the arms to replace them deliberately.")
+			return
+		}
 	}
 
 	id := writeIntent(c, "patch_experiment", userID, payload)

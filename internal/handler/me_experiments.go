@@ -640,7 +640,21 @@ func MeAppExperiments(c *gin.Context) {
 		return
 	}
 	exps := loadAppExperimentsFor(userID, app, appDir)
-	ok(c, "ok", gin.H{"experiments": exps, "count": len(exps)})
+	// What the PUBLISHED app declares that this install does not. The tab lists
+	// the local bundle and had no way to say "there is another one you do not
+	// have" — an experiment that lands upstream after you installed is
+	// invisible until someone runs app_update and notices.
+	localIDs := make([]string, 0, len(exps))
+	for _, e := range exps {
+		if id, _ := e["id"].(string); id != "" {
+			localIDs = append(localIDs, id)
+		}
+	}
+	resp := gin.H{"experiments": exps, "count": len(exps)}
+	if d := experimentDivergenceFor(userID, app, localIDs); d != nil {
+		resp["divergence"] = d
+	}
+	ok(c, "ok", resp)
 }
 
 func MeAppExperiment(c *gin.Context) {

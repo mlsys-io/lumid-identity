@@ -24,7 +24,6 @@ package handler
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -75,89 +74,70 @@ func MeLoopPatch(c *gin.Context) {
 		return
 	}
 
-	// Resolve the app dir: caller's tenant first, then operator-shared
-	// fallback so user-overrides for operator-shared apps land in the
-	// caller's tenant tree (their override doesn't mutate the shared
-	// install).
-	appDir := filepath.Join(tenantAppsDir(userID), app)
-	if st, err := os.Stat(appDir); err != nil || !st.IsDir() {
-		// Try operator-shared, then write overrides under the tenant root.
-		shared := filepath.Join(operatorHome(), ".xp", "apps", app)
-		if st2, err2 := os.Stat(shared); err2 == nil && st2.IsDir() {
-			// Synthesize a tenant app dir for the overrides file only.
-			// The actual code lives in `shared`; the tenant override is a
-			// thin shim. `os.MkdirAll` is idempotent.
-			if err := os.MkdirAll(appDir, 0o775); err != nil {
-				fail(c, http.StatusInternalServerError, 1500, "tenant mkdir: "+err.Error())
-				return
-			}
-		} else {
-			fail(c, http.StatusNotFound, 1404, "app not installed at "+appDir+" (or shared)")
-			return
-		}
-	}
-	overridesPath := filepath.Join(appDir, ".user-overrides.yaml")
-
-	// Read existing overrides into a forgiving map (preserve any keys
-	// we don't know about so user edits via CLI survive a PATCH).
-	overrides := readSimpleOverrides(overridesPath)
-	if overrides["loops"] == nil {
-		overrides["loops"] = map[string]any{}
-	}
-	loopsMap, _ := overrides["loops"].(map[string]any)
-	loopOver, _ := loopsMap[loop].(map[string]any)
-	if loopOver == nil {
-		loopOver = map[string]any{}
-	}
+	// ── This goes through an INTENT, not the disk ──
+	//
+	// It used to stat <tenant>/.xp/apps/<app>, then the operator-shared path,
+	// and 404 when neither existed. Identity mounts exactly one volume — the
+	// signing keys — so NEITHER EVER EXISTED, and every PATCH here 404'd for
+	// every user: pause, resume, schedule and the workflow panel's goal save,
+	// all of them, with a red toast naming a path nobody could create. The
+	// materialised bundle cache would not have rescued it either; it lives
+	// under a different root and holds the PUBLISHED tree, not the tenant's
+	// writable one.
+	//
+	// The scheduler is the process that can see that disk, so the write belongs
+	// there — the same route install and patch_experiment already take. The
+	// hand-rolled YAML emitter moved with it (_write_user_overrides in
+	// me_intent_picker.py), which also ends the two-writers-one-format problem.
+	payload := map[string]any{"app": app, "loop": loop}
+	requested := gin.H{}
 	if body.Runtime != nil {
-		loopOver["runtime"] = *body.Runtime
+		payload["runtime"] = *body.Runtime
+		requested["runtime"] = *body.Runtime
 	}
 	if body.Schedule != nil {
-		loopOver["schedule"] = *body.Schedule
+		payload["schedule"] = *body.Schedule
+		requested["schedule"] = *body.Schedule
 	}
 	if body.Enabled != nil {
-		loopOver["enabled"] = *body.Enabled
+		payload["enabled"] = *body.Enabled
+		requested["enabled"] = *body.Enabled
 	}
 	if body.Goal != nil {
-		// Single-line; bound the length so the tiny YAML emitter (which
-		// quotes via %q on one line) stays well-formed. Empty clears it.
-		g := strings.TrimSpace(*body.Goal)
-		g = strings.ReplaceAll(g, "\n", " ")
+		// Single-line and bounded, as the emitter on the far side expects.
+		// Empty clears the override (reverts to the declared goal).
+		g := strings.TrimSpace(strings.ReplaceAll(*body.Goal, "\n", " "))
 		if len(g) > 280 {
 			g = g[:280]
 		}
-		if g == "" {
-			delete(loopOver, "goal")
-		} else {
-			loopOver["goal"] = g
-		}
+		payload["goal"] = g
+		requested["goal"] = g
 	}
 	if body.Model != nil {
-		if m := strings.TrimSpace(*body.Model); m == "" {
-			delete(loopOver, "model") // empty → revert to the app default
-		} else {
-			loopOver["model"] = m
-		}
+		m := strings.TrimSpace(*body.Model)
+		payload["model"] = m
+		requested["model"] = m
 	}
-	loopsMap[loop] = loopOver
-	overrides["loops"] = loopsMap
-	// Audit trail — the file gets re-written every PATCH so we record
-	// the last write timestamp + last-touched user.
-	overrides["_meta"] = map[string]any{
-		"last_modified_at": time.Now().UTC().Format(time.RFC3339),
-		"last_modified_by": userID,
-	}
-
-	if err := writeSimpleOverrides(overridesPath, overrides); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write overrides: "+err.Error())
+	if len(requested) == 0 {
+		fail(c, http.StatusBadRequest, 1400, "nothing to change")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
+
+	id := writeIntent(c, "patch_loop", userID, payload)
+	if id == "" {
+		return // writeIntent already wrote the error response
+	}
+	// 202 and no claim that it landed — identity queues, the scheduler applies,
+	// exactly as for install. `overrides` echoes what was REQUESTED so a client
+	// can still render optimistically; poll the intent for the result.
+	c.JSON(http.StatusAccepted, gin.H{
+		"ret_code": 0, "message": "queued",
 		"data": gin.H{
 			"app":       app,
 			"loop":      loop,
-			"overrides": loopOver,
+			"intent_id": id,
+			"status":    "pending",
+			"overrides": requested,
 		},
 	})
 }
@@ -482,50 +462,11 @@ func readSimpleOverrides(path string) map[string]any {
 	return out
 }
 
-func writeSimpleOverrides(path string, data map[string]any) error {
-	var b strings.Builder
-	b.WriteString("# Auto-generated by lumid-identity /api/v1/me/loops PATCH.\n")
-	b.WriteString("# Merged AFTER xpcloud.yaml by app_runner.load_manifest() (P1+).\n")
-	b.WriteString("# Edit by hand if you must; PATCH preserves unknown top-level keys.\n\n")
-	if loops, ok := data["loops"].(map[string]any); ok && len(loops) > 0 {
-		b.WriteString("loops:\n")
-		for loopName, raw := range loops {
-			over, _ := raw.(map[string]any)
-			if over == nil {
-				continue
-			}
-			b.WriteString("  " + loopName + ":\n")
-			for _, k := range []string{"runtime", "schedule", "enabled", "goal", "model"} {
-				v, ok := over[k]
-				if !ok {
-					continue
-				}
-				b.WriteString("    " + k + ": ")
-				switch vv := v.(type) {
-				case bool:
-					if vv {
-						b.WriteString("true\n")
-					} else {
-						b.WriteString("false\n")
-					}
-				default:
-					b.WriteString(fmt.Sprintf("%q\n", fmt.Sprint(vv)))
-				}
-			}
-		}
-	}
-	if meta, ok := data["_meta"].(map[string]any); ok && len(meta) > 0 {
-		b.WriteString("\n_meta:\n")
-		for k, v := range meta {
-			b.WriteString("  " + k + ": " + fmt.Sprintf("%q", fmt.Sprint(v)) + "\n")
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
+// writeSimpleOverrides is GONE, deliberately. The format now has exactly one
+// writer — _write_user_overrides in sdk/scheduling/me_intent_picker.py — because
+// identity cannot reach the file it describes: the pod mounts one volume, the
+// signing keys, so every write here landed on a pod-local path nothing reads.
+// Two writers for one format is also how the emitter drifted from its reader (an
+// emptied loop override emitted `name:` with no children, which YAML reads back
+// as None). readSimpleOverrides stays: reading a path that may not exist is
+// harmless, and me_workflows still asks.

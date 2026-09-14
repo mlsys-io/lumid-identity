@@ -8,7 +8,6 @@ package handler
 
 import (
 	"encoding/json"
-	"fmt"
 	"lumid_identity/models"
 	"os"
 	"path/filepath"
@@ -251,51 +250,55 @@ func toolDraftAction(userID, id, action string, patch map[string]any) map[string
 }
 
 // toolPatchLoop — write a per-loop override (schedule, enabled).
-// Mirrors MeLoopPatch but in-process. The picker / scheduler honor
-// .user-overrides.yaml the moment it lands.
+//
+// Queues a `patch_loop` intent; the scheduler applies it. It used to write
+// .user-overrides.yaml directly, under exactly the same mistaken assumption as
+// MeLoopPatch: that identity can see the tenant's disk. It cannot — the pod
+// mounts one volume, the signing keys — so the stat() failed and this tool
+// returned `app %q not installed` for every app the user really did have
+// installed. Worse than the HTTP twin, because on the path where the operator-
+// shared directory did exist it went on to report "Override saved." having
+// written the file to a pod-local path that nothing reads and that dies with
+// the pod.
 func toolPatchLoop(userID, app, loop string, patch map[string]any) map[string]any {
-	appDir := filepath.Join(tenantAppsDir(userID), app)
-	if st, err := os.Stat(appDir); err != nil || !st.IsDir() {
-		// Tenant doesn't have the app — try the operator-shared tree
-		// for the override file (mirrors MeLoopPatch's fallback).
-		shared := filepath.Join(operatorHome(), ".xp", "apps", app)
-		if st2, err2 := os.Stat(shared); err2 != nil || !st2.IsDir() {
-			return map[string]any{"error": fmt.Sprintf("app %q not installed", app)}
-		}
-		if err := os.MkdirAll(appDir, 0o775); err != nil {
-			return map[string]any{"error": "tenant mkdir: " + err.Error()}
-		}
-	}
-	overridesPath := filepath.Join(appDir, ".user-overrides.yaml")
-	overrides := readSimpleOverrides(overridesPath)
-	if overrides["loops"] == nil {
-		overrides["loops"] = map[string]any{}
-	}
-	loopsMap, _ := overrides["loops"].(map[string]any)
-	loopOver, _ := loopsMap[loop].(map[string]any)
-	if loopOver == nil {
-		loopOver = map[string]any{}
-	}
+	payload := map[string]any{"app": app, "loop": loop}
+	requested := map[string]any{}
 	if v, ok := patch["schedule"].(string); ok && v != "" {
-		loopOver["schedule"] = v
+		payload["schedule"] = v
+		requested["schedule"] = v
 	}
 	if v, ok := patch["enabled"].(bool); ok {
-		loopOver["enabled"] = v
+		payload["enabled"] = v
+		requested["enabled"] = v
 	}
-	loopsMap[loop] = loopOver
-	overrides["loops"] = loopsMap
-	overrides["_meta"] = map[string]any{
-		"last_modified_at": time.Now().UTC().Format(time.RFC3339),
-		"last_modified_by": "agent:" + userID,
+	if v, ok := patch["runtime"].(string); ok && v != "" {
+		payload["runtime"] = v
+		requested["runtime"] = v
 	}
-	if err := writeSimpleOverrides(overridesPath, overrides); err != nil {
-		return map[string]any{"error": "write overrides: " + err.Error()}
+	if v, ok := patch["goal"].(string); ok {
+		payload["goal"] = v
+		requested["goal"] = v
+	}
+	if v, ok := patch["model"].(string); ok {
+		payload["model"] = v
+		requested["model"] = v
+	}
+	if len(requested) == 0 {
+		return map[string]any{"error": "nothing to change (schedule, enabled, runtime, goal or model)"}
+	}
+	id := writeIntentDirect(userID, "patch_loop", payload)
+	if id == "" {
+		return map[string]any{"error": "could not queue the change"}
 	}
 	return map[string]any{
 		"app":       app,
 		"loop":      loop,
-		"overrides": loopOver,
-		"note":      "Override saved. Scheduler picks it up on next refresh tick (≤60s).",
+		"intent_id": id,
+		"state":     "queued",
+		"overrides": requested,
+		// Report the QUEUE, not the outcome. The previous note said "Override
+		// saved." unconditionally, which was untrue on every path it reached.
+		"note": "Queued — the scheduler applies it and picks it up on its next refresh tick. Poll the intent for the result.",
 	}
 }
 

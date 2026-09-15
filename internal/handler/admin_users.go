@@ -718,6 +718,89 @@ var capabilityScopes = map[string]bool{
 	"flowmesh:ssh":             true,
 }
 
+// capabilityCatalog is capabilityScopes made SERVABLE: the same allowlist, plus
+// the one-line label and description the token UI needs to render a checkbox.
+//
+// WHY THIS EXISTS. The allowlist above is the authority on what may be minted,
+// but nothing published it, so lum.id/studio/account/tokens carried its own
+// hardcoded array of two entries (claude:proxy, lqt:strategy) and fell thirteen
+// behind. That is not a hypothetical: the comment on lqt:strategy above records
+// the SAME failure being fixed once already — a scope the docs told people to
+// use while the UI gave them no way to ask for it — and the Lumilake and
+// FlowMesh entries added 2026-09-13/14 landed straight back into it. A user who
+// needs flowmesh:workflows:write may mint it (canGrant returns true for any
+// active user) and has no control that offers it.
+//
+// So the server now answers "what may I ask for", and the UI renders that.
+// init() below refuses to start if the two lists ever drift apart again, which
+// is the whole point: a new tag cannot be added to the allowlist and silently
+// stay invisible.
+type capabilityInfo struct {
+	Scope string `json:"scope"`
+	Label string `json:"label"`
+	Desc  string `json:"desc"`
+}
+
+var capabilityCatalog = []capabilityInfo{
+	{"claude:proxy", "Claude proxy",
+		"Route Claude Code through the org account pool at lum.id/claude."},
+	{"lqt:strategy", "LQT strategy deploy",
+		"Submit and deploy your own LQT strategies (the strategy.deploy mailbox topic). Confers no admin and no real-trade — live trading is gated separately."},
+	{"lqt:universe:refresh", "LQT universe refresh",
+		"Trigger a monitored-universe refresh (the universe.refresh mailbox topic). Nothing else."},
+	{"findata:sql", "FinData warehouse SQL",
+		"Mark this token for warehouse work and issue your Postgres credential. Entitlement still needs a findata grant."},
+	{"lumilake:jobs:read", "Lumilake — read jobs",
+		"Read HALO-optimised jobs on the Lumilake control planes."},
+	{"lumilake:jobs:write", "Lumilake — submit jobs",
+		"Submit jobs to the Lumilake control planes."},
+	{"lumilake:jobs:cancel", "Lumilake — cancel jobs",
+		"Cancel a running Lumilake job."},
+	{"lumilake:workers:read", "Lumilake — read workers",
+		"List Lumilake workers and their status."},
+	{"flowmesh:workflows:write", "FlowMesh — submit workflows",
+		"Submit and cancel FlowMesh workflows. This is what a token needs to run a job end to end; the coarse flowmesh:write service level requires an access grant instead."},
+	{"flowmesh:workflows:read", "FlowMesh — read workflows",
+		"List FlowMesh workflows and their status."},
+	{"flowmesh:tasks:read", "FlowMesh — read tasks",
+		"List individual FlowMesh tasks."},
+	{"flowmesh:results:read", "FlowMesh — read results",
+		"Fetch the outputs of a finished FlowMesh task."},
+	{"flowmesh:workers:read", "FlowMesh — read workers",
+		"List FlowMesh workers and their hardware."},
+	{"flowmesh:nodes:read", "FlowMesh — read nodes",
+		"List FlowMesh nodes."},
+	{"flowmesh:ssh", "FlowMesh — SSH sessions",
+		"Open an SSH session task on a FlowMesh worker."},
+}
+
+// The two lists must describe the same set, in both directions. A tag on the
+// allowlist with no catalog entry is unmintable-in-practice (invisible in the
+// UI); a catalog entry with no allowlist tag is a control that mints a scope
+// canGrant will refuse. Failing at startup is deliberate — both mistakes are
+// silent at runtime and cost a release to notice.
+func init() {
+	for _, c := range capabilityCatalog {
+		if !capabilityScopes[c.Scope] {
+			panic("capabilityCatalog lists " + c.Scope + " which is not on the capabilityScopes allowlist")
+		}
+	}
+	if len(capabilityCatalog) != len(capabilityScopes) {
+		for scope := range capabilityScopes {
+			found := false
+			for _, c := range capabilityCatalog {
+				if c.Scope == scope {
+					found = true
+					break
+				}
+			}
+			if !found {
+				panic("capabilityScopes allows " + scope + " but capabilityCatalog does not describe it — the token UI would never offer it")
+			}
+		}
+	}
+}
+
 // isCapabilityScope reports whether a raw scope is an opaque LQT-style
 // capability tag on the allowlist (see capabilityScopes). Such scopes are
 // grantable by any active authenticated user and carry no platform access.

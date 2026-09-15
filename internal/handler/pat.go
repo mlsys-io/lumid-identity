@@ -583,11 +583,27 @@ func GrantableScopesHandler(c *gin.Context) {
 		Select("p.id AS id, p.name AS name, m.is_primary AS is_primary").
 		Scan(&claudePools)
 
+	// WHAT CAPABILITY TAGS THIS CALLER MAY ASK FOR.
+	//
+	// Served because the UI cannot derive them: parseScope splits on the FIRST
+	// colon, so "flowmesh:workflows:write" can never come out of the
+	// service x level matrix — it has to be an explicit control, and until now
+	// the only list of those was a hardcoded pair in the client that had fallen
+	// thirteen entries behind this allowlist. Filtered through canGrant so the
+	// page never offers something the mint would then refuse.
+	caps := make([]capabilityInfo, 0, len(capabilityCatalog))
+	for _, cap := range capabilityCatalog {
+		if canGrant(u, toks, cap.Scope) {
+			caps = append(caps, cap)
+		}
+	}
+
 	ok(c, "ok", gin.H{
 		"role":         u.Role,
 		"services":     accessServices,
 		"matrix":       matrix,
 		"can_wildcard": u.Role == "admin" || u.Role == "super_admin",
 		"claude_pools": claudePools,
+		"capabilities": caps,
 	})
 }

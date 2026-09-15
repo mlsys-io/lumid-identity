@@ -2347,7 +2347,7 @@ func min(a, b int) int {
 //     it out turns that button into a silently ignored request.
 //   - run_loop_now — the system prompt REQUIRES calling it in the same turn the
 //     user asks to run a workflow.
-//   - remember_about_me, generate_image, text_to_speech, data_catalog,
+//   - remember_about_me, data_catalog,
 //     data_query, query_findata, web_search, web_fetch, deep_research —
 //     all named imperatively in the system prompt. A prompt that
 //     orders a tool call the catalog does not offer is a turn
@@ -2364,7 +2364,7 @@ var simpleModeTools = map[string]bool{
 	"send_email": true, "create_calendar_event": true,
 	"list_drafts": true, "edit_draft": true, "send_draft": true, "dismiss_draft": true,
 	// output
-	"generate_image": true, "text_to_speech": true, "save_artifact": true,
+	"save_artifact": true,
 	// delegation
 	"spawn_agent": true, "spawn_agents": true,
 	// the user's own apps + workflows (read + run, not authoring)
@@ -2581,8 +2581,15 @@ func buildToolDefsForRole(role string) []map[string]any {
 	defs := append(buildToolDefs(), appOpsToolDefs()...)
 	// Account self-service (own tokens/profile) — available to every role.
 	defs = append(defs, accountToolDefs()...)
-	// Media generation (image + speech via the lumid-llm gateway) — every role.
-	defs = append(defs, mediaToolDefs()...)
+	// Media GENERATION (generate_image / text_to_speech) was removed 2026-09-15.
+	// The fleet moved to input-only modalities: the qwen-image (ComfyUI) and
+	// qwen-tts (CosyVoice2) backends behind those tools were retired, so the
+	// tools could only ever fail. Advertising a tool whose backend is gone is
+	// worse than not having it — the model spends turns calling it.
+	// Image INPUT still works: qwen3.8-27b reads images natively via mmproj.
+	// Restore path if those backends return: this append, the dispatch cases,
+	// the simpleModeTools entries, the system-prompt line, and
+	// internal/handler/me_agent_media.go (deleted here; see git history).
 	// LQT strategy submission is a per-USER write, not a control-plane one: it
 	// deploys into the caller's OWN tenant on their own scoped PAT, which is
 	// the documented self-serve path. It stays in destructiveTools (interactive
@@ -2638,7 +2645,6 @@ You have tools to:
     WORD TRAP - "market": in FinData a market is a STOCK EXCHANGE (NASDAQ/NYSE) and the market.* schema holds equities. In LQT / quant-research a "market" is a binary EVENT CONTRACT ("will BTC close above $X at 5pm?", priced 0-1) whose instrument_id looks like KXBTCD-26SEP0211-T77099.99. Asked about markets, volume or the universe while an LQT app is in context, answer from the LQT surfaces (lqt_mailbox_read, the app's own pages) - NEVER by ranking stock exchanges out of market.ohlc_daily. Ask which one they mean if it is genuinely ambiguous.
     LQT data is NOT in that warehouse: lqt.signals and lqt.signal_history live in LQT's own Postgres, which data_query cannot reach. data_catalog returning no lqt schema is EXPECTED and is NOT evidence the signals do not exist. Exactly three signal names are published - vpin, ofi_z, outcome_forecast - and an app's own workflow_detail description carries the authoritative list. Say that, rather than reporting the tables as missing.
   - remember things about the user long-term (remember_about_me) — call this whenever the user shares a preference, fact about themselves, or a working style hint that should persist
-  - generate an image from a prompt (generate_image) or synthesize speech from text (text_to_speech) — call these when the user asks you to draw/render a picture or read something aloud; the result appears inline in their artifact panel
 
 When the user expresses an intent, prefer doing the work via tools over describing how they could do it themselves. Confirm what you did in 1-2 sentences after each action. When the user asks you to run, pause, install, fork, or publish something, you MUST call the matching tool in that same turn — never answer with prose alone, and never claim an action happened without its tool result.
 
@@ -5120,10 +5126,6 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return toolAccountSetProfile(c, userID, args)
 	case "delete_loop":
 		return toolDeleteLoop(userID, args)
-	case "generate_image":
-		return toolGenerateImage(c.Request.Context(), userID, args)
-	case "text_to_speech":
-		return toolTextToSpeech(c.Request.Context(), userID, args)
 	}
 
 	// ── Generic app-ops bridge (operate any app from chat) ────────────────

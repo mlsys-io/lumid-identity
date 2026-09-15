@@ -37,8 +37,8 @@ func TestSimpleModeShrinksTheCatalog(t *testing.T) {
 	// The system prompt ORDERS these by name. A prompt that commands a tool the
 	// catalog does not carry is a turn that cannot succeed.
 	for _, must := range []string{
-		"run_loop_now", "app_answer", "remember_about_me", "generate_image",
-		"text_to_speech", "data_catalog", "data_query", "query_findata",
+		"run_loop_now", "app_answer", "remember_about_me",
+		"data_catalog", "data_query", "query_findata",
 		"web_search", "web_fetch", "deep_research",
 	} {
 		if !simpleModeTools[must] {

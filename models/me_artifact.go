@@ -3,8 +3,10 @@ package models
 import "time"
 
 // MeArtifact — the DB-backed store for Studio chat artifacts (output of
-// save_artifact / generate_image / text_to_speech / deep_research dumps /
-// code_run listings).
+// save_artifact / deep_research dumps / code_run listings). image + audio
+// kinds still exist in this table and still render, but the tools that
+// produced them (generate_image / text_to_speech) were removed 2026-09-15
+// along with their qwen-image / qwen-tts backends.
 //
 // It replaces the old pod-local file store (~/.tenants/<userID>/.artifacts/
 // <id>.json). That store lived on identity's POD-LOCAL ephemeral filesystem;

@@ -4,8 +4,11 @@ package handler
 // Studio artifact panel.
 //
 // Artifacts are first-class "output objects" the agent produces —
-// long-form text, code listings, JSON blobs, and (via generate_image /
-// text_to_speech) images + audio. They are stored in the auth DB
+// long-form text, code listings and JSON blobs. Image + audio kinds are
+// still READ and rendered (rows predating 2026-09-15, and anything
+// save_artifact stores), but nothing PRODUCES them any more: the
+// generate_image / text_to_speech tools were removed when the qwen-image
+// and qwen-tts backends were retired. They are stored in the auth DB
 // (models.MeArtifact) so BOTH identity replicas see them — the old
 // pod-local file store (~/.tenants/<userID>/.artifacts/<id>.json) flapped
 // 200/404 across the 2-replica deploy. Each row is a self-describing
@@ -93,9 +96,10 @@ func newArtifactID() string {
 }
 
 // persistArtifact writes one artifact row for the caller and returns the small
-// metadata map the UI/model use to pivot to the panel. Shared by the text
-// (save_artifact) and media (generate_image / text_to_speech) tools; maxBytes
-// lets media carry a larger ceiling than the text kinds.
+// metadata map the UI/model use to pivot to the panel. maxBytes lets a caller
+// raise the ceiling above the text default — it existed for the media tools
+// (removed 2026-09-15) and is kept because the media artifact KINDS are still
+// readable and storable.
 func persistArtifact(userID string, a artifact, maxBytes int) (map[string]any, bool) {
 	if userID == "" {
 		return map[string]any{"error": "no user"}, false

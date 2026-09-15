@@ -37,6 +37,17 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 				"model": r.Model, "source": r.Source,
 				"duration_s": r.DurationS, "metrics": m,
 			}
+			// The same run, addressed the way every OTHER run surface addresses
+			// it. `run_ts` is unix seconds; the cycle inspector, cycle-log and
+			// cycle-detail handlers all key on the cycle-dir id. A surface whose
+			// row_href interpolated run_ts therefore produced `?cycle=1788663446`,
+			// which matches no cycle — the deep link fell back to the newest run,
+			// making a backtest's submit and its poll indistinguishable from the
+			// table. Both fields ship: run_ts stays the sortable number and the
+			// `datetime` column's input, cycle_id is what you link with.
+			if cid := runTsToCycleID(r.RunTs); cid != "" {
+				row["cycle_id"] = cid
+			}
 			// Promote the run's SOURCE strategy to the top level.
 			//
 			// filterAppData matches top-level fields only, and deliberately

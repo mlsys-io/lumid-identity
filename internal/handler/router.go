@@ -587,6 +587,12 @@ func Register(r *gin.Engine) {
 			// scheduler volume and identity mounts none, so the panel could show
 			// declared arms whose results never appeared.
 			internal.POST("/app-experiments", InternalAppExperimentRecord)
+			// The installed app's own spec — same reason again, but for the
+			// DECLARATION rather than the results. Without it every read
+			// surface describes the PUBLISHED bundle, so an experiment defined
+			// through chat (which edits the install) stayed invisible to the
+			// very tools that had just created it.
+			internal.POST("/app-spec", InternalAppSpecRecord)
 			// Claude Code quota reporter — each account's cron/stop-hook
 			// POSTs here; no user session, only X-Bridge-Secret.
 			internal.POST("/claude-quota/report", InternalClaudeQuotaReport)

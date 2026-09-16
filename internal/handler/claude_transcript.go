@@ -949,14 +949,17 @@ func AdminClaudeFieldBoxes(c *gin.Context) {
 	}
 	// Degraded is counted with its own query so the per-row NotViaRelay stays a
 	// raw fact while the ALERTABLE total is restricted to turns the signal
-	// actually covers.
+	// actually covers. central turns have via_relay=false BY DESIGN (no relay
+	// hop ever happens), so they are excluded here — a central account is not a
+	// silently-degraded field box.
 	if signalStart != nil {
 		cut := *signalStart
 		if cut.Before(since) {
 			cut = since
 		}
 		common.DB.Model(&models.ClaudeSessionTurn{}).
-			Where("ts >= ? AND field_box <> ? AND via_relay = ?", cut, "", false).
+			Where("ts >= ? AND field_box <> ? AND field_box <> ? AND via_relay = ?",
+				cut, "", ClaudeCentralLabel, false).
 			Count(&totalDegraded)
 	}
 	ok(c, "ok", gin.H{

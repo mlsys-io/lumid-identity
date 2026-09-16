@@ -74,6 +74,39 @@ const (
 // does still route Messages API traffic through them.
 var fieldRelays = parseFieldRelays(os.Getenv("LUMID_CLAUDE_FIELD_RELAYS"))
 
+// ClaudeCentralLabel is the RESERVED account Label meaning "egress DIRECT from
+// the cluster, no relay hop". claude-proxy owns the routing behaviour (see its
+// pickRelay); identity only needs to know that the label is a REAL egress and
+// not an unwired typo, so an operator allocating an account to it is not warned
+// that it does not route.
+//
+// Deliberately a second copy rather than a shared package: identity and
+// claude-proxy are separate services that already keep parallel copies of
+// parseFieldRelays and the same env contract. Keep the two in step.
+const ClaudeCentralLabel = "central"
+
+// IsClaudeCentralLabel reports whether a Label names cluster-direct egress.
+// "direct" is accepted as an input alias, matching claude-proxy.
+func IsClaudeCentralLabel(label string) bool {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case ClaudeCentralLabel, "direct":
+		return true
+	}
+	return false
+}
+
+// claudeLabelRoutes reports whether a Label will actually get traffic somewhere
+// deliberate: a configured field box, the central sentinel, or "" (unlabeled,
+// which claude-proxy adopts onto a box). Anything else is an unwired label —
+// the quiet failure this predicate exists to surface.
+func claudeLabelRoutes(label string) bool {
+	if label == "" || IsClaudeCentralLabel(label) {
+		return true
+	}
+	_, known := fieldRelays[label]
+	return known
+}
+
 func parseFieldRelays(spec string) map[string]string {
 	out := map[string]string{}
 	for _, pair := range strings.Split(spec, ",") {
@@ -1232,8 +1265,7 @@ func AdminClaudeTokenLabel(c *gin.Context) {
 	}
 	if body.Label != nil {
 		label := updates["label"].(string)
-		_, known := fieldRelays[label]
-		log.Printf("claude-token label: %s %q -> %q (relay configured: %v)", email, prevLabel, label, known || label == "")
+		log.Printf("claude-token label: %s %q -> %q (relay configured: %v)", email, prevLabel, label, claudeLabelRoutes(label))
 	}
 	if poolChanged {
 		newPool := updates["pool_id"].(string)
@@ -1245,10 +1277,10 @@ func AdminClaudeTokenLabel(c *gin.Context) {
 	resp := gin.H{"email": email, "updated": updates}
 	if body.Label != nil {
 		label := updates["label"].(string)
-		_, known := fieldRelays[label]
 		// Surfaced so a caller can see immediately whether this label actually
-		// routes, rather than discovering it later from via_relay.
-		resp["relay_configured"] = known || label == ""
+		// routes, rather than discovering it later from via_relay. central is a
+		// deliberate cluster-direct egress, so it reports configured.
+		resp["relay_configured"] = claudeLabelRoutes(label)
 	}
 	ok(c, "ok", resp)
 }

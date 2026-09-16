@@ -79,6 +79,24 @@ func InternalAppSpecRecord(c *gin.Context) {
 }
 
 // storedAppSpec returns the self-reported spec for one installed app, or nil.
+// specEchoRestored — when POST /internal/app-spec began existing again.
+//
+// The table predates this code. An earlier implementation wrote it, its Go side
+// was deleted, and the table outlived it — so _echo_app_spec spent months
+// POSTing into a 404 and every row went stale where it stood. Measured
+// 2026-09-16: 16 rows, all written 12-15 July, including `lumid-arxiv` at 197
+// bytes and a `probe` row of 11.
+//
+// Those rows are indistinguishable from fresh ones by shape, and the overlay
+// PREFERS a stored spec over the published bundle — so trusting them serves a
+// two-month-old spec in place of a current one, which is worse than the problem
+// the overlay was built to fix. Anything written before the route came back
+// provably did not come from the live echo, so it is not trusted.
+//
+// This is a floor, not a TTL: a row written after this instant is trusted
+// however old it gets, because the install it mirrors only changes by an echo.
+var specEchoRestored = time.Date(2026, 9, 16, 0, 0, 0, 0, time.UTC)
+
 func storedAppSpec(userSub, app string) *models.MeAppSpec {
 	if userSub == "" || app == "" || common.DB == nil {
 		return nil
@@ -86,6 +104,12 @@ func storedAppSpec(userSub, app string) *models.MeAppSpec {
 	var row models.MeAppSpec
 	if err := common.DB.Where("user_sub = ? AND app = ?", userSub, app).
 		First(&row).Error; err != nil || row.SpecYAML == "" {
+		return nil
+	}
+	if row.UpdatedAt.Before(specEchoRestored) {
+		// Fall back to the published bundle, which is what every reader saw
+		// before this store existed. The row is left alone: the next install,
+		// update or spec edit overwrites it with a real echo.
 		return nil
 	}
 	return &row

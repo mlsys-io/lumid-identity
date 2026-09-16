@@ -19,27 +19,34 @@ import "time"
 // installed one, for every tenant, with nothing anywhere reporting a difference.
 //
 // Same answer as MeAppRun and MeAppExperiment, which is why this is a third
-// table rather than a third mechanism: the writer self-reports through the
-// bridge and identity reads MySQL.
+// table and not a third mechanism: the writer self-reports through the bridge
+// and identity reads MySQL.
 //
-// `SpecYAML` is the spec file VERBATIM. Identity stores and serves the text; it
-// does not parse, normalise or re-serialise it. The scheduler edits these files
-// TEXTUALLY on purpose — a yaml round-trip destroyed 58 comments in one pass and
-// those comments are the decision record — and a store that reformatted them on
-// the way through would undo that from the other end.
+// THE TABLE ALREADY EXISTS, AND THIS STRUCT MUST MATCH IT EXACTLY.
+//
+// `me_app_specs` was created by an earlier implementation whose Go side was
+// later deleted — the table outlived its code, still holding rows, while
+// _echo_app_spec went on POSTing into a route that no longer existed. Declaring
+// the conventional `ID uint gorm:"primaryKey"` here made AutoMigrate issue
+// `ALTER TABLE me_app_specs ADD id ... ADD PRIMARY KEY (id)` against a table
+// that already has `PRIMARY KEY (user_sub, app)`; MySQL answers 1068 "Multiple
+// primary key defined", AutoMigrate returns an error, and identity refuses to
+// start. Shipped as v0.5.382 and crash-looped the new pod on 2026-09-16.
+//
+// So: composite primary key, no surrogate id, and the column types are the ones
+// on disk. `spec_yaml`/`ui_files` are LONGTEXT — declaring mediumtext would make
+// AutoMigrate NARROW a live column. `app` is varchar(64), not 128, so migration
+// is a no-op rather than a lock on a table other code is reading.
 type MeAppSpec struct {
-	ID      uint   `gorm:"primaryKey"                                                        json:"-"`
-	UserSub string `gorm:"column:user_sub;size:36;not null;uniqueIndex:uq_appspec,priority:1" json:"user_sub"`
-	App     string `gorm:"column:app;size:128;not null;uniqueIndex:uq_appspec,priority:2"     json:"app"`
+	UserSub string `gorm:"column:user_sub;size:36;not null;primaryKey"  json:"user_sub"`
+	App     string `gorm:"column:app;size:64;not null;primaryKey"       json:"app"`
 
-	SpecYAML string `gorm:"column:spec_yaml;type:mediumtext" json:"-"`
+	SpecYAML string `gorm:"column:spec_yaml;type:longtext" json:"-"`
 	// ui_files, as the JSON object the echo sent. Same verbatim rule.
-	UIFiles string `gorm:"column:ui_files;type:mediumtext" json:"-"`
-	// Where the echo read it from, for diagnosing a tenant/operator mix-up.
-	SpecPath string `gorm:"column:spec_path;size:512" json:"spec_path,omitempty"`
+	UIFiles string `gorm:"column:ui_files;type:longtext" json:"-"`
 
-	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
-	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at" json:"updated_at"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
 }
 
 func (MeAppSpec) TableName() string { return "me_app_specs" }

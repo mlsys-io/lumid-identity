@@ -36,7 +36,6 @@ type appSpecBody struct {
 	App      string            `json:"app"`
 	SpecYAML string            `json:"spec_yaml"`
 	UIFiles  map[string]string `json:"ui_files"`
-	SpecPath string            `json:"spec_path"`
 }
 
 // InternalAppSpecRecord — POST /api/v1/internal/app-spec (X-Bridge-Secret).
@@ -66,7 +65,7 @@ func InternalAppSpecRecord(c *gin.Context) {
 	}
 	row := models.MeAppSpec{
 		UserSub: b.UserSub, App: b.App,
-		SpecYAML: b.SpecYAML, UIFiles: ui, SpecPath: b.SpecPath,
+		SpecYAML: b.SpecYAML, UIFiles: ui,
 		UpdatedAt: time.Now(),
 	}
 	res := common.DB.Where("user_sub = ? AND app = ?", b.UserSub, b.App).

@@ -30,6 +30,7 @@ var AllTables = []interface{}{
 	&MeAppIntent{},
 	&MeAppRun{},
 	&MeAppExperiment{},
+	&MeAppSpec{},
 	&MeInteractionEvent{},
 	&MeArtifact{},
 	&ClaudeQuotaToken{},

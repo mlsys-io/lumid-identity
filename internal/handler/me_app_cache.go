@@ -69,6 +69,63 @@ func cacheFresh(dir string) bool {
 	return time.Since(st.ModTime()) < tenantCacheTTL
 }
 
+// cacheFreshFor is cacheFresh plus the one event that must invalidate early: the
+// installed spec changed.
+//
+// A five-minute TTL is a fine answer to "the published bundle may have moved".
+// It is the wrong answer to "the user just defined an experiment", which is a
+// thing they did deliberately, one second ago, and will immediately look for.
+// Serving a stale copy for five minutes there reads exactly like the bug this
+// store was built to fix, and an assistant told "not found" does not wait — it
+// retries, or re-defines.
+func cacheFreshFor(dir, userSub, app string) bool {
+	if !cacheFresh(dir) {
+		return false
+	}
+	spec := storedAppSpec(userSub, app)
+	if spec == nil {
+		return true
+	}
+	st, err := os.Stat(filepath.Join(dir, tenantCacheMarker))
+	if err != nil {
+		return false
+	}
+	return !spec.UpdatedAt.After(st.ModTime())
+}
+
+// overlayStoredSpec replaces the materialised bundle's spec with the INSTALLED
+// one, when the scheduler has echoed it.
+//
+// The published tree still supplies everything else — ui/, datasets, whatever a
+// reader walks — so this is an overlay, not a replacement. Only the file whose
+// staleness actually misleads is swapped.
+//
+// Written to `.xpcloud.yaml` and any legacy `xpcloud.yaml` PRESENT in the
+// fetched tree. ResolveSpecPath prefers the dotfile, so writing only that would
+// leave a legacy twin behind that still says the old thing — the exact stale-copy
+// trap the dotfile precedence rule exists to warn about.
+func overlayStoredSpec(stage, userSub, app string) bool { //nolint:unparam
+	spec := storedAppSpec(userSub, app)
+	if spec == nil {
+		return false
+	}
+	wrote := false
+	for _, name := range []string{".xpcloud.yaml", "xpcloud.yaml"} {
+		p := filepath.Join(stage, name)
+		if name == "xpcloud.yaml" {
+			if _, err := os.Stat(p); err != nil {
+				continue // no legacy twin in this bundle; do not invent one
+			}
+		}
+		if err := os.WriteFile(p, []byte(spec.SpecYAML), 0o644); err != nil {
+			log.Printf("[tenant-cache] overlay %s for %s/%s: %v", name, userSub, app, err)
+			continue
+		}
+		wrote = true
+	}
+	return wrote
+}
+
 // repoTree lists every blob path in the caller's published bundle.
 func repoTree(owner, userSub, app, sub string) []string {
 	bearer, err := xpcloudUserJWT(userSub)
@@ -117,7 +174,7 @@ func materialiseTenantApp(userSub, app string) string {
 		return ""
 	}
 	dir := tenantCacheDir(userSub, app)
-	if cacheFresh(dir) {
+	if cacheFreshFor(dir, userSub, app) {
 		return dir
 	}
 
@@ -127,7 +184,7 @@ func materialiseTenantApp(userSub, app string) string {
 	mu.Lock()
 	defer mu.Unlock()
 	// Another caller may have finished while we waited on the lock.
-	if cacheFresh(dir) {
+	if cacheFreshFor(dir, userSub, app) {
 		return dir
 	}
 
@@ -162,7 +219,22 @@ func materialiseTenantApp(userSub, app string) string {
 		}
 	}
 	if len(paths) == 0 {
-		return ""
+		// NEVER PUBLISHED IS NOT THE SAME AS NOT INSTALLED. An app installed
+		// from a private or unpublished bundle has no repo tree to fetch, and
+		// this returned "" — "app not found" — for an app /me/apps reports
+		// ready. If the scheduler has echoed its installed spec, that alone is
+		// enough to answer every spec-shaped read, so serve it.
+		if storedAppSpec(userSub, app) == nil {
+			return ""
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return ""
+		}
+		if !overlayStoredSpec(dir, userSub, app) {
+			return ""
+		}
+		_ = os.WriteFile(filepath.Join(dir, tenantCacheMarker), []byte("spec-only\n"), 0o644)
+		return dir
 	}
 	if len(paths) > tenantCacheMaxFiles {
 		paths = paths[:tenantCacheMaxFiles]
@@ -205,6 +277,13 @@ func materialiseTenantApp(userSub, app string) string {
 		_ = os.RemoveAll(stage)
 		return ""
 	}
+	// THE INSTALLED SPEC WINS OVER THE PUBLISHED ONE, and it must win HERE —
+	// before the bare-name copy and before the dataset mounts are parsed, so
+	// both are derived from the app as it actually is rather than as it was last
+	// published. An app is published once and then edited; every read that
+	// described the published shape was describing a different app.
+	overlayStoredSpec(stage, userSub, app)
+
 	// The publisher stores the spec dot-prefixed; readAppUI/ResolveSpecPath look
 	// for the bare name too, so provide both rather than teach every reader.
 	spec, specErr := os.ReadFile(filepath.Join(stage, ".xpcloud.yaml"))

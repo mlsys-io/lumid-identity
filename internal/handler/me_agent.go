@@ -791,8 +791,22 @@ type llmProvider struct {
 	// addAnthropicVersion — Anthropic's API needs the "anthropic-version"
 	// header; kv.run's /v1/messages does not. Set to true for Anthropic.
 	addAnthropicVersion bool
-	// supportsVision — can read `image` content blocks. gemma4 (verified
-	// through the kv.run gateway) + Anthropic do; MiniMax is text-only.
+	// supportsVision — can read `image` content blocks.
+	//
+	// VERIFY THIS AGAINST THE GATEWAY, NOT AGAINST MEMORY. It named gemma4 for
+	// months after gemma4 was replaced (gemma4 -> qwen3.8-27b ->
+	// deepseek-v4-flash), and the true/false stayed on the chip rather than
+	// following the model — so the product sent every image to a text-only
+	// backend, which answered 400, while the model that could read images was
+	// flagged false. The self-serve check is one request:
+	//
+	//   curl $LUMID_LLM/v1/chat/completions -d '{"model":"<id>", "messages":
+	//     [{"role":"user","content":[{"type":"text","text":"colour?"},
+	//      {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'
+	//
+	// A model without an mmproj answers 400 "is not a multimodal model".
+	// autoRouteForTurn routes an image turn to the FIRST chip with this set, so
+	// a wrong true here captures every image in the product.
 	supportsVision bool
 	// minRole — minimum role allowed to SELECT this provider in the panel.
 	// "" / "user" = everyone; "admin"; "super_admin". Policy: gemma4 for
@@ -845,10 +859,20 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,   // multimodal; image blocks verified via lumid-llm
-		minRole:             "user", // in-house on our own GPUs; the default for everyone
-		maxOutputTokens:     16384,  // 512K ctx, free local GPU — let answers/structured output run
-		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
+		// NOT multimodal. Measured against the live gateway 2026-09-16:
+		//   POST /llm/v1/chat/completions {model: deepseek-v4-flash, image_url}
+		//   -> 400 "deepseek-v4-flash is not a multimodal model"
+		// The flag read true and its comment said "verified via lumid-llm" — of
+		// GEMMA4, which this chip replaced (gemma4 -> qwen3.8-27b ->
+		// deepseek-v4-flash). The flag outlived the model it described.
+		// autoRouteForTurn sends an image turn to the FIRST vision provider, so
+		// this chip captured every image in the product and answered 400 to all
+		// of them, while the one model that can actually read an image sat
+		// flagged false below.
+		supportsVision:    false,
+		minRole:           "user", // in-house on our own GPUs; the default for everyone
+		maxOutputTokens:   16384,  // 512K ctx, free local GPU — let answers/structured output run
+		dailyBudgetTokens: -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
 	{
 		// qwen3.8-27b — DUAL PURPOSE: the general chat chip AND the INDEPENDENT
@@ -893,10 +917,14 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      false,
-		minRole:             "user", // in-house GPU now, like deepseek — everyone
-		maxOutputTokens:     8192,   // matches skills/llm.py's gateway floor
-		dailyBudgetTokens:   1_500_000,
+		// THE ONLY CHIP THAT CAN ACTUALLY READ AN IMAGE. Measured against the
+		// live gateway 2026-09-16: the same image that made deepseek-v4-flash
+		// answer 400 "is not a multimodal model" was described correctly here.
+		// It ships with an mmproj; deepseek-v4-flash does not.
+		supportsVision:    true,
+		minRole:           "user", // in-house GPU now, like deepseek — everyone
+		maxOutputTokens:   8192,   // matches skills/llm.py's gateway floor
+		dailyBudgetTokens: 1_500_000,
 	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a

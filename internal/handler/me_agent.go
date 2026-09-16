@@ -2799,7 +2799,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "add_experiment_arm",
-			"description": "Add (or replace) ONE ARM on an existing experiment — a variant to compare against the baseline. Use when the user wants to try a change measurably (\"add an arm with deepseek as judge\", \"try the median-3 panel\", \"compare gemma4 as the analyst\"). An experiment with one arm can only report a level; arms are what make it a COMPARISON, and define_experiment cannot add them. Call list_experiments first to see which arms exist — passing an existing arm id replaces that arm, any other id appends. Arm keys are app-specific: pass judge_model/analyst_model/judge_panel for mbb-consultant-style apps, or config for anything else. Model names are checked and you are told when one would silently abstain. To RUN an arm afterwards, use dispatch_experiment_arm.",
+			"description": "Add (or replace) ONE ARM on an existing experiment — a variant to compare against the baseline. Use when the user wants to try a change measurably (\"add an arm with deepseek as judge\", \"try the median-3 panel\", \"compare gemma4 as the analyst\"). An experiment with one arm can only report a level; arms are what make it a COMPARISON, and define_experiment cannot add them. Passing an existing arm id replaces that arm, any other id appends. Call this straight after define_experiment — do NOT wait for the experiment to appear in list_experiments first: that lists the app's PUBLISHED bundle, and an experiment you just defined lives in the install, so it will not be there and no amount of waiting or re-defining will put it there. This verb is applied against the install and will tell you plainly if the experiment really is missing. Arm keys are app-specific: pass judge_model/analyst_model/judge_panel for mbb-consultant-style apps, or config for anything else. Model names are checked and you are told when one would silently abstain. To RUN an arm afterwards, use dispatch_experiment_arm.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -4291,13 +4291,26 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		out := map[string]any{"ok": true, "intent_id": id, "app": app,
 			"experiment": eid, "loop": loop, "metric": metric,
 			"scope": map[string]any{"dataset_id": ds, "cases": caseList}}
-		if warns, done := waitIntentWarnings(userID, id, 6*time.Second); done {
-			out["applied"] = true
-			if len(warns) > 0 {
+		if warns, succeeded, done := waitIntentWarnings(userID, id, 6*time.Second); done {
+			out["applied"] = succeeded
+			switch {
+			case !succeeded:
+				// A FAILED INTENT IS NOT AN APPLIED ONE. This reported
+				// `applied: true` for any settled intent and filed the
+				// scheduler's error under `warnings`, so a definition that
+				// never landed read as a definition that landed with advice
+				// attached — and the caller went on to add arms to an
+				// experiment that did not exist. Say it failed, and say why.
+				out["ok"] = false
+				out["error"] = "the definition did NOT land — the scheduler rejected it: " +
+					strings.Join(warns, "; ")
+				out["note"] = "NOT applied. Report this failure and its reason; do not " +
+					"retry the same definition unchanged, and do not add arms to it."
+			case len(warns) > 0:
 				out["warnings"] = warns
 				out["note"] = "applied, WITH WARNINGS — read them out; a model that " +
 					"resolves nowhere does not error, it abstains, and the panel shrinks silently"
-			} else {
+			default:
 				out["note"] = "applied"
 			}
 		} else {
@@ -4308,13 +4321,29 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return out, true
 
 	case "add_experiment_arm":
-		// WHY THIS READS BEFORE IT WRITES. patch_experiment replaces the whole
-		// experiments[] entry — there is no merge on the scheduler side, by
-		// design (a textual edit that tried to splice one key into an existing
-		// block is exactly how comments get eaten). So the arm is merged HERE,
-		// against the experiment as it currently stands, and the complete
-		// definition is resent. Sending only the new arm would silently delete
-		// the baseline, which is worse than refusing.
+		// WHY THIS NO LONGER READS BEFORE IT WRITES.
+		//
+		// It used to merge the arm HERE — read the experiment, splice, resend
+		// the whole entry via patch_experiment — because patch_experiment
+		// replaces an entry wholesale and the scheduler offered no merge. Both
+		// halves of that were wrong:
+		//
+		//   1. THIS SERVICE CANNOT SEE THE EXPERIMENT. identity mounts no
+		//      tenant volume, so resolveAppDir hands back a materialised copy
+		//      of the PUBLISHED repo, while define_experiment writes the
+		//      INSTALL through the scheduler and nothing publishes it back. An
+		//      experiment the user had just defined was absent from the only
+		//      bundle readable here — so this verb answered "experiment not
+		//      found" forever, and retrying could never fix it
+		//      (chiquanji@gmail.com, 2026-09-16: 14 defines, 0 arms added).
+		//   2. A MERGE FROM A STALE READ DELETES THINGS. Resending a whole
+		//      entry built from a copy that is behind is how both arms of a
+		//      finished 52-row experiment were erased on 2026-09-13.
+		//
+		// So the merge moved to where the spec actually lives:
+		// experiment_control op=add_arm touches ONE arm, textually, against the
+		// install. This verb now states the arm and nothing else — there is no
+		// carry-forward to get wrong, because nothing else is being rewritten.
 		app := strVal(args, "app")
 		if app == "" {
 			app = groundedApp(c)
@@ -4324,22 +4353,6 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if app == "" || eid == "" || armID == "" {
 			return map[string]any{"error": "app, experiment and arm are required"}, false
 		}
-		dir := resolveAppDir(userID, app)
-		if dir == "" {
-			return map[string]any{"error": "app not installed"}, false
-		}
-		var decl map[string]any
-		for _, e := range loadAppExperimentsFor(userID, app, dir) {
-			if id, _ := e["id"].(string); id == eid {
-				decl = e
-				break
-			}
-		}
-		if decl == nil {
-			return map[string]any{"error": "experiment " + eid + " not found — " +
-				"add_experiment_arm extends an EXISTING experiment; use define_experiment to create one"}, false
-		}
-
 		arm := map[string]any{"id": armID}
 		if v := strVal(args, "config"); v != "" {
 			// Free-form keys for apps that are not model-shaped. Parsed, not
@@ -4372,82 +4385,56 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			}
 		}
 
-		// Replace by id, else append — "add" twice with the same id must be an
-		// edit, not a duplicate the aggregator would then average together.
-		var arms []map[string]any
-		replaced := false
-		if existing, ok := decl["arms"].([]map[string]any); ok {
-			for _, a := range existing {
-				if id, _ := a["id"].(string); id == armID {
-					arms = append(arms, arm)
-					replaced = true
-					continue
-				}
-				arms = append(arms, a)
-			}
-		} else if raw, ok := decl["arms"].([]any); ok {
-			for _, a0 := range raw {
-				a, _ := a0.(map[string]any)
-				if a == nil {
-					continue
-				}
-				if id, _ := a["id"].(string); id == armID {
-					arms = append(arms, arm)
-					replaced = true
-					continue
-				}
-				arms = append(arms, a)
-			}
-		}
-		if !replaced {
-			arms = append(arms, arm)
-		}
+		// Advisory model check on the arm as stated. The scheduler re-checks the
+		// arm as it LANDED (which is the one that matters — a seat list written
+		// as a scalar resolves to no seats), but doing it here too gives the
+		// answer in the same turn rather than only in the intent result.
+		_, modelWarnings := validateExperimentModels(
+			&experimentWriteBody{Arms: []map[string]any{arm}})
 
-		// Model names are advisory-checked on the same path a define goes
-		// through, so a seat that would abstain is reported here too.
-		_, modelWarnings := validateExperimentModels(&experimentWriteBody{Arms: arms})
-
-		// declLoop reads BOTH linkage conventions; see its comment. Shared with
-		// the HTTP write path so the two cannot disagree about what "attached"
-		// means — knowing only loops[] made this verb refuse analyst_local_gpu,
-		// an experiment with 52 rows and a published verdict.
-		loop := declLoop(decl)
-		if loop == "" {
-			return map[string]any{"error": "experiment " + eid + " is attached to no loop, " +
-				"so an arm on it could never be dispatched"}, false
-		}
-		// This verb expresses ONE arm; patch_experiment replaces the whole
-		// entry. So every other key is one the caller had no way to preserve,
-		// and experimentCarryOnto puts all of them back. The hand-rolled version
-		// this replaces dropped six of them, three of them invisibly:
-		//   dispatch      — never on the row, so adding an arm to
-		//                   backtest_evidence deleted the `dispatch.ask` that
-		//                   makes its arms dispatchable at all;
-		//   cases         — never on the row AND never parsed, so an experiment
-		//                   scoped by cases with no dataset_id had its patch
-		//                   REFUSED by the scheduler's scope guard;
-		//   description   — never on the row;
-		//   min_samples   — on the row as an int, tested as a float64, so the
-		//                   assertion never fired and the threshold was erased
-		//                   on every arm add (floor falls back to 1);
-		//   benchmark_id, status — on the row, simply not copied.
-		payload := map[string]any{
-			"app": app, "experiment": eid, "loop": loop,
-			"metric": decl["metric"], "arms": arms,
-		}
-		experimentCarryOnto(payload, decl, "arms")
-		iid := writeIntent(c, "patch_experiment", userID, payload)
+		// ONE arm, merged where the spec lives. No loop, no metric, no carry —
+		// this op rewrites nothing but the arm, so there is no field the caller
+		// had to remember to preserve. The scheduler refuses by name if the
+		// experiment does not exist, which is a judgement made against the
+		// install rather than against a published copy that cannot see it.
+		iid := writeIntent(c, "experiment_control", userID, map[string]any{
+			"app": app, "experiment": eid, "op": "add_arm", "arm": arm,
+		})
 		if iid == "" {
 			return map[string]any{"error": "could not queue the arm"}, false
 		}
-		action := "added"
-		if replaced {
-			action = "replaced"
+		out := map[string]any{"ok": true, "intent_id": iid, "app": app,
+			"experiment": eid, "arm": armID}
+		if len(modelWarnings) > 0 {
+			out["warnings"] = modelWarnings
 		}
-		return map[string]any{"ok": true, "intent_id": iid, "app": app, "experiment": eid,
-			"arm": armID, "action": action, "arms_now": len(arms),
-			"warnings": modelWarnings,
-			"note":     "queued — the scheduler applies it. Run it with dispatch_experiment_arm."}, true
+		// Wait for the real answer, as define_experiment does. Reporting
+		// "queued" for work that has already settled is what turned this pair
+		// of verbs into a retry loop.
+		if warns, succeeded, done := waitIntentWarnings(userID, iid, 6*time.Second); done {
+			out["applied"] = succeeded
+			if len(warns) > 0 {
+				out["warnings"] = append(toStrings(out["warnings"]), warns...)
+			}
+			if !succeeded {
+				out["ok"] = false
+				out["error"] = "the arm did NOT land: " + strings.Join(warns, "; ")
+				out["note"] = "NOT applied. Report this and its reason; adding the same " +
+					"arm again unchanged will fail the same way."
+				return out, false
+			}
+			out["note"] = "applied. Run it with dispatch_experiment_arm."
+			if len(warns) > 0 {
+				out["note"] = "applied, WITH WARNINGS — read them out; a model that " +
+					"resolves nowhere does not error, it abstains, and the panel " +
+					"shrinks silently. Run it with dispatch_experiment_arm."
+			}
+		} else {
+			out["applied"] = false
+			out["note"] = "queued — the scheduler applies it. Check with list_experiments " +
+				"before adding it again; do not re-send it blind."
+		}
+		return out, true
 
 	case "experiment_control":
 		app := strVal(args, "app")

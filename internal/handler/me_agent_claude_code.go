@@ -305,6 +305,24 @@ func InterruptClaudeTurn(ctx context.Context, turnID, userID string) error {
 
 // streamClaudeCodeViaProxy sends the conversation to the claude-sandbox
 // runner, reads its streaming NDJSON, and re-emits as SSE events.
+// planOnly collapses the caller's permission_mode to the one value we are
+// willing to forward. Anything unrecognised becomes "" — today's behaviour —
+// rather than being passed through for the sandbox to interpret.
+//
+// The sandbox allowlists it again. That is not redundancy for its own sake:
+// this value selects a CLI argv flag, and the bridge secret is shared across
+// identity pods, so neither side gets to assume the other checked.
+//
+// Fail toward the RESTRICTIVE-looking answer being explicit: a typo'd "Plan"
+// silently runs an ordinary, fully-privileged turn, which is why the response
+// header is read back below instead of trusting that this was honoured.
+func planOnly(mode string) string {
+	if mode == "plan" {
+		return "plan"
+	}
+	return ""
+}
+
 func streamClaudeCodeViaProxy(
 	ctx context.Context,
 	_ *gin.Context,
@@ -315,6 +333,7 @@ func streamClaudeCodeViaProxy(
 	model string, // claude CLI --model alias or full claude-* id
 	sessionID string, // optional claude session to resume (must be owned by userID)
 	scope struct{ XpioRepo, ClusterID, DataApp string }, // working-context selection
+	permissionMode string, // "plan" for a read-only planning turn; "" for today's behaviour
 	emit func(map[string]any) bool,
 ) error {
 	if model == "" {
@@ -351,6 +370,7 @@ func streamClaudeCodeViaProxy(
 		"xpio_repo":       scope.XpioRepo,
 		"cluster_id":      scope.ClusterID,
 		"data_app":        scope.DataApp,
+		"permission_mode": planOnly(permissionMode),
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -415,6 +435,23 @@ func streamClaudeCodeViaProxy(
 		turn = registerClaudeTurn(turnID, userID)
 		defer unregisterClaudeTurn(turnID)
 		if !emit(map[string]any{"type": "turn_id", "turn_id": turnID}) {
+			return nil
+		}
+	}
+
+	// Read back the posture the turn ACTUALLY ran under, and say so even when
+	// it matches. The sandbox decodes its request body without
+	// DisallowUnknownFields, so an image that predates permission_mode accepts
+	// the field, ignores it, and returns a perfectly healthy 200 — a turn
+	// running fully privileged while the UI shows a plan badge. For a feature
+	// whose entire value is "it cannot write", the absence of an error is not
+	// evidence; the echo is. An empty header means exactly that older image.
+	if requested := planOnly(permissionMode); requested != "" || resp.Header.Get("X-Permission-Mode") == "plan" {
+		if !emit(map[string]any{
+			"type":      "permission_mode",
+			"mode":      resp.Header.Get("X-Permission-Mode"),
+			"requested": requested,
+		}) {
 			return nil
 		}
 	}
@@ -534,6 +571,33 @@ type claudeTranslator struct {
 	// task_type, so the agent ids have to be remembered. Without this a
 	// backgrounded `sleep` renders as a sub-agent panel.
 	agentTasks map[string]bool
+	// Unknown event kinds already logged for this turn, so a chatty new type
+	// costs one line and not one per event. See noteUnknown.
+	unknownSeen map[string]bool
+}
+
+// noteUnknown records a stream event this translator does not understand.
+//
+// All three switches below are allowlists that fall through to `return true`,
+// so anything the CLI adds is read off the wire and dropped with no log, no
+// counter and no passthrough. BUILD.md commits the sandbox to a MONTHLY CLI
+// bump and stream-json is not formally versioned, so the vocabulary is expected
+// to move — and until now nothing could tell us that it had. A capability could
+// disappear from the chatbox and the only symptom would be a feature quietly
+// not working.
+//
+// This is deliberately a log and not an emit: an unknown event is not something
+// the user can act on, and inventing a client-visible error for it would make
+// every CLI bump look like an outage. The turn is unaffected.
+func (t *claudeTranslator) noteUnknown(where, kind string) {
+	if kind == "" {
+		kind = "(empty)"
+	}
+	if t.unknownSeen[where+"/"+kind] {
+		return
+	}
+	t.unknownSeen[where+"/"+kind] = true
+	log.Printf("claude translator: unhandled %s event %q (user=%s) — CLI vocabulary moved; see BUILD.md event-shape contract", where, kind, t.userID)
 }
 
 func newClaudeTranslator(userID string, emit func(map[string]any) bool) *claudeTranslator {
@@ -545,6 +609,7 @@ func newClaudeTranslator(userID string, emit func(map[string]any) bool) *claudeT
 		blockKind:    map[string]string{},
 		blockToolID:  map[string]string{},
 		agentTasks:   map[string]bool{},
+		unknownSeen:  map[string]bool{},
 	}
 }
 
@@ -657,6 +722,9 @@ func (t *claudeTranslator) handle(event map[string]any) bool {
 
 	case "result":
 		return t.handleResult(event)
+	default:
+		tt, _ := event["type"].(string)
+		t.noteUnknown("top-level", tt)
 	}
 
 	return true
@@ -776,6 +844,8 @@ func (t *claudeTranslator) handleSystem(event map[string]any) bool {
 			"summary":     event["summary"],
 			"usage":       event["usage"],
 		})
+	default:
+		t.noteUnknown("system", sub)
 	}
 	return true
 }
@@ -852,6 +922,10 @@ func (t *claudeTranslator) handleStreamEvent(event map[string]any, parentID stri
 
 		// message_start / message_delta / message_stop carry no per-block
 		// content we don't already have from the blocks themselves.
+	default:
+		if it, _ := inner["type"].(string); it != "message_start" && it != "message_delta" && it != "message_stop" {
+			t.noteUnknown("stream_event", it)
+		}
 	}
 
 	return true

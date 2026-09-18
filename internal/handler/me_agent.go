@@ -1722,6 +1722,18 @@ type meAgentChatBody struct {
 	XpioRepo  string `json:"xpio_repo,omitempty"`
 	ClusterID string `json:"cluster_id,omitempty"`
 	DataApp   string `json:"data_app,omitempty"`
+	// Optional, claude-code provider only: "plan" runs this turn under the
+	// CLI's own read-only plan mode. Absent means today's behaviour.
+	//
+	// Deliberately NOT folded into Mode above. Mode already means
+	// search|deep_research, already reaches the claude-code branch through
+	// modeSystemSuffix, and the Studio shell puts a third meaning (the
+	// interview mode) at context.mode. A fourth on the same wire name is how
+	// this regresses silently in six months.
+	//
+	// Allowlisted on the way out (planOnly) as well as in the sandbox: two
+	// checks, because this value ends up deciding an argv flag.
+	PermissionMode string `json:"permission_mode,omitempty"`
 	// Optional: require a specific tool for THIS turn.
 	//
 	// Some turns are not the model's judgement call. When the user has picked a
@@ -2013,7 +2025,7 @@ func MeAgentChat(c *gin.Context) {
 			}
 			return true
 		}
-		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, struct{ XpioRepo, ClusterID, DataApp string }{body.XpioRepo, body.ClusterID, body.DataApp}, emit); err != nil {
+		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, struct{ XpioRepo, ClusterID, DataApp string }{body.XpioRepo, body.ClusterID, body.DataApp}, body.PermissionMode, emit); err != nil {
 			fail(c, http.StatusBadGateway, 1502, "llm call: "+err.Error())
 			return
 		}

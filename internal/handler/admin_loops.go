@@ -572,6 +572,106 @@ type rawGoal struct {
 	Tracked []string `json:"tracked" yaml:"tracked"`
 }
 
+// rawGoal accepts the object form {primary:, tracked:} AND a bare string.
+// Sixth instance of the scalar-attachment bug (flexStrings, expRef, expLoops,
+// …), and the one with the worst blast radius yet: `goal:` is descriptive
+// metadata that nothing in this service depends on, but decoding it strictly
+// made a single bare string fail the unmarshal of the ENTIRE loops list —
+//
+//	cannot unmarshal !!str into handler.rawGoal
+//
+// — and BOTH row builders swallow that error with `continue`, so every loop in
+// the app disappeared from /me/workflows, the Workflows tab, the lumid:workflow
+// canvas and chat dispatch at once, with nothing logged anywhere.
+//
+// The bare string is not a malformed spec, it is the OTHER HALF OF THE
+// CONTRACT. The Python scheduler that actually runs these loops coerces it
+// (sdk/apps/app_runner.py:4247):
+//
+//	goal_primary = goal.get("primary") if isinstance(goal, dict) else str(goal)
+//
+// so a string-goal app runs happily forever while Go renders it invisible —
+// precisely the "invisible automation" flexStrings was written to stop. This
+// mirrors the runtime's coercion rather than inventing a stricter policy.
+//
+// Deliberately TOTAL: it never returns an error. A goal is a label; it must not
+// be able to take an app's automation off the board. Unknown shapes (a sequence)
+// leave the zero value, and a mapping whose `tracked` entries are objects
+// salvages what it can through coerceFlexEntry instead of failing the list.
+//
+// NOT changed: `Tracked []string` stays a plain slice. Object-form tracked
+// entries are hypothetical — no installed spec ships one — and converting the
+// field to flexStrings would ripple through the WorkflowGoal call sites in
+// me_workflows.go and me_portfolio.go for no evidenced gain. The salvage path
+// below covers that shape anyway, without the type change.
+func (g *rawGoal) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		if value.Tag == "!!null" {
+			return nil
+		}
+		var s string
+		if err := value.Decode(&s); err == nil {
+			g.Primary = strings.TrimSpace(s)
+		}
+	case yaml.MappingNode:
+		type plain rawGoal
+		var p plain
+		if err := value.Decode(&p); err == nil {
+			*g = rawGoal(p)
+			return nil
+		}
+		var loose map[string]any
+		if err := value.Decode(&loose); err == nil {
+			g.salvage(loose)
+		}
+	}
+	return nil
+}
+
+func (g *rawGoal) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		g.Primary = strings.TrimSpace(s)
+		return nil
+	}
+	type plain rawGoal
+	var p plain
+	if err := json.Unmarshal(b, &p); err == nil {
+		*g = rawGoal(p)
+		return nil
+	}
+	var loose map[string]any
+	if err := json.Unmarshal(b, &loose); err == nil {
+		g.salvage(loose)
+	}
+	return nil
+}
+
+// salvage pulls a usable goal out of a mapping that failed strict decoding —
+// typically because `tracked` carries objects rather than bare strings.
+func (g *rawGoal) salvage(loose map[string]any) {
+	if s, ok := loose["primary"].(string); ok {
+		g.Primary = strings.TrimSpace(s)
+	}
+	entries, ok := loose["tracked"].([]any)
+	if !ok {
+		return
+	}
+	for _, e := range entries {
+		switch v := e.(type) {
+		case string:
+			if v != "" {
+				g.Tracked = append(g.Tracked, v)
+			}
+		case map[string]any:
+			if s := coerceFlexEntry(v); s != "" {
+				g.Tracked = append(g.Tracked, s)
+			}
+		}
+	}
+}
+
 // loadLoopDetail walks the app dir to fetch detail-fields for one
 // loop. Best-effort — every field is optional. Reads in order:
 //

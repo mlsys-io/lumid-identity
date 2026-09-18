@@ -99,3 +99,41 @@ func TestDeleteAppliesThePrefixLikePutAndGet(t *testing.T) {
 		t.Errorf("Delete did not apply the claude-sessions/ prefix: got path %q", gotPath)
 	}
 }
+
+// Archives must NOT land under the live session-blob prefix. If PutArchive ever
+// routed through Put's claude-sessions/ prefix, a session delete walking that
+// prefix could remove the only surviving copy of swept rows — the DB rows are
+// gone by then. This pins the separation rather than trusting the constant.
+func TestPutArchiveUsesArchivePrefixNotSessionPrefix(t *testing.T) {
+	var gotPath, gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	b := testBlobStore(t, srv)
+	if err := b.PutArchive("usage_events/20260915T120000Z-1-5000.ndjson.gz", []byte("x")); err != nil {
+		t.Fatalf("PutArchive: %v", err)
+	}
+	if gotMethod != "PUT" {
+		t.Errorf("method = %q, want PUT", gotMethod)
+	}
+	if !strings.Contains(gotPath, "/archive/") {
+		t.Errorf("path %q does not carry the archive/ prefix", gotPath)
+	}
+	if strings.Contains(gotPath, "claude-sessions") {
+		t.Fatalf("archive written under the LIVE session prefix: %q — a session "+
+			"delete sweeping that prefix would destroy archived rows", gotPath)
+	}
+
+	// Positive control: the same store must still put session blobs under
+	// claude-sessions/, so the assertion above is discriminating and not just
+	// passing because nothing is prefixed at all.
+	if err := b.Put("conv/0/response.gz", []byte("y")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !strings.Contains(gotPath, "claude-sessions/") {
+		t.Errorf("Put path = %q, want the claude-sessions/ prefix", gotPath)
+	}
+}

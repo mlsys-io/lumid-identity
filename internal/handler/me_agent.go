@@ -1277,7 +1277,66 @@ func controlIntent(msgs []chatMessage) bool {
 			return true
 		}
 	}
+	// Loop/cycle READ-BACK, gated. These patterns key on a platform noun near an
+	// outcome word, which is also how developers talk about `for` loops and
+	// GitHub Actions workflows -- measured: an ungated version stole "why did
+	// the workflow file fail to parse?", "the ci workflow output is confusing,
+	// explain it" and "why does this while loop never finish?". RE2 has no
+	// lookbehind, so the code-construct senses are excluded by phrase instead,
+	// and only for this set: every pattern above keeps its behaviour exactly.
+	if !codeConstructContext(text) {
+		for _, re := range loopReadBackPatterns {
+			if re.MatchString(text) {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+// codeConstructContext reports whether "loop" or "workflow" is being used in
+// its PROGRAMMING sense, where the turn belongs to claude-code and not here.
+func codeConstructContext(text string) bool {
+	for _, kw := range codeConstructPhrases {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+var codeConstructPhrases = []string{
+	// loop-as-control-flow
+	"while loop", "for loop", "event loop", "render loop", "main loop",
+	"infinite loop", "game loop", "inner loop", "outer loop", "foreach loop",
+	// workflow-as-CI-config
+	"workflow file", "github workflow", "github actions", "actions workflow",
+	"ci workflow", "workflow.yml", "workflow.yaml", ".github/workflows",
+	"build workflow", "release workflow",
+}
+
+var loopReadBackPatterns = []*regexp.Regexp{
+	// READING BACK A LOOP RUN. The block above makes exactly this argument for
+	// experiments -- "a control plane that can start a measurement and not read
+	// it back is half a control plane" -- and it was never generalised to the
+	// loops/runs/cycles the same chat dispatches. Measured 2026-09-18 across 8
+	// realistic phrasings: 6/6 "run the ..." forms routed and 0/8 read-backs
+	// did, so a user could start a run from chat and then had no way to ask how
+	// it went.
+	//
+	// Anchored on a RESULT noun rather than on the verb, because this router
+	// also fronts a CODING agent and the obvious `(show|how)[^.]*workflow`
+	// steals "how do I write a github workflow", "show me the workflow file"
+	// and every CI question in the repo. Requiring loop/workflow/cycle to sit
+	// near an OUTCOME word keeps those on claude-code.
+	regexp.MustCompile(`\b(loop|workflow|cycle)s?\b[^.?!]{0,60}\b(result|outcome|output|records?|manifest|produced?|wrote|written|fail(ed|ure)?|finish(ed)?|complete[d]?|verdict)\b`),
+	regexp.MustCompile(`\b(result|outcome|records?|manifest|verdict)s?\b[^.?!]{0,60}\b(loop|workflow|cycle)s?\b`),
+	// An UNDERSCORED identifier is a strong platform signal on its own: loops
+	// are named vla_curate / case_cycle / regression_sweep, and ordinary prose
+	// does not contain underscores. Still requires BOTH a read verb and a run
+	// noun, so "run test_integration" (a coding turn) does not qualify -- only
+	// asking ABOUT a named run does.
+	regexp.MustCompile(`\b(show|summari[sz]e|how|why|what|did|when)\b[^.?!]{0,40}\b\w+_\w+\b[^.?!]{0,40}\b(runs?|cycles?|loop|job)\b`),
 }
 
 // controlIntentPatterns — verb-near-noun forms the literal list cannot express.

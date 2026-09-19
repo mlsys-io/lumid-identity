@@ -237,8 +237,9 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app", MeAppsUninstall)
 			me.GET("/apps/:app/ui", MeAppUI) // app-declared Studio surface (markdown)
 			me.GET("/apps/:app/ui/:surface", MeAppUISurface)
-			me.GET("/apps/:app/data", MeAppData)   // read-only app content for declarative surfaces
-			me.PUT("/apps/:app/ui", MeUpdateAppUI) // write/create surface markdown
+			me.GET("/apps/:app/data", MeAppData)                 // read-only app content for declarative surfaces
+			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
+			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)
 			me.POST("/apps/:app/ui/generate", MeGenerateAppUI) // AI-generate surface from config
 			me.GET("/apps/:app/config", MeAppConfig)           // read xpcloud.yaml
@@ -587,6 +588,7 @@ func Register(r *gin.Engine) {
 			// scheduler volume and identity mounts none, so the panel could show
 			// declared arms whose results never appeared.
 			internal.POST("/app-experiments", InternalAppExperimentRecord)
+			internal.POST("/app-proposals", InternalAppProposalRecord)
 			// The installed app's own spec — same reason again, but for the
 			// DECLARATION rather than the results. Without it every read
 			// surface describes the PUBLISHED bundle, so an experiment defined

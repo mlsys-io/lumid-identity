@@ -110,7 +110,14 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 		pd := filepath.Join(dir, ".lumid", "proposals")
 		ents, err := os.ReadDir(pd)
 		if err != nil {
-			return map[string]any{"app": app, "proposals": []any{}, "count": 0}, true
+			// No slate on disk. For an operator-shared app that means none was
+			// produced; for a tenant install it means identity simply cannot
+			// see the runtime tree — the bundle it resolved is a materialised
+			// copy of the PUBLISHED one, and .lumid/ is not published. Fall
+			// back to what the producer self-reported through
+			// POST /me/apps/:app/proposals (or the internal bridge), which is
+			// the only copy identity can read for a tenant.
+			return proposalRowsFrom(storedProposalSlate(userID, app), app), true
 		}
 		newest := ""
 		for _, e := range ents {
@@ -122,7 +129,7 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 			}
 		}
 		if newest == "" {
-			return map[string]any{"app": app, "proposals": []any{}, "count": 0}, true
+			return proposalRowsFrom(storedProposalSlate(userID, app), app), true
 		}
 		raw, err := os.ReadFile(filepath.Join(pd, newest))
 		if err != nil {
@@ -135,21 +142,9 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 		if err := json.Unmarshal(raw, &slate); err != nil {
 			return map[string]any{"error": "malformed proposal slate: " + newest}, false
 		}
-		out := make([]map[string]any, 0, len(slate.Proposals))
-		for _, p := range slate.Proposals {
-			// Drop `findings` from the row: the surface renders verdict_reason,
-			// and a nested array in a table cell renders as [object Object].
-			// The detail stays on disk for anyone reading the slate directly.
-			row := make(map[string]any, len(p))
-			for k, v := range p {
-				if k == "findings" || k == "arms" {
-					continue
-				}
-				row[k] = v
-			}
-			out = append(out, row)
-		}
-		return map[string]any{"app": app, "proposals": out, "count": len(out), "slate": newest}, true
+		res := proposalRowsFrom(map[string]any{"proposals": toAnySlice(slate.Proposals)}, app)
+		res["slate"] = newest
+		return res, true
 	},
 }
 
@@ -279,4 +274,45 @@ func filterAppData(c *gin.Context, res map[string]any) map[string]any {
 		out["count"] = keptTotal
 	}
 	return out
+}
+
+// toAnySlice widens decoded rows so disk and DB feed proposalRowsFrom the same
+// shape. Without it the two paths would each shape rows their own way, which is
+// how a column renders on one and not the other.
+func toAnySlice(in []map[string]any) []any {
+	out := make([]any, 0, len(in))
+	for _, m := range in {
+		out = append(out, m)
+	}
+	return out
+}
+
+// proposalRowsFrom flattens a slate into surface-table rows.
+//
+// `findings` and `arms` are dropped: the surface renders verdict_reason, and a
+// nested array in a table cell renders as [object Object]. Dropping them is
+// only acceptable because verdict_reason carries the same information as prose.
+// A nil slate is an empty table, never an error — the surface runs unattended
+// on page load and its empty state says where proposals come from.
+func proposalRowsFrom(slate map[string]any, app string) map[string]any {
+	out := []map[string]any{}
+	if slate != nil {
+		if raw, ok := slate["proposals"].([]any); ok {
+			for _, it := range raw {
+				p, ok := it.(map[string]any)
+				if !ok {
+					continue
+				}
+				row := make(map[string]any, len(p))
+				for k, v := range p {
+					if k == "findings" || k == "arms" {
+						continue
+					}
+					row[k] = v
+				}
+				out = append(out, row)
+			}
+		}
+	}
+	return map[string]any{"app": app, "proposals": out, "count": len(out)}
 }

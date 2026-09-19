@@ -20,6 +20,7 @@ package handler
 // client cannot attribute an event to someone else.
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -147,27 +148,33 @@ func MeInteractionEventRecord(c *gin.Context) {
 // shared PVC that carries the auth database.
 func StartInteractionReclaimLoop() {
 	go func() {
+		time.Sleep(reclaimFirstPassDelay)
 		for {
-			time.Sleep(interactionReclaimEvery)
-			if n, err := reclaimOldInteractions(); err != nil {
+			if n, err := reclaimOldInteractions(); errors.Is(err, errLockBusy) {
+				log.Print("interaction reclaim: skipped, another replica holds the lock")
+			} else if err != nil {
 				log.Printf("interaction reclaim failed: %v", err)
 			} else if n > 0 {
 				log.Printf("interaction reclaim: deleted %d row(s) older than %v", n, interactionRetention)
 			}
+			time.Sleep(interactionReclaimEvery)
 		}
 	}()
 	log.Printf("interaction reclaim loop every %v (retention %v)", interactionReclaimEvery, interactionRetention)
 }
 
-func reclaimOldInteractions() (int64, error) {
+func reclaimOldInteractions() (total int64, err error) {
 	// Same named-lock discipline as session reclaim: identity runs replicas:2
 	// and two concurrent sweeps would contend on the same rows.
-	var got int
-	if err := common.DB.Raw("SELECT GET_LOCK('interaction_reclaim', 2)").Scan(&got).Error; err != nil || got != 1 {
-		return 0, nil
-	}
-	defer common.DB.Exec("DO RELEASE_LOCK('interaction_reclaim')")
+	err = withNamedLock(common.DB, "interaction_reclaim", 2*time.Second, func() error {
+		var e error
+		total, e = reclaimOldInteractionsLocked()
+		return e
+	})
+	return total, err
+}
 
+func reclaimOldInteractionsLocked() (int64, error) {
 	cutoff := time.Now().UTC().Add(-interactionRetention)
 	var total int64
 	for i := 0; i < interactionReclaimMaxIte; i++ {

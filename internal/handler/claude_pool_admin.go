@@ -18,6 +18,7 @@ package handler
 // (session transcripts). Pool CRUD is neither.
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -68,16 +69,20 @@ const claudePoolMigrationLock = "claude_pool_migration"
 // boot after the first, and safe to run concurrently across replicas.
 
 func EnsureDefaultClaudePool(db *gorm.DB) error {
-	const defaultID = models.DefaultClaudePoolID
-
-	var locked int
-	if err := db.Raw("SELECT GET_LOCK(?, 30)", claudePoolMigrationLock).Scan(&locked).Error; err != nil {
-		return fmt.Errorf("acquire migration lock: %w", err)
-	}
-	if locked != 1 {
+	// Pinned acquire/release (withNamedLock): a release on a different pool
+	// connection would leave the lock held for this pod's lifetime, and the
+	// next replica to boot would wait 30s here and log.Fatalf.
+	err := withNamedLock(db, claudePoolMigrationLock, 30*time.Second, func() error {
+		return ensureDefaultClaudePoolLocked(db)
+	})
+	if errors.Is(err, errLockBusy) {
 		return fmt.Errorf("could not acquire migration lock %q within 30s — another pod may be stuck mid-migration", claudePoolMigrationLock)
 	}
-	defer db.Exec("DO RELEASE_LOCK(?)", claudePoolMigrationLock)
+	return err
+}
+
+func ensureDefaultClaudePoolLocked(db *gorm.DB) error {
+	const defaultID = models.DefaultClaudePoolID
 
 	// 1. Resolve admin@lum.id's sub for OwnerSub. A missing admin@lum.id row
 	// degrades to an empty owner + a loud warning rather than failing

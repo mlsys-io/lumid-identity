@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -64,7 +65,12 @@ const (
 	// without the rebuild a sweep bounds row count but not the volume.
 	retentionOptimizeMinRows = 50000
 
-	retentionSweepEvery   = 6 * time.Hour
+	retentionSweepEvery = 6 * time.Hour
+	// The first pass runs shortly after boot, not one full interval later.
+	// Sleeping first meant any restart reset the countdown, and identity
+	// ships several releases a day (11 in the four days to 2026-09-19), so a
+	// sleep-first loop could go days without a single pass.
+	reclaimFirstPassDelay = 10 * time.Minute
 	retentionSweepBatch   = 5000
 	retentionSweepMaxIter = 40 // bounds one pass at 200k rows per table
 )
@@ -141,10 +147,14 @@ func StartRetentionSweep() {
 		names = append(names, fmt.Sprintf("%s>%dd", s.table, int(s.retention.Hours()/24)))
 	}
 	go func() {
+		time.Sleep(reclaimFirstPassDelay)
 		for {
-			time.Sleep(retentionSweepEvery)
 			for _, spec := range active {
 				n, bytesOut, err := sweepTable(spec)
+				if errors.Is(err, errLockBusy) {
+					log.Printf("retention sweep %s: skipped, another replica holds the lock", spec.table)
+					continue
+				}
 				if err != nil {
 					log.Printf("retention sweep %s failed: %v", spec.table, err)
 					continue
@@ -153,9 +163,10 @@ func StartRetentionSweep() {
 					log.Printf("retention sweep %s: archived+deleted %d row(s), %d KB to object storage", spec.table, n, bytesOut/1024)
 				}
 			}
+			time.Sleep(retentionSweepEvery)
 		}
 	}()
-	log.Printf("retention sweep every %v (%s)", retentionSweepEvery, strings.Join(names, " "))
+	log.Printf("retention sweep every %v, first pass in %v (%s)", retentionSweepEvery, reclaimFirstPassDelay, strings.Join(names, " "))
 }
 
 // activeSpecs resolves env overrides and returns only the tables to sweep.
@@ -181,16 +192,19 @@ func activeSpecs() []archiveSpec {
 
 // sweepTable archives then deletes one table's cold rows, oldest first.
 //
-// Serialised across replicas by a MySQL named lock, matching
-// StartSessionReclaimLoop: identity runs replicas:2 and two concurrent sweeps
-// would upload the same rows twice and contend on the same deletes.
-func sweepTable(spec archiveSpec) (int64, int, error) {
-	var got int
-	if err := common.DB.Raw("SELECT GET_LOCK('retention_sweep', 2)").Scan(&got).Error; err != nil || got != 1 {
-		return 0, 0, nil // another replica is on it
-	}
-	defer common.DB.Exec("DO RELEASE_LOCK('retention_sweep')")
+// Serialised across replicas by a MySQL named lock (withNamedLock): identity
+// runs replicas:2 and two concurrent sweeps would upload the same rows twice
+// and contend on the same deletes. Returns errLockBusy if another holds it.
+func sweepTable(spec archiveSpec) (n int64, bytesOut int, err error) {
+	err = withNamedLock(common.DB, "retention_sweep", 2*time.Second, func() error {
+		var e error
+		n, bytesOut, e = sweepTableLocked(spec)
+		return e
+	})
+	return n, bytesOut, err
+}
 
+func sweepTableLocked(spec archiveSpec) (int64, int, error) {
 	cutoff := time.Now().UTC().Add(-spec.retention)
 
 	// Cheap early-out. None of these tables index the ts column on its own, so

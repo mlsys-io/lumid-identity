@@ -1214,13 +1214,59 @@ func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx ma
 	//     by the Tavily-backed me_agent tools, and the sandbox's NetworkPolicy
 	//     blocks the CLI's own WebSearch/WebFetch anyway, so staying in
 	//     claude-code made the toggle a silent no-op.
+	//
+	// EXCEPT when the turn explicitly names a tool that exists ONLY inside the
+	// sandbox. The premise above — "can't see the me_agent registry" — is still
+	// true, but it is no longer the whole picture: the sandbox now carries ~41
+	// mcp__lumid__* tools of its own (app_detail, data_query, xp_*, workflows,
+	// save_artifact, stage_proposals). Stealing a turn that asks for one of
+	// those does not rescue it, it GUARANTEES the failure, because the
+	// destination provider has no such tool.
+	//
+	// Measured 2026-09-19: a turn selecting claude-code-sonnet and asking for
+	// mcp__lumid__app_detail + mcp__lumid__stage_proposals was auto-routed to
+	// deepseek-v4-flash, which answered — correctly — "I have no tools whose
+	// names start with mcp__lumid__ at all". The route event read
+	// {"auto_routed":true,"model_used":"deepseek-v4-flash"}. Three separate
+	// investigations blamed the sandbox image, the MCP server and the model
+	// before the route event was read.
+	// The guard covers the INFERRED arms only. Search / deep-research is an
+	// explicit UI toggle whose failure on this lane is SILENT — the sandbox's
+	// NetworkPolicy blocks the CLI's own WebSearch — so an explicit toggle
+	// still wins over an mcp__ mention. Naming a tool is a strong signal about
+	// which toolset you want; flipping the search switch is a stronger one
+	// about what the turn is for.
+	wantsWeb := mode == "search" || mode == "deep_research"
+	inferred := groundedDrillIn(ctx) || controlIntent(req)
 	if isClaudeCodeProvider(picked) &&
-		(groundedDrillIn(ctx) || controlIntent(req) || mode == "search" || mode == "deep_research") {
+		(wantsWeb || (inferred && !namesSandboxOnlyTool(req))) {
 		if p, ok := firstToolCapableProvider(role); ok {
 			return p, true
 		}
 	}
 	return picked, false
+}
+
+// sandboxOnlyToolRe matches an explicit reference to the sandbox's own MCP
+// surface. Deliberately requires the full `mcp__lumid__<name>` spelling: nobody
+// writes that by accident, and it cannot be produced by ordinary phrasing the
+// way a bare verb+noun can. A user who names one has said which toolset they
+// want more precisely than any heuristic can infer.
+var sandboxOnlyToolRe = regexp.MustCompile(`mcp__[a-z0-9_]+__[a-z0-9_]+`)
+
+// namesSandboxOnlyTool reports whether the latest user message asks for a tool
+// that only the claude-code lane can serve.
+//
+// Scoped to the LAST user message, matching controlIntent: an mcp__ name
+// mentioned earlier in a long thread should not pin every later turn to the
+// sandbox.
+func namesSandboxOnlyTool(msgs []chatMessage) bool {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return sandboxOnlyToolRe.MatchString(strings.ToLower(msgs[i].Content))
+		}
+	}
+	return false
 }
 
 // firstToolCapableProvider returns the best non-claude-code provider the role

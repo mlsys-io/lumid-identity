@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -79,6 +82,74 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 	// it to user_sub so a surface cannot widen it.
 	"report": func(userID, app string) (map[string]any, bool) {
 		return toolAppReport(userID, app)
+	},
+	// Candidate next experiments, as staged by the app's propose_experiments
+	// verb: each one a real experiments[] entry plus the findings that say
+	// whether it would actually collect rows. Read-only and argument-free, so
+	// it qualifies for a surface that runs unattended on page load.
+	//
+	// Newest file wins. The verb appends a timestamped file per run rather
+	// than rewriting one, so a proposal slate is never half-overwritten while
+	// a page is reading it, and an older slate stays inspectable on disk.
+	//
+	// SCOPE, stated because an empty table is otherwise unexplainable: this
+	// reads `.lumid/proposals/` inside the resolved bundle. For an operator or
+	// local tenant install that is the live runtime tree and the rows are
+	// there. For a CLOUD-installed tenant app, resolveAppDir falls back to
+	// materialising the PUBLISHED bundle — and `.lumid/` is runtime state that
+	// publishing does not carry, so this returns none. That is a real gap, not
+	// a bug to paper over here: proposals would need the same self-report
+	// bridge experiments already use (POST /internal/app-experiments) to cross
+	// that boundary. Until then the surface shows its empty state, which says
+	// where proposals come from.
+	"proposals": func(userID, app string) (map[string]any, bool) {
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not found: " + app}, false
+		}
+		pd := filepath.Join(dir, ".lumid", "proposals")
+		ents, err := os.ReadDir(pd)
+		if err != nil {
+			return map[string]any{"app": app, "proposals": []any{}, "count": 0}, true
+		}
+		newest := ""
+		for _, e := range ents {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			if e.Name() > newest {
+				newest = e.Name()
+			}
+		}
+		if newest == "" {
+			return map[string]any{"app": app, "proposals": []any{}, "count": 0}, true
+		}
+		raw, err := os.ReadFile(filepath.Join(pd, newest))
+		if err != nil {
+			return map[string]any{"error": "unreadable proposal slate: " + newest}, false
+		}
+		var slate struct {
+			Ts        int64            `json:"ts"`
+			Proposals []map[string]any `json:"proposals"`
+		}
+		if err := json.Unmarshal(raw, &slate); err != nil {
+			return map[string]any{"error": "malformed proposal slate: " + newest}, false
+		}
+		out := make([]map[string]any, 0, len(slate.Proposals))
+		for _, p := range slate.Proposals {
+			// Drop `findings` from the row: the surface renders verdict_reason,
+			// and a nested array in a table cell renders as [object Object].
+			// The detail stays on disk for anyone reading the slate directly.
+			row := make(map[string]any, len(p))
+			for k, v := range p {
+				if k == "findings" || k == "arms" {
+					continue
+				}
+				row[k] = v
+			}
+			out = append(out, row)
+		}
+		return map[string]any{"app": app, "proposals": out, "count": len(out), "slate": newest}, true
 	},
 }
 

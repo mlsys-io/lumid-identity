@@ -210,16 +210,9 @@ func sweepTableLocked(spec archiveSpec) (int64, int, error) {
 	// Cheap early-out. None of these tables index the ts column on its own, so
 	// the batch SELECT walks the primary key; when nothing is cold that walk is
 	// a full-table scan every 6h, flushing the buffer pool of a 2Gi-limit DB.
-	// Ids are autoincrement, so the lowest id is the oldest row: if it is not
-	// past the cutoff, nothing (materially) is.
-	var coldHead int64
-	if err := common.DB.Raw(fmt.Sprintf(
-		"SELECT COUNT(*) FROM (SELECT %s FROM %s ORDER BY %s ASC LIMIT 1) h WHERE %s",
-		spec.tsColumn, spec.table, spec.idColumn, coldPredicate(spec)), cutoff).
-		Scan(&coldHead).Error; err != nil {
+	if cold, err := hasColdHead(spec, cutoff); err != nil {
 		return 0, 0, fmt.Errorf("head check: %w", err)
-	}
-	if coldHead == 0 {
+	} else if !cold {
 		return 0, 0, nil
 	}
 
@@ -295,6 +288,26 @@ func sweepTableLocked(spec archiveSpec) (int64, int, error) {
 		}
 	}
 	return total, totalBytes, nil
+}
+
+// hasColdHead reports whether any of the lowest-id retentionSweepBatch rows is
+// past retention — a bounded PK read, unlike a bare "any cold row?" probe.
+//
+// It checks a WINDOW, not just the lowest row. Ids are autoincrement, so the
+// head of the table is its oldest part, but it is not uniformly cold: a sweep
+// deletes only the cold rows and keeps any newer row interleaved among them.
+// On 2026-09-19 the first audit_log pass removed 200k NULL-created_at rows and
+// left the dated ones; the lowest id became a 2026-05-11 row inside the
+// 400-day window, and a lowest-row-only check skipped the table with 555k cold
+// rows still behind it. A window of one batch tolerates up to a batch of kept
+// rows ahead of the cold ones.
+func hasColdHead(spec archiveSpec, cutoff time.Time) (bool, error) {
+	var n int64
+	err := common.DB.Raw(fmt.Sprintf(
+		"SELECT COUNT(*) FROM (SELECT %s FROM %s ORDER BY %s ASC LIMIT %d) h WHERE %s",
+		spec.tsColumn, spec.table, spec.idColumn, retentionSweepBatch, coldPredicate(spec)), cutoff).
+		Scan(&n).Error
+	return n > 0, err
 }
 
 // coldPredicate is the WHERE fragment selecting rows past retention, with one

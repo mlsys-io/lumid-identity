@@ -160,3 +160,59 @@ func TestProposalsIsRegisteredAndArgumentFree(t *testing.T) {
 		t.Error("an empty app name must not resolve")
 	}
 }
+
+// ── the DB fallback, which is the whole reason this is not an intent ────────
+
+func TestProposalRowsFromShapesDiskAndDBIdentically(t *testing.T) {
+	// One slate, two routes into the table. If these ever disagree, a column
+	// renders on an operator-shared app and silently not on a tenant install —
+	// and the tenant case is the one nobody is watching.
+	var slate map[string]any
+	if err := json.Unmarshal([]byte(proposalSlate), &slate); err != nil {
+		t.Fatal(err)
+	}
+	fromDB := proposalRowsFrom(slate, "quant-research")
+
+	var typed struct {
+		Proposals []map[string]any `json:"proposals"`
+	}
+	if err := json.Unmarshal([]byte(proposalSlate), &typed); err != nil {
+		t.Fatal(err)
+	}
+	fromDisk := proposalRowsFrom(map[string]any{"proposals": toAnySlice(typed.Proposals)}, "quant-research")
+
+	a, _ := json.Marshal(fromDB["proposals"])
+	b, _ := json.Marshal(fromDisk["proposals"])
+	if string(a) != string(b) {
+		t.Fatalf("disk and DB rows differ:\n db=%s\ndisk=%s", a, b)
+	}
+	if fromDB["count"] != 2 {
+		t.Fatalf("want 2 rows, got %v", fromDB["count"])
+	}
+}
+
+func TestNilSlateIsAnEmptyTableNotAnError(t *testing.T) {
+	// A tenant install with nothing self-reported yet. The surface must render
+	// its empty state rather than an error: it loads with no user intent
+	// behind it, and an error there reads as a broken app.
+	res := proposalRowsFrom(nil, "quant-research")
+	if res["count"] != 0 {
+		t.Fatalf("want 0, got %v", res["count"])
+	}
+	if _, ok := res["proposals"].([]map[string]any); !ok {
+		t.Fatal("proposals must be an empty array, not nil — a null renders as a broken table")
+	}
+}
+
+func TestNestedDetailIsDroppedOnTheDBPathToo(t *testing.T) {
+	var slate map[string]any
+	_ = json.Unmarshal([]byte(proposalSlate), &slate)
+	rows, _ := proposalRowsFrom(slate, "quant-research")["proposals"].([]map[string]any)
+	for _, r := range rows {
+		for _, k := range []string{"findings", "arms"} {
+			if _, present := r[k]; present {
+				t.Errorf("%q reached a table row via the DB path", k)
+			}
+		}
+	}
+}

@@ -1337,6 +1337,11 @@ func controlIntent(msgs []chatMessage) bool {
 			}
 		}
 	}
+	// App lifecycle by name. Gated on two things at once (the framework sense of
+	// "app", and the captured name), so it owns its own function.
+	if appLifecycleIntent(text) {
+		return true
+	}
 	return false
 }
 
@@ -1518,13 +1523,117 @@ var controlIntentPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\b(score|grade|rate)\b[^.?!]{0,40}\b(my|this|that|the)\b[^.?!]{0,20}\b(answer|response|reply)\b`),
 }
 
+// appLifecyclePatterns — matched through appLifecycleIntent, never in the
+// ungated controlIntentPatterns loop: each needs BOTH the framework gate and a
+// check on the captured name.
+var appLifecyclePatterns = []*regexp.Regexp{
+	// APP LIFECYCLE, BY NAME. These replace the literals "install the app",
+	// "install app", "reinstall the app", "remove the app", "delete the app"
+	// and bare "uninstall", which were wrong in BOTH directions at once.
+	//
+	// Too narrow: they are strings.Contains substrings, and a real install has
+	// to say WHAT to install — so the name sits between the article and the
+	// noun and the substring is gone. "install the quant-research app" did not
+	// match "install the app". The most obvious control-plane verb in the
+	// product was reachable only by phrasing it in a way that names nothing,
+	// and the turn stayed on claude-code, whose CLI toolset has no install_app.
+	//
+	// Too broad: "install the app" is *also* a substring of "install the app
+	// dependencies", "install the app router in next.js" and "where is the
+	// install the app button rendered?" — all code turns, all silently taken
+	// off the coding lane. Bare "uninstall" took "uninstall numpy" outright.
+	//
+	// Word ORDER does most of the work. In the platform sense "app" is the
+	// head noun and the name qualifies it ("the quant-research app"); in the
+	// framework senses another noun follows it ("the app router", "the app
+	// dependencies"), so requiring `app` to be the LAST word of the phrase
+	// excludes them without a lookahead — RE2 has none, the same constraint
+	// codeConstructContext works around.
+	regexp.MustCompile(`\b(?:install|reinstall|uninstall|add|get|set ?up|remove|delete|drop)\s+(?:the\s+|a\s+|an\s+|this\s+|that\s+|my\s+)?([a-z0-9][a-z0-9._-]*)\s+apps?\b`),
+	// The reverse ordering, "install the app <name>", is genuinely ambiguous
+	// with "install the app <noun>" — only the name tells them apart. So this
+	// one demands a SLUG-SHAPED name (an internal - or _), which "dependencies"
+	// and "router" do not have and quant-research / mbb-ai / auto-quant do.
+	// Ordinary prose does not hyphenate this way; the same argument the
+	// underscore pattern in loopReadBackPatterns already makes.
+	regexp.MustCompile(`\b(?:install|reinstall|uninstall|add|get|set ?up|remove|delete|drop)\s+(?:the\s+)?apps?\s+([a-z0-9]+[-_][a-z0-9._-]*)\b`),
+}
+
+// appLifecycleBareRe keeps the ORIGINAL literals' job: "install the app" with
+// the app implied by the conversation, which is a real and common request and
+// which the name-capturing patterns above cannot match (there is no name).
+//
+// What separates it from "install the app dependencies" is only that "app" ends
+// the clause — so that is what this anchors on: end of string, punctuation, or
+// one of a few trailing adverbs. Restored after removing the literals dropped
+// it; caught by probing the phrasings the literals used to serve, not by the
+// test suite, which had no case for them.
+var appLifecycleBareRe = regexp.MustCompile(
+	`\b(?:install|reinstall|uninstall|add|get|set ?up|remove|delete)\s+(?:the\s+|this\s+|that\s+|it\s+)?apps?(?:\s+(?:now|please|again|for me|first))*\s*(?:[.!?,;]|$)`)
+
+// appLifecycleStopNames are words that can occupy the name slot without being a
+// name. The article group above is OPTIONAL, so without this check the regex
+// simply skips it and lets the article itself be the name: "install the app
+// dependencies" matched with name="the", which is precisely the code turn these
+// patterns exist to stop stealing. RE2 has no negative lookahead, so the
+// exclusion cannot live in the pattern — it is a capture plus a lookup.
+var appLifecycleStopNames = map[string]bool{
+	"the": true, "a": true, "an": true, "this": true, "that": true,
+	"my": true, "your": true, "our": true, "its": true,
+	"some": true, "any": true, "another": true, "new": true,
+	"app": true, "apps": true,
+}
+
+// appLifecycleIntent reports an install/remove request that NAMES an app.
+func appLifecycleIntent(text string) bool {
+	// "app" in a framework sense is not this app registry's "app".
+	if appFrameworkContext(text) {
+		return false
+	}
+	for _, re := range appLifecyclePatterns {
+		// All occurrences, not just the first: one hit landing on a stop-name
+		// must not mask a real one later in the same sentence.
+		for _, m := range re.FindAllStringSubmatch(text, -1) {
+			if len(m) > 1 && !appLifecycleStopNames[m[1]] {
+				return true
+			}
+		}
+	}
+	return appLifecycleBareRe.MatchString(text)
+}
+
+// appFrameworkContext reports whether "<x> app" is a FRAMEWORK or platform-
+// target idiom rather than an xpio app name. Same shape and same reason as
+// codeConstructContext: the app-lifecycle patterns above anchor on the word
+// "app", which is ordinary English, and "install the react app" / "set up the
+// flask app" are coding turns that belong to claude-code. Kept as a phrase
+// list because the distinction is lexical — nothing about the SHAPE of "react"
+// separates it from "findata".
+func appFrameworkContext(text string) bool {
+	for _, kw := range appFrameworkPhrases {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+var appFrameworkPhrases = []string{
+	"react app", "node app", "nodejs app", "node.js app", "web app",
+	"flask app", "django app", "rails app", "vue app", "svelte app",
+	"next app", "nextjs app", "next.js app", "express app", "spring app",
+	"electron app", "native app", "console app", "desktop app",
+	"mobile app", "ios app", "android app", "flutter app",
+	// "<x> app" where x names a build artefact rather than a product
+	"sample app", "demo app", "example app", "starter app", "test app",
+}
+
 // controlIntentPhrases — platform-control cues. Deliberately phrase-level (e.g.
 // "run the workflow", not bare "run ") so code/shell asks a super_admin uses
 // claude-code for ("run the tests", "install numpy") are NOT routed away.
 var controlIntentPhrases = []string{
-	// app lifecycle
-	"install the app", "install app", "uninstall", "reinstall the app",
-	"remove the app", "delete the app",
+	// app lifecycle — the INSTALL family lives in controlIntentPatterns, not
+	// here; see appLifecyclePatterns for why a literal cannot express it.
 	"fork the app", "fork this app", "publish the app", "publish this app",
 	"publish my app", "unpublish", "propose upstream", "open a pr upstream",
 	"subscribe to", "add the skill", "add skill to", "import the skill",

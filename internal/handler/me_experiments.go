@@ -513,12 +513,31 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		"dataset_id": decl.DatasetID, "metric": decl.Metric,
 		"metric_name": metricName, "baseline": decl.Baseline,
 		"success_criteria": decl.Criteria, "min_samples": decl.MinSamples,
-		"status":  strOr(decl.Status, "active"),
-		"loops":   expLoops(m)[decl.ID],
-		"state":   st,
-		"results": rows,
-		"series":  series,
-		"cases":   cases,
+		"status":      strOr(decl.Status, "active"),
+		"description": decl.Description,
+		// The DECLARED arms and the app's dispatch routing — the same two
+		// fields the LIST row carries, for the same reason its comment gives:
+		// an arm that has never run exists only in the declaration, so a
+		// client without these can neither show it nor offer to run it.
+		//
+		// The list was fixed and this was not, so the two endpoints answered
+		// differently about one object: /experiments returned kol_alpha with
+		// two arms and `dispatch: {loop: kol_strategy}`, while
+		// /experiments/kol_alpha returned `arms: []` and `dispatch: null`.
+		// Anything reading detail — a deep link, a refresh on that route —
+		// lost every dispatch button. Measured 2026-09-21.
+		//
+		// NOTE `cases` below is NOT decl.Cases: detail computes a per-case
+		// aggregation under that key while the list row carries the declared
+		// case list. Different meanings, same name; left alone deliberately
+		// rather than "unified" into a breaking change to the casebook view.
+		"arms":     decl.Arms,
+		"dispatch": decl.Dispatch,
+		"loops":    expLoops(m)[decl.ID],
+		"state":    st,
+		"results":  rows,
+		"series":   series,
+		"cases":    cases,
 		// The ledger is served as a TAIL. Say so, and say how big the real
 		// thing is: state.n_results is computed by evaluate() over every row,
 		// so without this a long experiment shows `n_results: 3000` beside a

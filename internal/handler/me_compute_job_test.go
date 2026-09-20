@@ -1,6 +1,9 @@
 package handler
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // The handler itself needs a real bearer token (currentUserID reads the
 // request, not a context key), so these cover the parts that are wrong in a way
@@ -120,5 +123,39 @@ func TestComputeJobOwnershipFailsClosedOnBadData(t *testing.T) {
 		if computeJobsContain(raw, "office", "req-a") {
 			t.Fatalf("malformed stored value %q authorized a job", raw)
 		}
+	}
+}
+
+// A switcher is only useful if it names what it draws, so the arm has to
+// survive the round trip through the stored JSON.
+func TestStoredJobRefsCarryTheirArmAndWorkers(t *testing.T) {
+	const stored = `[{"job_id":"req-a","site":"office","arm":"baseline",` +
+		`"workers":{"score":"w-1"}},{"job_id":"req-b","site":"home","arm":"variant"}]`
+	var refs []computeJobRef
+	if err := json.Unmarshal([]byte(stored), &refs); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(refs) != 2 || refs[0].Arm != "baseline" || refs[1].Arm != "variant" {
+		t.Fatalf("arms lost in the round trip: %+v", refs)
+	}
+	if refs[0].Workers["score"] != "w-1" {
+		t.Fatalf("worker placement lost: %+v", refs[0].Workers)
+	}
+	// An arm-less entry is legal — a single-job run has no arm — and must not
+	// become the empty string masquerading as one.
+	if refs[1].Workers != nil {
+		t.Fatalf("absent workers should stay nil, got %+v", refs[1].Workers)
+	}
+}
+
+// Ownership still decides, and it decides on the pair — adding arm/workers to
+// the struct must not have widened what counts as a match.
+func TestArmDoesNotWidenOwnership(t *testing.T) {
+	const stored = `[{"job_id":"req-a","site":"office","arm":"baseline"}]`
+	if !computeJobsContain(stored, "office", "req-a") {
+		t.Fatal("the owned pair stopped matching")
+	}
+	if computeJobsContain(stored, "home", "req-a") {
+		t.Fatal("arm presence let a wrong-site job through")
 	}
 }

@@ -305,3 +305,63 @@ func MeComputeJobClaimCreate(c *gin.Context) {
 	}
 	ok(c, "", gin.H{"site": b.Site, "job_id": b.JobID, "claimed": true})
 }
+
+// MeComputeJobSiblings — GET /me/compute/jobs/:site/:job_id/siblings.
+//
+// The other jobs from the SAME run. With N arms fanned out over one graph there
+// are N jobs against one canvas, and the panel starts life holding exactly one
+// of them (whatever a chat tool call returned). Without this it can only ever
+// draw that one, unlabelled.
+//
+// Returns the run's jobs with their arm and HALO placement, so a switcher can
+// say WHICH arm it is drawing and where each landed. An unlabelled overlay
+// across parallel arms is worse than no overlay.
+//
+// Gated the same way as the status route, through the same helper: you get the
+// siblings of a job you own, and a job you do not own is 404 — not an empty
+// list, which would confirm the job exists.
+func MeComputeJobSiblings(c *gin.Context) {
+	sub, authed := currentUserID(c)
+	if !authed {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	site, jobID := c.Param("site"), c.Param("job_id")
+	if !computeSiteRe.MatchString(site) || !computeJobRe.MatchString(jobID) {
+		fail(c, http.StatusBadRequest, 1400, "invalid site or job_id")
+		return
+	}
+	if !callerOwnsComputeJob(sub, site, jobID) {
+		fail(c, http.StatusNotFound, 1404, "no such job for this user")
+		return
+	}
+	// The run that contains this job, not every run that mentions it. A job
+	// belongs to one run; returning the union across rows would mix arms from
+	// different cycles into one switcher, which reads as a fan-out that never
+	// happened.
+	var rows []models.MeAppRun
+	if err := common.DB.
+		Select("app, `loop`, run_ts, compute_jobs").
+		Where("user_sub = ? AND compute_jobs IS NOT NULL AND compute_jobs LIKE ?",
+			sub, "%"+jobID+"%").
+		Order("run_ts desc").Limit(64).
+		Find(&rows).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "read: "+err.Error())
+		return
+	}
+	for _, r := range rows {
+		if r.ComputeJobs == nil || !computeJobsContain(*r.ComputeJobs, site, jobID) {
+			continue
+		}
+		var refs []computeJobRef
+		if json.Unmarshal([]byte(*r.ComputeJobs), &refs) != nil {
+			continue
+		}
+		ok(c, "", gin.H{"app": r.App, "loop": r.Loop, "run_ts": r.RunTs, "jobs": refs})
+		return
+	}
+	// Owned but not through a run row — a chat-dispatched job, claimed rather
+	// than reported. It is a run of one, and saying so is better than 404ing a
+	// job the caller demonstrably owns.
+	ok(c, "", gin.H{"jobs": []computeJobRef{{JobID: jobID, Site: site}}})
+}

@@ -824,6 +824,28 @@ func resolveExperimentArm(appDir, experimentID, armID string) (string, map[strin
 	return decl.Hypothesis, cfg, loopName, nil
 }
 
+// experimentDispatchAsk returns the app's own `dispatch.ask` question for an
+// experiment, or "" when a dispatch needs no subject.
+//
+// `ask` means the run needs a SUBJECT the dispatcher cannot know — which
+// strategy, which case. An arm supplies CONFIG; without a subject some loops
+// run, fail, and record a row that measures nothing. The UI has honoured this
+// since per-arm dispatch shipped (it hands the dispatch to the chat rail with
+// this question instead of firing); the chat tool never read it, so the one
+// path with no fallback was the one that fired blind. Measured 2026-09-21:
+// dispatching backtest_evidence/current from chat produced
+// `strategy is empty — pass raw .lqts source or a JSON payload`.
+func experimentDispatchAsk(appDir, experimentID string) string {
+	m := readExpManifest(appDir)
+	for i := range m.Experiments {
+		if m.Experiments[i].ID == experimentID {
+			s, _ := m.Experiments[i].Dispatch["ask"].(string)
+			return s
+		}
+	}
+	return ""
+}
+
 // repeatVariant returns n copies of one variant — the enqueue contract is one
 // entry per run, and each becomes its own queued unit so the drain's
 // back-pressure (budget per tick, serial within an app) still applies.

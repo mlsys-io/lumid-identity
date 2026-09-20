@@ -791,8 +791,22 @@ type llmProvider struct {
 	// addAnthropicVersion — Anthropic's API needs the "anthropic-version"
 	// header; kv.run's /v1/messages does not. Set to true for Anthropic.
 	addAnthropicVersion bool
-	// supportsVision — can read `image` content blocks. gemma4 (verified
-	// through the kv.run gateway) + Anthropic do; MiniMax is text-only.
+	// supportsVision — can read `image` content blocks.
+	//
+	// VERIFY THIS AGAINST THE GATEWAY, NOT AGAINST MEMORY. It named gemma4 for
+	// months after gemma4 was replaced (gemma4 -> qwen3.8-27b ->
+	// deepseek-v4-flash), and the true/false stayed on the chip rather than
+	// following the model — so the product sent every image to a text-only
+	// backend, which answered 400, while the model that could read images was
+	// flagged false. The self-serve check is one request:
+	//
+	//   curl $LUMID_LLM/v1/chat/completions -d '{"model":"<id>", "messages":
+	//     [{"role":"user","content":[{"type":"text","text":"colour?"},
+	//      {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]}]}'
+	//
+	// A model without an mmproj answers 400 "is not a multimodal model".
+	// autoRouteForTurn routes an image turn to the FIRST chip with this set, so
+	// a wrong true here captures every image in the product.
 	supportsVision bool
 	// minRole — minimum role allowed to SELECT this provider in the panel.
 	// "" / "user" = everyone; "admin"; "super_admin". Policy: gemma4 for
@@ -845,10 +859,20 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      true,   // multimodal; image blocks verified via lumid-llm
-		minRole:             "user", // in-house on our own GPUs; the default for everyone
-		maxOutputTokens:     16384,  // 512K ctx, free local GPU — let answers/structured output run
-		dailyBudgetTokens:   -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
+		// NOT multimodal. Measured against the live gateway 2026-09-16:
+		//   POST /llm/v1/chat/completions {model: deepseek-v4-flash, image_url}
+		//   -> 400 "deepseek-v4-flash is not a multimodal model"
+		// The flag read true and its comment said "verified via lumid-llm" — of
+		// GEMMA4, which this chip replaced (gemma4 -> qwen3.8-27b ->
+		// deepseek-v4-flash). The flag outlived the model it described.
+		// autoRouteForTurn sends an image turn to the FIRST vision provider, so
+		// this chip captured every image in the product and answered 400 to all
+		// of them, while the one model that can actually read an image sat
+		// flagged false below.
+		supportsVision:    false,
+		minRole:           "user", // in-house on our own GPUs; the default for everyone
+		maxOutputTokens:   16384,  // 512K ctx, free local GPU — let answers/structured output run
+		dailyBudgetTokens: -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
 	{
 		// qwen3.8-27b — DUAL PURPOSE: the general chat chip AND the INDEPENDENT
@@ -893,10 +917,14 @@ var llmProviders = []llmProvider{
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
 		addAnthropicVersion: false,
-		supportsVision:      false,
-		minRole:             "user", // in-house GPU now, like deepseek — everyone
-		maxOutputTokens:     8192,   // matches skills/llm.py's gateway floor
-		dailyBudgetTokens:   1_500_000,
+		// THE ONLY CHIP THAT CAN ACTUALLY READ AN IMAGE. Measured against the
+		// live gateway 2026-09-16: the same image that made deepseek-v4-flash
+		// answer 400 "is not a multimodal model" was described correctly here.
+		// It ships with an mmproj; deepseek-v4-flash does not.
+		supportsVision:    true,
+		minRole:           "user", // in-house GPU now, like deepseek — everyone
+		maxOutputTokens:   8192,   // matches skills/llm.py's gateway floor
+		dailyBudgetTokens: 1_500_000,
 	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a
@@ -1186,13 +1214,59 @@ func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx ma
 	//     by the Tavily-backed me_agent tools, and the sandbox's NetworkPolicy
 	//     blocks the CLI's own WebSearch/WebFetch anyway, so staying in
 	//     claude-code made the toggle a silent no-op.
+	//
+	// EXCEPT when the turn explicitly names a tool that exists ONLY inside the
+	// sandbox. The premise above — "can't see the me_agent registry" — is still
+	// true, but it is no longer the whole picture: the sandbox now carries ~41
+	// mcp__lumid__* tools of its own (app_detail, data_query, xp_*, workflows,
+	// save_artifact, stage_proposals). Stealing a turn that asks for one of
+	// those does not rescue it, it GUARANTEES the failure, because the
+	// destination provider has no such tool.
+	//
+	// Measured 2026-09-19: a turn selecting claude-code-sonnet and asking for
+	// mcp__lumid__app_detail + mcp__lumid__stage_proposals was auto-routed to
+	// deepseek-v4-flash, which answered — correctly — "I have no tools whose
+	// names start with mcp__lumid__ at all". The route event read
+	// {"auto_routed":true,"model_used":"deepseek-v4-flash"}. Three separate
+	// investigations blamed the sandbox image, the MCP server and the model
+	// before the route event was read.
+	// The guard covers the INFERRED arms only. Search / deep-research is an
+	// explicit UI toggle whose failure on this lane is SILENT — the sandbox's
+	// NetworkPolicy blocks the CLI's own WebSearch — so an explicit toggle
+	// still wins over an mcp__ mention. Naming a tool is a strong signal about
+	// which toolset you want; flipping the search switch is a stronger one
+	// about what the turn is for.
+	wantsWeb := mode == "search" || mode == "deep_research"
+	inferred := groundedDrillIn(ctx) || controlIntent(req)
 	if isClaudeCodeProvider(picked) &&
-		(groundedDrillIn(ctx) || controlIntent(req) || mode == "search" || mode == "deep_research") {
+		(wantsWeb || (inferred && !namesSandboxOnlyTool(req))) {
 		if p, ok := firstToolCapableProvider(role); ok {
 			return p, true
 		}
 	}
 	return picked, false
+}
+
+// sandboxOnlyToolRe matches an explicit reference to the sandbox's own MCP
+// surface. Deliberately requires the full `mcp__lumid__<name>` spelling: nobody
+// writes that by accident, and it cannot be produced by ordinary phrasing the
+// way a bare verb+noun can. A user who names one has said which toolset they
+// want more precisely than any heuristic can infer.
+var sandboxOnlyToolRe = regexp.MustCompile(`mcp__[a-z0-9_]+__[a-z0-9_]+`)
+
+// namesSandboxOnlyTool reports whether the latest user message asks for a tool
+// that only the claude-code lane can serve.
+//
+// Scoped to the LAST user message, matching controlIntent: an mcp__ name
+// mentioned earlier in a long thread should not pin every later turn to the
+// sandbox.
+func namesSandboxOnlyTool(msgs []chatMessage) bool {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return sandboxOnlyToolRe.MatchString(strings.ToLower(msgs[i].Content))
+		}
+	}
+	return false
 }
 
 // firstToolCapableProvider returns the best non-claude-code provider the role
@@ -1249,7 +1323,71 @@ func controlIntent(msgs []chatMessage) bool {
 			return true
 		}
 	}
+	// Loop/cycle READ-BACK, gated. These patterns key on a platform noun near an
+	// outcome word, which is also how developers talk about `for` loops and
+	// GitHub Actions workflows -- measured: an ungated version stole "why did
+	// the workflow file fail to parse?", "the ci workflow output is confusing,
+	// explain it" and "why does this while loop never finish?". RE2 has no
+	// lookbehind, so the code-construct senses are excluded by phrase instead,
+	// and only for this set: every pattern above keeps its behaviour exactly.
+	if !codeConstructContext(text) {
+		for _, re := range loopReadBackPatterns {
+			if re.MatchString(text) {
+				return true
+			}
+		}
+	}
+	// App lifecycle by name. Gated on two things at once (the framework sense of
+	// "app", and the captured name), so it owns its own function.
+	if appLifecycleIntent(text) {
+		return true
+	}
 	return false
+}
+
+// codeConstructContext reports whether "loop" or "workflow" is being used in
+// its PROGRAMMING sense, where the turn belongs to claude-code and not here.
+func codeConstructContext(text string) bool {
+	for _, kw := range codeConstructPhrases {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+var codeConstructPhrases = []string{
+	// loop-as-control-flow
+	"while loop", "for loop", "event loop", "render loop", "main loop",
+	"infinite loop", "game loop", "inner loop", "outer loop", "foreach loop",
+	// workflow-as-CI-config
+	"workflow file", "github workflow", "github actions", "actions workflow",
+	"ci workflow", "workflow.yml", "workflow.yaml", ".github/workflows",
+	"build workflow", "release workflow",
+}
+
+var loopReadBackPatterns = []*regexp.Regexp{
+	// READING BACK A LOOP RUN. The block above makes exactly this argument for
+	// experiments -- "a control plane that can start a measurement and not read
+	// it back is half a control plane" -- and it was never generalised to the
+	// loops/runs/cycles the same chat dispatches. Measured 2026-09-18 across 8
+	// realistic phrasings: 6/6 "run the ..." forms routed and 0/8 read-backs
+	// did, so a user could start a run from chat and then had no way to ask how
+	// it went.
+	//
+	// Anchored on a RESULT noun rather than on the verb, because this router
+	// also fronts a CODING agent and the obvious `(show|how)[^.]*workflow`
+	// steals "how do I write a github workflow", "show me the workflow file"
+	// and every CI question in the repo. Requiring loop/workflow/cycle to sit
+	// near an OUTCOME word keeps those on claude-code.
+	regexp.MustCompile(`\b(loop|workflow|cycle)s?\b[^.?!]{0,60}\b(result|outcome|output|records?|manifest|produced?|wrote|written|fail(ed|ure)?|finish(ed)?|complete[d]?|verdict)\b`),
+	regexp.MustCompile(`\b(result|outcome|records?|manifest|verdict)s?\b[^.?!]{0,60}\b(loop|workflow|cycle)s?\b`),
+	// An UNDERSCORED identifier is a strong platform signal on its own: loops
+	// are named vla_curate / case_cycle / regression_sweep, and ordinary prose
+	// does not contain underscores. Still requires BOTH a read verb and a run
+	// noun, so "run test_integration" (a coding turn) does not qualify -- only
+	// asking ABOUT a named run does.
+	regexp.MustCompile(`\b(show|summari[sz]e|how|why|what|did|when)\b[^.?!]{0,40}\b\w+_\w+\b[^.?!]{0,40}\b(runs?|cycles?|loop|job)\b`),
 }
 
 // controlIntentPatterns — verb-near-noun forms the literal list cannot express.
@@ -1385,13 +1523,117 @@ var controlIntentPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\b(score|grade|rate)\b[^.?!]{0,40}\b(my|this|that|the)\b[^.?!]{0,20}\b(answer|response|reply)\b`),
 }
 
+// appLifecyclePatterns — matched through appLifecycleIntent, never in the
+// ungated controlIntentPatterns loop: each needs BOTH the framework gate and a
+// check on the captured name.
+var appLifecyclePatterns = []*regexp.Regexp{
+	// APP LIFECYCLE, BY NAME. These replace the literals "install the app",
+	// "install app", "reinstall the app", "remove the app", "delete the app"
+	// and bare "uninstall", which were wrong in BOTH directions at once.
+	//
+	// Too narrow: they are strings.Contains substrings, and a real install has
+	// to say WHAT to install — so the name sits between the article and the
+	// noun and the substring is gone. "install the quant-research app" did not
+	// match "install the app". The most obvious control-plane verb in the
+	// product was reachable only by phrasing it in a way that names nothing,
+	// and the turn stayed on claude-code, whose CLI toolset has no install_app.
+	//
+	// Too broad: "install the app" is *also* a substring of "install the app
+	// dependencies", "install the app router in next.js" and "where is the
+	// install the app button rendered?" — all code turns, all silently taken
+	// off the coding lane. Bare "uninstall" took "uninstall numpy" outright.
+	//
+	// Word ORDER does most of the work. In the platform sense "app" is the
+	// head noun and the name qualifies it ("the quant-research app"); in the
+	// framework senses another noun follows it ("the app router", "the app
+	// dependencies"), so requiring `app` to be the LAST word of the phrase
+	// excludes them without a lookahead — RE2 has none, the same constraint
+	// codeConstructContext works around.
+	regexp.MustCompile(`\b(?:install|reinstall|uninstall|add|get|set ?up|remove|delete|drop)\s+(?:the\s+|a\s+|an\s+|this\s+|that\s+|my\s+)?([a-z0-9][a-z0-9._-]*)\s+apps?\b`),
+	// The reverse ordering, "install the app <name>", is genuinely ambiguous
+	// with "install the app <noun>" — only the name tells them apart. So this
+	// one demands a SLUG-SHAPED name (an internal - or _), which "dependencies"
+	// and "router" do not have and quant-research / mbb-ai / auto-quant do.
+	// Ordinary prose does not hyphenate this way; the same argument the
+	// underscore pattern in loopReadBackPatterns already makes.
+	regexp.MustCompile(`\b(?:install|reinstall|uninstall|add|get|set ?up|remove|delete|drop)\s+(?:the\s+)?apps?\s+([a-z0-9]+[-_][a-z0-9._-]*)\b`),
+}
+
+// appLifecycleBareRe keeps the ORIGINAL literals' job: "install the app" with
+// the app implied by the conversation, which is a real and common request and
+// which the name-capturing patterns above cannot match (there is no name).
+//
+// What separates it from "install the app dependencies" is only that "app" ends
+// the clause — so that is what this anchors on: end of string, punctuation, or
+// one of a few trailing adverbs. Restored after removing the literals dropped
+// it; caught by probing the phrasings the literals used to serve, not by the
+// test suite, which had no case for them.
+var appLifecycleBareRe = regexp.MustCompile(
+	`\b(?:install|reinstall|uninstall|add|get|set ?up|remove|delete)\s+(?:the\s+|this\s+|that\s+|it\s+)?apps?(?:\s+(?:now|please|again|for me|first))*\s*(?:[.!?,;]|$)`)
+
+// appLifecycleStopNames are words that can occupy the name slot without being a
+// name. The article group above is OPTIONAL, so without this check the regex
+// simply skips it and lets the article itself be the name: "install the app
+// dependencies" matched with name="the", which is precisely the code turn these
+// patterns exist to stop stealing. RE2 has no negative lookahead, so the
+// exclusion cannot live in the pattern — it is a capture plus a lookup.
+var appLifecycleStopNames = map[string]bool{
+	"the": true, "a": true, "an": true, "this": true, "that": true,
+	"my": true, "your": true, "our": true, "its": true,
+	"some": true, "any": true, "another": true, "new": true,
+	"app": true, "apps": true,
+}
+
+// appLifecycleIntent reports an install/remove request that NAMES an app.
+func appLifecycleIntent(text string) bool {
+	// "app" in a framework sense is not this app registry's "app".
+	if appFrameworkContext(text) {
+		return false
+	}
+	for _, re := range appLifecyclePatterns {
+		// All occurrences, not just the first: one hit landing on a stop-name
+		// must not mask a real one later in the same sentence.
+		for _, m := range re.FindAllStringSubmatch(text, -1) {
+			if len(m) > 1 && !appLifecycleStopNames[m[1]] {
+				return true
+			}
+		}
+	}
+	return appLifecycleBareRe.MatchString(text)
+}
+
+// appFrameworkContext reports whether "<x> app" is a FRAMEWORK or platform-
+// target idiom rather than an xpio app name. Same shape and same reason as
+// codeConstructContext: the app-lifecycle patterns above anchor on the word
+// "app", which is ordinary English, and "install the react app" / "set up the
+// flask app" are coding turns that belong to claude-code. Kept as a phrase
+// list because the distinction is lexical — nothing about the SHAPE of "react"
+// separates it from "findata".
+func appFrameworkContext(text string) bool {
+	for _, kw := range appFrameworkPhrases {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+var appFrameworkPhrases = []string{
+	"react app", "node app", "nodejs app", "node.js app", "web app",
+	"flask app", "django app", "rails app", "vue app", "svelte app",
+	"next app", "nextjs app", "next.js app", "express app", "spring app",
+	"electron app", "native app", "console app", "desktop app",
+	"mobile app", "ios app", "android app", "flutter app",
+	// "<x> app" where x names a build artefact rather than a product
+	"sample app", "demo app", "example app", "starter app", "test app",
+}
+
 // controlIntentPhrases — platform-control cues. Deliberately phrase-level (e.g.
 // "run the workflow", not bare "run ") so code/shell asks a super_admin uses
 // claude-code for ("run the tests", "install numpy") are NOT routed away.
 var controlIntentPhrases = []string{
-	// app lifecycle
-	"install the app", "install app", "uninstall", "reinstall the app",
-	"remove the app", "delete the app",
+	// app lifecycle — the INSTALL family lives in controlIntentPatterns, not
+	// here; see appLifecyclePatterns for why a literal cannot express it.
 	"fork the app", "fork this app", "publish the app", "publish this app",
 	"publish my app", "unpublish", "propose upstream", "open a pr upstream",
 	"subscribe to", "add the skill", "add skill to", "import the skill",
@@ -1635,6 +1877,18 @@ type meAgentChatBody struct {
 	XpioRepo  string `json:"xpio_repo,omitempty"`
 	ClusterID string `json:"cluster_id,omitempty"`
 	DataApp   string `json:"data_app,omitempty"`
+	// Optional, claude-code provider only: "plan" runs this turn under the
+	// CLI's own read-only plan mode. Absent means today's behaviour.
+	//
+	// Deliberately NOT folded into Mode above. Mode already means
+	// search|deep_research, already reaches the claude-code branch through
+	// modeSystemSuffix, and the Studio shell puts a third meaning (the
+	// interview mode) at context.mode. A fourth on the same wire name is how
+	// this regresses silently in six months.
+	//
+	// Allowlisted on the way out (planOnly) as well as in the sandbox: two
+	// checks, because this value ends up deciding an argv flag.
+	PermissionMode string `json:"permission_mode,omitempty"`
 	// Optional: require a specific tool for THIS turn.
 	//
 	// Some turns are not the model's judgement call. When the user has picked a
@@ -1926,7 +2180,7 @@ func MeAgentChat(c *gin.Context) {
 			}
 			return true
 		}
-		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, struct{ XpioRepo, ClusterID, DataApp string }{body.XpioRepo, body.ClusterID, body.DataApp}, emit); err != nil {
+		if err := streamClaudeCodeViaProxy(ccCtx, c, userID, role, body.Messages, systemPrompt, provider.upstreamModel, body.ClaudeSessionID, struct{ XpioRepo, ClusterID, DataApp string }{body.XpioRepo, body.ClusterID, body.DataApp}, body.PermissionMode, emit); err != nil {
 			fail(c, http.StatusBadGateway, 1502, "llm call: "+err.Error())
 			return
 		}
@@ -2799,7 +3053,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "add_experiment_arm",
-			"description": "Add (or replace) ONE ARM on an existing experiment — a variant to compare against the baseline. Use when the user wants to try a change measurably (\"add an arm with deepseek as judge\", \"try the median-3 panel\", \"compare gemma4 as the analyst\"). An experiment with one arm can only report a level; arms are what make it a COMPARISON, and define_experiment cannot add them. Call list_experiments first to see which arms exist — passing an existing arm id replaces that arm, any other id appends. Arm keys are app-specific: pass judge_model/analyst_model/judge_panel for mbb-consultant-style apps, or config for anything else. Model names are checked and you are told when one would silently abstain. To RUN an arm afterwards, use dispatch_experiment_arm.",
+			"description": "Add (or replace) ONE ARM on an existing experiment — a variant to compare against the baseline. Use when the user wants to try a change measurably (\"add an arm with deepseek as judge\", \"try the median-3 panel\", \"compare gemma4 as the analyst\"). An experiment with one arm can only report a level; arms are what make it a COMPARISON, and define_experiment cannot add them. Passing an existing arm id replaces that arm, any other id appends. Call this straight after define_experiment — do NOT wait for the experiment to appear in list_experiments first: that lists the app's PUBLISHED bundle, and an experiment you just defined lives in the install, so it will not be there and no amount of waiting or re-defining will put it there. This verb is applied against the install and will tell you plainly if the experiment really is missing. Arm keys are app-specific: pass judge_model/analyst_model/judge_panel for mbb-consultant-style apps, or config for anything else. Model names are checked and you are told when one would silently abstain. To RUN an arm afterwards, use dispatch_experiment_arm.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -4291,13 +4545,26 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		out := map[string]any{"ok": true, "intent_id": id, "app": app,
 			"experiment": eid, "loop": loop, "metric": metric,
 			"scope": map[string]any{"dataset_id": ds, "cases": caseList}}
-		if warns, done := waitIntentWarnings(userID, id, 6*time.Second); done {
-			out["applied"] = true
-			if len(warns) > 0 {
+		if warns, succeeded, done := waitIntentWarnings(userID, id, 6*time.Second); done {
+			out["applied"] = succeeded
+			switch {
+			case !succeeded:
+				// A FAILED INTENT IS NOT AN APPLIED ONE. This reported
+				// `applied: true` for any settled intent and filed the
+				// scheduler's error under `warnings`, so a definition that
+				// never landed read as a definition that landed with advice
+				// attached — and the caller went on to add arms to an
+				// experiment that did not exist. Say it failed, and say why.
+				out["ok"] = false
+				out["error"] = "the definition did NOT land — the scheduler rejected it: " +
+					strings.Join(warns, "; ")
+				out["note"] = "NOT applied. Report this failure and its reason; do not " +
+					"retry the same definition unchanged, and do not add arms to it."
+			case len(warns) > 0:
 				out["warnings"] = warns
 				out["note"] = "applied, WITH WARNINGS — read them out; a model that " +
 					"resolves nowhere does not error, it abstains, and the panel shrinks silently"
-			} else {
+			default:
 				out["note"] = "applied"
 			}
 		} else {
@@ -4308,13 +4575,29 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return out, true
 
 	case "add_experiment_arm":
-		// WHY THIS READS BEFORE IT WRITES. patch_experiment replaces the whole
-		// experiments[] entry — there is no merge on the scheduler side, by
-		// design (a textual edit that tried to splice one key into an existing
-		// block is exactly how comments get eaten). So the arm is merged HERE,
-		// against the experiment as it currently stands, and the complete
-		// definition is resent. Sending only the new arm would silently delete
-		// the baseline, which is worse than refusing.
+		// WHY THIS NO LONGER READS BEFORE IT WRITES.
+		//
+		// It used to merge the arm HERE — read the experiment, splice, resend
+		// the whole entry via patch_experiment — because patch_experiment
+		// replaces an entry wholesale and the scheduler offered no merge. Both
+		// halves of that were wrong:
+		//
+		//   1. THIS SERVICE CANNOT SEE THE EXPERIMENT. identity mounts no
+		//      tenant volume, so resolveAppDir hands back a materialised copy
+		//      of the PUBLISHED repo, while define_experiment writes the
+		//      INSTALL through the scheduler and nothing publishes it back. An
+		//      experiment the user had just defined was absent from the only
+		//      bundle readable here — so this verb answered "experiment not
+		//      found" forever, and retrying could never fix it
+		//      (chiquanji@gmail.com, 2026-09-16: 14 defines, 0 arms added).
+		//   2. A MERGE FROM A STALE READ DELETES THINGS. Resending a whole
+		//      entry built from a copy that is behind is how both arms of a
+		//      finished 52-row experiment were erased on 2026-09-13.
+		//
+		// So the merge moved to where the spec actually lives:
+		// experiment_control op=add_arm touches ONE arm, textually, against the
+		// install. This verb now states the arm and nothing else — there is no
+		// carry-forward to get wrong, because nothing else is being rewritten.
 		app := strVal(args, "app")
 		if app == "" {
 			app = groundedApp(c)
@@ -4324,22 +4607,6 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if app == "" || eid == "" || armID == "" {
 			return map[string]any{"error": "app, experiment and arm are required"}, false
 		}
-		dir := resolveAppDir(userID, app)
-		if dir == "" {
-			return map[string]any{"error": "app not installed"}, false
-		}
-		var decl map[string]any
-		for _, e := range loadAppExperimentsFor(userID, app, dir) {
-			if id, _ := e["id"].(string); id == eid {
-				decl = e
-				break
-			}
-		}
-		if decl == nil {
-			return map[string]any{"error": "experiment " + eid + " not found — " +
-				"add_experiment_arm extends an EXISTING experiment; use define_experiment to create one"}, false
-		}
-
 		arm := map[string]any{"id": armID}
 		if v := strVal(args, "config"); v != "" {
 			// Free-form keys for apps that are not model-shaped. Parsed, not
@@ -4372,82 +4639,56 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			}
 		}
 
-		// Replace by id, else append — "add" twice with the same id must be an
-		// edit, not a duplicate the aggregator would then average together.
-		var arms []map[string]any
-		replaced := false
-		if existing, ok := decl["arms"].([]map[string]any); ok {
-			for _, a := range existing {
-				if id, _ := a["id"].(string); id == armID {
-					arms = append(arms, arm)
-					replaced = true
-					continue
-				}
-				arms = append(arms, a)
-			}
-		} else if raw, ok := decl["arms"].([]any); ok {
-			for _, a0 := range raw {
-				a, _ := a0.(map[string]any)
-				if a == nil {
-					continue
-				}
-				if id, _ := a["id"].(string); id == armID {
-					arms = append(arms, arm)
-					replaced = true
-					continue
-				}
-				arms = append(arms, a)
-			}
-		}
-		if !replaced {
-			arms = append(arms, arm)
-		}
+		// Advisory model check on the arm as stated. The scheduler re-checks the
+		// arm as it LANDED (which is the one that matters — a seat list written
+		// as a scalar resolves to no seats), but doing it here too gives the
+		// answer in the same turn rather than only in the intent result.
+		_, modelWarnings := validateExperimentModels(
+			&experimentWriteBody{Arms: []map[string]any{arm}})
 
-		// Model names are advisory-checked on the same path a define goes
-		// through, so a seat that would abstain is reported here too.
-		_, modelWarnings := validateExperimentModels(&experimentWriteBody{Arms: arms})
-
-		// declLoop reads BOTH linkage conventions; see its comment. Shared with
-		// the HTTP write path so the two cannot disagree about what "attached"
-		// means — knowing only loops[] made this verb refuse analyst_local_gpu,
-		// an experiment with 52 rows and a published verdict.
-		loop := declLoop(decl)
-		if loop == "" {
-			return map[string]any{"error": "experiment " + eid + " is attached to no loop, " +
-				"so an arm on it could never be dispatched"}, false
-		}
-		// This verb expresses ONE arm; patch_experiment replaces the whole
-		// entry. So every other key is one the caller had no way to preserve,
-		// and experimentCarryOnto puts all of them back. The hand-rolled version
-		// this replaces dropped six of them, three of them invisibly:
-		//   dispatch      — never on the row, so adding an arm to
-		//                   backtest_evidence deleted the `dispatch.ask` that
-		//                   makes its arms dispatchable at all;
-		//   cases         — never on the row AND never parsed, so an experiment
-		//                   scoped by cases with no dataset_id had its patch
-		//                   REFUSED by the scheduler's scope guard;
-		//   description   — never on the row;
-		//   min_samples   — on the row as an int, tested as a float64, so the
-		//                   assertion never fired and the threshold was erased
-		//                   on every arm add (floor falls back to 1);
-		//   benchmark_id, status — on the row, simply not copied.
-		payload := map[string]any{
-			"app": app, "experiment": eid, "loop": loop,
-			"metric": decl["metric"], "arms": arms,
-		}
-		experimentCarryOnto(payload, decl, "arms")
-		iid := writeIntent(c, "patch_experiment", userID, payload)
+		// ONE arm, merged where the spec lives. No loop, no metric, no carry —
+		// this op rewrites nothing but the arm, so there is no field the caller
+		// had to remember to preserve. The scheduler refuses by name if the
+		// experiment does not exist, which is a judgement made against the
+		// install rather than against a published copy that cannot see it.
+		iid := writeIntent(c, "experiment_control", userID, map[string]any{
+			"app": app, "experiment": eid, "op": "add_arm", "arm": arm,
+		})
 		if iid == "" {
 			return map[string]any{"error": "could not queue the arm"}, false
 		}
-		action := "added"
-		if replaced {
-			action = "replaced"
+		out := map[string]any{"ok": true, "intent_id": iid, "app": app,
+			"experiment": eid, "arm": armID}
+		if len(modelWarnings) > 0 {
+			out["warnings"] = modelWarnings
 		}
-		return map[string]any{"ok": true, "intent_id": iid, "app": app, "experiment": eid,
-			"arm": armID, "action": action, "arms_now": len(arms),
-			"warnings": modelWarnings,
-			"note":     "queued — the scheduler applies it. Run it with dispatch_experiment_arm."}, true
+		// Wait for the real answer, as define_experiment does. Reporting
+		// "queued" for work that has already settled is what turned this pair
+		// of verbs into a retry loop.
+		if warns, succeeded, done := waitIntentWarnings(userID, iid, 6*time.Second); done {
+			out["applied"] = succeeded
+			if len(warns) > 0 {
+				out["warnings"] = append(toStrings(out["warnings"]), warns...)
+			}
+			if !succeeded {
+				out["ok"] = false
+				out["error"] = "the arm did NOT land: " + strings.Join(warns, "; ")
+				out["note"] = "NOT applied. Report this and its reason; adding the same " +
+					"arm again unchanged will fail the same way."
+				return out, false
+			}
+			out["note"] = "applied. Run it with dispatch_experiment_arm."
+			if len(warns) > 0 {
+				out["note"] = "applied, WITH WARNINGS — read them out; a model that " +
+					"resolves nowhere does not error, it abstains, and the panel " +
+					"shrinks silently. Run it with dispatch_experiment_arm."
+			}
+		} else {
+			out["applied"] = false
+			out["note"] = "queued — the scheduler applies it. Check with list_experiments " +
+				"before adding it again; do not re-send it blind."
+		}
+		return out, true
 
 	case "experiment_control":
 		app := strVal(args, "app")

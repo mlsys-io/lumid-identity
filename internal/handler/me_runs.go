@@ -387,6 +387,21 @@ func journalRowToRun(app string, r map[string]any) RunRow {
 		state = "failed"
 	}
 	reason, _ := r["reason"].(string)
+	// THE JOURNAL ROW KNOWS WHY, and this only ever read a top-level `reason`
+	// that the runtime does not write. A cycle records its failure as `outcome`
+	// plus `metrics.error` (or metrics.command_engine.error for a Pattern-B
+	// engine), so every failed run arrived here saying "failed" and nothing
+	// more — which is where the reader already was.
+	//
+	// Measured 2026-09-16: four runs dead on
+	// "unknown case id(s): ['Case_001_DieselTruck_PK20_v5']" — a platform bug,
+	// written plainly to the journal and invisible on every surface. The user
+	// reported it as "won't run".
+	if reason == "" && state == "failed" {
+		metrics, _ := r["metrics"].(map[string]any)
+		outcome, _ := r["outcome"].(string)
+		reason = runFailureReason(metrics, outcome)
+	}
 	var duration float64
 	if v, ok := r["duration_s"].(float64); ok {
 		duration = v

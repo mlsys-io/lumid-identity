@@ -237,8 +237,21 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app", MeAppsUninstall)
 			me.GET("/apps/:app/ui", MeAppUI) // app-declared Studio surface (markdown)
 			me.GET("/apps/:app/ui/:surface", MeAppUISurface)
-			me.GET("/apps/:app/data", MeAppData)   // read-only app content for declarative surfaces
-			me.PUT("/apps/:app/ui", MeUpdateAppUI) // write/create surface markdown
+			me.GET("/apps/:app/data", MeAppData) // read-only app content for declarative surfaces
+			// Job status for the workflow canvas. The browser cannot reach
+			// Lumilake directly — /ll/<site>/ wants a PAT, the SPA carries a
+			// session, and session-bearer rejects PATs — so the hop is here.
+			// Read-only and narrow: it cannot submit, cancel or list.
+			me.GET("/compute/jobs/:site/:job_id", MeComputeJob)
+			// The submitter claiming a job it just started, from the sandbox.
+			// Without it the GET above 404s every chat-dispatched job, because
+			// nothing in that path writes a run row.
+			me.POST("/compute/jobs", MeComputeJobClaimCreate)
+			// The other jobs from the same run — what a switcher across
+			// parallel arms needs in order to name what it is drawing.
+			me.GET("/compute/jobs/:site/:job_id/siblings", MeComputeJobSiblings)
+			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
+			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)
 			me.POST("/apps/:app/ui/generate", MeGenerateAppUI) // AI-generate surface from config
 			me.GET("/apps/:app/config", MeAppConfig)           // read xpcloud.yaml
@@ -587,6 +600,13 @@ func Register(r *gin.Engine) {
 			// scheduler volume and identity mounts none, so the panel could show
 			// declared arms whose results never appeared.
 			internal.POST("/app-experiments", InternalAppExperimentRecord)
+			internal.POST("/app-proposals", InternalAppProposalRecord)
+			// The installed app's own spec — same reason again, but for the
+			// DECLARATION rather than the results. Without it every read
+			// surface describes the PUBLISHED bundle, so an experiment defined
+			// through chat (which edits the install) stayed invisible to the
+			// very tools that had just created it.
+			internal.POST("/app-spec", InternalAppSpecRecord)
 			// Claude Code quota reporter — each account's cron/stop-hook
 			// POSTs here; no user session, only X-Bridge-Secret.
 			internal.POST("/claude-quota/report", InternalClaudeQuotaReport)

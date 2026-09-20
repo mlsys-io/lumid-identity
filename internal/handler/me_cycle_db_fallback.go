@@ -215,8 +215,13 @@ func runRowFromStore(r models.MeAppRun) (RunRow, bool) {
 	}
 	var m map[string]any
 	if r.Metrics != "" && json.Unmarshal([]byte(r.Metrics), &m) == nil {
-		if v, ok := m["outcome"].(string); ok {
-			row.Reason = v
+		// SPECIFIC BEATS TERSE — and this used to run the other way round:
+		// `outcome` ("bad_cases") overwrote a step error already found above,
+		// replacing the CAUSE with its CATEGORY.
+		outcome, _ := m["outcome"].(string)
+		if why := runFailureReason(m, outcome); why != "" &&
+			(row.Reason == "" || row.Reason == outcome) {
+			row.Reason = why
 		}
 		if cost, ok := m["cost"].(map[string]any); ok {
 			if v, ok := cost["cost_usd"].(float64); ok {
@@ -240,4 +245,48 @@ func mergeRunRows(disk, db []RunRow) []RunRow {
 		}
 	}
 	return out
+}
+
+// runFailureReason — the most specific explanation a failed cycle offers.
+//
+// A failed run used to state only that it failed, which is where the reader
+// already was. The explanation existed the whole time: the runtime writes it to
+// .lumid/journal.jsonl AND self-reports it into me_app_runs.metrics, and both
+// row builders dropped it on the floor.
+//
+// Measured 2026-09-16. Four scoped runs died with
+//
+//	metrics.command_engine.error =
+//	  "unknown case id(s): ['Case_001_DieselTruck_PK20_v5']"
+//
+// — a stringified list, i.e. a platform bug — and the user saw a run that
+// silently did nothing, four times, and reported it as "跑不起来" (won't run).
+// It ran. It said why. Nothing showed it.
+//
+// Ordered most specific first, because the terse `outcome` code ("bad_cases")
+// names a CATEGORY and the error names the CAUSE. runRowFromStore used to let
+// outcome overwrite a step error it had already found, which is the same
+// mistake in the other direction.
+//
+// Shared by both row builders deliberately: this file's own header warns that
+// every field must match journalRowToRun "or a run both sources know about
+// appears twice with the two rows disagreeing about what it is called".
+func runFailureReason(metrics map[string]any, outcome string) string {
+	if metrics != nil {
+		if s, _ := metrics["error"].(string); s != "" {
+			return s
+		}
+		// Pattern-B engines nest their own result under command_engine.
+		if ce, ok := metrics["command_engine"].(map[string]any); ok {
+			if s, _ := ce["error"].(string); s != "" {
+				return s
+			}
+			if inner, ok := ce["metrics"].(map[string]any); ok {
+				if s, _ := inner["error"].(string); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return outcome
 }

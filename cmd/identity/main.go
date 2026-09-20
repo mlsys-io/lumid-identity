@@ -67,6 +67,12 @@ func main() {
 	// Drop client-fingerprint observations too old for any window to read.
 	handler.StartClaudeFingerprintGC()
 
+	// Archive cold rows from the append-only growth tables to object storage,
+	// then delete them. This DB filled its volume on 2026-08-17 and again on
+	// 2026-09-15 (100%, auth down estate-wide); the drivers grow ~14 MB/day and
+	// nothing bounded them. No-ops unless the blobstore is configured.
+	handler.StartRetentionSweep()
+
 	if cfg.App.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
 	}

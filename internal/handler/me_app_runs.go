@@ -44,6 +44,14 @@ type appRunBody struct {
 type computeJobRef struct {
 	JobID string `json:"job_id"`
 	Site  string `json:"site"`
+	// The ARM this job ran, when the run fanned out. Optional — a single-job
+	// run has none — but without it a parallel view can only offer N anonymous
+	// jobs, which is worse than offering none.
+	Arm string `json:"arm,omitempty"`
+	// HALO's placement for this arm, op -> worker. With N arms on one fleet it
+	// is the difference between "it is slow" and "three arms are queued behind
+	// one card". Bounded at the producer (32 ops) and again here.
+	Workers map[string]string `json:"workers,omitempty"`
 }
 
 // InternalAppRunRecord — POST /api/v1/internal/app-runs (X-Bridge-Secret).
@@ -106,6 +114,19 @@ func InternalAppRunRecord(c *gin.Context) {
 			}
 			if !computeSiteRe.MatchString(e.Site) || !computeJobRe.MatchString(e.JobID) {
 				continue
+			}
+			// Re-bound the worker map here rather than trusting the producer's
+			// cap: this column is written by a bridge caller, and a limit that
+			// only exists on the other side of the wire is not a limit.
+			if len(e.Workers) > 32 {
+				trimmed := make(map[string]string, 32)
+				for k, v := range e.Workers {
+					if len(trimmed) >= 32 {
+						break
+					}
+					trimmed[k] = v
+				}
+				e.Workers = trimmed
 			}
 			keep = append(keep, e)
 		}

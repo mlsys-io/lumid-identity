@@ -247,6 +247,9 @@ func Register(r *gin.Engine) {
 			// Without it the GET above 404s every chat-dispatched job, because
 			// nothing in that path writes a run row.
 			me.POST("/compute/jobs", MeComputeJobClaimCreate)
+			// The other jobs from the same run — what a switcher across
+			// parallel arms needs in order to name what it is drawing.
+			me.GET("/compute/jobs/:site/:job_id/siblings", MeComputeJobSiblings)
 			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
 			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)

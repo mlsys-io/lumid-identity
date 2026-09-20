@@ -66,3 +66,59 @@ func TestStatusTokenEnvNameIsStable(t *testing.T) {
 			computeStatusTokenEnv)
 	}
 }
+
+// The compute job-status route proxies with OUR credential, not the caller's.
+// Everything that keeps it from being an open reader of every job on every
+// site runs through computeJobsContain, so these are the security tests.
+func TestComputeJobOwnershipIsExactNotSubstring(t *testing.T) {
+	const stored = `[{"job_id":"req-abcdef","site":"office"},{"job_id":"req-zz","site":"home"}]`
+
+	cases := []struct {
+		name      string
+		site, job string
+		want      bool
+		why       string
+	}{
+		{"the pair it actually ran", "office", "req-abcdef", true, ""},
+		{"a second pair on another site", "home", "req-zz", true, ""},
+
+		// The LIKE pre-filter matches a substring anywhere in the column, so a
+		// row holding req-abcdef is HANDED to this function when the caller
+		// asks for req-abc. Authorizing on that would grant a job the caller
+		// never ran, using a prefix of one they did.
+		{"a prefix of a job it ran", "office", "req-abc", false,
+			"prefix must not authorize the longer id"},
+		{"a suffix of a job it ran", "office", "abcdef", false,
+			"suffix must not authorize"},
+
+		// Both halves or nothing: cloud/home/office are three separate
+		// Lumilakes that each answer "not found" for the others' jobs, so
+		// owning req-abcdef on office says nothing about it on home.
+		{"right job, wrong site", "home", "req-abcdef", false,
+			"a job id is only owned on the site it ran"},
+		{"right site, wrong job", "office", "req-zz", false, ""},
+
+		{"empty job", "office", "", false, ""},
+		{"empty site", "", "req-abcdef", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := computeJobsContain(stored, tc.site, tc.job); got != tc.want {
+				t.Fatalf("computeJobsContain(%q, %q) = %v, want %v — %s",
+					tc.site, tc.job, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+func TestComputeJobOwnershipFailsClosedOnBadData(t *testing.T) {
+	// A column that cannot be parsed is not permission. Malformed state must
+	// deny, never default open — the whole point of the gate is that the
+	// upstream credential is ours.
+	for _, raw := range []string{"", "not json", "{}", "null", `[{"job_id":"req-a"}]`,
+		`[{"site":"office"}]`, `["req-a"]`} {
+		if computeJobsContain(raw, "office", "req-a") {
+			t.Fatalf("malformed stored value %q authorized a job", raw)
+		}
+	}
+}

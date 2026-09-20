@@ -10,24 +10,17 @@ package handler
 // then said — correctly, and uselessly — that it had no numbers and would not
 // guess. The verdict was sitting in the API the whole time.
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
+// routes DELEGATES to controlIntent rather than re-implementing it. It used to
+// walk controlIntentPatterns and controlIntentPhrases itself, which meant any
+// routing rule that did not live in exactly those two slices was invisible to
+// every test using this helper -- and it also matched patterns against the RAW
+// string while production lowercases first. Measured 2026-09-18: a new gated
+// read-back set routed correctly through controlIntent while this helper
+// reported it did not, which reads as a broken feature and is a broken test.
 func routes(s string) bool {
-	for _, re := range controlIntentPatterns {
-		if re.MatchString(s) {
-			return true
-		}
-	}
-	low := strings.ToLower(s)
-	for _, kw := range controlIntentPhrases {
-		if kw != "" && strings.Contains(low, kw) {
-			return true
-		}
-	}
-	return false
+	return controlIntent([]chatMessage{{Role: "user", Content: s}})
 }
 
 func TestAskingHowAnExperimentWentIsRouted(t *testing.T) {

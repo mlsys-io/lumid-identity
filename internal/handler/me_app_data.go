@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -18,6 +21,55 @@ import (
 var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, bool){
 	"casebook": func(userID, app string) (map[string]any, bool) {
 		return toolCasebook(userID, app, "")
+	},
+	// The app's declared compute DAGs — `workflows/<name>.yaml` in the bundle,
+	// the graph a loop runs when its engine is {type: lumilake|flowmesh}.
+	//
+	// This exists so the Lumilake canvas can be reached from the APP PAGE.
+	// Until now it mounted only from StudioWorkflowPanel on a chat tool-call
+	// event, so an app's own declared graph rendered only if a human happened
+	// to ask chat to optimize it — the artifact was published and unviewable.
+	//
+	// Unlike `proposals`, this one crosses the cloud-tenant boundary. That
+	// reader looks in `.lumid/`, which is runtime state publishing does not
+	// carry, so for a cloud install resolveAppDir materialises the PUBLISHED
+	// bundle and it comes back empty. `workflows/` IS published (LumidOS
+	// v0.4.62 added it to app_push's subdirectory allowlist), so the same
+	// fallback returns real content here.
+	"workflows": func(userID, app string) (map[string]any, bool) {
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not found: " + app}, false
+		}
+		wd := filepath.Join(dir, "workflows")
+		ents, err := os.ReadDir(wd)
+		if err != nil {
+			// No workflows/ is the ordinary case for most apps, not a failure:
+			// an empty list lets a surface render its own empty state instead
+			// of an error box.
+			return map[string]any{"app": app, "workflows": []any{}, "count": 0}, true
+		}
+		out := make([]map[string]any, 0, len(ents))
+		for _, e := range ents {
+			n := e.Name()
+			if e.IsDir() || !(strings.HasSuffix(n, ".yaml") || strings.HasSuffix(n, ".yml")) {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(wd, n))
+			if err != nil {
+				continue
+			}
+			// The YAML verbatim: the canvas parses the ops graph itself, and
+			// re-serialising here would be a second chance to reformat a graph
+			// the server takes literally.
+			out = append(out, map[string]any{
+				"name":  strings.TrimSuffix(strings.TrimSuffix(n, ".yml"), ".yaml"),
+				"file":  n,
+				"yaml":  string(b),
+				"bytes": len(b),
+			})
+		}
+		return map[string]any{"app": app, "workflows": toAnySlice(out), "count": len(out)}, true
 	},
 	// The app's own run history — every cycle, scheduled or interactive, with
 	// the metrics blob each one reported. This is what a results surface reads
@@ -79,6 +131,69 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 	// it to user_sub so a surface cannot widen it.
 	"report": func(userID, app string) (map[string]any, bool) {
 		return toolAppReport(userID, app)
+	},
+	// Candidate next experiments, as staged by the app's propose_experiments
+	// verb: each one a real experiments[] entry plus the findings that say
+	// whether it would actually collect rows. Read-only and argument-free, so
+	// it qualifies for a surface that runs unattended on page load.
+	//
+	// Newest file wins. The verb appends a timestamped file per run rather
+	// than rewriting one, so a proposal slate is never half-overwritten while
+	// a page is reading it, and an older slate stays inspectable on disk.
+	//
+	// SCOPE, stated because an empty table is otherwise unexplainable: this
+	// reads `.lumid/proposals/` inside the resolved bundle. For an operator or
+	// local tenant install that is the live runtime tree and the rows are
+	// there. For a CLOUD-installed tenant app, resolveAppDir falls back to
+	// materialising the PUBLISHED bundle — and `.lumid/` is runtime state that
+	// publishing does not carry, so this returns none. That is a real gap, not
+	// a bug to paper over here: proposals would need the same self-report
+	// bridge experiments already use (POST /internal/app-experiments) to cross
+	// that boundary. Until then the surface shows its empty state, which says
+	// where proposals come from.
+	"proposals": func(userID, app string) (map[string]any, bool) {
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not found: " + app}, false
+		}
+		pd := filepath.Join(dir, ".lumid", "proposals")
+		ents, err := os.ReadDir(pd)
+		if err != nil {
+			// No slate on disk. For an operator-shared app that means none was
+			// produced; for a tenant install it means identity simply cannot
+			// see the runtime tree — the bundle it resolved is a materialised
+			// copy of the PUBLISHED one, and .lumid/ is not published. Fall
+			// back to what the producer self-reported through
+			// POST /me/apps/:app/proposals (or the internal bridge), which is
+			// the only copy identity can read for a tenant.
+			return proposalRowsFrom(storedProposalSlate(userID, app), app), true
+		}
+		newest := ""
+		for _, e := range ents {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			if e.Name() > newest {
+				newest = e.Name()
+			}
+		}
+		if newest == "" {
+			return proposalRowsFrom(storedProposalSlate(userID, app), app), true
+		}
+		raw, err := os.ReadFile(filepath.Join(pd, newest))
+		if err != nil {
+			return map[string]any{"error": "unreadable proposal slate: " + newest}, false
+		}
+		var slate struct {
+			Ts        int64            `json:"ts"`
+			Proposals []map[string]any `json:"proposals"`
+		}
+		if err := json.Unmarshal(raw, &slate); err != nil {
+			return map[string]any{"error": "malformed proposal slate: " + newest}, false
+		}
+		res := proposalRowsFrom(map[string]any{"proposals": toAnySlice(slate.Proposals)}, app)
+		res["slate"] = newest
+		return res, true
 	},
 }
 
@@ -208,4 +323,45 @@ func filterAppData(c *gin.Context, res map[string]any) map[string]any {
 		out["count"] = keptTotal
 	}
 	return out
+}
+
+// toAnySlice widens decoded rows so disk and DB feed proposalRowsFrom the same
+// shape. Without it the two paths would each shape rows their own way, which is
+// how a column renders on one and not the other.
+func toAnySlice(in []map[string]any) []any {
+	out := make([]any, 0, len(in))
+	for _, m := range in {
+		out = append(out, m)
+	}
+	return out
+}
+
+// proposalRowsFrom flattens a slate into surface-table rows.
+//
+// `findings` and `arms` are dropped: the surface renders verdict_reason, and a
+// nested array in a table cell renders as [object Object]. Dropping them is
+// only acceptable because verdict_reason carries the same information as prose.
+// A nil slate is an empty table, never an error — the surface runs unattended
+// on page load and its empty state says where proposals come from.
+func proposalRowsFrom(slate map[string]any, app string) map[string]any {
+	out := []map[string]any{}
+	if slate != nil {
+		if raw, ok := slate["proposals"].([]any); ok {
+			for _, it := range raw {
+				p, ok := it.(map[string]any)
+				if !ok {
+					continue
+				}
+				row := make(map[string]any, len(p))
+				for k, v := range p {
+					if k == "findings" || k == "arms" {
+						continue
+					}
+					row[k] = v
+				}
+				out = append(out, row)
+			}
+		}
+	}
+	return map[string]any{"app": app, "proposals": out, "count": len(out)}
 }

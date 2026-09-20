@@ -226,8 +226,80 @@ func hydratePatchBody(b *experimentWriteBody, decl map[string]any) {
 	}
 }
 
+// toStrings recovers a []string from an `any` that may be nil or absent, so a
+// caller can append to a warnings slice it has already parked in a response map.
+func toStrings(v any) []string {
+	if s, ok := v.([]string); ok {
+		return s
+	}
+	return nil
+}
+
+// intentIsSettled reports whether an intent row has reached a terminal status.
+//
+// THE STORED VOCABULARY IS pending|claimed|done|failed. InternalMeIntentResult
+// writes "done" on success and "failed" otherwise. "completed" is ONLY the
+// value MeAppIntentGet projects for API clients (me_apps.go) — it is never
+// persisted, and comparing a DB column against it matches nothing.
+func intentIsSettled(status string) bool {
+	return status == "done" || status == "failed"
+}
+
+// readIntentOutcome pulls the warnings and the success verdict out of a stored
+// result envelope.
+//
+// THE ENVELOPE IS NESTED. drain_once stores
+// {"ok":…, "action":…, "data": <the handler's own return>} and only its crash
+// arm puts "error" at the top level. So a handler's `warnings` — the
+// model-abstention guard this whole path exists to deliver — live at
+// data.warnings, and reading only the top level yielded an empty list for every
+// intent that actually had something to say.
+func readIntentOutcome(status, result string) (warns []string, succeeded bool) {
+	var res struct {
+		OK       *bool    `json:"ok"`
+		Warnings []string `json:"warnings"`
+		Error    string   `json:"error"`
+		Data     struct {
+			OK       *bool    `json:"ok"`
+			Warnings []string `json:"warnings"`
+			Error    string   `json:"error"`
+		} `json:"data"`
+	}
+	if result != "" {
+		_ = json.Unmarshal([]byte(result), &res)
+	}
+	out := append(append([]string{}, res.Warnings...), res.Data.Warnings...)
+	for _, e := range []string{res.Error, res.Data.Error} {
+		if e != "" {
+			out = append(out, e)
+		}
+	}
+	// Any signal of failure wins. The scheduler derives the envelope's `ok`
+	// from the handler's own return, so an error reported inside a settled
+	// intent is still a failure.
+	ok := status == "done"
+	if res.OK != nil && !*res.OK {
+		ok = false
+	}
+	if res.Data.OK != nil && !*res.Data.OK {
+		ok = false
+	}
+	if res.Error != "" || res.Data.Error != "" {
+		ok = false
+	}
+	return out, ok
+}
+
 // waitIntentWarnings polls one intent briefly and returns the warnings its
-// result carries, plus whether it completed.
+// result carries, whether it SUCCEEDED, and whether it settled at all.
+//
+// `succeeded` exists because `done` used to carry both meanings. A failed
+// intent settles, so `done` was true, and the only caller read that as
+// "applied" — reporting a definition as landed while demoting the scheduler's
+// error into the warnings list, where it reads like advice about an experiment
+// that exists. That is half of the 2026-09-16 define_experiment loop: the chat
+// said "applied, WITH WARNINGS" and add_experiment_arm then kept answering
+// "experiment not found", which is the truth the first answer had buried.
 //
 // WHY A CHAT TOOL WAITS AT ALL. The model guard is the whole reason
 // define_experiment has a guard: a model name that resolves nowhere does not
@@ -241,33 +313,33 @@ func hydratePatchBody(b *experimentWriteBody, decl map[string]any) {
 // Bounded hard. A chat turn cannot stall on a queue, so this waits seconds, not
 // the 90 the UI can afford, and says plainly when it gave up rather than
 // implying there was nothing to report.
-func waitIntentWarnings(userSub, intentID string, budget time.Duration) ([]string, bool) {
+func waitIntentWarnings(userSub, intentID string, budget time.Duration) (warns []string, succeeded, done bool) {
 	if intentID == "" || common.DB == nil {
-		return nil, false
+		return nil, false, false
 	}
 	deadline := time.Now().Add(budget)
 	for {
 		var row models.MeAppIntent
 		if err := common.DB.Where("id = ? AND user_sub = ?", intentID, userSub).
 			First(&row).Error; err != nil {
-			return nil, false
+			return nil, false, false
 		}
-		if row.Status == "completed" || row.Status == "failed" {
-			var res struct {
-				Warnings []string `json:"warnings"`
-				Error    string   `json:"error"`
-			}
-			if row.Result != "" {
-				_ = json.Unmarshal([]byte(row.Result), &res)
-			}
-			out := res.Warnings
-			if res.Error != "" {
-				out = append(out, res.Error)
-			}
-			return out, true
+		// THE STORED VOCABULARY IS done|failed, NOT completed.
+		// InternalMeIntentResult writes "done" on success and "failed"
+		// otherwise; "completed" exists only as the value MeAppIntentGet
+		// PROJECTS for API clients (me_apps.go), and is never persisted. This
+		// loop compared a DB column against the projection, so it could match
+		// only a FAILED intent — a successful definition polled to the deadline
+		// and the tool answered "queued — still applying ... do not report it
+		// as done yet", every time, forever. That is the 2026-09-16 loop: the
+		// assistant re-issued define_experiment a dozen times because the one
+		// answer it got back told it the work had not landed yet.
+		if intentIsSettled(row.Status) {
+			warns, ok := readIntentOutcome(row.Status, row.Result)
+			return warns, ok, true
 		}
 		if time.Now().After(deadline) {
-			return nil, false
+			return nil, false, false
 		}
 		time.Sleep(400 * time.Millisecond)
 	}

@@ -229,3 +229,26 @@ func (b *BlobStore) s3delete(objKey string) error {
 	}
 	return nil
 }
+
+// ── Archive prefix ──────────────────────────────────────────────────────────
+
+// ArchivePrefix is where retention sweeps park cold rows. Deliberately a
+// SIBLING of the session-blob prefix, not a child: `claude-sessions/` holds
+// live blobs that a transcript read can still fault in, and the nightly
+// lifecycle rules that apply there must not apply to archived rows, which are
+// the only surviving copy once the DB rows are gone.
+const ArchivePrefix = "archive/"
+
+// PutArchive stores data at archive/{relKey}.
+//
+// Separate from Put because Put hard-codes the claude-sessions/ prefix. A
+// retention sweep writing through Put would bury archives under the live blob
+// prefix, where a session delete walking that prefix could remove them.
+func (b *BlobStore) PutArchive(relKey string, data []byte) error {
+	return b.s3do("PUT", ArchivePrefix+relKey, data)
+}
+
+// GetArchive retrieves data from archive/{relKey}, for restoring a swept range.
+func (b *BlobStore) GetArchive(relKey string) ([]byte, error) {
+	return b.s3get(ArchivePrefix + relKey)
+}

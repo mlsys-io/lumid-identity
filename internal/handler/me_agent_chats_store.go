@@ -128,14 +128,26 @@ func chatStoreList(userSub string) ([]*chatRecord, error) {
 	return out, nil
 }
 
-func chatStoreDelete(userSub, id string) error {
+// chatStoreDelete returns how many rows it removed, so the caller can tell a
+// real delete from a no-op on someone else's id. The scoping was never the
+// problem; not reporting the outcome was.
+func chatStoreDelete(userSub, id string) (int64, error) {
 	// Remove the legacy file too, or the next list would migrate it straight
 	// back and the delete would look like it silently failed.
+	removedFile := false
 	if p := chatPath(userSub, id); p != "" {
-		_ = os.Remove(p)
+		removedFile = os.Remove(p) == nil
 	}
-	return common.DB.Where("id = ? AND user_sub = ?", id, userSub).
-		Delete(&models.MeChat{}).Error
+	tx := common.DB.Where("id = ? AND user_sub = ?", id, userSub).
+		Delete(&models.MeChat{})
+	n := tx.RowsAffected
+	// A chat that existed only as a legacy file has no row to delete, and
+	// removing that file IS a successful delete. Counting it keeps the
+	// migration path from reporting 404 for something it just removed.
+	if n == 0 && removedFile {
+		n = 1
+	}
+	return n, tx.Error
 }
 
 // chatStorePrune keeps the newest `keep` transcripts.

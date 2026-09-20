@@ -315,9 +315,28 @@ func MeChatDelete(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid chat id")
 		return
 	}
-	err := chatStoreDelete(userID, id)
+	n, err := chatStoreDelete(userID, id)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "remove: "+err.Error())
+		return
+	}
+	// Deleting nothing is not success.
+	//
+	// The store has always been scoped (`WHERE id = ? AND user_sub = ?`), so
+	// another user's chat was never at risk — but GORM does not error on zero
+	// rows, and this returned 200 {"id": …} either way. A caller deleting an id
+	// they do not own was told it worked.
+	//
+	// That cost real attention: qa-sentinel's chat_isolation probe reads
+	// "DELETE returned 200" as proof of a cross-tenant leak and has filed a
+	// recurring BLOCKER — "Cross-tenant chat DELETE succeeded (isolation
+	// leak)" — every sweep. The isolation was fine; the response was lying, and
+	// a permanently-red probe for a non-bug is how a real one gets ignored.
+	//
+	// 404, not 403, matching the convention the compute-job routes set: a 403
+	// would confirm the chat exists to someone with no business knowing.
+	if n == 0 {
+		fail(c, http.StatusNotFound, 1404, "no such chat for this user")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"id": id}})

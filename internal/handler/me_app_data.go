@@ -22,6 +22,55 @@ var readOnlyAppDataTools = map[string]func(userID, app string) (map[string]any, 
 	"casebook": func(userID, app string) (map[string]any, bool) {
 		return toolCasebook(userID, app, "")
 	},
+	// The app's declared compute DAGs — `workflows/<name>.yaml` in the bundle,
+	// the graph a loop runs when its engine is {type: lumilake|flowmesh}.
+	//
+	// This exists so the Lumilake canvas can be reached from the APP PAGE.
+	// Until now it mounted only from StudioWorkflowPanel on a chat tool-call
+	// event, so an app's own declared graph rendered only if a human happened
+	// to ask chat to optimize it — the artifact was published and unviewable.
+	//
+	// Unlike `proposals`, this one crosses the cloud-tenant boundary. That
+	// reader looks in `.lumid/`, which is runtime state publishing does not
+	// carry, so for a cloud install resolveAppDir materialises the PUBLISHED
+	// bundle and it comes back empty. `workflows/` IS published (LumidOS
+	// v0.4.62 added it to app_push's subdirectory allowlist), so the same
+	// fallback returns real content here.
+	"workflows": func(userID, app string) (map[string]any, bool) {
+		dir := resolveAppDir(userID, app)
+		if dir == "" {
+			return map[string]any{"error": "app not found: " + app}, false
+		}
+		wd := filepath.Join(dir, "workflows")
+		ents, err := os.ReadDir(wd)
+		if err != nil {
+			// No workflows/ is the ordinary case for most apps, not a failure:
+			// an empty list lets a surface render its own empty state instead
+			// of an error box.
+			return map[string]any{"app": app, "workflows": []any{}, "count": 0}, true
+		}
+		out := make([]map[string]any, 0, len(ents))
+		for _, e := range ents {
+			n := e.Name()
+			if e.IsDir() || !(strings.HasSuffix(n, ".yaml") || strings.HasSuffix(n, ".yml")) {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(wd, n))
+			if err != nil {
+				continue
+			}
+			// The YAML verbatim: the canvas parses the ops graph itself, and
+			// re-serialising here would be a second chance to reformat a graph
+			// the server takes literally.
+			out = append(out, map[string]any{
+				"name":  strings.TrimSuffix(strings.TrimSuffix(n, ".yml"), ".yaml"),
+				"file":  n,
+				"yaml":  string(b),
+				"bytes": len(b),
+			})
+		}
+		return map[string]any{"app": app, "workflows": toAnySlice(out), "count": len(out)}, true
+	},
 	// The app's own run history — every cycle, scheduled or interactive, with
 	// the metrics blob each one reported. This is what a results surface reads
 	// to show coverage over time, and it is deliberately the SAME record the

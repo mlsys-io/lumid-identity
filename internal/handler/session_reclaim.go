@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"log"
 	"time"
 
@@ -38,25 +39,31 @@ const (
 // sweeps would just contend on the same rows.
 func StartSessionReclaimLoop() {
 	go func() {
+		time.Sleep(reclaimFirstPassDelay)
 		for {
-			time.Sleep(sessionReclaimEvery)
-			if n, err := reclaimExpiredSessions(); err != nil {
+			if n, err := reclaimExpiredSessions(); errors.Is(err, errLockBusy) {
+				log.Print("session reclaim: skipped, another replica holds the lock")
+			} else if err != nil {
 				log.Printf("session reclaim failed: %v", err)
 			} else if n > 0 {
 				log.Printf("session reclaim: deleted %d row(s) expired more than %v ago", n, sessionRetention)
 			}
+			time.Sleep(sessionReclaimEvery)
 		}
 	}()
 	log.Printf("session reclaim loop every %v (retention %v past expiry)", sessionReclaimEvery, sessionRetention)
 }
 
-func reclaimExpiredSessions() (int64, error) {
-	var got int
-	if err := common.DB.Raw("SELECT GET_LOCK('session_reclaim', 2)").Scan(&got).Error; err != nil || got != 1 {
-		return 0, nil // another replica is on it
-	}
-	defer common.DB.Exec("DO RELEASE_LOCK('session_reclaim')")
+func reclaimExpiredSessions() (total int64, err error) {
+	err = withNamedLock(common.DB, "session_reclaim", 2*time.Second, func() error {
+		var e error
+		total, e = reclaimExpiredSessionsLocked()
+		return e
+	})
+	return total, err
+}
 
+func reclaimExpiredSessionsLocked() (int64, error) {
 	cutoff := time.Now().UTC().Add(-sessionRetention)
 	var total int64
 	for i := 0; i < sessionReclaimMaxIter; i++ {

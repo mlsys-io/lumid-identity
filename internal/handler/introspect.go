@@ -497,9 +497,14 @@ func recordIntrospectAudit(ip, ua, token string) {
 	switch prefix {
 	case "rm_pat-legacy", "rmk-legacy", "flm-legacy":
 		common.DB.Exec(
-			`INSERT INTO audit_log (event, source, path, detail, ip, user_agent)
-			 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?)`,
-			prefix, `{"prefix":"`+prefix+`"}`, ip, ua,
+			// created_at is set explicitly: raw SQL bypasses GORM's autoCreateTime,
+			// and the column has no DB default. Every row this statement wrote
+			// before 2026-09-19 has created_at NULL (755k of them), which made
+			// them invisible to every time-windowed reader AND to the retention
+			// sweep's age predicate.
+			`INSERT INTO audit_log (event, source, path, detail, ip, user_agent, created_at)
+			 VALUES ('introspect', ?, '/oauth/introspect', ?, ?, ?, ?)`,
+			prefix, `{"prefix":"`+prefix+`"}`, ip, ua, time.Now().UTC(),
 		)
 	}
 }

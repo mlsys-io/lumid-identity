@@ -47,9 +47,28 @@ type MeAppRun struct {
 	// Its own column, not folded into `outputs`: that field is the cycle's final
 	// ARTIFACT and MeAppLatestOutput serves it straight to the Outputs tier,
 	// where run events would render as artifact keys.
-	Events    *string   `gorm:"column:events;type:text"                json:"events,omitempty"`
-	Source    string    `gorm:"column:source;size:24"            json:"source,omitempty"` // self_report | backfill
-	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
+	Events *string `gorm:"column:events;type:text"                json:"events,omitempty"`
+	// `compute_jobs` — WHICH fleet compute jobs this run ran, as a JSON array
+	// of {"job_id","site"}.
+	//
+	// This is an AUTHORIZATION record, not a metric. It is what lets the
+	// compute job-status route answer "is this job yours?" instead of proxying
+	// any job id any authenticated user happens to learn. Without it that route
+	// can only be a service-token proxy over every job on every site.
+	//
+	// Its own column, not inside `metrics`: metricFromBlob resolves a declared
+	// metric name recursively at ANY depth of that blob, so a job_id nested
+	// there could answer an app's metric lookup from the wrong place — the same
+	// hazard that put `outputs` in its own column.
+	//
+	// A LIST because dispatch_arms runs N arms inside one cycle; a scalar would
+	// record one arm and silently drop the rest, and parallel dispatch is the
+	// point of the feature. Each entry carries BOTH halves: every Lumilake read
+	// route is /ll/<site>/-scoped and cloud/home/office each answer "not found"
+	// for the others' jobs, so an id without a site authorizes nothing.
+	ComputeJobs *string   `gorm:"column:compute_jobs;type:text" json:"compute_jobs,omitempty"`
+	Source      string    `gorm:"column:source;size:24"            json:"source,omitempty"` // self_report | backfill
+	CreatedAt   time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
 }
 
 func (MeAppRun) TableName() string { return "me_app_runs" }

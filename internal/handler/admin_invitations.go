@@ -3,7 +3,9 @@ package handler
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -37,9 +39,92 @@ func resolveRole(tok string) (userID, role string, ok bool) {
 	return "", "", false
 }
 
+// adminScopeNames — the PAT scopes that authorize the ADMIN surface.
+//
+// Deliberately NOT lumid:write. callerHasLumidWrite (pat.go) accepts it for
+// write operations on your own resources; the operator surface is a different
+// question and wants to be asked for explicitly.
+var adminScopeNames = map[string]bool{"*": true, "lumid:*": true, "lumid:admin": true}
+
+// callerPATLacksAdminScope reports whether this request is authenticated by a
+// PAT whose scopes do not authorize the admin surface.
+//
+// Session JWTs are exempt: a browser session has no scopes, and role is the
+// only gate it has ever had. The hole is specifically the PAT path.
+//
+// BOTH token prefixes are checked. callerHasLumidWrite tests only `lm_pat_`
+// and therefore returns true — "not PAT-gated" — for a legacy
+// `rm_pat_live_*`, while resolveRole above resolves both. A gate that resolves
+// one set of credentials and scope-checks a smaller set has a hole exactly the
+// size of the difference.
+func callerPATLacksAdminScope(c *gin.Context) (isPAT, lacks bool, scopes string) {
+	tok := bearerToken(c)
+	if !strings.HasPrefix(tok, "lm_pat_") && !strings.HasPrefix(tok, "rm_pat_") {
+		return false, false, ""
+	}
+	row, found := lookupPAT(tok)
+	if !found {
+		return true, true, ""
+	}
+	return true, !scopesAuthorizeAdmin(row.Scopes), row.Scopes
+}
+
+// scopesAuthorizeAdmin — the decision itself, separated from credential
+// lookup so it can be tested without a database.
+func scopesAuthorizeAdmin(scopes string) bool {
+	for _, s := range strings.Fields(scopes) {
+		if adminScopeNames[s] {
+			return true
+		}
+	}
+	return false
+}
+
+// requireAdminScope — enforce (true) or merely observe (false, the default).
+//
+// OBSERVE FIRST, ON PURPOSE. Every admin PAT in the estate today was minted
+// without an admin scope, because nothing ever asked for one; flipping
+// straight to enforcement would revoke operator access from automation that is
+// working correctly, including whatever is holding the credential this change
+// is meant to protect. The federator solved the same problem the same way with
+// FEDERATOR_REQUIRE_SITE_AUTH: log every call that DEPENDS on the loophole,
+// under its own name, until a quiet period shows nothing unaccounted for.
+//
+// Flip IDENTITY_REQUIRE_ADMIN_SCOPE=true once the log is clean.
+func requireAdminScope() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("IDENTITY_REQUIRE_ADMIN_SCOPE")))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+// gateAdminScope applies the scope check to a caller that has ALREADY passed
+// the role check. Returns false when the request must be aborted.
+func gateAdminScope(c *gin.Context, userID, role, gate string) bool {
+	isPAT, lacks, scopes := callerPATLacksAdminScope(c)
+	if !isPAT || !lacks {
+		return true
+	}
+	if requireAdminScope() {
+		fail(c, http.StatusForbidden, 1005,
+			"this PAT has no admin scope — mint one with lumid:admin, or use a browser session")
+		log.Printf("identity: DENIED %s %s %s user=%s role=%s scopes=%q (no admin scope)",
+			gate, c.Request.Method, c.Request.URL.Path, userID, role, scopes)
+		c.Abort()
+		return false
+	}
+	// Observe mode: behaviour unchanged, but every call that depends on the
+	// loophole is named. A PAT minted for one narrow purpose reaching the whole
+	// operator surface is the thing being measured here.
+	log.Printf("identity: ADMIN-BY-ROLE-ONLY %s %s %s user=%s role=%s scopes=%q — would be DENIED under IDENTITY_REQUIRE_ADMIN_SCOPE",
+		gate, c.Request.Method, c.Request.URL.Path, userID, role, scopes)
+	return true
+}
+
 // RequireAdmin blocks callers whose credential doesn't carry role=admin.
 // Accepts session JWTs (lm_session cookie or Authorization header) and
 // lm_pat_* / rm_pat_* tokens whose owning account has role=admin|super_admin.
+//
+// Role is necessary and, for a PAT, no longer meant to be sufficient — see
+// gateAdminScope. That check is in OBSERVE mode by default.
 func RequireAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tok := bearerToken(c)
@@ -57,6 +142,9 @@ func RequireAdmin() gin.HandlerFunc {
 		if role != "admin" && role != "super_admin" {
 			fail(c, http.StatusForbidden, 1005, "admin required")
 			c.Abort()
+			return
+		}
+		if !gateAdminScope(c, userID, role, "RequireAdmin") {
 			return
 		}
 		c.Set("admin_user_id", userID)
@@ -87,6 +175,9 @@ func RequireSuperAdmin() gin.HandlerFunc {
 		if role != "super_admin" {
 			fail(c, http.StatusForbidden, 1005, "super_admin required")
 			c.Abort()
+			return
+		}
+		if !gateAdminScope(c, userID, role, "RequireSuperAdmin") {
 			return
 		}
 		c.Set("admin_user_id", userID)

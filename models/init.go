@@ -29,6 +29,7 @@ var AllTables = []interface{}{
 	&GpuRental{},
 	&MeAppIntent{},
 	&MeAppRun{},
+	&MeComputeJobClaim{},
 	&MeAppExperiment{},
 	&MeAppProposal{},
 	&MeAppSpec{},

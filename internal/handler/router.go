@@ -243,6 +243,10 @@ func Register(r *gin.Engine) {
 			// session, and session-bearer rejects PATs — so the hop is here.
 			// Read-only and narrow: it cannot submit, cancel or list.
 			me.GET("/compute/jobs/:site/:job_id", MeComputeJob)
+			// The submitter claiming a job it just started, from the sandbox.
+			// Without it the GET above 404s every chat-dispatched job, because
+			// nothing in that path writes a run row.
+			me.POST("/compute/jobs", MeComputeJobClaimCreate)
 			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
 			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)

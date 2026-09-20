@@ -33,6 +33,17 @@ type appRunBody struct {
 	Outputs   any            `json:"outputs"`
 	// Offers + step_errors — what the run SAID. See models.MeAppRun.Events.
 	Events any `json:"events"`
+	// WHICH fleet compute jobs this run ran: [{job_id, site}, ...].
+	// An authorization record, not a metric — see models.MeAppRun.ComputeJobs.
+	ComputeJobs []computeJobRef `json:"compute_jobs"`
+}
+
+// computeJobRef is one job's ADDRESS. Both halves required: every Lumilake read
+// route is /ll/<site>/-scoped and cloud/home/office each answer "not found" for
+// the others' jobs, so an id without a site authorizes nothing.
+type computeJobRef struct {
+	JobID string `json:"job_id"`
+	Site  string `json:"site"`
 }
 
 // InternalAppRunRecord — POST /api/v1/internal/app-runs (X-Bridge-Secret).
@@ -83,6 +94,28 @@ func InternalAppRunRecord(c *gin.Context) {
 			ej = &e
 		}
 	}
+	// Compute job addresses. Entries missing either half are dropped rather
+	// than stored: a half-address authorizes nothing and resolves nowhere,
+	// while reading as evidence the run was captured.
+	var cj *string
+	if len(b.ComputeJobs) > 0 {
+		keep := make([]computeJobRef, 0, len(b.ComputeJobs))
+		for _, e := range b.ComputeJobs {
+			if e.JobID == "" || e.Site == "" {
+				continue
+			}
+			if !computeSiteRe.MatchString(e.Site) || !computeJobRe.MatchString(e.JobID) {
+				continue
+			}
+			keep = append(keep, e)
+		}
+		if len(keep) > 0 {
+			if raw, err := json.Marshal(keep); err == nil && len(raw) <= 16*1024 {
+				v := string(raw)
+				cj = &v
+			}
+		}
+	}
 	row := models.MeAppRun{
 		UserSub: b.UserSub, App: b.App, Loop: b.Loop, RunTs: b.RunTs,
 		Model: b.Model, Ok: b.Ok, DurationS: b.DurationS, Metrics: mj, Source: src,
@@ -97,6 +130,11 @@ func InternalAppRunRecord(c *gin.Context) {
 	// the store's point of view: only a NEW one replaces it.
 	if oj != "" {
 		row.Outputs = oj
+	}
+	// Append-only, same reasoning: a re-report or backfill carrying no jobs
+	// must not blank the authorization record an earlier report established.
+	if cj != nil {
+		row.ComputeJobs = cj
 	}
 	// `loop` is a MySQL reserved word — must be backtick-quoted in raw SQL.
 	res := common.DB.Where("user_sub = ? AND app = ? AND `loop` = ? AND run_ts = ?",

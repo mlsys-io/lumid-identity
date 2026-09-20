@@ -4750,6 +4750,39 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			return map[string]any{"error": "experiment '" + expID + "' is not attached to any loop " +
 				"(engine.experiment / steps[].experiment), so there is nowhere to dispatch it"}, false
 		}
+		// The app said this dispatch needs a SUBJECT. Refuse until one is
+		// supplied, and hand back the app's own question so the model can ask
+		// for it rather than guess.
+		//
+		// The panel has always honoured dispatch.ask — it routes to the chat
+		// rail instead of firing. The chat tool did not, so the path with
+		// nowhere left to defer to was the one that fired blind, and the run
+		// failed with the app's own "strategy is empty" while still being
+		// recorded against the arm. A failed row is worse than a refusal: it
+		// looks like evidence the arm was tried.
+		//
+		// `cases` counts as a subject too — that is what a case-scoped loop
+		// varies over, and requiring `args` specifically would refuse a
+		// perfectly-specified casebook dispatch.
+		if ask := experimentDispatchAsk(dir, expID); ask != "" {
+			hasSubject := false
+			if ra, ok := args["args"].(map[string]any); ok && len(ra) > 0 {
+				hasSubject = true
+			}
+			if cs, _ := args["cases"].(string); cs != "" {
+				hasSubject = true
+			}
+			if !hasSubject {
+				return map[string]any{
+					"error": "this arm needs a subject before it can run — " + ask +
+						" Ask the user, then dispatch again passing it as `args` " +
+						"(the loop's own invocation args) or `cases`.",
+					"needs_subject": true,
+					"ask":           ask,
+					"app":           app, "experiment": expID, "arm": armID,
+				}, false
+			}
+		}
 		samples := 1
 		if n, ok := args["samples"].(float64); ok && int(n) > 1 {
 			samples = int(n)

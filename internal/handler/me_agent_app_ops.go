@@ -40,6 +40,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -1141,6 +1142,56 @@ func appReadSource(c *gin.Context, userID, src string) (any, error) {
 			return all, nil
 		case p == "drafts" || strings.HasPrefix(p, "drafts?"):
 			return toolListDrafts(userID, ""), nil
+		// me://app-data?app=<app>&tool=<tool> — an app's OWN declared surfaces.
+		//
+		// This is how every app exposes its domain data (casebook, runs, report,
+		// workflows, proposals). Surfaces could read it and the HTTP endpoint
+		// served it, but app_read had no case for it at all, so the assistant
+		// could not read any app's own data — it fell through to
+		// "source not allowed" while GET /me/apps/<app>/data?tool=proposals
+		// returned 200 for the same caller.
+		//
+		// That is worst exactly where it matters most: Proposals is the channel
+		// where planners stage suggestions for a human, and the assistant
+		// helping that human could not see them. Measured 2026-09-21 — a turn
+		// asking why an experiment was stuck tried this source and was refused.
+		//
+		// Same allowlist and the same per-caller scoping as MeAppData (the tools
+		// take userID), so this adds no reachable data — only the path to it.
+		// Extra query params are ignored rather than applied: MeAppData's
+		// filterAppData narrows by them off a gin.Context, and re-implementing
+		// that filter here is how the two copies start to disagree.
+		case p == "app-data" || strings.HasPrefix(p, "app-data?"):
+			q := ""
+			if i := strings.IndexByte(p, '?'); i >= 0 {
+				q = p[i+1:]
+			}
+			vals, err := url.ParseQuery(q)
+			if err != nil {
+				return nil, errReadNotAllowed(src)
+			}
+			app, tool := vals.Get("app"), vals.Get("tool")
+			if !slugRe.MatchString(app) {
+				return nil, &appOpsError{"invalid app: " + app}
+			}
+			fn, allowed := readOnlyAppDataTools[tool]
+			if !allowed {
+				// Name the allowlist, for the same reason MeAppData does: an
+				// author pointing at the wrong tool otherwise sees a refusal
+				// with no cause.
+				names := make([]string, 0, len(readOnlyAppDataTools))
+				for k := range readOnlyAppDataTools {
+					names = append(names, k)
+				}
+				sort.Strings(names)
+				return nil, &appOpsError{"tool not readable: " + tool +
+					"; allowed: " + strings.Join(names, ", ")}
+			}
+			// MeAppData passes a tool's own error text through rather than
+			// flattening it to a 500 — the text ("app not found: x") is the
+			// useful signal. Same here.
+			res, _ := fn(userID, app)
+			return res, nil
 		default:
 			return nil, errReadNotAllowed(src)
 		}

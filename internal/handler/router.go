@@ -237,7 +237,12 @@ func Register(r *gin.Engine) {
 			me.DELETE("/apps/:app", MeAppsUninstall)
 			me.GET("/apps/:app/ui", MeAppUI) // app-declared Studio surface (markdown)
 			me.GET("/apps/:app/ui/:surface", MeAppUISurface)
-			me.GET("/apps/:app/data", MeAppData)                 // read-only app content for declarative surfaces
+			me.GET("/apps/:app/data", MeAppData) // read-only app content for declarative surfaces
+			// Job status for the workflow canvas. The browser cannot reach
+			// Lumilake directly — /ll/<site>/ wants a PAT, the SPA carries a
+			// session, and session-bearer rejects PATs — so the hop is here.
+			// Read-only and narrow: it cannot submit, cancel or list.
+			me.GET("/compute/jobs/:site/:job_id", MeComputeJob)
 			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
 			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)

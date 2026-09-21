@@ -129,3 +129,31 @@ func TestGateAsksForTheSpecRatherThanAssumingItIsThere(t *testing.T) {
 		t.Fatal("tenantCacheDir only NAMES the dir — it does not populate it")
 	}
 }
+
+// TestMachineManagedCacheRowsNeverReachTheCycleEnv pins the v0.5.405 defect.
+//
+// The loop skipped lqtStrategyPATCacheKey by NAME. computePATCacheKey was added
+// beside it without a second `continue`, so `__lumilake_compute_pat_cache` — an
+// `<expiry>:<token>` pair this handler writes for itself — was injected into
+// every quant-research cycle's environment. Observed live:
+//
+//	keys: ['LQT_STRATEGY_PAT','LUMID_PAT','LUMILAKE_TOKEN','__lumilake_compute_pat_cache']
+//
+// The rule is now a PREFIX, so the next cache key is safe by default rather
+// than depending on whoever adds it remembering this loop. This test asserts
+// the rule, not the two keys that exist today.
+func TestMachineManagedCacheRowsNeverReachTheCycleEnv(t *testing.T) {
+	for _, k := range []string{lqtStrategyPATCacheKey, computePATCacheKey} {
+		if !strings.HasPrefix(k, "__") {
+			t.Fatalf("cache key %q must start with __ or the prefix skip misses it", k)
+		}
+	}
+	src, err := os.ReadFile("me_secrets.go")
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	if !strings.Contains(string(src), `strings.HasPrefix(rows[i].Key, "__")`) {
+		t.Fatal("the secrets loop must skip machine-managed rows by PREFIX; " +
+			"skipping them by name is what leaked __lumilake_compute_pat_cache")
+	}
+}

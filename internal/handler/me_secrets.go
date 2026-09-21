@@ -12,6 +12,7 @@ package handler
 import (
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -252,8 +253,20 @@ func InternalAppSecretsFetch(c *gin.Context) {
 			if isCurrent != pass {
 				continue
 			}
-			if rows[i].Key == lqtStrategyPATCacheKey {
-				continue // machine-managed cache, not a user credential
+			// Machine-managed caches, not user credentials. Every key in a
+			// `__`-prefixed row is an internal cache value that this handler
+			// writes for itself, and injecting one into the cycle env hands the
+			// app a credential blob it has no use for.
+			//
+			// Matched by PREFIX rather than by listing each key. Listing was the
+			// bug: computePATCacheKey was added beside lqtStrategyPATCacheKey
+			// without a second `continue`, so `__lumilake_compute_pat_cache` —
+			// an `<expiry>:<token>` pair — shipped into every quant-research
+			// cycle's environment in v0.5.405. A prefix rule makes the next
+			// cache key safe by default instead of relying on whoever adds it
+			// remembering this loop.
+			if strings.HasPrefix(rows[i].Key, "__") {
+				continue
 			}
 			if v, err := common.DecryptGrant(rows[i].ValueEncrypted); err == nil {
 				out[rows[i].Key] = v

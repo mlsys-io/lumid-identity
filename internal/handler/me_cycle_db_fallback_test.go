@@ -11,6 +11,7 @@ package handler
 // happened.
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -170,5 +171,39 @@ func TestStoreRowsCarryCostAndDuration(t *testing.T) {
 	// Never invented: the store has no per-step rows.
 	if item.StepCount != 0 || item.Running {
 		t.Errorf("invented detail the store does not carry: %+v", item)
+	}
+}
+
+// TestComputeEngineFailureIsLegibleOnTheSurface pins the 2026-09-21 case: a
+// Pattern-C loop (body = a compute DAG) refused by Lumilake surfaced as
+// reason "ran". runFailureReason knew command_engine but not compute_engine,
+// so it fell through to the outcome string — which reads like a success word
+// and tells the researcher nothing.
+func TestComputeEngineFailureIsLegibleOnTheSurface(t *testing.T) {
+	metrics := map[string]any{
+		"rows": 0,
+		"compute_engine": map[string]any{
+			"ok":          false,
+			"error":       "ComputeError: submit rejected (403): write on object-prefix/lumilake-runs/ denied",
+			"engine_type": "lumilake",
+		},
+	}
+	got := runFailureReason(metrics, "ran")
+	if got == "ran" {
+		t.Fatal("a compute failure must not surface as its outcome string")
+	}
+	if !strings.Contains(got, "403") {
+		t.Fatalf("reason must carry what actually failed, got %q", got)
+	}
+}
+
+// TestCommandEngineStillWins guards the older Pattern-B path, which was fixed
+// first and must not regress behind the new branch.
+func TestCommandEngineStillWins(t *testing.T) {
+	metrics := map[string]any{
+		"command_engine": map[string]any{"error": "unknown case id(s)"},
+	}
+	if got := runFailureReason(metrics, "ran"); got != "unknown case id(s)" {
+		t.Fatalf("command_engine reason lost, got %q", got)
 	}
 }

@@ -276,6 +276,16 @@ func runFailureReason(metrics map[string]any, outcome string) string {
 		if s, _ := metrics["error"].(string); s != "" {
 			return s
 		}
+		// Pattern-C engines (a loop whose BODY is a compute DAG) nest theirs
+		// under compute_engine. Without this a failed fleet dispatch surfaced as
+		// its outcome string — measured 2026-09-21, a run refused by Lumilake
+		// with "write on object-prefix/... denied" displayed as reason "ran",
+		// which tells the reader nothing and looks like a success word.
+		if ce, ok := metrics["compute_engine"].(map[string]any); ok {
+			if s, _ := ce["error"].(string); s != "" {
+				return s
+			}
+		}
 		// Pattern-B engines nest their own result under command_engine.
 		if ce, ok := metrics["command_engine"].(map[string]any); ok {
 			if s, _ := ce["error"].(string); s != "" {

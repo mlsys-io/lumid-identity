@@ -398,9 +398,19 @@ func journalRowToRun(app string, r map[string]any) RunRow {
 	// written plainly to the journal and invisible on every surface. The user
 	// reported it as "won't run".
 	if reason == "" && state == "failed" {
-		metrics, _ := r["metrics"].(map[string]any)
-		outcome, _ := r["outcome"].(string)
-		reason = runFailureReason(metrics, outcome)
+		// THE ROW'S OWN `error` FIRST. app_runner writes the derived failure
+		// reason straight onto the journal record (`_jrec["error"]`) for both
+		// the command and compute engines, and nothing here ever read it — so
+		// the one field that always holds the answer was skipped in favour of
+		// digging through `metrics`. Measured 2026-09-21: a compute run refused
+		// by Lumilake reached this surface as reason "ran".
+		if s, _ := r["error"].(string); s != "" {
+			reason = s
+		} else {
+			metrics, _ := r["metrics"].(map[string]any)
+			outcome, _ := r["outcome"].(string)
+			reason = runFailureReason(metrics, outcome)
+		}
 	}
 	var duration float64
 	if v, ok := r["duration_s"].(float64); ok {

@@ -315,6 +315,24 @@ func InternalAppSecretsFetch(c *gin.Context) {
 			}
 		}
 	}
+	// A loop whose BODY is a compute DAG needs a `lumilake:jobs:write` token,
+	// and for the same reason the block above needs `lqt:strategy`: the picker
+	// only has the caller's LOGIN JWT, and compute.py refuses it by shape. On a
+	// schedule the cycle inherits a real PAT and the loop runs; from chat or the
+	// UI it cannot, which is precisely the two surfaces that are the product.
+	//
+	// LUMILAKE_TOKEN, not LUMID_PAT: it is FIRST in compute.py's _TOKEN_VARS, so
+	// it wins over the JWT sitting in LUMID_PAT without disturbing anything else
+	// that reads LUMID_PAT (xpio_client, the lqt deploy path above).
+	//
+	// Gated on the app's own spec rather than a slug list — see compute_token.go
+	// for why, and for what the hardcoded list above cost when the app was
+	// renamed. A user-set LUMILAKE_TOKEN stays authoritative.
+	if _, userSet := out["LUMILAKE_TOKEN"]; !userSet && appDeclaresComputeEngine(body.UserSub, body.App) {
+		if tok := computePATCached(body.UserSub, body.App); tok != "" {
+			out["LUMILAKE_TOKEN"] = tok
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{"secrets": out},

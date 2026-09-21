@@ -82,11 +82,10 @@ var computeEngineTypes = map[string]bool{
 // appDeclaresComputeEngine reports whether any loop in this app's spec declares
 // a compute engine.
 //
-// Reads the MATERIALISED TENANT COPY rather than fetching the blob over HTTP.
-// `InternalAppSecretsFetch` runs per cycle per user, so a network round-trip
-// here is on the hot path for every cycle of every app — including the large
-// majority that declare no compute engine at all and would pay it for a
-// guaranteed "no".
+// Materialises the tenant copy and reads its spec. The materialiser is cached
+// (5 min TTL) and single-flighted per (sub, app), so the common case on this
+// hot path — `InternalAppSecretsFetch` runs per cycle per user — is a stat
+// rather than a fetch.
 //
 // A miss returns false, which fails CLOSED: the app then fails at compute.py's
 // own credential check, whose message names the cause ("no PAT-shaped
@@ -98,7 +97,22 @@ func appDeclaresComputeEngine(userSub, app string) bool {
 	if userSub == "" || app == "" {
 		return false
 	}
-	dir := tenantCacheDir(userSub, app)
+	// materialiseTenantApp, NOT tenantCacheDir. The cache is populated LAZILY;
+	// reading the directory without ever asking for it to exist is how the first
+	// version of this shipped INERT — verified against the live v0.5.404 pod,
+	// where /root/.xp/_tenant-cache does not exist at all, so the gate returned
+	// false for every app and no token was ever minted. The endpoint answered
+	// 200 the whole time, which is exactly why it took a functional check rather
+	// than a rollout status to notice.
+	//
+	// Affordable on this hot path: materialiseTenantApp is a no-op within its
+	// 5 minute TTL and single-flights per (sub, app), so the common case is a
+	// stat, not a fetch — the same reasoning ensureTenantAppsMaterialised
+	// relies on.
+	dir := materialiseTenantApp(userSub, app)
+	if dir == "" {
+		return false
+	}
 	var spec []byte
 	for _, name := range []string{".xpcloud.yaml", "xpcloud.yaml"} {
 		b, err := os.ReadFile(filepath.Join(dir, name))

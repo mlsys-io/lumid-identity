@@ -1,6 +1,10 @@
 package handler
 
-import "testing"
+import (
+	"os"
+	"strings"
+	"testing"
+)
 
 // The decision this file guards is "does this app's spec declare a compute
 // engine", and it is deliberately pure — no DB, no filesystem. A test that
@@ -97,5 +101,31 @@ loops:
 `)
 	if !specDeclaresComputeEngine(spec) {
 		t.Fatal("the decision must come from the spec, not from a slug allowlist")
+	}
+}
+
+// TestGateAsksForTheSpecRatherThanAssumingItIsThere pins the defect that
+// shipped in v0.5.404: the first version read tenantCacheDir() directly, and
+// that cache is populated LAZILY — on the live pod
+// /root/.xp/_tenant-cache did not exist at all, so the gate returned false for
+// every app and no token was ever minted. The endpoint answered 200 throughout,
+// so nothing short of a functional check could see it.
+//
+// A unit test cannot reach the materialiser (it fetches over HTTP), so this
+// asserts the property that makes the bug impossible to reintroduce silently:
+// the lookup must go through materialiseTenantApp, which CREATES the directory,
+// not through tenantCacheDir, which merely names it.
+func TestGateAsksForTheSpecRatherThanAssumingItIsThere(t *testing.T) {
+	src, err := os.ReadFile("compute_token.go")
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	s := string(src)
+	if !strings.Contains(s, "materialiseTenantApp(userSub, app)") {
+		t.Fatal("appDeclaresComputeEngine must materialise the tenant copy; " +
+			"reading tenantCacheDir alone ships an inert gate (v0.5.404)")
+	}
+	if strings.Contains(s, "dir := tenantCacheDir(") {
+		t.Fatal("tenantCacheDir only NAMES the dir — it does not populate it")
 	}
 }

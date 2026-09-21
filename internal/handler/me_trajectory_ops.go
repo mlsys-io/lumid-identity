@@ -282,6 +282,38 @@ func MeLoopEnqueue(c *gin.Context) {
 		return
 	}
 
+	// A dispatch the app says needs a SUBJECT must not be queued without one.
+	//
+	// THE GUARD BELONGS HERE, not only in the callers. `dispatch.ask` means the
+	// run needs something the dispatcher cannot know — which strategy, which
+	// case — and without it some loops run, fail, and record a row that
+	// measures nothing. A failed row is worse than a refusal: it reads as
+	// evidence the arm was tried.
+	//
+	// It was enforced in the panel (ArmsBlock hands the dispatch to the chat
+	// rail instead of firing) and then in the chat tool. Both are CLIENTS. This
+	// endpoint is what they call, and it accepted a subject-less dispatch from
+	// anyone calling it directly — demonstrated 2026-09-21 against
+	// quant-research/backtest_evidence, whose own declaration reads "Which
+	// strategy should this arm backtest? Dispatch with args.strategy_id". Two
+	// client-side guards in front of an open server is the same bug the first
+	// fix was for, one layer down.
+	//
+	// `cases` counts as a subject as well as `args`: that is what a case-scoped
+	// loop varies over, and demanding `args` specifically would refuse a
+	// perfectly-specified casebook dispatch. An experiment declaring no `ask`
+	// is untouched, so one-click arms stay one click.
+	if body.ExperimentID != "" && len(body.Args) == 0 && len(body.Cases) == 0 {
+		if dir := resolveAppDir(userSub, app); dir != "" {
+			if ask := experimentDispatchAsk(dir, body.ExperimentID); ask != "" {
+				fail(c, http.StatusBadRequest, 1400,
+					"this arm needs a subject before it can run — "+ask+
+						" Supply it as `args` (the loop's own invocation args) or `cases`.")
+				return
+			}
+		}
+	}
+
 	payload := map[string]any{
 		"app":      app,
 		"loop":     loop,

@@ -22,8 +22,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const gemma4Model = "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL"
-const gemma4Endpoint = "https://kv.run:5000/v1/messages"
+// The page-gen LLM. The old kv.run:5000 gateway is dead (retired at the
+// LLM cutover); the in-cluster lumid-llm gateway (lumidLLMBase, default
+// http://lumid-llm:8088) speaks the same Anthropic /v1/messages API. Model
+// default follows the gateway's own default (deepseek-v4-flash); the retired
+// Gemma-4 id is kept as a fallback only if explicitly set via LUMID_UI_GEN_MODEL.
+const gemma4Model = "deepseek-v4-flash"
 
 const generateUISysPrompt = `You are generating a Lumid markdown UI surface file (ui/home.md) for an xpio app.
 
@@ -372,22 +376,24 @@ func callGemmaBlocking(ctx context.Context, userMsg, systemPrompt string) (strin
 		"messages":   []map[string]any{{"role": "user", "content": userMsg}},
 	})
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gemma4Endpoint, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, lumidLLMBase()+"/v1/messages", bytes.NewReader(reqBody))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", pat)
+	// The lumid-llm gateway authenticates with Authorization: Bearer (the same
+	// as the chat path in me_agent.go); x-api-key was the old kv.run convention.
+	req.Header.Set("Authorization", "Bearer "+pat)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("kv.run unreachable: %w", err)
+		return "", fmt.Errorf("llm gateway unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("kv.run %d: %s", resp.StatusCode, truncateStr(string(body), 200))
+		return "", fmt.Errorf("llm gateway %d: %s", resp.StatusCode, truncateStr(string(body), 200))
 	}
 
 	var msg struct {

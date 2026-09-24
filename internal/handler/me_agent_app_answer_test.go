@@ -107,3 +107,44 @@ func TestForcedToolPathExcludesAppAnswer(t *testing.T) {
 		t.Fatal("app_feedback should be forceable — it is only ever sent by an explicit button")
 	}
 }
+
+// Bug: the Data Warehouse / Compute Fleet / Apps-list docked chats have no
+// app in context, but "Ask the app" is a sticky toggle ON by default, so it
+// forced tool_choice=app_answer on every turn. runForcedAppTool used to check
+// body.Context["app"] BEFORE dispatching on `tool`, so it returned the
+// "no app in context" error for app_answer too — even though app_answer is
+// deliberately excluded from the switch below and is supposed to fall
+// through untouched to a normal model turn. Every general data-mesh question
+// asked from those surfaces rendered a dead `app_answer` error tool card
+// instead of an answer.
+func TestForcedAppAnswerWithNoAppFallsThroughToModel(t *testing.T) {
+	body := meAgentChatBody{
+		Messages: []chatMessage{{Role: "user", Content: "what is the difference between FinData, LumidData, and LQT Data?"}},
+		Context:  map[string]any{"page": "data"}, // no "app" key — Data Warehouse surface
+	}
+	res, handled := runForcedAppTool(nil, "u1", "member", "app_answer", body)
+	if handled {
+		t.Fatalf("app_answer must fall through to a normal model turn when unhandled, got handled=true res=%v", res)
+	}
+	if res != nil {
+		t.Fatalf("expected nil result on fallthrough, got %v", res)
+	}
+}
+
+// Same surfaces also have no REAL app for app_feedback to ground on — that
+// path legitimately needs one and should still degrade to the explicit
+// error card (a correction with nothing to correct against), not silently
+// drop the user's note.
+func TestForcedAppFeedbackWithNoAppStillErrors(t *testing.T) {
+	body := meAgentChatBody{
+		Messages: []chatMessage{{Role: "user", Content: "Record a correction against this app: it's wrong"}},
+		Context:  map[string]any{"page": "data"},
+	}
+	res, handled := runForcedAppTool(nil, "u1", "member", "app_feedback", body)
+	if !handled {
+		t.Fatal("app_feedback with no app should still be handled (with an error), not silently fall through")
+	}
+	if errMsg, _ := res["error"].(string); errMsg == "" {
+		t.Fatalf("expected an error result for app_feedback with no app, got %v", res)
+	}
+}

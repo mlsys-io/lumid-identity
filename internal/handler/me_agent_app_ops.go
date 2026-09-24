@@ -1031,7 +1031,8 @@ func groundedActionsHint(userID, app string) string {
 }
 
 // appVerbsHint inlines the grounded app's user-invokable loop descriptions
-// (`schedule: @trigger`) into the system prompt. Those descriptions are the
+// (`schedule: @trigger`, plus scheduled loops that document `Args:`) into the
+// system prompt. Those descriptions are the
 // app author's own "how to call me" docs — quant-research's `send_strategy`
 // carries the full `.lqts` grammar, a compiled worked example, the three
 // exact parse errors students hit, and the explicit "do NOT go hunting the
@@ -1067,24 +1068,44 @@ func appVerbsHint(userID, app string) string {
 	const maxVerbs = 12 << 10
 	var b strings.Builder
 	used := 0
-	for _, L := range loops {
-		if strings.TrimSpace(L.Schedule) != "@trigger" {
-			continue
+	// Two passes: @trigger loops first (their grammar must survive the cap),
+	// then scheduled loops whose description documents an `Args:` contract.
+	// A cron schedule does not make a loop chat-uninvokable — quant-research's
+	// `backtest` runs on `5 */2 * * *` AND is what "backtest strategy X on
+	// symbol Y" means. Filtering it out left the model holding run_loop_now
+	// with no grammar for its args; measured 2026-09-22 it wandered for 5+
+	// minutes through nonexistent seed files and a 404 instead of submitting.
+	// This is the send_strategy failure of 2026-08-29, generalised.
+	full := false
+	for pass := 0; pass < 2 && !full; pass++ {
+		for _, L := range loops {
+			trigger := strings.TrimSpace(L.Schedule) == "@trigger"
+			desc := strings.TrimSpace(L.Description)
+			if desc == "" || L.Name == "" {
+				continue
+			}
+			if pass == 0 && !trigger {
+				continue
+			}
+			if pass == 1 && (trigger || !strings.Contains(desc, "Args:")) {
+				continue
+			}
+			if used == 0 {
+				fmt.Fprintf(&b, "\n--- %s: how to call this app's workflows (author payloads from THIS, not from the filesystem) ---\n", app)
+			}
+			heading := L.Name
+			if !trigger {
+				heading += " (also runs on a schedule; invoke on demand with run_loop_now and the Args below)"
+			}
+			block := fmt.Sprintf("\n## %s\n%s\n", heading, desc)
+			if used+len(block) > maxVerbs {
+				// Stop cleanly at a loop boundary rather than truncate mid-grammar.
+				full = true
+				break
+			}
+			b.WriteString(block)
+			used += len(block)
 		}
-		desc := strings.TrimSpace(L.Description)
-		if desc == "" || L.Name == "" {
-			continue
-		}
-		if used == 0 {
-			fmt.Fprintf(&b, "\n--- %s: how to call this app's workflows (author payloads from THIS, not from the filesystem) ---\n", app)
-		}
-		block := fmt.Sprintf("\n## %s\n%s\n", L.Name, desc)
-		if used+len(block) > maxVerbs {
-			// Stop cleanly at a loop boundary rather than truncate mid-grammar.
-			break
-		}
-		b.WriteString(block)
-		used += len(block)
 	}
 	if used == 0 {
 		return ""

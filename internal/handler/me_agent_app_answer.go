@@ -695,29 +695,19 @@ func firstMemoryAgent(spec []byte) string {
 // message. It cannot reach anything else, so "force a tool" can never become
 // "call an arbitrary handler with attacker-chosen args".
 func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentChatBody) (map[string]any, bool) {
-	app := ""
-	if body.Context != nil {
-		app, _ = body.Context["app"].(string)
-	}
-	if app == "" {
-		// Falling through here produced an EMPTY turn: the caller asked for a
-		// specific tool, the tool could not be grounded, and the model — handed a
-		// forced choice it could not satisfy — returned nothing at all. The user
-		// saw a button that did nothing. Say what went wrong instead.
-		return map[string]any{
-			"error": "no app in context — a correction has to say which app it is about",
-		}, true
-	}
-	last := ""
-	for i := len(body.Messages) - 1; i >= 0; i-- {
-		if body.Messages[i].Role == "user" {
-			last = strings.TrimSpace(body.Messages[i].Content)
-			break
-		}
-	}
-	if last == "" {
-		return nil, false
-	}
+	// The app lookup and its "no app" error used to sit ABOVE this switch and
+	// fired for any forced tool, including app_answer — which is deliberately
+	// NOT a case below. That meant a surface with no app in context (the Data
+	// Warehouse / Compute Fleet / Apps-list docked chats, whose sticky "Ask the
+	// app" toggle is ON by default) forced tool_choice=app_answer, hit this
+	// function, found body.Context["app"] empty, and returned the
+	// "no app in context — a correction has to say which app it is about"
+	// error as a dead tool-call card on every general question — even though
+	// the comment right below already says app_answer must fall through to a
+	// normal model turn. Gating on `tool` FIRST means an app tool this
+	// function does not actually execute (app_answer, or anything future and
+	// unlisted) always falls through to `return nil, false` and gets a normal
+	// model turn, regardless of whether an app happens to be in context.
 	switch tool {
 	// app_answer is deliberately NOT here. "Ask the app" is a sticky toggle that
 	// is ON by default, so forcing it server-side hijacked EVERY docked turn into
@@ -726,6 +716,29 @@ func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentCha
 	// reverted 20 minutes later). Only a tool sent by an explicit, per-turn user
 	// action belongs on this path.
 	case "app_feedback":
+		app := ""
+		if body.Context != nil {
+			app, _ = body.Context["app"].(string)
+		}
+		if app == "" {
+			// Falling through here produced an EMPTY turn: the caller asked for a
+			// specific tool, the tool could not be grounded, and the model — handed a
+			// forced choice it could not satisfy — returned nothing at all. The user
+			// saw a button that did nothing. Say what went wrong instead.
+			return map[string]any{
+				"error": "no app in context — a correction has to say which app it is about",
+			}, true
+		}
+		last := ""
+		for i := len(body.Messages) - 1; i >= 0; i-- {
+			if body.Messages[i].Role == "user" {
+				last = strings.TrimSpace(body.Messages[i].Content)
+				break
+			}
+		}
+		if last == "" {
+			return nil, false
+		}
 		// The composer prefixes the correction; the note is what follows.
 		note := last
 		if i := strings.Index(note, ":"); i > 0 && i < 60 {
@@ -738,7 +751,7 @@ func runForcedAppTool(c *gin.Context, userID, role, tool string, body meAgentCha
 		res, _ := toolAppFeedback(userID, app, note, -1, feedbackContext{})
 		return res, true
 	}
-	return nil, false // any other tool stays the model's business
+	return nil, false // any other tool (including app_answer) stays the model's business
 }
 
 // caseContextAtQuestion is the interviewer's view for ONE question.

@@ -131,3 +131,22 @@ func TestStrategyCyclesRequiresAnID(t *testing.T) {
 		t.Errorf("expected refusal for a traversal id, got %v", out)
 	}
 }
+
+// The prune once compared tokens.scopes against a JSON array while mint stored
+// the space-joined form, so it matched nothing and expired auto-PATs piled up
+// (443 on one account). Both now go through patScopesColumn; pin the stored
+// form so a change to one side cannot silently re-open the gap.
+func TestIntentPATScopeColumnMatchesWhatMintStores(t *testing.T) {
+	for _, scope := range []string{lqtStrategyScope, computeScope} {
+		got := patScopesColumn([]string{scope})
+		if got != scope {
+			t.Fatalf("patScopesColumn(%q) = %q; mint stores the bare scope for a single-scope PAT", scope, got)
+		}
+		if strings.HasPrefix(got, "[") {
+			t.Fatalf("scope column %q looks like JSON; mint stores space-joined scopes", got)
+		}
+	}
+	if got := patScopesColumn([]string{"a", "b"}); got != "a b" {
+		t.Fatalf("multi-scope column = %q, want space-joined", got)
+	}
+}

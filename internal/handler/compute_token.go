@@ -58,6 +58,9 @@ const (
 	// nothing here should be able to administer the fleet.
 	computeScope = "lumilake:jobs:write"
 
+	// The display name of every auto-minted compute PAT; prune and revoke match on it.
+	computePATName = "lumilake-compute (intent, auto)"
+
 	// Cached under the app the token is for, so a user running two
 	// compute-bearing apps does not have one app's cache answer for the other.
 	computePATCacheKey = "__lumilake_compute_pat_cache"
@@ -159,10 +162,13 @@ type rawComputeLoop struct {
 // mintComputePAT returns a fresh scoped PAT for userSub, or "" if minting
 // fails. Best-effort BY DESIGN: a miss must not block the run.
 func mintComputePAT(userSub string) string {
+	// Same accretion as the deploy PAT: without this, every renewal left one
+	// expired row behind for good.
+	pruneExpiredIntentPATs(userSub, computePATName, computeScope)
 	exp := time.Now().Add(computePATTTL)
 	tok, _, err := mintPATForUser(
 		userSub,
-		"lumilake-compute (intent, auto)",
+		computePATName,
 		[]string{computeScope},
 		&exp,
 		"intent",

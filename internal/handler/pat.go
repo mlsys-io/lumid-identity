@@ -286,6 +286,15 @@ func PATMintHandler(c *gin.Context) {
 // by PATMintHandler (user-facing, validated + canGrant-gated + rate-limited)
 // and claudeSandboxPAT (internal auto-mint, source="claude_sandbox").
 // Returns the cleartext (surfaced exactly once) and the stored row.
+// patScopesColumn is how a PAT's scopes are stored in tokens.scopes: space-
+// joined. Anything that matches rows by scope must build the value here, not
+// by hand — the auto-PAT prune once compared against a JSON array
+// ('["lqt:strategy"]') while mint stored "lqt:strategy", so it never matched and
+// 443 expired rows accumulated on one account (measured 2026-09-26).
+func patScopesColumn(scopes []string) string {
+	return strings.Join(scopes, " ")
+}
+
 func mintPATForUser(userID, name string, scopes []string, expiresAt *time.Time, source string) (string, *models.Token, error) {
 	// 32 bytes of entropy → 64 hex chars, prefixed lm_pat_live_.
 	raw, err := randHex(32)
@@ -305,7 +314,7 @@ func mintPATForUser(userID, name string, scopes []string, expiresAt *time.Time, 
 		Hash:      argonHash,
 		HashAlg:   "argon2id",
 		Name:      name,
-		Scopes:    strings.Join(scopes, " "),
+		Scopes:    patScopesColumn(scopes),
 		ExpiresAt: expiresAt,
 		Source:    source,
 	}
@@ -398,6 +407,10 @@ func PATRevokeHandler(c *gin.Context) {
 	// The revoked row may be this user's cached claude-sandbox PAT — drop
 	// the cache entry so new turns re-mint instead of shipping a dead token.
 	invalidateSandboxPATCache(userID)
+	// Likewise the intent-minted deploy/compute PATs: their caches would keep
+	// serving the revoked token until it neared expiry (up to ~1h40m), and
+	// every deploy or compute run in that window would fail auth.
+	invalidateIntentPATCaches(userID, existing.Name)
 	ok_(c, "revoked", nil)
 }
 

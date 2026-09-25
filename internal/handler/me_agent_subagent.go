@@ -59,6 +59,7 @@ var subAgentDefaultTools = map[string]bool{
 	"workflow_detail":      true,
 	"list_runs":            true,
 	"run_detail":           true,
+	"run_result":           true,
 	"workflow_report_card": true,
 	"today_summary":        true,
 	"search_marketplace":   true,

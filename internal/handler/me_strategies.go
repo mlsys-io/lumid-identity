@@ -58,6 +58,17 @@ const (
 	// The reader clamps this server-side too, so a wrong value here cannot widen
 	// the read.
 	rejectionRowCap = 20
+
+	// The rejections read gets its OWN deadline, far below the list's. It joins
+	// the mailbox tables on unindexed JSON expressions (lqt_outbox is 4.8M rows /
+	// 5.8GB; processed has no index on verified_tenant_id), so it ran into
+	// strategiesOpTimeout on every call measured 2026-09-25: the Strategies tab
+	// — every researcher's landing page in Quant Research — took 15.2s, and the
+	// "Rejected submissions" panel then read empty because the read had been
+	// cut off. The list itself answers in ~40ms. Bounding the additive read
+	// returns the list promptly and reports the rejections as unavailable
+	// (`rejected_unavailable`), which the surface now renders as such.
+	rejectionsOpTimeout = 3 * time.Second
 )
 
 func strategiesDSN() string { return strings.TrimSpace(os.Getenv("LQT_CORE_DSN")) }
@@ -224,7 +235,9 @@ func MeStrategies(c *gin.Context) {
 	//
 	// Best-effort: a failure here must not take down the strategy list, which is
 	// the primary answer. Rejections are additive context.
-	if rej, rejErr := recentRejections(ctx, conn, tenant); rejErr != "" {
+	rejCtx, rejCancel := context.WithTimeout(ctx, rejectionsOpTimeout)
+	defer rejCancel()
+	if rej, rejErr := recentRejections(rejCtx, conn, tenant); rejErr != "" {
 		// Report, do not swallow. An empty list and a failed query are the same
 		// value to a reader, and that ambiguity cost real time: the surfacing
 		// this block exists for was itself debugged blind because a failure here

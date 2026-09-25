@@ -56,7 +56,12 @@ type onpremStatsPayload struct {
 }
 
 type onpremBackendStats struct {
-	Label   string   `json:"label"`
+	Label string `json:"label"`
+	// Model is the pool model id (lumid-llm >= llm-df8cc54). This struct is a
+	// typed decode, not a byte passthrough: a field missing here is silently
+	// DROPPED, which is how the gateway's new `model` reached identity and
+	// never reached /code. Empty on older gateways.
+	Model   string   `json:"model,omitempty"`
 	URL     string   `json:"url"`
 	Tier    uint32   `json:"tier"`
 	Healthy bool     `json:"healthy"`

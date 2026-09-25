@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"encoding/json"
 	"fmt"
 	"gorm.io/gorm/clause"
 	"log"
@@ -51,6 +50,9 @@ const (
 	lqtStrategyPATTTL = 2 * time.Hour
 
 	lqtStrategyScope = "lqt:strategy"
+
+	// The display name of every auto-minted deploy PAT; prune and revoke match on it.
+	lqtStrategyPATName = "lqt-strategy (intent, auto)"
 
 	// The app_secrets slug the minted deploy PAT is CACHED under. Deliberately
 	// the legacy name: it is a cache key, not a display name, and one row per
@@ -105,11 +107,11 @@ func lqtIntentNeedsStrategyPAT(action string, payload map[string]any) bool {
 // app then fails at its own credential check with a message naming the cause,
 // which is strictly better than this layer swallowing the intent.
 func mintLQTStrategyPAT(userSub string) string {
-	pruneExpiredLQTStrategyPATs(userSub)
+	pruneExpiredIntentPATs(userSub, lqtStrategyPATName, lqtStrategyScope)
 	exp := time.Now().Add(lqtStrategyPATTTL)
 	tok, _, err := mintPATForUser(
 		userSub,
-		"lqt-strategy (intent, auto)",
+		lqtStrategyPATName,
 		[]string{lqtStrategyScope},
 		&exp,
 		"intent",
@@ -225,18 +227,34 @@ func attachLQTStrategyPAT(action, userSub string, p map[string]any) {
 	}
 }
 
-// pruneExpiredLQTStrategyPATs deletes this user's already-expired auto-minted
-// deploy PATs. Called opportunistically on mint so the table does not accrete
-// one dead row per deploy forever. Only ever touches rows this code created
-// (name + source + scope all match) and only ones already past expiry, so it
-// can never revoke a credential anyone is using.
-func pruneExpiredLQTStrategyPATs(userSub string) {
-	scopesJSON, err := json.Marshal([]string{lqtStrategyScope})
-	if err != nil {
-		return
-	}
-	_ = common.DB.
+// pruneExpiredIntentPATs deletes this user's already-expired auto-minted PATs
+// of one kind (name + scope). Called opportunistically on mint so the table
+// does not accrete one dead row per mint forever. Only ever touches rows this
+// code created (name + source + scope all match) and only ones already past
+// expiry, so it can never revoke a credential anyone is using.
+//
+// The scope is compared through patScopesColumn — the same serialisation mint
+// uses. The first version compared a JSON array and deleted nothing, ever.
+func pruneExpiredIntentPATs(userSub, name, scope string) {
+	res := common.DB.
 		Where("user_id = ? AND name = ? AND source = ? AND scopes = ? AND expires_at IS NOT NULL AND expires_at < ?",
-			userSub, "lqt-strategy (intent, auto)", "intent", string(scopesJSON), time.Now()).
-		Delete(&models.Token{}).Error
+			userSub, name, "intent", patScopesColumn([]string{scope}), time.Now()).
+		Delete(&models.Token{})
+	if res.Error != nil {
+		log.Printf("[intent-pat] prune failed for %s (%s): %v", userSub, name, res.Error)
+	} else if res.RowsAffected > 0 {
+		log.Printf("[intent-pat] pruned %d expired %q for %s", res.RowsAffected, name, userSub)
+	}
+}
+
+// invalidateIntentPATCaches drops the cached copy of an intent-minted PAT when
+// the user revokes one, so the next cycle mints instead of serving the dead
+// token. Only acts for the auto-minted names; a user's own PATs have no cache.
+func invalidateIntentPATCaches(userSub, name string) {
+	switch name {
+	case lqtStrategyPATName:
+		common.DB.Where("user_sub = ? AND `key` = ?", userSub, lqtStrategyPATCacheKey).Delete(&models.AppSecret{})
+	case computePATName:
+		common.DB.Where("user_sub = ? AND `key` = ?", userSub, computePATCacheKey).Delete(&models.AppSecret{})
+	}
 }

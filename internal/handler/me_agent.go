@@ -2623,7 +2623,7 @@ var simpleModeTools = map[string]bool{
 	"spawn_agent": true, "spawn_agents": true,
 	// the user's own apps + workflows (read + run, not authoring)
 	"list_workflows": true, "workflow_detail": true, "loops_health": true,
-	"list_runs": true, "run_detail": true, "run_loop_now": true, "pause_workflow": true,
+	"list_runs": true, "run_detail": true, "run_loop_now": true, "run_result": true, "pause_workflow": true,
 	"dispatch_experiment_arm": true, "list_experiments": true, "define_experiment": true,
 	"add_experiment_arm": true,
 	// Simple mode is the DEFAULT surface. Without these it could define an
@@ -3028,6 +3028,17 @@ func buildToolDefs() []map[string]any {
 					},
 				},
 				"required": []string{"app", "loop"},
+			},
+		},
+		{
+			"name":        "run_result",
+			"description": "Read the outcome of a run you started with run_loop_now, by the job_id it returned. run_loop_now only QUEUES the run and returns immediately; this is how you learn what it did. Returns status \"pending\" until the cycle finishes, then ok/error plus the command's own output (e.g. quant-research backtest submit → claim_id, symbol, outcome). Poll this, do not hunt for the run in cycle_detail / run_detail / list_runs — those index scheduled cycles and often cannot see a one-shot run. If still pending after a few checks, tell the user it is queued and give them the job_id.",
+			"input_schema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"job_id": map[string]any{"type": "string", "description": "The job_id run_loop_now returned."},
+				},
+				"required": []string{"job_id"},
 			},
 		},
 		{
@@ -4833,7 +4844,12 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if err != nil {
 			return map[string]any{"error": err.Error()}, false
 		}
-		return map[string]any{"job_id": jobID, "state": "queued"}, true
+		return map[string]any{"job_id": jobID, "state": "queued",
+			"next": "call run_result with this job_id to read the outcome; the run is not finished yet"}, true
+
+	case "run_result":
+		jobID, _ := args["job_id"].(string)
+		return toolRunResult(userID, jobID)
 
 	case "stop_loop":
 		app, _ := args["app"].(string)

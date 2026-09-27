@@ -127,6 +127,19 @@ var destructiveTools = map[string]bool{
 	// Operator control-plane: remediation mutates live stack state (super_admin
 	// only). operator_healthcheck is read-only and intentionally NOT gated.
 	"operator_remediate": true,
+	// Experiment DEFINITION and LIFECYCLE writes. Measured 2026-09-27: asked to
+	// "run the arm called panel_of_seven" (an arm that did not exist), a chat
+	// turn invented a seven-judge configuration, added it to the owner's live
+	// judge_panel_parity experiment via add_experiment_arm, and queued five
+	// paid scoring runs on it — no approval anywhere, because none of these
+	// was gated. Changing what an experiment IS (define, add an arm, remove /
+	// fork / conclude / delete / revert) now needs the user's yes. Running an
+	// arm that is ALREADY declared (dispatch_experiment_arm) stays ungated, for
+	// the same reason run_loop does: it is the ordinary action, not a mutation
+	// of the experiment.
+	"define_experiment":  true,
+	"add_experiment_arm": true,
+	"experiment_control": true,
 }
 
 // lumidosToolNames is the set of tool names dispatched to the LumidOS schedule

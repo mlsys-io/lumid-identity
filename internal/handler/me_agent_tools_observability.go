@@ -328,9 +328,9 @@ func toolAppConfigGet(userID, app string) (map[string]any, bool) {
 	if appDir == "" {
 		return map[string]any{"error": "app not found: " + app}, false
 	}
-	specPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(specPath)
-	if err != nil {
+	// Same view as MeAppConfig: an applied queued save wins over the bundle.
+	b := readAppSpecBytes(userID, app, appDir)
+	if len(b) == 0 {
 		return map[string]any{"error": "xpcloud.yaml not found"}, false
 	}
 	if len(b) > configMaxBytes {
@@ -355,8 +355,19 @@ func toolAppConfigSet(userID string, args map[string]any) (map[string]any, bool)
 	if err := yaml.Unmarshal([]byte(yamlText), &check); err != nil {
 		return map[string]any{"error": "invalid YAML: " + err.Error()}, false
 	}
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
+	// Ownership, as MeUpdateAppConfig. This used resolveAppDir — the READ
+	// resolver — so it would write into the operator-shared bundle every tenant
+	// reads, or into the materialised published-bundle cache, a pod-local copy
+	// nothing reads, and report "saved". The caller's own install is on the
+	// scheduler's disk on UKS, so the save is queued for the scheduler there.
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		return queuedToolResult(userID, app, appFileSpecRel, "write", yamlText, baseSHA, nil)
+	}
+	if !direct {
+		if shared {
+			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
+		}
 		return map[string]any{"error": "app not found: " + app}, false
 	}
 	curPath, _ := ResolveSpecPath(appDir)

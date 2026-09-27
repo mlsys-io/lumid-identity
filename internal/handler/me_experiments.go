@@ -384,6 +384,7 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 		}
 		markStaleState(row, &d, st)
 		markUnfed(row, &d, loops[d.ID])
+		markStarved(row, userSub, app, loops[d.ID])
 		out = append(out, row)
 	}
 	return out
@@ -406,6 +407,78 @@ func markUnfed(row gin.H, d *expDecl, feeding []string) {
 	// carries the metric" (TestNeverRunCarriesNoReason), a different fact.
 	row["unfed"] = true
 	row["unfed_reason"] = "no loop feeds this experiment: declare dispatch.loop, or list it under a loop's engine.experiment"
+}
+
+// starvedRunWindow is how many of a feeding loop's newest runs markStarved reads.
+const starvedRunWindow = 5
+
+// markStarved explains a zero-row experiment that a loop DOES feed, but whose
+// feeding loops either never ran or failed every recent run. markUnfed covers
+// "nothing can feed this"; this covers "something should, and here is why it
+// has not". Measured 2026-09-28: mbb-issue-tree's regression_sweep fired daily
+// for 7 days, failed every time with "no inbox cases match. Run seed_inbox
+// first.", and its experiment card said only "0 results".
+func markStarved(row gin.H, userSub, app string, feeding []string) {
+	if len(feeding) == 0 || userSub == "" || app == "" || common.DB == nil {
+		return
+	}
+	if n, _ := row["n_results"].(int); n != 0 {
+		return
+	}
+	var runs []models.MeAppRun
+	if err := common.DB.Select("`loop`", "run_ts", "ok", "metrics").
+		Where("user_sub = ? AND app = ? AND `loop` IN ?", userSub, app, feeding).
+		Order("run_ts DESC").Limit(starvedRunWindow).Find(&runs).Error; err != nil {
+		return
+	}
+	if starved, reason := starvedReason(runs, feeding); starved {
+		row["starved"] = true
+		row["starved_reason"] = reason
+	}
+}
+
+// starvedReason is markStarved's decision, split out so it is testable
+// without a database. (false, "") means "nothing to explain": a run succeeded,
+// so the zero is the metric's business, not the loop's.
+func starvedReason(runs []models.MeAppRun, feeding []string) (bool, string) {
+	if len(runs) == 0 {
+		return true, "no run of " + strings.Join(feeding, ", ") + " has been recorded yet"
+	}
+	for _, r := range runs {
+		if r.Ok {
+			return false, ""
+		}
+	}
+	last := runs[0]
+	msg := runErrorText(last.Metrics)
+	reason := fmt.Sprintf("%s failed its last %d run(s)", last.Loop, len(runs))
+	if msg != "" {
+		reason += ": " + msg
+	}
+	return true, reason
+}
+
+// runErrorText pulls the error a cycle reported about itself, from the shapes
+// the runtime writes (top-level `error`, or the command engine's).
+func runErrorText(metrics string) string {
+	var m map[string]any
+	if json.Unmarshal([]byte(metrics), &m) != nil {
+		return ""
+	}
+	pick := func(v any) string {
+		s, _ := v.(string)
+		s = strings.TrimSpace(s)
+		if len(s) > 200 {
+			s = s[:200] + "…"
+		}
+		return s
+	}
+	if ce, ok := m["command_engine"].(map[string]any); ok {
+		if s := pick(ce["error"]); s != "" {
+			return s
+		}
+	}
+	return pick(m["error"])
 }
 
 // specMetricName is the metric the spec declares now, or "".
@@ -709,6 +782,7 @@ func MeAppExperiments(c *gin.Context) {
 						row[k] = v
 					}
 				}
+				markStarved(row, userID, app, loops[d.ID])
 				exps = append(exps, row)
 			}
 			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps)})

@@ -477,6 +477,20 @@ func runErrorText(metrics string) string {
 		if s := pick(ce["error"]); s != "" {
 			return s
 		}
+		// Command apps often report failure as flags, not an error string —
+		// auto-sysresearch's benchmark says "bench_failed: docker build
+		// failed …" there on all 566 of its runs.
+		if flags, ok := ce["flags"].([]any); ok && len(flags) > 0 {
+			parts := make([]string, 0, len(flags))
+			for _, f := range flags {
+				if fs, ok := f.(string); ok && fs != "" {
+					parts = append(parts, fs)
+				}
+			}
+			if s := pick(strings.Join(parts, "; ")); s != "" {
+				return s
+			}
+		}
 	}
 	return pick(m["error"])
 }

@@ -26,6 +26,11 @@ func TestStarvedReason(t *testing.T) {
 	if _, r := starvedReason([]models.MeAppRun{top}, []string{"l"}); !strings.HasSuffix(r, ": boom") {
 		t.Fatalf("top-level error: %q", r)
 	}
+	flagged := models.MeAppRun{Loop: "benchmark", Ok: false,
+		Metrics: `{"command_engine":{"flags":["bench_failed: docker build failed"],"ok":false}}`}
+	if _, r := starvedReason([]models.MeAppRun{flagged}, []string{"benchmark"}); !strings.HasSuffix(r, ": bench_failed: docker build failed") {
+		t.Fatalf("flags as the reason: %q", r)
+	}
 	long := models.MeAppRun{Loop: "l", Ok: false, Metrics: `{"error":"` + strings.Repeat("x", 500) + `"}`}
 	if _, r := starvedReason([]models.MeAppRun{long}, []string{"l"}); len(r) > 260 {
 		t.Fatalf("error text not capped: %d", len(r))

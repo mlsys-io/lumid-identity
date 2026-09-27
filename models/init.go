@@ -48,6 +48,7 @@ var AllTables = []interface{}{
 	&ClaudeFieldPresenting{},
 	&MeChat{},
 	&MeDraft{},
+	&MePersona{},
 	&ClaudePool{},
 	&ClaudePoolMember{},
 }

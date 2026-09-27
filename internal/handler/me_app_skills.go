@@ -26,8 +26,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -99,11 +97,13 @@ func MeAppAddSkill(c *gin.Context) {
 	// Target must be a TENANT-owned install — operator-shared bundles are
 	// read-only to users (different UID; and editing a shared app would
 	// change it for everyone).
-	appDir := filepath.Join(tenantAppsDir(userID), app)
-	if st, err := os.Stat(appDir); err != nil || !st.IsDir() {
-		// Distinguish "shared, not yours" from "not installed at all" for a
-		// clearer message.
-		if shared := resolveAppDir(userID, app); shared != "" {
+	//
+	// This stat()ed <tenant>/.xp/apps/<app>, which never exists on a cloud
+	// pod — identity mounts no tenant volume; the scheduler can see the disk —
+	// so every cloud user got 403 for their own install. ownerWriteTarget
+	// knows both cases; the intent below is what runs either way.
+	if _, direct, viaIntent, shared := ownerWriteTarget(userID, app); !direct && !viaIntent {
+		if shared {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return
 		}

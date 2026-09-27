@@ -20,10 +20,12 @@ package handler
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -177,39 +179,52 @@ func MeMindEvaluate(c *gin.Context) {
 		return
 	}
 
-	queuePath := filepath.Join(operatorHome(), ".xp", "apps", "skill-roster", "data", "eval-queue.jsonl")
-	if err := os.MkdirAll(filepath.Dir(queuePath), 0o775); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "queue dir: "+err.Error())
-		return
-	}
-
-	entry := map[string]any{
-		"skill":        body.SkillName,
-		"for_app":      body.ForApp,
-		"requested_by": userID,
-		"requested_at": time.Now().UTC().Format(time.RFC3339),
-		"status":       "queued",
-	}
-	row, _ := json.Marshal(entry)
-	f, err := os.OpenFile(queuePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	id, err := queueSkillEval(userID, body.SkillName, body.ForApp)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "open queue: "+err.Error())
+		if errors.Is(err, errSkillEvalArgs) {
+			fail(c, http.StatusBadRequest, 1400, err.Error())
+			return
+		}
+		fail(c, http.StatusInternalServerError, 1500, "queue intent: "+err.Error())
 		return
 	}
-	defer f.Close()
-	if _, err := f.Write(append(row, '\n')); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write queue: "+err.Error())
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{
-			"queued":  true,
-			"skill":   body.SkillName,
-			"for_app": body.ForApp,
-			"note":    "skill-roster picks up the queue within 60s; attestation lands on xpcloud once scoring completes.",
-		},
+	respondQueued(c, id, gin.H{
+		"skill":   body.SkillName,
+		"for_app": body.ForApp,
+		"note":    "queued for the scheduler, which hands it to skill-roster; attestation lands on xpcloud once scoring completes.",
 	})
+}
+
+// ── the eval request, crossing the node boundary ──
+//
+// This appended to <operator home>/.xp/apps/skill-roster/data/eval-queue.jsonl
+// with key `for_app`. identity mounts no operator home; the scheduler can see
+// the disk — and even there it was the wrong file and the wrong key: the
+// evaluator (skill-roster commands/evaluate.py) pops data/eval_queue.jsonl and
+// reads `app`. No request ever arrived. The `enqueue_eval` intent writes the
+// row the evaluator reads: {skill, app, requested_by, requested_at}.
+
+var (
+	skillEvalSkillRe = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,128}$`)
+	// The picker's _SLUG_RE.
+	skillEvalAppRe   = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$`)
+	errSkillEvalArgs = errors.New("invalid skill_name or for_app")
+)
+
+// skillEvalArgsOK mirrors the picker's check, so a bad name is a 400 now
+// rather than a failed intent later.
+func skillEvalArgsOK(skill, app string) bool {
+	return skillEvalSkillRe.MatchString(skill) && !strings.Contains(skill, "..") &&
+		skillEvalAppRe.MatchString(app)
+}
+
+// queueSkillEval enqueues one enqueue_eval intent. No tenant ownership: the
+// queue belongs to the operator's skill-roster, and the row records who asked.
+func queueSkillEval(userID, skill, app string) (string, error) {
+	if !skillEvalArgsOK(skill, app) {
+		return "", errSkillEvalArgs
+	}
+	return insertIntent("enqueue_eval", userID, map[string]any{"skill": skill, "app": app})
 }
 
 // LoopStats — what we summarise per workflow over a time window.

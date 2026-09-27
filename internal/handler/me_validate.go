@@ -14,6 +14,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -59,15 +60,27 @@ func MeValidateWorkflow(c *gin.Context) {
 		return
 	}
 
+	var checks []validateCheck
 	dir := filepath.Join(tenantAppsDir(userID), slug)
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+	if st, err := os.Stat(dir); err == nil && st.IsDir() {
+		checks = []validateCheck{
+			validateManifestLint(dir),
+			validatePipelineShape(dir),
+		}
+	} else if row := storedAppSpec(userID, slug); row != nil {
+		// identity mounts no tenant volume; the scheduler can see the disk. A
+		// draft composed on a cloud pod is a stage_app intent whose spec was
+		// written to me_app_specs at compose time — validate that. The manifest
+		// is not stored; compose builds it from the same name/kind/version the
+		// spec carries, so it is rebuilt from the spec here.
+		spec := []byte(row.SpecYAML)
+		checks = []validateCheck{
+			validateManifestLintBytes(manifestFromSpec(spec), nil),
+			validatePipelineShapeBytes(spec, nil),
+		}
+	} else {
 		fail(c, http.StatusNotFound, 1404, "draft not found — compose it first")
 		return
-	}
-
-	checks := []validateCheck{
-		validateManifestLint(dir),
-		validatePipelineShape(dir),
 	}
 	allPass := true
 	for _, ck := range checks {
@@ -81,10 +94,33 @@ func MeValidateWorkflow(c *gin.Context) {
 // validateManifestLint mirrors app_ci gate_manifest_lint over the draft's
 // manifest.json: name regex, kind ∈ valid kinds, non-empty version.
 func validateManifestLint(dir string) validateCheck {
-	ck := validateCheck{Check: "manifest_lint", Status: "pass"}
 	mfPath, _ := ResolveManifestPath(dir)
 	b, err := os.ReadFile(mfPath)
-	if err != nil {
+	return validateManifestLintBytes(b, err)
+}
+
+// manifestFromSpec rebuilds the draft manifest compose writes — name, kind,
+// version, description — from the spec's own top-level fields. nil when the
+// spec does not parse (the lint then reports it unparseable).
+func manifestFromSpec(spec []byte) []byte {
+	var doc struct {
+		Name        string `yaml:"name"`
+		Kind        string `yaml:"kind"`
+		Version     string `yaml:"version"`
+		Description string `yaml:"description"`
+	}
+	if yaml.Unmarshal(spec, &doc) != nil {
+		return nil
+	}
+	b, _ := json.Marshal(map[string]any{
+		"name": doc.Name, "kind": doc.Kind, "version": doc.Version, "description": doc.Description,
+	})
+	return b
+}
+
+func validateManifestLintBytes(b []byte, err error) validateCheck {
+	ck := validateCheck{Check: "manifest_lint", Status: "pass"}
+	if err != nil || b == nil {
 		ck.Status = "fail"
 		ck.Detail = "manifest.json missing"
 		ck.Issues = []string{"expected manifest.json in the draft bundle"}
@@ -120,10 +156,14 @@ func validateManifestLint(dir string) validateCheck {
 // loop, and that every loop is runnable: it has a non-empty steps[] (Pattern A)
 // or an engine (Pattern B). This is the "do I have a real pipeline?" gate.
 func validatePipelineShape(dir string) validateCheck {
-	ck := validateCheck{Check: "pipeline_shape", Status: "pass"}
 	specPath, _ := ResolveSpecPath(dir)
 	b, err := os.ReadFile(specPath)
-	if err != nil {
+	return validatePipelineShapeBytes(b, err)
+}
+
+func validatePipelineShapeBytes(b []byte, err error) validateCheck {
+	ck := validateCheck{Check: "pipeline_shape", Status: "pass"}
+	if err != nil || b == nil {
 		ck.Status = "fail"
 		ck.Detail = "xpcloud.yaml missing"
 		return ck

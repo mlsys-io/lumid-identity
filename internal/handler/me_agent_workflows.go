@@ -409,25 +409,18 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 		"status":      "draft",
 	}
 
-	// Step 3: stage under ~/.tenants/<sub>/.xp/apps/<slug>-draft/.
-	draftDir := filepath.Join(tenantAppsDir(userID), slug+"-draft")
-	if err := os.MkdirAll(draftDir, 0o775); err != nil {
-		return map[string]any{"error": "draft dir: " + err.Error()}
+	// Step 3: stage under ~/.tenants/<sub>/.xp/apps/<slug>-draft/ — directly
+	// when this identity mounts the tenant tree, else via a stage_app intent.
+	draftDir, intentID, err := stageDraftApp(userID, slug+"-draft", yaml, manifest, true)
+	if err != nil {
+		return map[string]any{"error": err.Error()}
 	}
-	if err := os.WriteFile(SpecWritePath(draftDir), []byte(yaml), 0o644); err != nil {
-		return map[string]any{"error": "write yaml: " + err.Error()}
-	}
-	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
-	if err := os.WriteFile(ManifestWritePath(draftDir), manifestBytes, 0o644); err != nil {
-		return map[string]any{"error": "write manifest: " + err.Error()}
-	}
-	makeDraftWritable(draftDir)
 
 	note := "Drafted as a tenant workflow. Open Studio composer to review + adjust skills + schedule, then Save to install."
 	if noMatch {
 		note = "No catalog skill matched this intent yet — staged an empty draft. Add skills in the composer (or ask me to search the marketplace), then Save to install."
 	}
-	return map[string]any{
+	out := map[string]any{
 		"draft_slug":      slug + "-draft",
 		"draft_dir":       draftDir,
 		"intent":          intent,
@@ -437,6 +430,85 @@ func toolComposeWorkflow(c *gin.Context, userID, intent, forApp, name string) ma
 		"no_match":        noMatch,
 		"review_url":      "/studio/workflows/" + slug + "-draft:" + slug,
 		"note":            note,
+	}
+	markStagedQueued(out, intentID)
+	return out
+}
+
+// stageDraftApp writes a draft bundle (<name>/.xpcloud.yaml + manifest.json)
+// into the caller's tenant tree.
+//
+// identity mounts no tenant volume; the scheduler can see the disk. So unless
+// this identity demonstrably sees the tenant tree (tenantTreeVisible), the
+// draft is a `stage_app` intent and its spec is ALSO written straight into
+// me_app_specs — the store storedAppSpec reads — so the composer and
+// MeValidateWorkflow can read the draft immediately instead of 404ing until
+// the picker's echo arrives. Before this, compose wrote the draft into a
+// pod-local directory: the wizard validated it (same pod, sometimes), the
+// install promoted a directory the scheduler had never seen.
+//
+// Returns (draftDir, "") when written directly, ("", intentID) when queued.
+// manifestRequired=false keeps the trading case's best-effort manifest write.
+func stageDraftApp(userID, name, specYAML string, manifest map[string]any, manifestRequired bool) (string, string, error) {
+	if !validAppSlug(name) {
+		return "", "", fmt.Errorf("invalid draft name %q", name)
+	}
+	if !tenantTreeVisible(userID) {
+		id, err := insertIntent("stage_app", userID, map[string]any{
+			"name": name, "spec_yaml": specYAML, "manifest": manifest,
+		})
+		if err != nil {
+			return "", "", fmt.Errorf("queue stage_app: %w", err)
+		}
+		// Best-effort, like the echo it pre-empts: a miss only delays reads.
+		_ = upsertStoredAppSpec(userID, name, specYAML, "{}")
+		return "", id, nil
+	}
+	draftDir := filepath.Join(tenantAppsDir(userID), name)
+	if err := os.MkdirAll(draftDir, 0o775); err != nil {
+		return "", "", fmt.Errorf("draft dir: %w", err)
+	}
+	if err := os.WriteFile(SpecWritePath(draftDir), []byte(specYAML), 0o644); err != nil {
+		return "", "", fmt.Errorf("write yaml: %w", err)
+	}
+	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
+	if err := os.WriteFile(ManifestWritePath(draftDir), manifestBytes, 0o644); err != nil && manifestRequired {
+		return "", "", fmt.Errorf("write manifest: %w", err)
+	}
+	makeDraftWritable(draftDir)
+	return draftDir, "", nil
+}
+
+// tenantTreeVisible reports whether this identity mounts the caller's tenant
+// tree: at least one of their installed apps is on the local disk. A cloud pod
+// never sees one. A user with no installs at all gets false — the intent is
+// correct everywhere a scheduler runs; the direct write is only a shortcut.
+// Without a DB (tests, bare tooling) there is no queue, so direct it is.
+func tenantTreeVisible(userSub string) bool {
+	if common.DB == nil {
+		return true
+	}
+	for _, n := range tenantInstalledAppNames(userSub) {
+		if _, owned, _ := resolveOwnedAppDir(userSub, n); owned {
+			return true
+		}
+	}
+	return false
+}
+
+// markStagedQueued adds the queued markers to a compose result. The fields the
+// UI reads (draft_slug, review_url, ...) are unchanged; draft_dir is "" because
+// the directory is on the scheduler's disk.
+func markStagedQueued(out map[string]any, intentID string) {
+	if intentID == "" {
+		return
+	}
+	out["intent_id"] = intentID
+	out["queued"] = true
+	out["status"] = "pending"
+	out["draft_dir"] = ""
+	if n, _ := out["note"].(string); n != "" {
+		out["note"] = n + " (Staging is QUEUED for the scheduler — a few seconds before install can see it.)"
 	}
 }
 
@@ -471,17 +543,11 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 		}
 	}
 
-	draftDir := filepath.Join(tenantAppsDir(userID), slug+"-draft")
-	if err := os.MkdirAll(draftDir, 0o775); err != nil {
-		return map[string]any{"error": "draft dir: " + err.Error()}
-	}
-	if err := os.WriteFile(SpecWritePath(draftDir), []byte(buildTradingXpcloudYaml(slug, intent)), 0o644); err != nil {
-		return map[string]any{"error": "write yaml: " + err.Error()}
-	}
 	manifest := map[string]any{"name": slug, "kind": "app", "version": "0.1.0", "description": intent, "status": "draft", "fork_of": "auto-quant"}
-	mb, _ := json.MarshalIndent(manifest, "", "  ")
-	_ = os.WriteFile(ManifestWritePath(draftDir), mb, 0o644)
-	makeDraftWritable(draftDir)
+	draftDir, intentID, err := stageDraftApp(userID, slug+"-draft", buildTradingXpcloudYaml(slug, intent), manifest, false)
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
 
 	// Run the REAL search → match → verify procedure against live xp.io:
 	// resolve each pipeline skill to its repo+path+sha (fork parent first,
@@ -493,7 +559,7 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 	trace, enrichedSteps := buildAssemblyTrace(traceCtx, intent, stepOut)
 	stepOut = enrichedSteps
 
-	return map[string]any{
+	out := map[string]any{
 		"draft_slug":      slug + "-draft",
 		"draft_dir":       draftDir,
 		"intent":          intent,
@@ -515,6 +581,8 @@ func composeTradingDraft(userID, slug, intent string) map[string]any {
 		"review_url": "/studio/workflows/" + slug + "-draft:" + slug,
 		"note":       "Drafted a paper-mode momentum trading bot — review the pipeline + schedule, then install.",
 	}
+	markStagedQueued(out, intentID)
+	return out
 }
 
 // makeDraftWritable makes a composed draft tree writable by the lumid-scheduler.
@@ -545,12 +613,34 @@ func makeDraftWritable(draftDir string) {
 
 // toolAddSkillToWorkflow appends a skill to an existing tenant workflow's
 // `skill_imports[]`. Writes back to the same xpcloud.yaml.
+//
+// identity mounts no tenant volume; the scheduler can see the disk. For an
+// install only it can see this queues the same `add_skill` intent the HTTP
+// route (MeAppAddSkill) does, with the same payload.
 func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
 	parts := splitN(slug, ":", 2)
 	if len(parts) != 2 {
 		return map[string]any{"error": "slug must be '<app>:<loop>'"}
 	}
 	app := parts[0]
+	if _, direct, viaIntent, _ := ownerWriteTarget(userID, app); viaIntent && !direct {
+		repo := skillName
+		if !strings.Contains(repo, "/") {
+			repo = "community/" + skillName
+		}
+		if !slugRe.MatchString(repo) || strings.Count(repo, "/") != 1 {
+			return map[string]any{"error": "skill_name must be a skill name or owner/name"}
+		}
+		id := writeIntentDirect(userID, "add_skill", map[string]any{
+			"app":        app,
+			"skill_repo": repo,
+			"version":    "",
+		})
+		if id == "" {
+			return map[string]any{"error": "could not queue the skill add"}
+		}
+		return queuedOpsToolResult(id, map[string]any{"slug": slug, "added": false, "skill_repo": repo})
+	}
 	appDir := filepath.Join(tenantAppsDir(userID), app)
 	xpcloudPath, ok := ResolveSpecPath(appDir)
 	if !ok {
@@ -959,32 +1049,18 @@ func toolWorkflowReportCard(c *gin.Context, userID, slug string) map[string]any 
 // toolTriggerEvaluation appends a (skill, for_app) entry to skill-roster's
 // evaluate queue; skill-roster picks it up within ~60s.
 func toolTriggerEvaluation(userID, skillName, forApp string) map[string]any {
-	queuePath := filepath.Join(operatorHome(), ".xp", "apps", "skill-roster", "data", "eval-queue.jsonl")
-	if err := os.MkdirAll(filepath.Dir(queuePath), 0o775); err != nil {
-		return map[string]any{"error": "queue dir: " + err.Error()}
-	}
-	entry := map[string]any{
-		"skill":        skillName,
-		"for_app":      forApp,
-		"requested_by": userID,
-		"requested_at": time.Now().UTC().Format(time.RFC3339),
-		"status":       "queued",
-	}
-	row, _ := json.Marshal(entry)
-	f, err := os.OpenFile(queuePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// Same enqueue_eval intent as MeMindEvaluate (see queueSkillEval): the
+	// pod-local eval-queue.jsonl this appended to was never read by anything.
+	id, err := queueSkillEval(userID, skillName, forApp)
 	if err != nil {
-		return map[string]any{"error": "open queue: " + err.Error()}
+		return map[string]any{"error": "could not queue the evaluation: " + err.Error()}
 	}
-	defer f.Close()
-	if _, err := f.Write(append(row, '\n')); err != nil {
-		return map[string]any{"error": "write queue: " + err.Error()}
-	}
-	return map[string]any{
-		"queued":  true,
+	return queuedOpsToolResult(id, map[string]any{
 		"skill":   skillName,
 		"for_app": forApp,
-		"note":    "skill-roster picks up the queue within 60s; new attestation will land on xpcloud's community repo for the skill.",
-	}
+		"note": "Evaluation QUEUED for the scheduler, which hands it to skill-roster; a new " +
+			"attestation lands on xpcloud's community repo for the skill once scoring completes.",
+	})
 }
 
 // toolSuggestImprovement looks at one workflow's recent runs + report

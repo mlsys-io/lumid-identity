@@ -4870,11 +4870,14 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if app == "" || loop == "" {
 			return map[string]any{"error": "app and loop required"}, false
 		}
-		stopped, err := agentStopLoop(userID, app, loop)
+		intentID, err := agentStopLoop(userID, app, loop)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, false
 		}
-		return map[string]any{"app": app, "loop": loop, "stopped_cycle": stopped, "state": "stopping"}, true
+		return map[string]any{"app": app, "loop": loop, "intent_id": intentID, "state": "queued",
+			"queued": true,
+			"note": "Stop QUEUED for the scheduler, which signals the running cycle (a few seconds). " +
+				"It has not stopped yet."}, true
 
 	case "cycle_detail":
 		app, _ := args["app"].(string)
@@ -4982,8 +4985,13 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			}
 			ts = resolved
 		}
-		if err := agentWriteFeedback(userID, app, loop, ts, rating, note); err != nil {
+		intentID, err := agentWriteFeedback(userID, app, loop, ts, rating, note)
+		if err != nil {
 			return map[string]any{"error": err.Error()}, false
+		}
+		if intentID != "" {
+			return queuedOpsToolResult(intentID, map[string]any{
+				"saved": false, "app": app, "loop": loop, "ts": ts}), true
 		}
 		return map[string]any{"saved": true, "app": app, "loop": loop, "ts": ts}, true
 

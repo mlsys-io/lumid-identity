@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"time"
 
@@ -47,12 +45,10 @@ var paTokenRe = regexp.MustCompile(`^[a-f0-9]{64}$`)
 // collide on the same millisecond.
 var inboxFilenameRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,200}$`) // for safety on parsed values
 
-// powerAutomateInboxDir is the per-user dir written by the inbound
-// webhook. xpio apps read from here; the path is stable across
-// installs so any future Outlook-bridge skill knows where to look.
-func powerAutomateInboxDir(userSub string) string {
-	return filepath.Join(tenantRoot(userSub), ".xp", "inbox", "power-automate")
-}
+// powerAutomateInboxMax is the picker's inbox_drop content cap (8 MB). The
+// file lands at <tenant root>/.xp/inbox/power-automate/<name> on the
+// SCHEDULER's disk; xpio apps read from there.
+const powerAutomateInboxMax = 8 << 20
 
 // MePowerAutomateTokenMint — POST /api/v1/me/power-automate-tokens
 // Returns the freshly-minted webhook URL. ROTATES — any prior token
@@ -193,17 +189,6 @@ func InboxPowerAutomateReceive(c *gin.Context) {
 		return
 	}
 
-	dir := powerAutomateInboxDir(row.UserSub)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		c.AbortWithStatus(http.StatusInternalServerError)
-		return
-	}
-	// The lumid-identity container runs as root but the xpio runner +
-	// per-app skills run as UID 1001 (webmaster). Without chown the
-	// runner can't move processed files into .processed/. Best-effort
-	// — silently skip on non-Linux dev setups where the IDs differ.
-	_ = os.Chown(dir, 1001, 1001)
-
 	// Filename: <ts>-<random4>.json. ts in compact UTC so xpio apps
 	// can lexicographically sort. random4 avoids collisions when two
 	// emails arrive in the same millisecond.
@@ -227,24 +212,33 @@ func InboxPowerAutomateReceive(c *gin.Context) {
 		"payload":     payload,
 	}
 	out, _ := json.MarshalIndent(envelope, "", "  ")
+	if len(out) > powerAutomateInboxMax {
+		// The envelope's indentation can push a body just under the read cap
+		// over the picker's 8 MB content cap; refuse here, not in the picker.
+		c.AbortWithStatus(http.StatusRequestEntityTooLarge)
+		return
+	}
 
-	// Atomic write — tmpfile + rename, otherwise a partial write
-	// could be picked up by a polling xpio app.
-	tmp := filepath.Join(dir, filename+".tmp")
-	final := filepath.Join(dir, filename)
-	if err := os.WriteFile(tmp, out, 0o644); err != nil {
-		c.AbortWithStatus(http.StatusInternalServerError)
+	// ── The file lands on the scheduler's disk, via an intent ──
+	//
+	// This wrote <tenant>/.xp/inbox/power-automate/<name> here and acked the
+	// webhook — but identity mounts no tenant volume; the scheduler can see the
+	// disk. Every email went into this pod's own filesystem, where no app reads
+	// and the next rollout deletes it. `inbox_drop` writes the same file (same
+	// name, same bytes, atomically, idempotent by name) where the apps look.
+	// Enqueue failure is a 5xx so Power Automate retries; the name is fixed
+	// per request, so a retry after a lost ack is a fresh file, never a torn one.
+	if id := writeIntentDirect(row.UserSub, "inbox_drop", map[string]any{
+		"source":  "power-automate",
+		"name":    filename,
+		"content": string(out),
+	}); id == "" {
+		c.AbortWithStatus(http.StatusServiceUnavailable)
 		return
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
-		c.AbortWithStatus(http.StatusInternalServerError)
-		return
-	}
-	_ = os.Chown(final, 1001, 1001)
 
 	// Update use stats. Best-effort; failure here doesn't block the
-	// webhook ack (the email is already on disk).
+	// webhook ack (the email is already queued).
 	now2 := time.Now().UTC()
 	_ = common.DB.Model(&models.PowerAutomateToken{}).
 		Where("user_sub = ?", row.UserSub).

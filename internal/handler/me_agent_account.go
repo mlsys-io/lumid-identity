@@ -73,9 +73,13 @@ func toolDeleteLoop(userID string, args map[string]any) (map[string]any, bool) {
 	if app == "" || loop == "" {
 		return map[string]any{"error": "app and loop are required"}, false
 	}
-	remaining, status, _, msg := removeLoopFromApp(userID, app, loop)
+	remaining, intentID, status, _, msg := removeLoopFromApp(userID, app, loop)
 	if status != 200 {
 		return map[string]any{"error": msg}, false
+	}
+	if intentID != "" {
+		return queuedOpsToolResult(intentID, map[string]any{
+			"deleted": false, "app": app, "loop": loop, "remaining": nil}), true
 	}
 	return map[string]any{"deleted": true, "app": app, "loop": loop, "remaining": remaining}, true
 }

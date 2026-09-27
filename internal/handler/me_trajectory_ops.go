@@ -193,6 +193,23 @@ func meRunMark(c *gin.Context, verb string) {
 		}
 		args = append(args, "--loop", loop)
 	}
+	// Owner write — this marked whatever $HOME/.xp/apps/<app> the CLI found,
+	// with no ownership check. identity mounts no tenant volume; the scheduler
+	// can see the disk: for an install only it sees, the CLI would run against
+	// an empty pod-local tree, so the whole mark is a trajectory_mark intent
+	// (the picker runs the same CLI with HOME bound to the real tenant root).
+	_, direct, viaIntent, shared := ownerWriteTarget(userSub, app)
+	if viaIntent {
+		id := writeIntent(c, "trajectory_mark", userSub, trajectoryMarkPayload(verb, app, ts, c.Query("loop")))
+		if id != "" {
+			respondQueued(c, id, gin.H{"app": app, "ts": ts, "op": verb})
+		}
+		return
+	}
+	if !direct {
+		ownerWriteFail(c, shared)
+		return
+	}
 	obj, err, status := runTrajectoryCLI(userSub, args...)
 	if err == nil {
 		ok(c, verb+"d", obj)
@@ -225,6 +242,15 @@ func meRunMark(c *gin.Context, verb string) {
 		return
 	}
 	fail(c, status, 1502, err.Error())
+}
+
+// trajectoryMarkPayload is the `trajectory_mark` intent: {verb, app, ts, loop?}.
+func trajectoryMarkPayload(verb, app, ts, loop string) map[string]any {
+	p := map[string]any{"verb": verb, "app": app, "ts": ts}
+	if loop != "" {
+		p["loop"] = loop
+	}
+	return p
 }
 
 // meLoopEnqueueBody — fan-out a batch of variants into the trajectory queue.

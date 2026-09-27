@@ -63,19 +63,32 @@ func InternalAppSpecRecord(c *gin.Context) {
 			ui = string(raw)
 		}
 	}
-	row := models.MeAppSpec{
-		UserSub: b.UserSub, App: b.App,
-		SpecYAML: b.SpecYAML, UIFiles: ui,
-		UpdatedAt: time.Now(),
-	}
-	res := common.DB.Where("user_sub = ? AND app = ?", b.UserSub, b.App).
-		Assign(row).FirstOrCreate(&models.MeAppSpec{})
-	if res.Error != nil {
-		fail(c, http.StatusInternalServerError, 1500, "save: "+res.Error.Error())
+	if err := upsertStoredAppSpec(b.UserSub, b.App, b.SpecYAML, ui); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "recorded",
 		"data": gin.H{"app": b.App, "bytes": len(b.SpecYAML), "ui_files": len(b.UIFiles)}})
+}
+
+// upsertStoredAppSpec writes one me_app_specs row — the store the scheduler's
+// echo fills. Identity writes it itself for a draft it has just queued
+// (stage_app): the draft is then readable at once, and the echo that follows
+// the stage overwrites it with what actually landed.
+func upsertStoredAppSpec(userSub, app, specYAML, uiFilesJSON string) error {
+	if common.DB == nil {
+		return nil
+	}
+	if uiFilesJSON == "" {
+		uiFilesJSON = "{}"
+	}
+	row := models.MeAppSpec{
+		UserSub: userSub, App: app,
+		SpecYAML: specYAML, UIFiles: uiFilesJSON,
+		UpdatedAt: time.Now(),
+	}
+	return common.DB.Where("user_sub = ? AND app = ?", userSub, app).
+		Assign(row).FirstOrCreate(&models.MeAppSpec{}).Error
 }
 
 // storedAppSpec returns the self-reported spec for one installed app, or nil.

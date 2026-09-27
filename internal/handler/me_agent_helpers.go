@@ -110,48 +110,23 @@ func agentEnqueueOneshot(userID, app, loop string, args map[string]any) (string,
 	return id, nil
 }
 
-// agentStopLoop — chat twin of REST MeLoopStop. Writes the per-loop cooperative
-// stop signal the runner checks before each LLM call (→ cycle aborts) + a
-// "stopped by user" journal event. Returns the in-flight cycle ts it observed
-// (best-effort, may be ""). Safe + reversible (just re-run to restart).
+// agentStopLoop — chat twin of REST MeLoopStop, and now the same transport.
+//
+// It used to write the stop signal, a journal line and look for the in-flight
+// cycle under resolveAppDir — which on a pod is the materialised bundle cache,
+// a copy of the PUBLISHED tree. So it never failed, and it never stopped
+// anything: identity mounts no tenant volume; the scheduler can see the disk.
+// It queues the same `stop_loop` intent MeLoopStop does and returns its id. The
+// in-flight cycle ts it used to report cannot be known from here.
 func agentStopLoop(userID, app, loop string) (string, error) {
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
-		return "", fmt.Errorf("app not found: %s", app)
+	if !slugRe.MatchString(app) || !slugRe.MatchString(loop) {
+		return "", fmt.Errorf("invalid app/loop name")
 	}
-	controlDir := filepath.Join(appDir, "data", "control")
-	if err := os.MkdirAll(controlDir, 0o755); err != nil {
-		return "", err
+	id := writeIntentDirect(userID, "stop_loop", map[string]any{"app": app, "loop": loop})
+	if id == "" {
+		return "", fmt.Errorf("could not queue the stop")
 	}
-	sig := map[string]any{"loop": loop, "by": userID, "at": time.Now().UTC().Format(time.RFC3339)}
-	if b, err := json.Marshal(sig); err == nil {
-		if err := os.WriteFile(filepath.Join(controlDir, "stop."+loop+".signal"), b, 0o644); err != nil {
-			return "", err
-		}
-	}
-	jrow := map[string]any{
-		"ts": time.Now().UTC().Format(time.RFC3339), "loop": loop,
-		"event": "control", "stage": "stopped", "status": "stopped",
-		"ok": false, "outcome": "interrupted", "note": "stopped by user (chat)",
-	}
-	if b, err := json.Marshal(jrow); err == nil {
-		if f, e := os.OpenFile(filepath.Join(appDir, "data", "journal.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
-			_, _ = f.Write(append(b, '\n'))
-			_ = f.Close()
-		}
-	}
-	stopped := ""
-	cyclesDir := filepath.Join(appDir, "data", "cycles", loop)
-	if entries, err := os.ReadDir(cyclesDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() && e.Name() > stopped {
-				if _, err := os.Stat(filepath.Join(cyclesDir, e.Name(), "cycle.json")); err != nil {
-					stopped = e.Name()
-				}
-			}
-		}
-	}
-	return stopped, nil
+	return id, nil
 }
 
 // agentLatestCycleTs returns the most recent cycle ts dir name for
@@ -181,11 +156,29 @@ func agentLatestCycleTs(userID, app, loop string) (string, error) {
 }
 
 // agentWriteFeedback writes a feedback entry to the cycle dir +
-// app journal. Same logic as MeCycleFeedback minus the HTTP response.
-func agentWriteFeedback(userID, app, loop, ts string, rating int, note string) error {
+// app journal. Same logic as MeCycleFeedback minus the HTTP response (and
+// minus its improvement-ledger mirror, which the chat path never wrote).
+// When the cycle is only on the scheduler's disk — identity mounts no tenant
+// volume — the two appends are queued as one batch and the intent id returned;
+// "" means written directly.
+func agentWriteFeedback(userID, app, loop, ts string, rating int, note string) (string, error) {
 	cycleDir, source := resolveCycleDir(userID, app, loop, ts)
 	if cycleDir == "" {
-		return fmt.Errorf("cycle not found: %s/%s/%s", app, loop, ts)
+		if _, _, viaIntent, _ := ownerWriteTarget(userID, app); viaIntent {
+			if !safeSeg(loop) || !safeSeg(ts) {
+				return "", fmt.Errorf("invalid loop or ts")
+			}
+			entry := cycleFeedbackEntry(userID, app, loop, ts, rating, note, "tenant")
+			entry["via"] = "agent"
+			id, err := queueAppFileOps(userID, app, func() ([]map[string]any, error) {
+				return cycleFeedbackOps(loop, ts, entry, nil)
+			})
+			if err != nil {
+				return "", fmt.Errorf("could not queue the feedback: %w", err)
+			}
+			return id, nil
+		}
+		return "", fmt.Errorf("cycle not found: %s/%s/%s", app, loop, ts)
 	}
 	entry := map[string]any{
 		"type":       "feedback",
@@ -200,7 +193,7 @@ func agentWriteFeedback(userID, app, loop, ts string, rating int, note string) e
 		"via":        "agent",
 	}
 	if err := appendJSONL(filepath.Join(cycleDir, "feedback.jsonl"), entry); err != nil {
-		return err
+		return "", err
 	}
 	// Best-effort journal append; primary record is feedback.jsonl.
 	// cycleDir is <appDir>/{.lumid|data}/cycles/<loop>/<ts>; strip ts, loop,
@@ -216,7 +209,7 @@ func agentWriteFeedback(userID, app, loop, ts string, rating int, note string) e
 		journalPath = filepath.Join(appDir, "data", "journal.jsonl")
 	}
 	_ = appendJSONL(journalPath, entry)
-	return nil
+	return "", nil
 }
 
 // agentListCycles returns the N most-recent cycle ts dirs for a loop.

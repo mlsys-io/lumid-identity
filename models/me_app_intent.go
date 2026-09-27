@@ -27,11 +27,17 @@ type MeAppIntent struct {
 	ID      string `gorm:"column:id;size:36;primaryKey"                                              json:"intent_id"`
 	Action  string `gorm:"column:action;size:32;not null;index:idx_meintent_status,priority:2"       json:"action"`
 	UserSub string `gorm:"column:user_sub;size:36;not null;index:idx_meintent_user"                  json:"user_sub"`
-	Payload string `gorm:"column:payload;type:text"                                                  json:"-"` // JSON (slug/runtime/as/app/...) — no bearer
+	// Payload and Result are MEDIUMTEXT (16 MB), not TEXT. MySQL TEXT is 64 KB
+	// and prod runs strict mode, so a payload one byte over is an INSERT error,
+	// not a truncation: an app_file_write of a 256 KB prompt, an enqueue_runs
+	// fan-out (already ~50 KB) or an 8 MB inbox_drop could never be queued.
+	// AutoMigrate ALTERs the existing TEXT column on the type change (see
+	// TestMeAppIntentPayloadWidenedByAutoMigrate).
+	Payload string `gorm:"column:payload;type:mediumtext"                                            json:"-"` // JSON (slug/runtime/as/app/...) — no bearer
 	Bearer  string `gorm:"column:bearer;type:text"                                                   json:"-"` // short-lived user JWT, picker-only
 	// pending → claimed → done | failed
 	Status string `gorm:"column:status;size:16;not null;default:pending;index:idx_meintent_status,priority:1" json:"status"`
-	Result string `gorm:"column:result;type:text"                                                            json:"-"` // JSON result envelope written on completion
+	Result string `gorm:"column:result;type:mediumtext"                                                      json:"-"` // JSON result envelope written on completion
 	// Attempts counts how many times this intent has been CLAIMED, including
 	// re-claims after a stale-claim re-queue. It exists to bound the retry that
 	// staleClaimAfter provides: that re-queue assumes the PICKER died for reasons

@@ -73,9 +73,12 @@ func MeTrajectorySignal(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid loop")
 		return
 	}
-	appDir := resolveAppDir(userSub, app)
-	if appDir == "" {
-		fail(c, http.StatusNotFound, 1404, "app not found")
+	// Owner write: only the caller's own install, never the operator-shared
+	// bundle (this used resolveAppDir, which also hands out that bundle — and,
+	// on a cloud pod, the materialised cache nothing reads).
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userSub, app)
+	if !direct && !viaIntent {
+		ownerWriteFail(c, shared)
 		return
 	}
 
@@ -89,6 +92,23 @@ func MeTrajectorySignal(c *gin.Context) {
 		Note:          req.Note,
 		By:            userSub,
 		Status:        "pending",
+	}
+
+	// identity mounts no tenant volume; the scheduler can see the disk. The
+	// record is appended there. `pending` — the count of undrained signals —
+	// is a read of that file, which identity cannot do, so it is null rather
+	// than a number computed from a copy nobody writes.
+	if viaIntent {
+		id, err := queueAppFileOps(userSub, app, func() ([]map[string]any, error) {
+			op, err := appendOp(signalsRel, rec)
+			return []map[string]any{op}, err
+		})
+		if err != nil {
+			appFileOpsStatus(c, err)
+			return
+		}
+		respondQueued(c, id, gin.H{"recorded": rec, "pending": nil})
+		return
 	}
 
 	controlDir, err := ResolveRuntimeWritePath(appDir, "data/control")

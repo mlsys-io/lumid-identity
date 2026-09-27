@@ -39,7 +39,7 @@ var cycleTsRe = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z[A-Za-z0-9_-]{0,32}$`)
 type meCycleFeedbackBody struct {
 	App    string `json:"app"    binding:"required"`
 	Loop   string `json:"loop"   binding:"required"`
-	Ts     string `json:"ts"     binding:"required"`
+	Ts     string `json:"ts"`     // a cycle id, or "latest"/empty for the newest cycle
 	Rating int    `json:"rating"` // -1 (bad), 0 (neutral), +1 (good)
 	Note   string `json:"note"`   // free-text — the natural-language signal
 }
@@ -67,6 +67,14 @@ func MeCycleFeedback(c *gin.Context) {
 	if !slugRe.MatchString(body.App) || !slugRe.MatchString(body.Loop) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app or loop name")
 		return
+	}
+	if body.Ts == "" || body.Ts == "latest" {
+		resolved, err := resolveLatestCycleTs(userID, body.App, body.Loop)
+		if err != nil {
+			fail(c, http.StatusNotFound, 1404, fmt.Sprintf("no recorded cycles for %s/%s", body.App, body.Loop))
+			return
+		}
+		body.Ts = resolved
 	}
 	if !cycleTsRe.MatchString(body.Ts) {
 		fail(c, http.StatusBadRequest, 1400, "invalid ts — expected YYYYMMDDTHHMMSSZ")

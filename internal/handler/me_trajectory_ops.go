@@ -23,6 +23,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"os/exec"
@@ -122,6 +123,14 @@ func MeNextActions(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app name")
 		return
 	}
+	if obj, status, msg, routed := trajectoryQueryViaScheduler(ginReqCtx(c), userSub, "next-actions", app, ""); routed {
+		if msg != "" {
+			fail(c, status, 1502, msg)
+			return
+		}
+		ok(c, "ok", obj)
+		return
+	}
 	obj, err, status := runTrajectoryCLI(userSub, "next-actions", "--app", app)
 	if err != nil {
 		fail(c, status, 1502, err.Error())
@@ -149,12 +158,55 @@ func MeLoopLineage(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid loop name")
 		return
 	}
+	if obj, status, msg, routed := trajectoryQueryViaScheduler(ginReqCtx(c), userSub, "lineage", app, loop); routed {
+		if msg != "" {
+			fail(c, status, 1502, msg)
+			return
+		}
+		ok(c, "ok", obj)
+		return
+	}
 	obj, err, status := runTrajectoryCLI(userSub, "lineage", "--app", app, "--loop", loop)
 	if err != nil {
 		fail(c, status, 1502, err.Error())
 		return
 	}
 	ok(c, "ok", obj)
+}
+
+// trajectoryQueryViaScheduler answers next-actions / lineage for the caller's
+// own install when identity cannot see it: the CLI would run here against a
+// tenant root that does not exist. The picker runs the same CLI with HOME bound
+// to the real tenant root (a `trajectory_query` read intent) and returns its
+// JSON merged with `ok`, which is stripped so the response matches the local
+// path's. routed=false means "not this case — run the CLI locally as before".
+// A non-empty msg is the failure to report with `status`.
+func trajectoryQueryViaScheduler(ctx context.Context, userSub, verb, app, loop string) (obj map[string]any, status int, msg string, routed bool) {
+	_, direct, viaIntent, _ := ownerWriteTarget(userSub, app)
+	if direct || !viaIntent {
+		return nil, 0, "", false
+	}
+	payload := map[string]any{"verb": verb, "app": app}
+	if loop != "" {
+		payload["loop"] = loop
+	}
+	data, err := runReadIntent(ctx, userSub, "trajectory_query", payload, readIntentDefaultTimeout)
+	switch {
+	case errors.Is(err, errReadIntentTimeout):
+		return nil, http.StatusGatewayTimeout, "trajectory " + verb + " timed out waiting for the scheduler — try again in a moment", true
+	case err != nil:
+		var rf *readIntentFailed
+		if errors.As(err, &rf) {
+			return nil, http.StatusBadGateway, "trajectory CLI failed: " + rf.msg, true
+		}
+		return nil, http.StatusBadGateway, "trajectory " + verb + ": " + err.Error(), true
+	}
+	delete(data, "ok")
+	// The picker wraps unparseable stdout as {output}; the local path 502s it.
+	if _, raw := data["output"]; raw && len(data) == 1 {
+		return nil, http.StatusBadGateway, "trajectory CLI emitted non-JSON output", true
+	}
+	return data, http.StatusOK, "", true
 }
 
 // MeRunPromote — POST /me/apps/:app/runs/:ts/promote

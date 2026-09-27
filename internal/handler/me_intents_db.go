@@ -137,7 +137,13 @@ func InternalMeIntentsClaim(c *gin.Context) {
 		if err := tx.
 			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("status = ?", "pending").
-			Order("created_at asc").
+			// Read intents first: a request is blocked on each one
+			// (me_read_intent.go), while every other action is fire-and-poll.
+			Order(clause.OrderBy{Expression: clause.Expr{
+				SQL:                "CASE WHEN action IN ? THEN 0 ELSE 1 END, created_at asc",
+				Vars:               []any{readIntentActions},
+				WithoutParentheses: true,
+			}}).
 			Limit(claimBatchSize).
 			Find(&rows).Error; err != nil {
 			return err

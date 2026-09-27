@@ -60,7 +60,12 @@ func resolveOwnedAppDir(userSub, app string) (dir string, owned, shared bool) {
 	if app == "" || strings.ContainsAny(app, "/\\") || strings.Contains(app, "..") {
 		return "", false, false
 	}
-	tenantDir := filepath.Join(tenantAppsDir(userSub), app)
+	// resolveBundleDir: a `kind: agent` install lives at .xp/agents/<app>, not
+	// .xp/apps/<app>. Checking only apps/ made every owner write to their own
+	// agent-kind app (quant-research, doc-readability, mbb-consultant) fail
+	// 1403 "operator-shared (read-only)" — prompts, config and UI edits alike
+	// (found 2026-09-27 via qa-sentinel's prompt_edit probe).
+	tenantDir := resolveBundleDir(filepath.Join(tenantAppsDir(userSub), app))
 	if st, err := os.Stat(tenantDir); err == nil && st.IsDir() {
 		return tenantDir, true, false
 	}

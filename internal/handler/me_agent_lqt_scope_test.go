@@ -18,7 +18,7 @@ func TestLqtCrossTenantFeedsAreOperatorOnly(t *testing.T) {
 			t.Errorf("%q returns every tenant's rows and must be marked crossTenant", ep)
 		}
 		for _, role := range []string{"", "user", "admin"} {
-			res, ok := toolLqtMailboxRead(role, ep, "", 5)
+			res, ok := toolLqtMailboxRead(role, "", ep, "", 5)
 			if ok {
 				t.Errorf("role %q must not read the cross-tenant feed %q", role, ep)
 			}

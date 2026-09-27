@@ -63,6 +63,14 @@ type lqtReadSpec struct {
 	// every strategy but not read the one it was grounded to — which is the
 	// whole point of grounding it.
 	needsID bool
+	// callerScoped marks a self_tenant read served by the lqt-inspect ingress
+	// (`https://lum.id/lqt/inspect/...`), NOT the dataapp-proxy hairpin — that
+	// proxy fronts the old lqt app, whose config has no /lqt/inspect path, so
+	// every `strategy_cycles` read 404'd in the Discuss turn (measured
+	// 2026-09-27). It is authenticated AS THE CHAT USER: self_tenant scopes
+	// rows to the bearer's tenant, and the operator PAT would have scoped them
+	// to the operator's (or, for an admin operator, every tenant's).
+	callerScoped bool
 }
 
 // safeLQTID accepts only what a strategy id can actually be: a uuid, or the
@@ -108,13 +116,23 @@ var lqtReadEndpoints = map[string]lqtReadSpec{
 	// Per-strategy reads — what a grounded chat actually needs. Tenant-scoped
 	// server-side (unlike the cross-tenant `results` feed), so this narrows
 	// exposure rather than widening it.
-	"strategy_cycles": {path: "/lqt/inspect/cycles/%s", list: true, needsID: true},
+	"strategy_cycles": {path: "/lqt/inspect/cycles/%s", list: true, needsID: true, callerScoped: true},
 }
 
 // lqtMailboxBase resolves the base URL of the LQT mailbox read/write ingress.
 // Defaults to the public dataapp-proxy hairpin (the only path admitted by the
 // lqt NetworkPolicy from this service). Trailing slashes are trimmed so callers
 // can append paths.
+// lqtInspectBase is where caller-scoped (self_tenant) reads go: the public
+// lqt-inspect ingress. Overridable for tests and non-prod stacks.
+func lqtInspectBase() string {
+	base := strings.TrimSpace(os.Getenv("LQT_INSPECT_BASE"))
+	if base == "" {
+		base = "https://lum.id"
+	}
+	return strings.TrimRight(base, "/")
+}
+
 func lqtMailboxBase() string {
 	base := strings.TrimSpace(os.Getenv("LQT_MAILBOX_BASE"))
 	if base == "" {
@@ -175,7 +193,13 @@ func lqtMailboxDo(method, path string, body []byte) (map[string]any, int, error)
 // attributed to the caller, matching the credential carried in
 // `payload.auth.pat` — reads keep using the operator PAT via lqtMailboxDo.
 func lqtMailboxDoAs(method, path string, body []byte, bearer string) (map[string]any, int, error) {
-	u := lqtMailboxBase() + path
+	return lqtDoAt(lqtMailboxBase(), method, path, body, bearer)
+}
+
+// lqtDoAt is lqtMailboxDoAs against an explicit base (the inspect ingress for
+// caller-scoped reads).
+func lqtDoAt(base, method, path string, body []byte, bearer string) (map[string]any, int, error) {
+	u := base + path
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
@@ -229,7 +253,7 @@ func resolveLqtEndpoint(e string) (lqtReadSpec, bool) {
 // returns the parsed JSON. `endpoint` names a known-good surface (see
 // lqtReadEndpoints); `limit` caps list endpoints. Read-only — no gating beyond
 // the endpoint allowlist, mirroring data_query.
-func toolLqtMailboxRead(role, endpoint, strategyID string, limit int) (map[string]any, bool) {
+func toolLqtMailboxRead(role, userID, endpoint, strategyID string, limit int) (map[string]any, bool) {
 	spec, ok := resolveLqtEndpoint(endpoint)
 	if !ok {
 		return map[string]any{"error": fmt.Sprintf("unknown lqt endpoint %q — use one of: %s", endpoint, strings.Join(sortedKeys(lqtReadEndpoints), ", "))}, false
@@ -260,7 +284,24 @@ func toolLqtMailboxRead(role, endpoint, strategyID string, limit int) (map[strin
 		}
 		path += "?" + url.Values{"limit": {fmt.Sprintf("%d", limit)}}.Encode()
 	}
-	out, status, err := lqtMailboxDo(http.MethodGet, path, nil)
+	var (
+		out    map[string]any
+		status int
+		err    error
+	)
+	if spec.callerScoped {
+		bearer := ""
+		if strings.TrimSpace(userID) != "" {
+			bearer = lqtStrategyPATCached(userID)
+		}
+		if bearer == "" {
+			return map[string]any{"error": fmt.Sprintf(
+				"endpoint %q reads this user's own rows and needs their credential, which could not be resolved", endpoint)}, false
+		}
+		out, status, err = lqtDoAt(lqtInspectBase(), http.MethodGet, path, nil, bearer)
+	} else {
+		out, status, err = lqtMailboxDo(http.MethodGet, path, nil)
+	}
 	if err != nil {
 		return map[string]any{"error": err.Error()}, false
 	}

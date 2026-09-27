@@ -382,9 +382,68 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 				row[k] = v
 			}
 		}
+		markStaleState(row, &d, st)
+		markUnfed(row, &d, loops[d.ID])
 		out = append(out, row)
 	}
 	return out
+}
+
+// markUnfed explains a zero-row experiment that NO loop can ever feed: no
+// `dispatch.loop`, and no loop lists it under engine.experiment / steps.
+// Measured 2026-09-27: 10 of 18 experiments declared on the scheduler volume
+// had never recorded a row, and several were in exactly this shape, while the
+// card said only "0 results" -- the same words as a loop that simply has not
+// run yet.
+func markUnfed(row gin.H, d *expDecl, feeding []string) {
+	if len(feeding) > 0 || len(d.Dispatch) > 0 {
+		return
+	}
+	if n, _ := row["n_results"].(int); n != 0 {
+		return
+	}
+	// Its OWN field, not n_zero_reason: that one means "rows exist but none
+	// carries the metric" (TestNeverRunCarriesNoReason), a different fact.
+	row["unfed"] = true
+	row["unfed_reason"] = "no loop feeds this experiment: declare dispatch.loop, or list it under a loop's engine.experiment"
+}
+
+// specMetricName is the metric the spec declares now, or "".
+func specMetricName(d *expDecl) string {
+	if d == nil {
+		return ""
+	}
+	name, _ := d.Metric["name"].(string)
+	return strings.TrimSpace(name)
+}
+
+// markStaleState makes a row whose state.json was computed under a different
+// metric than the spec now declares say so, instead of presenting the old
+// metric's name and verdict as current. Measured 2026-09-26: kol_alpha's spec
+// moved real_tape -> realized_pnl_ticks, and every install whose loop had not
+// run since showed the new hypothesis beside "measures real tape" and a
+// verdict about a metric the experiment no longer has. evaluate() rewrites the
+// state on the next cycle, so this only covers the gap.
+func markStaleState(row gin.H, d *expDecl, st map[string]any) {
+	spec := specMetricName(d)
+	was, _ := st["metric"].(string)
+	if spec == "" || was == "" || was == spec {
+		return
+	}
+	row["metric_name"] = spec
+	if hib, ok := d.Metric["higher_is_better"]; ok {
+		row["higher_is_better"] = hib
+	}
+	row["state_stale"] = true
+	row["state_metric"] = was
+	for _, k := range []string{"variants", "best_variant", "baseline_value", "delta",
+		"delta_pp", "criteria_reason", "verdict", "comparable"} {
+		delete(row, k)
+	}
+	row["criteria_met"] = false
+	row["n_results"] = 0
+	row["n_zero_reason"] = fmt.Sprintf(
+		"state predates the current metric (it measured %q); it is recomputed on this experiment's next run", was)
 }
 
 func strOr(s, d string) string {
@@ -435,10 +494,11 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 	st := readExpStateFor(userSub, app, appDir, id)
 	rows, rowsTotal := readExpRowsCounted(appDir, id, expResultsTailCap)
 	metricName, _ := st["metric"].(string)
-	if metricName == "" {
-		if mm, ok := decl.Metric["name"].(string); ok {
-			metricName = mm
-		}
+	stateMetric := metricName
+	if spec := specMetricName(decl); spec != "" && spec != metricName {
+		// The spec's metric wins: the series below must plot what the
+		// experiment measures now, not what a stale state.json last measured.
+		metricName = spec
 	}
 
 	// per-variant series over the primary metric (same point shape as
@@ -512,6 +572,7 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		"id": decl.ID, "hypothesis": decl.Hypothesis, "kind": decl.Kind,
 		"dataset_id": decl.DatasetID, "metric": decl.Metric,
 		"metric_name": metricName, "baseline": decl.Baseline,
+		"state_stale":      stateMetric != "" && stateMetric != metricName,
 		"success_criteria": decl.Criteria, "min_samples": decl.MinSamples,
 		"status":      strOr(decl.Status, "active"),
 		"description": decl.Description,

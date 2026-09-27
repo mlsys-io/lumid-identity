@@ -5257,7 +5257,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if v, ok := args["limit"].(float64); ok {
 			limit = int(v)
 		}
-		return toolLqtMailboxRead(role, endpoint, strategyID, limit)
+		return toolLqtMailboxRead(role, userID, endpoint, strategyID, limit)
 
 	case "remember_about_me":
 		note, _ := args["note"].(string)

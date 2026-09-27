@@ -383,9 +383,29 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			}
 		}
 		markStaleState(row, &d, st)
+		markUnfed(row, &d, loops[d.ID])
 		out = append(out, row)
 	}
 	return out
+}
+
+// markUnfed explains a zero-row experiment that NO loop can ever feed: no
+// `dispatch.loop`, and no loop lists it under engine.experiment / steps.
+// Measured 2026-09-27: 10 of 18 experiments declared on the scheduler volume
+// had never recorded a row, and several were in exactly this shape, while the
+// card said only "0 results" -- the same words as a loop that simply has not
+// run yet.
+func markUnfed(row gin.H, d *expDecl, feeding []string) {
+	if len(feeding) > 0 || len(d.Dispatch) > 0 {
+		return
+	}
+	if n, _ := row["n_results"].(int); n != 0 {
+		return
+	}
+	// Its OWN field, not n_zero_reason: that one means "rows exist but none
+	// carries the metric" (TestNeverRunCarriesNoReason), a different fact.
+	row["unfed"] = true
+	row["unfed_reason"] = "no loop feeds this experiment: declare dispatch.loop, or list it under a loop's engine.experiment"
 }
 
 // specMetricName is the metric the spec declares now, or "".

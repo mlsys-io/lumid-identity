@@ -48,3 +48,22 @@ func TestStrategyCyclesIsCallerScoped(t *testing.T) {
 		t.Fatalf("without a caller it must refuse, not fall back to the operator PAT: %v", out)
 	}
 }
+
+func TestUnfedExperimentSaysWhy(t *testing.T) {
+	d := &expDecl{ID: "analyst_model_arms", Metric: map[string]any{"name": "avg_question_score"}}
+	row := gin.H{"n_results": 0}
+	markUnfed(row, d, nil)
+	if row["unfed"] != true || !strings.Contains(row["unfed_reason"].(string), "no loop feeds") {
+		t.Fatalf("unfed experiment not explained: %v", row)
+	}
+	fed := gin.H{"n_results": 0}
+	markUnfed(fed, d, []string{"case_cycle"})
+	if _, ok := fed["unfed"]; ok {
+		t.Fatalf("a fed experiment was marked unfed: %v", fed)
+	}
+	withRows := gin.H{"n_results": 4}
+	markUnfed(withRows, d, nil)
+	if _, ok := withRows["unfed"]; ok {
+		t.Fatalf("an experiment with rows was marked unfed: %v", withRows)
+	}
+}

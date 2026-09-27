@@ -382,9 +382,48 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 				row[k] = v
 			}
 		}
+		markStaleState(row, &d, st)
 		out = append(out, row)
 	}
 	return out
+}
+
+// specMetricName is the metric the spec declares now, or "".
+func specMetricName(d *expDecl) string {
+	if d == nil {
+		return ""
+	}
+	name, _ := d.Metric["name"].(string)
+	return strings.TrimSpace(name)
+}
+
+// markStaleState makes a row whose state.json was computed under a different
+// metric than the spec now declares say so, instead of presenting the old
+// metric's name and verdict as current. Measured 2026-09-26: kol_alpha's spec
+// moved real_tape -> realized_pnl_ticks, and every install whose loop had not
+// run since showed the new hypothesis beside "measures real tape" and a
+// verdict about a metric the experiment no longer has. evaluate() rewrites the
+// state on the next cycle, so this only covers the gap.
+func markStaleState(row gin.H, d *expDecl, st map[string]any) {
+	spec := specMetricName(d)
+	was, _ := st["metric"].(string)
+	if spec == "" || was == "" || was == spec {
+		return
+	}
+	row["metric_name"] = spec
+	if hib, ok := d.Metric["higher_is_better"]; ok {
+		row["higher_is_better"] = hib
+	}
+	row["state_stale"] = true
+	row["state_metric"] = was
+	for _, k := range []string{"variants", "best_variant", "baseline_value", "delta",
+		"delta_pp", "criteria_reason", "verdict", "comparable"} {
+		delete(row, k)
+	}
+	row["criteria_met"] = false
+	row["n_results"] = 0
+	row["n_zero_reason"] = fmt.Sprintf(
+		"state predates the current metric (it measured %q); it is recomputed on this experiment's next run", was)
 }
 
 func strOr(s, d string) string {
@@ -435,10 +474,11 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 	st := readExpStateFor(userSub, app, appDir, id)
 	rows, rowsTotal := readExpRowsCounted(appDir, id, expResultsTailCap)
 	metricName, _ := st["metric"].(string)
-	if metricName == "" {
-		if mm, ok := decl.Metric["name"].(string); ok {
-			metricName = mm
-		}
+	stateMetric := metricName
+	if spec := specMetricName(decl); spec != "" && spec != metricName {
+		// The spec's metric wins: the series below must plot what the
+		// experiment measures now, not what a stale state.json last measured.
+		metricName = spec
 	}
 
 	// per-variant series over the primary metric (same point shape as
@@ -512,6 +552,7 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		"id": decl.ID, "hypothesis": decl.Hypothesis, "kind": decl.Kind,
 		"dataset_id": decl.DatasetID, "metric": decl.Metric,
 		"metric_name": metricName, "baseline": decl.Baseline,
+		"state_stale":      stateMetric != "" && stateMetric != metricName,
 		"success_criteria": decl.Criteria, "min_samples": decl.MinSamples,
 		"status":      strOr(decl.Status, "active"),
 		"description": decl.Description,

@@ -130,8 +130,13 @@ func toolReviewAction(userID string, args map[string]any) (map[string]any, bool)
 	if v, ok := args["outbox_ref"].(string); ok {
 		body.OutboxRef = v
 	}
-	if code, msg := applyCycleReview(userID, app, loop, body); code != 0 {
+	code, msg, intentID := applyCycleReview(userID, app, loop, body)
+	if code != 0 {
 		return map[string]any{"error": msg}, false
+	}
+	if intentID != "" {
+		return queuedOpsToolResult(intentID, map[string]any{
+			"app": app, "loop": loop, "decision": decision, "applied": false}), true
 	}
 	return map[string]any{"app": app, "loop": loop, "decision": decision, "applied": true}, true
 }

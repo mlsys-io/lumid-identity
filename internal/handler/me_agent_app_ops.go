@@ -33,6 +33,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -657,14 +658,8 @@ func toolAppUIGenerate(c *gin.Context, userID, app string) (map[string]any, bool
 	if app == "" || !validAppSlug(app) {
 		return map[string]any{"error": "valid app required (or open an app first)"}, false
 	}
-	// Generation persists into the bundle — require ownership (same as the UI).
-	_, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
-		if shared {
-			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
-		}
-		return map[string]any{"error": "app not found: " + app}, false
-	}
+	// Generation persists into the bundle — ownership is enforced inside
+	// generateAppUIPage (direct, queued for the scheduler, or refused).
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 	defer cancel()
 	data, status, msg := generateAppUIPage(ctx, userID, app)
@@ -684,6 +679,11 @@ func toolAppUIGenerate(c *gin.Context, userID, app string) (map[string]any, bool
 	data["app"] = app
 	data["surface"] = "home" // generation always (re)writes the home surface
 	data["generated"] = true
+	if id, _ := data["intent_id"].(string); id != "" {
+		data["state"] = "queued"
+		data["note"] = "Generated page QUEUED for the scheduler, which saves it and points the app at it " +
+			"(a few seconds). It is rejected if the app config changed since it was read."
+	}
 	return data, true
 }
 
@@ -704,6 +704,19 @@ func toolRunMark(userID, verb, app, ts, loop string) (map[string]any, bool) {
 			return map[string]any{"error": "invalid loop name"}, false
 		}
 		cliArgs = append(cliArgs, "--loop", loop)
+	}
+	// Same routing as meRunMark: the caller's own install only, and for an
+	// install on the scheduler's disk a trajectory_mark intent.
+	_, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		id := writeIntentDirect(userID, "trajectory_mark", trajectoryMarkPayload(verb, app, ts, loop))
+		if id == "" {
+			return map[string]any{"error": "could not queue the " + verb}, false
+		}
+		return queuedOpsToolResult(id, map[string]any{"app": app, "ts": ts, verb + "d": false}), true
+	}
+	if !direct {
+		return ownerWriteToolFail(app, shared)
 	}
 	obj, err, _ := runTrajectoryCLI(userID, cliArgs...)
 	if err != nil {
@@ -866,9 +879,9 @@ func toolBranchRun(userID, app string, args map[string]any) (map[string]any, boo
 	if v, ok := args["variant"].(map[string]any); ok {
 		variant = v
 	}
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
-		return map[string]any{"error": "app not found: " + app}, false
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if !direct && !viaIntent {
+		return ownerWriteToolFail(app, shared)
 	}
 	rec := signalRecord{
 		Ts:     time.Now().UTC().Format(time.RFC3339),
@@ -879,6 +892,23 @@ func toolBranchRun(userID, app string, args map[string]any) (map[string]any, boo
 		Note:   note,
 		By:     userID,
 		Status: "pending",
+	}
+	// Same transport as MeTrajectorySignal: the signal is appended on the
+	// scheduler's disk. The pending count cannot be read from here.
+	if viaIntent {
+		id, err := queueAppFileOps(userID, app, func() ([]map[string]any, error) {
+			op, err := appendOp(signalsRel, rec)
+			return []map[string]any{op}, err
+		})
+		if err != nil {
+			if errors.Is(err, errAppFileTooBig) {
+				return map[string]any{"error": "branch signal exceeds 16 KB — shorten the note or variant"}, false
+			}
+			return map[string]any{"error": "could not queue the signal: " + err.Error()}, false
+		}
+		return queuedOpsToolResult(id, map[string]any{
+			"app": app, "loop": loop, "from_ts": fromTs, "branched": false, "branch_note": note,
+		}), true
 	}
 	controlDir, err := ResolveRuntimeWritePath(appDir, "data/control")
 	if err != nil {

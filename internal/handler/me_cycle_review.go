@@ -55,8 +55,15 @@ func MeCycleReview(c *gin.Context) {
 		return
 	}
 
-	if code, msg := applyCycleReview(userID, app, loop, body); code != 0 {
+	code, msg, intentID := applyCycleReview(userID, app, loop, body)
+	if code != 0 {
 		fail(c, code, code+1000, msg)
+		return
+	}
+	if intentID != "" {
+		respondQueued(c, intentID, gin.H{
+			"app": app, "loop": loop, "ts": c.Param("ts"), "decision": body.Decision,
+		})
 		return
 	}
 
@@ -70,18 +77,72 @@ func MeCycleReview(c *gin.Context) {
 }
 
 // applyCycleReview is MeCycleReview's core, shared with the chat tool
-// `review_action`. Returns (0, "") on success or (httpStatus, message).
-func applyCycleReview(userID, app, loop string, body cycleReviewBody) (int, string) {
-	dataDir := filepath.Join(tenantAppsDir(userID), app, "data")
-	// Anchor inside the tenant tree so app/loop params can't escape.
-	abs, err := filepath.Abs(dataDir)
-	if err != nil || !strings.HasPrefix(abs, tenantAppsDir(userID)+string(os.PathSeparator)) {
-		return http.StatusBadRequest, "invalid path"
+// `review_action`. Returns (0, "", intentID) on success or (httpStatus,
+// message, ""). intentID is non-empty when the decision was QUEUED rather
+// than written.
+//
+// Owner write: only the caller's own install. It used to MkdirAll
+// <tenant>/.xp/apps/<app>/data whether or not the app was installed — on a
+// cloud pod that is a pod-local directory the engine never reads. identity
+// mounts no tenant volume; the scheduler can see the disk, so there the
+// decision is queued as an app_file_write json_set, which changes only the one
+// key — the engine rewrites these files itself as it consumes them, and a
+// whole-file write from here would race it.
+func applyCycleReview(userID, app, loop string, body cycleReviewBody) (int, string, string) {
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if !direct && !viaIntent {
+		if shared {
+			return http.StatusForbidden, "this app is operator-shared (read-only) — install your own copy first", ""
+		}
+		return http.StatusNotFound, "app not found", ""
 	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return http.StatusInternalServerError, "mkdir: " + err.Error()
+	rel, set, code, msg := cycleReviewSet(loop, body, time.Now().UTC())
+	if code != 0 {
+		return code, msg, ""
+	}
+	if rel == "" {
+		return 0, "", "" // dismiss: nothing to write either way
+	}
+	if viaIntent {
+		id, err := queueAppFileOps(userID, app, func() ([]map[string]any, error) {
+			op, err := jsonSetOp(rel, set)
+			return []map[string]any{op}, err
+		})
+		if err != nil {
+			return http.StatusInternalServerError, "queue intent: " + err.Error(), ""
+		}
+		return 0, "", id
 	}
 
+	dataDir := filepath.Join(appDir, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return http.StatusInternalServerError, "mkdir: " + err.Error(), ""
+	}
+	kp := set[0].([]string)
+	if err := reviewMergeJSON(filepath.Join(appDir, rel), func(m map[string]any) {
+		if len(kp) == 1 {
+			m[kp[0]] = set[1]
+			return
+		}
+		inner, _ := m[kp[0]].(map[string]any)
+		if inner == nil {
+			inner = map[string]any{}
+		}
+		inner[kp[1]] = set[1]
+		m[kp[0]] = inner
+	}); err != nil {
+		return http.StatusInternalServerError, err.Error(), ""
+	}
+	return 0, "", ""
+}
+
+// cycleReviewSet turns a decision into (file, one json_set pair). The direct
+// write and the queued one apply the same pair, so they cannot drift:
+//
+//	approve       → data/approved_actions.json          [[ref], {approved_at}]
+//	revamp|edit   → data/step_instructions_pending.json [[loop, step_id], text]
+//	dismiss       → rel "" (no-op)
+func cycleReviewSet(loop string, body cycleReviewBody, now time.Time) (rel string, set []any, code int, msg string) {
 	switch body.Decision {
 	case "approve":
 		ref := body.OutboxRef
@@ -89,35 +150,20 @@ func applyCycleReview(userID, app, loop string, body cycleReviewBody) (int, stri
 			ref = loop + ":" + body.StepID
 		}
 		if ref == "" {
-			return http.StatusBadRequest, "approve needs outbox_ref or step_id"
+			return "", nil, http.StatusBadRequest, "approve needs outbox_ref or step_id"
 		}
-		if err := reviewMergeJSON(filepath.Join(dataDir, "approved_actions.json"),
-			func(m map[string]any) {
-				m[ref] = map[string]any{"approved_at": time.Now().UTC().Format(time.RFC3339)}
-			}); err != nil {
-			return http.StatusInternalServerError, err.Error()
-		}
+		return approvedActsRel, jsonSetPair(map[string]any{"approved_at": now.Format(time.RFC3339)}, ref), 0, ""
 	case "revamp", "edit":
 		if body.StepID == "" || strings.TrimSpace(body.StepInstructions) == "" {
-			return http.StatusBadRequest, "revamp needs step_id and step_instructions"
+			return "", nil, http.StatusBadRequest, "revamp needs step_id and step_instructions"
 		}
-		if err := reviewMergeJSON(filepath.Join(dataDir, "step_instructions_pending.json"),
-			func(m map[string]any) {
-				loopMap, _ := m[loop].(map[string]any)
-				if loopMap == nil {
-					loopMap = map[string]any{}
-				}
-				loopMap[body.StepID] = body.StepInstructions
-				m[loop] = loopMap
-			}); err != nil {
-			return http.StatusInternalServerError, err.Error()
-		}
+		return stepInstrPendRel, jsonSetPair(body.StepInstructions, loop, body.StepID), 0, ""
 	case "dismiss":
 		// No-op: the held action simply re-stages on the next cycle.
+		return "", nil, 0, ""
 	default:
-		return http.StatusBadRequest, "unknown decision: " + body.Decision
+		return "", nil, http.StatusBadRequest, "unknown decision: " + body.Decision
 	}
-	return 0, ""
 }
 
 // reviewMergeJSON reads a JSON object file (or {} if absent), applies mut,

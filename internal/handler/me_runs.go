@@ -151,22 +151,18 @@ func MeRunMark(c *gin.Context) {
 		return
 	}
 
-	// Resolve the cycle dir (best-effort) so we can journal next to it.
-	cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
-	// Locate the app bundle dir (tenant first, then operator-shared), then
-	// write the synthetic journal entry to the canonical .lumid/journal.jsonl.
-	appDir := filepath.Join(tenantAppsDir(userID), app)
-	if _, err := os.Stat(appDir); err != nil {
-		// Try operator-shared.
-		appDir = filepath.Join(operatorHome(), ".xp", "apps", app)
-		if _, err := os.Stat(appDir); err != nil {
-			fail(c, http.StatusNotFound, 1404, "app not installed")
-			return
-		}
+	// The id is caller-supplied and flows into paths: single safe segments only.
+	if !validAppSlug(app) || !safeSeg(loop) || !safeSeg(ts) {
+		fail(c, http.StatusBadRequest, 1400, "invalid run id")
+		return
 	}
-	journalPath, err := ResolveRuntimeWritePath(appDir, "data/journal.jsonl")
-	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "resolve journal: "+err.Error())
+
+	// Owner write. This used to fall back to the OPERATOR-SHARED bundle and
+	// append a manual override to a journal every other tenant reads; now only
+	// the caller's own install is marked (shared → 403, absent → 404).
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if !direct && !viaIntent {
+		ownerWriteFail(c, shared)
 		return
 	}
 
@@ -178,11 +174,38 @@ func MeRunMark(c *gin.Context) {
 		"original_run_ts": ts,
 		"marked_by":       userID,
 	}
-	if cycleDir != "" {
-		entry["cycle_dir"] = cycleDir
-	}
 	if body.Note != "" {
 		entry["note"] = body.Note
+	}
+
+	// identity mounts no tenant volume; the scheduler can see the disk. The
+	// journal row is appended there (cycle_dir is omitted: it is a path on a
+	// disk identity cannot resolve).
+	if viaIntent {
+		id, err := queueAppFileOps(userID, app, func() ([]map[string]any, error) {
+			op, err := appendOp(journalRel, entry)
+			return []map[string]any{op}, err
+		})
+		if err != nil {
+			appFileOpsStatus(c, err)
+			return
+		}
+		respondQueued(c, id, gin.H{
+			"run_id": runID, "new_state": body.State,
+			"note": "Manual override queued for the scheduler. Next scheduler refresh after it applies picks it up.",
+		})
+		return
+	}
+
+	// Resolve the cycle dir (best-effort) so we can journal next to it.
+	if cycleDir, _ := resolveCycleDir(userID, app, loop, ts); cycleDir != "" {
+		entry["cycle_dir"] = cycleDir
+	}
+	// Write the synthetic journal entry to the canonical .lumid/journal.jsonl.
+	journalPath, err := ResolveRuntimeWritePath(appDir, "data/journal.jsonl")
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "resolve journal: "+err.Error())
+		return
 	}
 	row, _ := json.Marshal(entry)
 	f, err := os.OpenFile(journalPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)

@@ -32,6 +32,7 @@ package handler
 // xpcloud.yaml to point to it (detaches the fork from the template).
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -785,24 +786,7 @@ func patchXpcloudUISurfacePage(appDir, pagePath string) error {
 	if err != nil {
 		return err
 	}
-	var doc map[string]interface{}
-	if err := yaml.Unmarshal(b, &doc); err != nil {
-		return err
-	}
-	ui, _ := doc["ui"].(map[string]interface{})
-	if ui == nil {
-		ui = map[string]interface{}{}
-		doc["ui"] = ui
-	}
-	surface, _ := ui["surface"].(map[string]interface{})
-	if surface == nil {
-		surface = map[string]interface{}{}
-		ui["surface"] = surface
-	}
-	surface["page"] = pagePath
-	delete(surface, "markdown")
-	delete(surface, "native")
-	out, err := yaml.Marshal(doc)
+	out, err := patchSpecUISurfacePage(b, pagePath)
 	if err != nil {
 		return err
 	}
@@ -819,6 +803,33 @@ func patchXpcloudUISurfacePage(appDir, pagePath string) error {
 		_ = os.Remove(readPath)
 	}
 	return nil
+}
+
+// patchSpecUISurfacePage is patchXpcloudUISurfacePage on bytes: the direct
+// write and the queued one (generateAppUIPage's viaIntent branch) produce the
+// same spec.
+func patchSpecUISurfacePage(b []byte, pagePath string) ([]byte, error) {
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return nil, err
+	}
+	if doc == nil {
+		return nil, errors.New("spec is not a mapping")
+	}
+	ui, _ := doc["ui"].(map[string]interface{})
+	if ui == nil {
+		ui = map[string]interface{}{}
+		doc["ui"] = ui
+	}
+	surface, _ := ui["surface"].(map[string]interface{})
+	if surface == nil {
+		surface = map[string]interface{}{}
+		ui["surface"] = surface
+	}
+	surface["page"] = pagePath
+	delete(surface, "markdown")
+	delete(surface, "native")
+	return yaml.Marshal(doc)
 }
 
 func patchXpcloudUISurface(appDir, surfaceName, newPath string) error {

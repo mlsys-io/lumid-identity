@@ -53,9 +53,18 @@ func MeLoopDelete(c *gin.Context) {
 	}
 	app := c.Param("app")
 	loop := c.Param("loop")
-	remaining, status, code, msg := removeLoopFromApp(userID, app, loop)
+	remaining, intentID, status, code, msg := removeLoopFromApp(userID, app, loop)
 	if status != http.StatusOK {
 		fail(c, status, code, msg)
+		return
+	}
+	if intentID != "" {
+		// `remaining` is the scheduler's to report (the intent result carries
+		// it); identity only saw the spec it validated against.
+		respondQueued(c, intentID, gin.H{
+			"app": app, "removed_loop": loop, "remaining": nil,
+			"note": "removal queued for the scheduler; it unregisters this workflow once applied",
+		})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -71,49 +80,62 @@ func MeLoopDelete(c *gin.Context) {
 // strips it from xpcloud.yaml::loops[] (and the manifest.json mirror) and
 // ARCHIVES its cycle history into .xp/.trash (never destroys it). Shared by
 // MeLoopDelete (HTTP) and the delete_loop chatbox tool. Returns
-// (remaining, httpStatus, retCode, message); status==200 means success.
-func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
+// (remaining, intentID, httpStatus, retCode, message); status==200 means
+// success, and a non-empty intentID means it was QUEUED, not done.
+//
+// identity mounts no tenant volume; the scheduler can see the disk. For an
+// install only it can see, the removal is a `remove_loop` intent. The checks
+// identity CAN make from the spec it reads (unknown loop, last loop) still
+// answer immediately; the picker makes them again against the real file.
+func removeLoopFromApp(userID, app, loop string) (int, string, int, int, string) {
 	if !slugRe.MatchString(app) || loop == "" {
-		return 0, http.StatusBadRequest, 1400, "invalid app or loop"
+		return 0, "", http.StatusBadRequest, 1400, "invalid app or loop"
 	}
-	appDir := filepath.Join(tenantAppsDir(userID), app)
+	appDir, direct, viaIntent, _ := ownerWriteTarget(userID, app)
+	if viaIntent {
+		if !safeSeg(loop) {
+			return 0, "", http.StatusBadRequest, 1400, "invalid loop"
+		}
+		if b := readAppSpecBytes(userID, app, resolveAppDir(userID, app)); len(b) > 0 {
+			var doc map[string]any
+			if yaml.Unmarshal(b, &doc) == nil {
+				if _, status, code, msg := specLoopsWithout(doc, app, loop); status != http.StatusOK {
+					return 0, "", status, code, msg
+				}
+			}
+		}
+		id, err := insertIntent("remove_loop", userID, map[string]any{"app": app, "loop": loop})
+		if err != nil {
+			return 0, "", http.StatusInternalServerError, 1500, "queue intent: " + err.Error()
+		}
+		return 0, id, http.StatusOK, 0, ""
+	}
+	if !direct {
+		return 0, "", http.StatusNotFound, 1404,
+			"app not found in your account (operator-shared apps can't be edited)"
+	}
 	xpPath, _ := ResolveSpecPath(appDir)
 	b, err := os.ReadFile(xpPath)
 	if err != nil {
-		return 0, http.StatusNotFound, 1404,
+		return 0, "", http.StatusNotFound, 1404,
 			"app not found in your account (operator-shared apps can't be edited)"
 	}
 	var doc map[string]any
 	if err := yaml.Unmarshal(b, &doc); err != nil {
-		return 0, http.StatusInternalServerError, 1500, "parse xpcloud.yaml: " + err.Error()
+		return 0, "", http.StatusInternalServerError, 1500, "parse xpcloud.yaml: " + err.Error()
 	}
-	rawLoops, _ := doc["loops"].([]any)
-	kept := make([]any, 0, len(rawLoops))
-	found := false
-	for _, l := range rawLoops {
-		lm, _ := l.(map[string]any)
-		name, _ := lm["name"].(string)
-		if name == loop {
-			found = true
-			continue
-		}
-		kept = append(kept, l)
-	}
-	if !found {
-		return 0, http.StatusNotFound, 1404, "workflow '" + loop + "' not found in " + app
-	}
-	if len(kept) == 0 {
-		return 0, http.StatusBadRequest, 1409,
-			"can't remove the last workflow — delete the app instead"
+	kept, status, code, msg := specLoopsWithout(doc, app, loop)
+	if status != http.StatusOK {
+		return 0, "", status, code, msg
 	}
 	doc["loops"] = kept
 	out, err := yaml.Marshal(doc)
 	if err != nil {
-		return 0, http.StatusInternalServerError, 1500, "marshal: " + err.Error()
+		return 0, "", http.StatusInternalServerError, 1500, "marshal: " + err.Error()
 	}
 	specOut := SpecWritePath(appDir)
 	if err := os.WriteFile(specOut, out, 0o644); err != nil {
-		return 0, http.StatusInternalServerError, 1500, "write xpcloud.yaml: " + err.Error()
+		return 0, "", http.StatusInternalServerError, 1500, "write xpcloud.yaml: " + err.Error()
 	}
 	if xpPath != specOut {
 		_ = os.Remove(xpPath) // don't orphan a pre-existing legacy spec file
@@ -155,7 +177,33 @@ func removeLoopFromApp(userID, app, loop string) (int, int, int, string) {
 			_ = os.RemoveAll(srcCycles) // fallback: still remove from the live tree
 		}
 	}
-	return len(kept), http.StatusOK, 0, ""
+	return len(kept), "", http.StatusOK, 0, ""
+}
+
+// specLoopsWithout returns the spec's loops[] minus `loop`, or the refusal:
+// 404 for an unknown loop, 409 for the last one (an app with zero
+// workflows is meaningless — delete the app instead).
+func specLoopsWithout(doc map[string]any, app, loop string) ([]any, int, int, string) {
+	rawLoops, _ := doc["loops"].([]any)
+	kept := make([]any, 0, len(rawLoops))
+	found := false
+	for _, l := range rawLoops {
+		lm, _ := l.(map[string]any)
+		name, _ := lm["name"].(string)
+		if name == loop {
+			found = true
+			continue
+		}
+		kept = append(kept, l)
+	}
+	if !found {
+		return nil, http.StatusNotFound, 1404, "workflow '" + loop + "' not found in " + app
+	}
+	if len(kept) == 0 {
+		return nil, http.StatusConflict, 1409,
+			"can't remove the last workflow — delete the app instead"
+	}
+	return kept, http.StatusOK, 0, ""
 }
 
 // readAppVersion reads an app's version from manifest.json (preferred) or
@@ -1165,6 +1213,16 @@ func MeWorkflowDetail(c *gin.Context) {
 	// Cross-node fallback: identity can't read a tenant kind=agent app's PVC,
 	// so readLoopsFromAnywhere is empty → detail 404'd even though the loop
 	// exists. Pull loops from the caller's PUBLISHED xp.io spec.
+	// A draft composed on a cloud pod exists only as a stage_app intent plus
+	// the me_app_specs row compose wrote for it (stageDraftApp) — it has no
+	// published spec, so read that row before asking xp.io.
+	if len(loops) == 0 {
+		if row := storedAppSpec(userID, app); row != nil {
+			if pl, err := readYamlLoopsBytes([]byte(row.SpecYAML)); err == nil && len(pl) > 0 {
+				loops, src = pl, "installed"
+			}
+		}
+	}
 	if len(loops) == 0 {
 		if spec, okf := fetchRepoSpecYAML(userID, app); okf {
 			if pl, err := readYamlLoopsBytes(spec); err == nil {
@@ -1230,36 +1288,51 @@ func MeImportFromN8n(c *gin.Context) {
 	if slug == "" {
 		slug = "n8n-" + body.N8nID
 	}
+	// The slug becomes a directory name in the tenant tree — it was joined
+	// unvalidated before.
+	if !validAppSlug(slug) {
+		fail(c, http.StatusBadRequest, 1400, "invalid target_slug")
+		return
+	}
+	// Never overwrite an installed app with an import. The stage_app picker
+	// refuses too, but only after the fact; this answers now.
+	if common.DB != nil {
+		for _, n := range tenantInstalledAppNames(userID) {
+			if n == slug {
+				fail(c, http.StatusConflict, 1409, "an installed app is already named "+slug+" — pick another target_slug")
+				return
+			}
+		}
+	}
 
 	yaml, unsupported := translateN8nToXpcloud(wf, slug)
-
-	draftDir := filepath.Join(tenantAppsDir(userID), slug)
-	if err := os.MkdirAll(draftDir, 0o775); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "draft dir: "+err.Error())
-		return
-	}
-	if err := os.WriteFile(SpecWritePath(draftDir), []byte(yaml), 0o644); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write yaml: "+err.Error())
-		return
-	}
 	manifest := map[string]any{
 		"name": slug, "kind": "app", "version": "0.1.0",
 		"description": "Promoted from n8n workflow " + body.N8nID,
 		"fork_of":     "n8n:" + body.N8nID,
 	}
-	manifestBytes, _ := json.MarshalIndent(manifest, "", "  ")
-	_ = os.WriteFile(ManifestWritePath(draftDir), manifestBytes, 0o644)
 
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{
-			"draft_slug":        slug,
-			"draft_dir":         draftDir,
-			"n8n_id":            body.N8nID,
-			"unsupported_nodes": unsupported,
-			"note":              "Promoted as a draft. Open /studio/workflows to install + adjust.",
-		},
-	})
+	// Direct when this identity mounts the tenant tree, else a stage_app
+	// intent (see stageDraftApp) — identity mounts no tenant volume; the
+	// scheduler can see the disk.
+	draftDir, intentID, err := stageDraftApp(userID, slug, yaml, manifest, false)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 1500, err.Error())
+		return
+	}
+	data := gin.H{
+		"draft_slug":        slug,
+		"draft_dir":         draftDir,
+		"n8n_id":            body.N8nID,
+		"unsupported_nodes": unsupported,
+		"note":              "Promoted as a draft. Open /studio/workflows to install + adjust.",
+	}
+	if intentID != "" {
+		data["note"] = "Promotion QUEUED for the scheduler (a few seconds). Open /studio/workflows to install + adjust."
+		respondQueued(c, intentID, data)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
 }
 
 // translateN8nToXpcloud — best-effort node-type mapping. Returns the

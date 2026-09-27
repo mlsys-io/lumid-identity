@@ -2,8 +2,10 @@ package handler
 
 // User-defined personas for the Studio chat. Each persona is a
 // custom system prompt + optional tool whitelist + display label.
-// Lives at ~/.tenants/<userID>/.personas/<id>.json. Endpoints
-// follow the same shape as artifacts + chats (list/get/upsert/delete).
+// Stored in MySQL (models.MePersona, me_personas) — see
+// me_agent_personas_store.go for why they are no longer pod-local files.
+// Endpoints follow the same shape as artifacts + chats
+// (list/get/upsert/delete); the API shapes did not change with the store.
 //
 // When the chat body sets `persona_id`, buildSystemPrompt swaps the
 // LumidOS assistant base + agent-bank block entirely for the
@@ -17,12 +19,8 @@ package handler
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -49,14 +47,6 @@ type persona struct {
 	UpdatedAt      string   `json:"updated_at"`
 }
 
-func personasDir(userID string) string {
-	return filepath.Join(tenantRoot(userID), ".personas")
-}
-
-func personaPath(userID, id string) string {
-	return filepath.Join(personasDir(userID), id+".json")
-}
-
 func newPersonaID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
@@ -65,24 +55,13 @@ func newPersonaID() string {
 	return "per-" + hex.EncodeToString(b)
 }
 
-// loadPersona reads one persona from disk. Returns nil + nil error
-// when the id doesn't exist (caller decides whether that's fatal).
+// loadPersona reads one persona. Returns nil + nil error when the id
+// doesn't exist (caller decides whether that's fatal).
 func loadPersona(userID, id string) (*persona, error) {
 	if !personaIDRe.MatchString(id) {
 		return nil, fmt.Errorf("invalid persona id")
 	}
-	b, err := os.ReadFile(personaPath(userID, id))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var p persona
-	if err := json.Unmarshal(b, &p); err != nil {
-		return nil, err
-	}
-	return &p, nil
+	return personaStoreGet(userID, id)
 }
 
 // buildPersonaSystemPrompt — replaces buildSystemPrompt entirely
@@ -102,14 +81,9 @@ func MePersonasList(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
-	dir := personasDir(userID)
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"personas": []any{}}})
-		return
-	}
+	list, err := personaStoreList(userID)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "readdir: "+err.Error())
+		fail(c, http.StatusInternalServerError, 1500, "list: "+err.Error())
 		return
 	}
 	type row struct {
@@ -122,18 +96,7 @@ func MePersonasList(c *gin.Context) {
 		UpdatedAt      string   `json:"updated_at"`
 	}
 	rows := []row{}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		var p persona
-		if err := json.Unmarshal(b, &p); err != nil {
-			continue
-		}
+	for _, p := range list {
 		rows = append(rows, row{
 			ID:             p.ID,
 			Name:           p.Name,
@@ -233,28 +196,13 @@ func MePersonaSave(c *gin.Context) {
 	rec.PreferredModel = body.PreferredModel
 	rec.UpdatedAt = now
 
-	if err := os.MkdirAll(personasDir(userID), 0o755); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "mkdir: "+err.Error())
-		return
-	}
-	buf, err := json.Marshal(rec)
-	if err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "marshal: "+err.Error())
-		return
-	}
-	tmp := personaPath(userID, rec.ID) + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o644); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "write: "+err.Error())
-		return
-	}
-	if err := os.Rename(tmp, personaPath(userID, rec.ID)); err != nil {
-		_ = os.Remove(tmp)
-		fail(c, http.StatusInternalServerError, 1500, "rename: "+err.Error())
+	if err := personaStoreSave(userID, &rec); err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "save: "+err.Error())
 		return
 	}
 
 	if isNew {
-		go prunePersonas(userID, personasKeep)
+		prunePersonas(userID, personasKeep)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
@@ -274,45 +222,14 @@ func MePersonaDelete(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid persona id")
 		return
 	}
-	err := os.Remove(personaPath(userID, id))
-	if errors.Is(err, os.ErrNotExist) {
-		fail(c, http.StatusNotFound, 1404, "not found")
-		return
-	}
+	found, err := personaStoreDelete(userID, id)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "remove: "+err.Error())
 		return
 	}
+	if !found {
+		fail(c, http.StatusNotFound, 1404, "not found")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"id": id}})
-}
-
-// prunePersonas keeps only the `keep` newest files. Mirrors the
-// artifact/chat pruning pattern.
-func prunePersonas(userID string, keep int) {
-	entries, err := os.ReadDir(personasDir(userID))
-	if err != nil {
-		return
-	}
-	type item struct {
-		name string
-		mod  time.Time
-	}
-	rows := make([]item, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		rows = append(rows, item{e.Name(), info.ModTime()})
-	}
-	if len(rows) <= keep {
-		return
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].mod.Before(rows[j].mod) })
-	for _, r := range rows[:len(rows)-keep] {
-		_ = os.Remove(filepath.Join(personasDir(userID), r.name))
-	}
 }

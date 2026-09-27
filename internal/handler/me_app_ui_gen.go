@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -246,14 +247,22 @@ func MeGenerateAppUI(c *gin.Context) {
 		switch status {
 		case http.StatusBadRequest:
 			code = 1400
+		case http.StatusForbidden:
+			code = 1403
 		case http.StatusNotFound:
 			code = 1404
+		case http.StatusRequestEntityTooLarge:
+			code = 1413
 		case http.StatusUnprocessableEntity:
 			code = 1422
 		case http.StatusServiceUnavailable:
 			code = 1503
 		}
 		fail(c, status, code, msg)
+		return
+	}
+	if id, _ := data["intent_id"].(string); id != "" {
+		c.JSON(http.StatusAccepted, gin.H{"ret_code": 0, "message": "queued", "data": data})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
@@ -266,21 +275,44 @@ func MeGenerateAppUI(c *gin.Context) {
 // (app_ui_generate) so the AI can author/regenerate an app's page in
 // conversation — closing the "UI authoring is UI-only" control-plane gap.
 //
+// Owner write. The HTTP route had no ownership check at all — it resolved
+// through resolveAppDir, which also returns the operator-shared bundle, and
+// rewrote that (or, on a cloud pod, the materialised cache nothing reads).
+// Now: direct → written here as before; viaIntent → identity mounts no tenant
+// volume; the scheduler can see the disk, so ONE app_file_write batch carries
+// both files (.ui/page.yaml and the patched .xpcloud.yaml, base_sha = the spec
+// bytes it was patched from) and data carries intent_id + queued:true.
+//
 // Returns (data, 0, "") on success; on failure (nil, httpStatus, message) so
 // callers can map to their own error envelope.
 func generateAppUIPage(ctx context.Context, userID, app string) (map[string]any, int, string) {
 	if !slugRe.MatchString(app) {
 		return nil, http.StatusBadRequest, "invalid app"
 	}
-	appDir := resolveAppDir(userID, app)
-	if appDir == "" {
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if !direct && !viaIntent {
+		if shared {
+			return nil, http.StatusForbidden, "this app is operator-shared (read-only) — install your own copy first"
+		}
 		return nil, http.StatusNotFound, "app not found"
 	}
 
-	specPath, _ := ResolveSpecPath(appDir)
-	yamlBytes, err := os.ReadFile(specPath)
-	if err != nil {
-		return nil, http.StatusUnprocessableEntity, "xpcloud.yaml not found in app bundle"
+	var yamlBytes []byte
+	if viaIntent {
+		// Read what the caller sees: queued spec edits, the echoed install, the
+		// published bundle — in that order (readAppSpecBytes).
+		appDir = resolveAppDir(userID, app)
+		yamlBytes = readAppSpecBytes(userID, app, appDir)
+		if len(yamlBytes) == 0 {
+			return nil, http.StatusUnprocessableEntity, "xpcloud.yaml not found in app bundle"
+		}
+	} else {
+		specPath, _ := ResolveSpecPath(appDir)
+		b, err := os.ReadFile(specPath)
+		if err != nil {
+			return nil, http.StatusUnprocessableEntity, "xpcloud.yaml not found in app bundle"
+		}
+		yamlBytes = b
 	}
 
 	// Context: improve the CURRENT page.yaml if present; else seed from the NL
@@ -288,6 +320,11 @@ func generateAppUIPage(ctx context.Context, userID, app string) (map[string]any,
 	currentPage := ""
 	if pb, e := readAppUIFile(appDir, "page.yaml"); e == nil {
 		currentPage = string(pb)
+	}
+	if viaIntent {
+		if ob, deleted, found := appFileOverlay(userID, app, appUIWriteRef("page.yaml")); found && !deleted {
+			currentPage = string(ob)
+		}
 	}
 	pageSpec := ""
 	if pb, e := readAppUIFile(appDir, "page-spec.md"); e == nil {
@@ -311,6 +348,29 @@ func generateAppUIPage(ctx context.Context, userID, app string) (map[string]any,
 		return nil, http.StatusUnprocessableEntity, "generated page.yaml invalid: " + cerr.Error()
 	}
 
+	ref := appUIWriteRef("page.yaml")
+	if viaIntent {
+		patched, perr := patchSpecUISurfacePage(yamlBytes, ref)
+		if perr != nil {
+			return nil, http.StatusUnprocessableEntity, "cannot patch xpcloud.yaml: " + perr.Error()
+		}
+		id, qerr := queueAppFileBatch(userID, app, []map[string]any{
+			writeOp(ref, generated, ""),
+			writeOp(appFileSpecRel, string(patched), contentSHA(yamlBytes)),
+		})
+		if qerr != nil {
+			if errors.Is(qerr, errAppFileTooBig) {
+				return nil, http.StatusRequestEntityTooLarge, "generated page or patched spec exceeds the size limit"
+			}
+			return nil, http.StatusInternalServerError, "queue intent: " + qerr.Error()
+		}
+		return map[string]any{
+			"markdown": md, "path": ref, "source": "generated",
+			"intent_id": id, "status": "pending", "queued": true, "saved": false,
+			"sha": contentSHA([]byte(generated)),
+		}, 0, ""
+	}
+
 	// Persist page.yaml as the source of truth + point the surface at it.
 	// NEW writes land in the canonical ".ui/" dotfile directory.
 	uiDir := appUIWriteDir(appDir)
@@ -326,36 +386,8 @@ func generateAppUIPage(ctx context.Context, userID, app string) (map[string]any,
 		_ = os.Remove(tmp)
 		return nil, http.StatusInternalServerError, "cannot save page.yaml"
 	}
-	_ = patchXpcloudUISurfacePage(appDir, appUIWriteRef("page.yaml"))
-	return map[string]any{"markdown": md, "path": appUIWriteRef("page.yaml"), "source": "generated"}, 0, ""
-}
-
-// writeSurfaceAndRespond persists the surface markdown to ui/home.md (atomic),
-// patches xpcloud.yaml to point at it, and returns the standard JSON. Shared by
-// the LLM path and the deterministic compiler path.
-func writeSurfaceAndRespond(c *gin.Context, appDir, md, source string) {
-	// NEW writes land in the canonical ".ui/" dotfile directory.
-	uiDir := appUIWriteDir(appDir)
-	if err := os.MkdirAll(uiDir, 0755); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "cannot create ui directory")
-		return
-	}
-	target := filepath.Join(uiDir, "home.md")
-	tmp := target + ".tmp"
-	if err := os.WriteFile(tmp, []byte(md), 0644); err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "cannot write surface file")
-		return
-	}
-	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		fail(c, http.StatusInternalServerError, 1500, "cannot save surface file")
-		return
-	}
-	_ = patchXpcloudUISurface(appDir, "home", appUIWriteRef("home.md"))
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{"markdown": md, "path": appUIWriteRef("home.md"), "source": source},
-	})
+	_ = patchXpcloudUISurfacePage(appDir, ref)
+	return map[string]any{"markdown": md, "path": ref, "source": "generated"}, 0, ""
 }
 
 // callGemmaBlocking calls Gemma4 on kv.run synchronously and returns the full text.

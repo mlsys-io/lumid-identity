@@ -83,6 +83,13 @@ func MeCycleFeedback(c *gin.Context) {
 
 	cycleDir, source := resolveCycleDir(userID, body.App, body.Loop, body.Ts)
 	if cycleDir == "" {
+		// identity mounts no tenant volume; the scheduler can see the disk.
+		// A cycle of the caller's own cloud install is never visible here, so
+		// its feedback is queued there instead of 404ing.
+		if _, _, viaIntent, _ := ownerWriteTarget(userID, body.App); viaIntent {
+			queueCycleFeedback(c, userID, body)
+			return
+		}
 		fail(c, http.StatusNotFound, 1404,
 			fmt.Sprintf("cycle not found in tenant or shared at %s/%s/%s", body.App, body.Loop, body.Ts))
 		return
@@ -118,31 +125,7 @@ func MeCycleFeedback(c *gin.Context) {
 	//     page can render this as an axis="examples" event without
 	//     scanning every cycle dir. Non-fatal; the canonical record
 	//     lives in feedback.jsonl above.
-	{
-		var verb string
-		switch {
-		case body.Rating > 0:
-			verb = "good"
-		case body.Rating < 0:
-			verb = "wrong"
-		default:
-			verb = "edit"
-		}
-		label := body.Note
-		if label == "" {
-			label = fmt.Sprintf("user %s on %s/%s @ %s", verb, body.App, body.Loop, body.Ts)
-		}
-		_ = appendImprovement(userID, &improvementEvent{
-			App:       body.App,
-			Loop:      body.Loop,
-			CycleTs:   body.Ts,
-			Axis:      "examples",
-			Verb:      verb,
-			Label:     label,
-			Rationale: body.Note,
-			Source:    "user",
-		})
-	}
+	_, _ = appendImprovement(userID, cycleFeedbackImprovement(body))
 
 	journalPath, jerr := ResolveRuntimeWritePath(appDir, "data/journal.jsonl")
 	if jerr != nil {
@@ -176,6 +159,101 @@ func MeCycleFeedback(c *gin.Context) {
 			"source":    source, // "tenant" | "shared"
 			"saved_at":  entry["at"],
 		},
+	})
+}
+
+// cycleFeedbackImprovement is the improvement-ledger mirror of one cycle
+// feedback, so the Intent detail page can render it as an axis="examples"
+// event without scanning every cycle dir.
+func cycleFeedbackImprovement(body meCycleFeedbackBody) *improvementEvent {
+	var verb string
+	switch {
+	case body.Rating > 0:
+		verb = "good"
+	case body.Rating < 0:
+		verb = "wrong"
+	default:
+		verb = "edit"
+	}
+	label := body.Note
+	if label == "" {
+		label = fmt.Sprintf("user %s on %s/%s @ %s", verb, body.App, body.Loop, body.Ts)
+	}
+	return &improvementEvent{
+		App:       body.App,
+		Loop:      body.Loop,
+		CycleTs:   body.Ts,
+		Axis:      "examples",
+		Verb:      verb,
+		Label:     label,
+		Rationale: body.Note,
+		Source:    "user",
+	}
+}
+
+// cycleFeedbackOps is the batch for one feedback on a cycle only the
+// scheduler can see: the co-located feedback.jsonl, the journal row, and
+// (when imp != nil) the improvement-ledger row. All-or-nothing on the picker,
+// which also refuses it when the cycle directory does not exist on the install.
+func cycleFeedbackOps(loop, ts string, entry map[string]any, imp *improvementEvent) ([]map[string]any, error) {
+	rel := cycleFeedbackRel(loop, ts)
+	if rel == "" {
+		return nil, errAppFileOp
+	}
+	fb, err := appendOp(rel, entry)
+	if err != nil {
+		return nil, err
+	}
+	jr, err := appendOp(journalRel, entry)
+	if err != nil {
+		return nil, err
+	}
+	ops := []map[string]any{fb, jr}
+	if imp != nil {
+		if err := prepareImprovement(imp); err != nil {
+			return nil, err
+		}
+		im, err := appendOp(improvementsRel, imp)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, im)
+	}
+	return ops, nil
+}
+
+// cycleFeedbackEntry is the record written to feedback.jsonl and the journal.
+func cycleFeedbackEntry(userID, app, loop, ts string, rating int, note, source string) map[string]any {
+	return map[string]any{
+		"type":       "feedback",
+		"app":        app,
+		"loop":       loop,
+		"ts":         ts,
+		"rating":     rating,
+		"note":       note,
+		"by":         userID,
+		"at":         time.Now().UTC().Format(time.RFC3339),
+		"cycle_root": source,
+	}
+}
+
+// queueCycleFeedback is MeCycleFeedback's viaIntent branch: one batch, 202.
+func queueCycleFeedback(c *gin.Context, userID string, body meCycleFeedbackBody) {
+	if !safeSeg(body.Loop) || !safeSeg(body.Ts) {
+		fail(c, http.StatusBadRequest, 1400, "invalid loop or ts")
+		return
+	}
+	entry := cycleFeedbackEntry(userID, body.App, body.Loop, body.Ts, body.Rating, body.Note, "tenant")
+	id, err := queueAppFileOps(userID, body.App, func() ([]map[string]any, error) {
+		return cycleFeedbackOps(body.Loop, body.Ts, entry, cycleFeedbackImprovement(body))
+	})
+	if err != nil {
+		appFileOpsStatus(c, err)
+		return
+	}
+	respondQueued(c, id, gin.H{
+		"app": body.App, "loop": body.Loop, "ts": body.Ts,
+		"cycle_dir": nil, "source": "tenant", "saved_at": entry["at"],
 	})
 }
 

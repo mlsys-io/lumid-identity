@@ -95,8 +95,16 @@ const (
 )
 
 // improvementsPath — per-app ledger path. Lives under the user's
-// tenant tree so each user's improvement history is private.
+// tenant tree so each user's improvement history is private. When the
+// caller's own install is visible (on-prem mount) its directory is used —
+// agents/ or apps/ — so the reader and appendImprovement agree; otherwise the
+// historical tenant apps/ path, which on a cloud pod does not exist: the
+// ledger there is on the scheduler's disk and GET /me/intents/:id/audit reads
+// nothing (known, not fixed here — see me_app_file_ops_intent.go).
 func improvementsPath(userID, app string) string {
+	if dir, owned, _ := resolveOwnedAppDir(userID, app); owned && dir != "" {
+		return filepath.Join(dir, "data", "improvements.jsonl")
+	}
 	// xpio apps live under tenant/.xp/apps in the per-user view —
 	// matches sdk/ops/apps.py + the existing journal/cycles layout.
 	return filepath.Join(tenantRoot(userID), ".xp", "apps", app, "data", "improvements.jsonl")
@@ -110,11 +118,9 @@ func newImprovementID() string {
 	return "imp-" + hex.EncodeToString(b)
 }
 
-// appendImprovement — atomic append of one event to the ledger.
-// O_APPEND on POSIX guarantees the write is atomic up to PIPE_BUF
-// size (~4KB on Linux), which is more than enough for one event.
-// Returns the event id assigned (server-minted).
-func appendImprovement(userID string, e *improvementEvent) error {
+// prepareImprovement validates one event and fills the server-minted fields
+// (id, ts, default source). Shared by the direct append and the intent path.
+func prepareImprovement(e *improvementEvent) error {
 	if e.Axis == "" || !validAxes[e.Axis] {
 		return fmt.Errorf("invalid axis %q (must be one of examples/standard/recipe/pieces/memory/rules)", e.Axis)
 	}
@@ -133,23 +139,53 @@ func appendImprovement(userID string, e *improvementEvent) error {
 	if e.Ts == "" {
 		e.Ts = time.Now().UTC().Format(time.RFC3339)
 	}
-	dir := filepath.Dir(improvementsPath(userID, e.App))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
+	return nil
+}
+
+var errImprovementNotOwned = errors.New("app is not installed for this user")
+
+// appendImprovement — append one event to the caller's OWN install's ledger.
+//
+// It used to write a hardcoded <tenant>/.xp/apps/<app>/data path, creating it
+// if missing — on a cloud pod that is a pod-local directory nothing reads.
+// identity mounts no tenant volume; the scheduler can see the disk, so when
+// the install is only there the row is queued as an app_file_write append and
+// the intent id returned. direct: O_APPEND on POSIX is atomic up to PIPE_BUF
+// (~4KB on Linux), which is more than enough for one event.
+//
+// Returns errImprovementNotOwned when the caller has no install of the app
+// (shared or absent) — the operator-shared ledger is not the caller's to write.
+func appendImprovement(userID string, e *improvementEvent) (intentID string, err error) {
+	if err := prepareImprovement(e); err != nil {
+		return "", err
+	}
+	appDir, direct, viaIntent, _ := ownerWriteTarget(userID, e.App)
+	if viaIntent {
+		return queueAppFileOps(userID, e.App, func() ([]map[string]any, error) {
+			op, err := appendOp(improvementsRel, e)
+			return []map[string]any{op}, err
+		})
+	}
+	if !direct {
+		return "", errImprovementNotOwned
+	}
+	path := filepath.Join(appDir, "data", "improvements.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", fmt.Errorf("mkdir: %w", err)
 	}
 	buf, err := json.Marshal(e)
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return "", fmt.Errorf("marshal: %w", err)
 	}
-	f, err := os.OpenFile(improvementsPath(userID, e.App), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return "", fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 	if _, err := f.Write(append(buf, '\n')); err != nil {
-		return fmt.Errorf("write: %w", err)
+		return "", fmt.Errorf("write: %w", err)
 	}
-	return nil
+	return "", nil
 }
 
 // readImprovements walks the ledger for one app + optional loop
@@ -316,8 +352,27 @@ func MeFeedbackSave(c *gin.Context) {
 		Rationale: body.Note,
 		Source:    "user",
 	}
-	if err := appendImprovement(userID, e); err != nil {
+	// Owner write — the ledger of the caller's own install. shared → 403,
+	// not installed → 404, before anything is minted or queued.
+	if _, direct, viaIntent, shared := ownerWriteTarget(userID, body.App); !direct && !viaIntent {
+		ownerWriteFail(c, shared)
+		return
+	}
+	intentID, err := appendImprovement(userID, e)
+	if err != nil {
+		if errors.Is(err, errImprovementNotOwned) {
+			fail(c, http.StatusNotFound, 1404, "app not found")
+			return
+		}
+		if errors.Is(err, errAppFileTooBig) {
+			fail(c, http.StatusRequestEntityTooLarge, 1413, "feedback record exceeds 16 KB")
+			return
+		}
 		fail(c, http.StatusInternalServerError, 1500, err.Error())
+		return
+	}
+	if intentID != "" {
+		respondQueued(c, intentID, gin.H{"id": e.ID, "ts": e.Ts})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

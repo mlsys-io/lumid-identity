@@ -28,6 +28,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"lumid_identity/models"
@@ -299,4 +300,35 @@ func runFailureReason(metrics map[string]any, outcome string) string {
 		}
 	}
 	return outcome
+}
+
+// resolveLatestCycleTs resolves ts "latest" for a feedback write. For the
+// caller's own install that identity cannot see there are no cycle dirs to
+// list here, so the newest run the cycle self-reported to me_app_runs answers
+// instead (its run_ts is the cycle dir's id). Otherwise the dirs on disk, as
+// before.
+func resolveLatestCycleTs(userID, app, loop string) (string, error) {
+	if _, direct, viaIntent, _ := ownerWriteTarget(userID, app); !direct && viaIntent {
+		return latestRunCycleID(userID, app, loop)
+	}
+	return agentLatestCycleTs(userID, app, loop)
+}
+
+// latestRunCycleID is the cycle id of the newest recorded run of app/loop.
+func latestRunCycleID(userID, app, loop string) (string, error) {
+	if common.DB == nil || loop == "" {
+		return "", fmt.Errorf("no cycles found")
+	}
+	var row models.MeAppRun
+	err := common.DB.Select("run_ts").
+		Where("user_sub = ? AND app IN ? AND `loop` = ?", userID, appAliases(app), loop).
+		Order("run_ts DESC").Limit(1).Take(&row).Error
+	if err != nil {
+		return "", fmt.Errorf("no cycles found")
+	}
+	id := runTsToCycleID(row.RunTs)
+	if id == "" {
+		return "", fmt.Errorf("no cycles found")
+	}
+	return id, nil
 }

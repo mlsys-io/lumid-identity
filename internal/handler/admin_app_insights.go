@@ -240,7 +240,9 @@ func AdminAppInsights(c *gin.Context) {
 	// discard most of them — silently undercounting this app whenever the fleet
 	// is busy. LIKE is a prefilter only; the exact match still happens below on
 	// the decoded payload.
-	q := common.DB.Where("created_at >= ?", since)
+	// Read intents (me_read_intent.go) are request plumbing, not something
+	// anyone clicked; they are normally deleted on read, and must not count.
+	q := common.DB.Where("created_at >= ? AND action NOT IN ?", since, readIntentActions)
 	likes := common.DB.Session(&gorm.Session{NewDB: true})
 	for i, a := range aliases {
 		// Match the bare name, not `"app":"<name>"`. The exact check below is
@@ -411,20 +413,18 @@ func AdminAppInsights(c *gin.Context) {
 		if r.Metrics == "" || json.Unmarshal([]byte(r.Metrics), &m) != nil {
 			continue
 		}
-		arm, _ := m["arm"].(string)
-		if arm == "" {
-			continue // the LIKE can match a substring; the decode is the truth
-		}
-		armRuns[arm]++
-		if !r.Ok {
-			armFails[arm]++
-		}
-		if armUsers[arm] == nil {
-			armUsers[arm] = map[string]bool{}
-		}
-		armUsers[arm][r.UserSub] = true
-		if e, _ := m["experiment"].(string); e != "" {
-			expRuns[e]++
+		for _, ae := range runArmObservations(m) {
+			armRuns[ae.arm]++
+			if !r.Ok {
+				armFails[ae.arm]++
+			}
+			if armUsers[ae.arm] == nil {
+				armUsers[ae.arm] = map[string]bool{}
+			}
+			armUsers[ae.arm][r.UserSub] = true
+			if ae.experiment != "" {
+				expRuns[ae.experiment]++
+			}
 		}
 	}
 	armRows := []gin.H{}
@@ -599,4 +599,34 @@ func touch2(m map[string]*insightDay, day string) *insightDay {
 		m[day] = d
 	}
 	return d
+}
+
+type armObservation struct{ arm, experiment string }
+
+// runArmObservations returns every (arm, experiment) a run's metrics carry.
+//
+// A run dispatched by enqueue_runs carries ONE arm at the top level. Since
+// 2026-09-25 quant-research records its arms from inside the poll loops
+// instead — one run resolves several claims, each tagged in
+// command_engine.results[] — and a top-level-only read counted zero arms for
+// two days while 34+ arm results a day were landing. Both shapes count; the
+// LIKE prefilter can match a substring, so the decode is the truth.
+func runArmObservations(m map[string]any) []armObservation {
+	if arm, _ := m["arm"].(string); arm != "" {
+		e, _ := m["experiment"].(string)
+		return []armObservation{{arm, e}}
+	}
+	ce, _ := m["command_engine"].(map[string]any)
+	results, _ := ce["results"].([]any)
+	var out []armObservation
+	for _, it := range results {
+		rm, _ := it.(map[string]any)
+		arm, _ := rm["arm"].(string)
+		if arm == "" {
+			continue
+		}
+		e, _ := rm["experiment"].(string)
+		out = append(out, armObservation{arm, e})
+	}
+	return out
 }

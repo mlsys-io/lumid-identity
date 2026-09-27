@@ -24,11 +24,13 @@ package handler
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -98,9 +100,8 @@ const (
 // tenant tree so each user's improvement history is private. When the
 // caller's own install is visible (on-prem mount) its directory is used —
 // agents/ or apps/ — so the reader and appendImprovement agree; otherwise the
-// historical tenant apps/ path, which on a cloud pod does not exist: the
-// ledger there is on the scheduler's disk and GET /me/intents/:id/audit reads
-// nothing (known, not fixed here — see me_app_file_ops_intent.go).
+// historical tenant apps/ path, which on a cloud pod does not exist — there
+// readImprovements fetches the ledger from the scheduler instead.
 func improvementsPath(userID, app string) string {
 	if dir, owned, _ := resolveOwnedAppDir(userID, app); owned && dir != "" {
 		return filepath.Join(dir, "data", "improvements.jsonl")
@@ -191,7 +192,26 @@ func appendImprovement(userID string, e *improvementEvent) (intentID string, err
 // readImprovements walks the ledger for one app + optional loop
 // filter. Returns events sorted newest-first. since may be empty
 // (returns everything) or an RFC3339 / unix-seconds string.
-func readImprovements(userID, app, loop, since string, limit int) ([]improvementEvent, error) {
+//
+// For the caller's own install that identity cannot see (a cloud install —
+// ownerWriteTarget viaIntent), the ledger is on the scheduler's disk: it is
+// fetched with an `app_file_read` read intent and parsed the same way. Only
+// the ledger's tail comes back when it is large (the picker caps it at
+// 256 KB, whole lines); `truncated` is not surfaced — the audit is a
+// newest-first window already.
+func readImprovements(ctx context.Context, userID, app, loop, since string, limit int) ([]improvementEvent, error) {
+	if _, direct, viaIntent, _ := ownerWriteTarget(userID, app); !direct && viaIntent {
+		data, err := runReadIntent(ctx, userID, "app_file_read",
+			map[string]any{"app": app, "path": improvementsRel}, readIntentDefaultTimeout)
+		if err != nil {
+			return nil, err
+		}
+		if exists, _ := data["exists"].(bool); !exists {
+			return nil, nil
+		}
+		content, _ := data["content"].(string)
+		return parseImprovements(strings.NewReader(content), loop, since, limit), nil
+	}
 	path := improvementsPath(userID, app)
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -201,7 +221,11 @@ func readImprovements(userID, app, loop, since string, limit int) ([]improvement
 		return nil, err
 	}
 	defer f.Close()
+	return parseImprovements(f, loop, since, limit), nil
+}
 
+// parseImprovements is the JSONL parser both ledger sources share.
+func parseImprovements(r io.Reader, loop, since string, limit int) []improvementEvent {
 	var sinceTs time.Time
 	if since != "" {
 		if t, err := time.Parse(time.RFC3339, since); err == nil {
@@ -216,7 +240,7 @@ func readImprovements(userID, app, loop, since string, limit int) ([]improvement
 	}
 
 	out := []improvementEvent{}
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		var e improvementEvent
@@ -238,7 +262,7 @@ func readImprovements(userID, app, loop, since string, limit int) ([]improvement
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
-	return out, nil
+	return out
 }
 
 // summarizeImprovements computes per-axis movement counts + deltas
@@ -399,8 +423,17 @@ func MeIntentAudit(c *gin.Context) {
 	since := c.Query("since")
 	loop := c.Query("loop")
 	limit := 200
-	events, err := readImprovements(userID, app, loop, since, limit)
+	events, err := readImprovements(ginReqCtx(c), userID, app, loop, since, limit)
 	if err != nil {
+		if errors.Is(err, errReadIntentTimeout) {
+			fail(c, http.StatusGatewayTimeout, 1504, "reading the improvements ledger timed out waiting for the scheduler — try again in a moment")
+			return
+		}
+		var rf *readIntentFailed
+		if errors.As(err, &rf) {
+			fail(c, http.StatusBadGateway, 1502, "reading the improvements ledger failed: "+rf.msg)
+			return
+		}
 		fail(c, http.StatusInternalServerError, 1500, err.Error())
 		return
 	}

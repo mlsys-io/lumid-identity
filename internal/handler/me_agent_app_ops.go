@@ -33,7 +33,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -893,22 +892,19 @@ func toolBranchRun(userID, app string, args map[string]any) (map[string]any, boo
 		By:     userID,
 		Status: "pending",
 	}
-	// Same transport as MeTrajectorySignal: the signal is appended on the
-	// scheduler's disk. The pending count cannot be read from here.
+	// Same transport as MeTrajectorySignal: for an install only the scheduler
+	// sees, a me_app_signals row the runner claims at the next cycle start.
 	if viaIntent {
-		id, err := queueAppFileOps(userID, app, func() ([]map[string]any, error) {
-			op, err := appendOp(signalsRel, rec)
-			return []map[string]any{op}, err
-		})
-		if err != nil {
-			if errors.Is(err, errAppFileTooBig) {
-				return map[string]any{"error": "branch signal exceeds 16 KB — shorten the note or variant"}, false
-			}
-			return map[string]any{"error": "could not queue the signal: " + err.Error()}, false
+		if _, err := insertAppSignal(userID, app, rec); err != nil {
+			return map[string]any{"error": "could not record the signal: " + err.Error()}, false
 		}
-		return queuedOpsToolResult(id, map[string]any{
-			"app": app, "loop": loop, "from_ts": fromTs, "branched": false, "branch_note": note,
-		}), true
+		return map[string]any{
+			"app": app, "loop": loop, "from_ts": fromTs,
+			"branched": true, "note": note, "pending": appSignalPendingCount(userID, app),
+			"state": "recorded",
+			"message": "Branch signal recorded. It steers the next run of " + loop +
+				" (picked up when that cycle starts).",
+		}, true
 	}
 	controlDir, err := ResolveRuntimeWritePath(appDir, "data/control")
 	if err != nil {

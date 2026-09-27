@@ -583,6 +583,11 @@ func Register(r *gin.Engine) {
 			// pending intents (atomic SKIP LOCKED) + posts results back.
 			internal.POST("/me-intents/claim", InternalMeIntentsClaim)
 			internal.POST("/me-intents/:id/result", InternalMeIntentResult)
+			// Trajectory control signals for installs identity cannot see —
+			// the runner claims them at cycle start, appends them to its
+			// signals.jsonl, then acks (app_runner._sync_identity_overlays).
+			internal.POST("/app-signals/claim", InternalAppSignalsClaim)
+			internal.POST("/app-signals/ack", InternalAppSignalsAck)
 			// Decrypted per-(user,app) secrets for the scheduler to inject
 			// into the cycle env (pure-UI credential path).
 			internal.POST("/app-secrets/fetch", InternalAppSecretsFetch)

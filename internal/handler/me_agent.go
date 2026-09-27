@@ -4979,7 +4979,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			return map[string]any{"error": "app/loop/ts required"}, false
 		}
 		if ts == "latest" {
-			resolved, err := agentLatestCycleTs(userID, app, loop)
+			resolved, err := resolveLatestCycleTs(userID, app, loop)
 			if err != nil {
 				return map[string]any{"error": "no recent cycles for " + app + "." + loop}, false
 			}
@@ -5018,7 +5018,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		if v, ok := args["limit"].(float64); ok && int(v) > 0 {
 			limit = int(v)
 		}
-		events, err := readImprovements(userID, app, loop, since, limit)
+		events, err := readImprovements(ginReqCtx(c), userID, app, loop, since, limit)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, false
 		}

@@ -49,8 +49,10 @@ func fnBlock(t *testing.T, file, fn string) string {
 func TestRemainingWritesGoThroughAnIntent(t *testing.T) {
 	for _, c := range []struct{ file, fn, marker string }{
 		{"me_agent_helpers.go", "agentStopLoop", `"stop_loop"`},
-		{"me_trajectory_signal.go", "MeTrajectorySignal", `appendOp(signalsRel`},
-		{"me_agent_app_ops.go", "toolBranchRun", `appendOp(signalsRel`},
+		// Signals: a me_app_signals row the runner claims at cycle start
+		// (me_app_signals_db.go), not a queued file append.
+		{"me_trajectory_signal.go", "MeTrajectorySignal", `insertAppSignal(`},
+		{"me_agent_app_ops.go", "toolBranchRun", `insertAppSignal(`},
 		{"me_cycles.go", "MeCycleFeedback", `queueCycleFeedback(`},
 		{"me_cycles.go", "cycleFeedbackOps", `appendOp(journalRel`},
 		{"me_cycles.go", "cycleFeedbackOps", `appendOp(improvementsRel`},

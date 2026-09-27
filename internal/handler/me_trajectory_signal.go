@@ -7,7 +7,9 @@ package handler
 //   GET  /me/apps/:app/trajectory/signals  — list signals (optionally ?loop=).
 //
 // Signals are appended to <appDir>/data/control/signals.jsonl (one JSON record
-// per line). This is a durable, append-only channel an operator/loop can drain
+// per line) when identity can see the install (on-prem). For an install only
+// the scheduler sees, they are me_app_signals rows the runner claims at cycle
+// start (me_app_signals_db.go). This is a durable, append-only channel an operator/loop can drain
 // later; the handlers here only record + read. Read-only except the single
 // append-write; best-effort, never panics.
 
@@ -94,20 +96,20 @@ func MeTrajectorySignal(c *gin.Context) {
 		Status:        "pending",
 	}
 
-	// identity mounts no tenant volume; the scheduler can see the disk. The
-	// record is appended there. `pending` — the count of undrained signals —
-	// is a read of that file, which identity cannot do, so it is null rather
-	// than a number computed from a copy nobody writes.
+	// identity mounts no tenant volume, so for an install only the scheduler
+	// sees the signal is a me_app_signals row: the runner claims it at the
+	// next cycle start and appends it to its own signals.jsonl. The row is
+	// written now and is durable, so this is `recorded`, not queued, and the
+	// pending count is real (undelivered rows for this app).
 	if viaIntent {
-		id, err := queueAppFileOps(userSub, app, func() ([]map[string]any, error) {
-			op, err := appendOp(signalsRel, rec)
-			return []map[string]any{op}, err
-		})
-		if err != nil {
-			appFileOpsStatus(c, err)
+		if _, err := insertAppSignal(userSub, app, rec); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "could not record signal: "+err.Error())
 			return
 		}
-		respondQueued(c, id, gin.H{"recorded": rec, "pending": nil})
+		ok(c, "recorded", gin.H{
+			"recorded": rec,
+			"pending":  appSignalPendingCount(userSub, app),
+		})
 		return
 	}
 
@@ -159,6 +161,15 @@ func MeTrajectorySignals(c *gin.Context) {
 	}
 	if loop != "" && !slugRe.MatchString(loop) {
 		fail(c, http.StatusBadRequest, 1400, "invalid loop")
+		return
+	}
+	// The caller's own install that identity cannot see: its signals are the
+	// me_app_signals rows (see me_app_signals_db.go for the status mapping).
+	// resolveAppDir would hand back the published bundle here, whose
+	// signals.jsonl is not the install's.
+	if _, direct, viaIntent, _ := ownerWriteTarget(userSub, app); !direct && viaIntent {
+		records := appSignalsFromDB(userSub, app, loop)
+		ok(c, "ok", gin.H{"signals": records, "count": len(records)})
 		return
 	}
 	appDir := resolveAppDir(userSub, app)

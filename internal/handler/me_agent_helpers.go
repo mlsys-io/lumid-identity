@@ -162,6 +162,13 @@ func agentLatestCycleTs(userID, app, loop string) (string, error) {
 // volume — the two appends are queued as one batch and the intent id returned;
 // "" means written directly.
 func agentWriteFeedback(userID, app, loop, ts string, rating int, note string) (string, error) {
+	if ts == "" || ts == "latest" {
+		resolved, err := resolveLatestCycleTs(userID, app, loop)
+		if err != nil {
+			return "", fmt.Errorf("no recent cycles for %s.%s", app, loop)
+		}
+		ts = resolved
+	}
 	cycleDir, source := resolveCycleDir(userID, app, loop, ts)
 	if cycleDir == "" {
 		if _, _, viaIntent, _ := ownerWriteTarget(userID, app); viaIntent {

@@ -28,6 +28,7 @@ var AllTables = []interface{}{
 	&MicrosoftGrantPending{},
 	&GpuRental{},
 	&MeAppIntent{},
+	&MeAppSignal{},
 	&MeAppRun{},
 	&MeComputeJobClaim{},
 	&MeAppExperiment{},

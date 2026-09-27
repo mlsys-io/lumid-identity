@@ -260,9 +260,17 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 	appDir := resolveAppDir(userID, app)
 	remote := appDir == ""
 
+	// Writes queued through the scheduler (me_app_file_intent.go) are on a disk
+	// this pod cannot read; their overlay is what the user last saved, so it
+	// wins over the bundle for the spec and for the surface file below.
+	overlays := appFileOverlays(userID, app)
+
 	var ui *appUI
 	var appCfg map[string]any
-	if remote {
+	if ov, ok := overlays[appFileSpecRel]; ok && !ov.Deleted && len(ov.Content) > 0 {
+		ui = parseAppUI(ov.Content)
+		appCfg = parseAppConfigBytes(ov.Content)
+	} else if remote {
 		spec, ok := fetchRepoSpecYAML(userID, app)
 		if !ok {
 			fail(c, http.StatusNotFound, 1404, "app not found")
@@ -305,7 +313,13 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 			return
 		}
 		var pb []byte
-		if remote {
+		if ov, ok := overlays[normAppFileRel(pagePath)]; ok {
+			if ov.Deleted {
+				fail(c, http.StatusNotFound, 1404, "page spec not found: "+pagePath)
+				return
+			}
+			pb = ov.Content
+		} else if remote {
 			var ok bool
 			if pb, ok = fetchRepoBlob(userID, app, pagePath); !ok {
 				fail(c, http.StatusNotFound, 1404, "page spec not found: "+pagePath)
@@ -363,6 +377,21 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 	// The resolved path is reported back as-is so the client can show
 	// "inherits from template" in the editor UI.
 	resolvedPath := mdPath
+	if ov, ok := overlays[normAppFileRel(mdPath)]; ok && !strings.HasPrefix(mdPath, "@") {
+		if ov.Deleted {
+			fail(c, http.StatusNotFound, 1404, "surface file not found")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{
+				"app": app, "surface": name, "path": mdPath,
+				"markdown": string(ov.Content), "bytes": len(ov.Content), "truncated": false,
+				"nav": ui.Nav, "config": appCfg, "sha": contentSHA(ov.Content),
+			},
+		})
+		return
+	}
 	// Remote (cloud-installed) apps: the .md body comes from the published
 	// bundle. The @fork_of / @shared indirections below are filesystem-only
 	// (they resolve against a parent app dir / the operator templates dir), so
@@ -530,8 +559,22 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 	// Both dirs are bind-mounted RW into the container, so editing the
 	// operator-shared copy would silently change the surface for every other
 	// tenant + the scheduler — refuse it (install your own fork first).
-	appDir, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
+	//
+	// On UKS that install is on the scheduler's disk and identity mounts no
+	// tenant volume, so the edit is queued as an app_file_write for the process
+	// that can see it (me_app_file_intent.go) — same validation first.
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		ui := parseAppUI(readAppSpecBytes(userID, app, resolveAppDir(userID, app)))
+		rel, content, status, msg := surfaceIntentWrite(ui, name, body.Markdown, body.Spec)
+		if status != 0 {
+			fail(c, status, 1000+status, msg) // 1404 / 1400 / 1422, as the direct path
+			return
+		}
+		enqueueAppFileWrite(c, userID, app, rel, "write", content, body.BaseSHA)
+		return
+	}
+	if !direct {
 		if shared {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return
@@ -684,6 +727,51 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 		"data": gin.H{"ok": true, "path": mdPath, "bytes": len(body.Markdown),
 			"sha": contentSHA([]byte(body.Markdown))},
 	})
+}
+
+// surfaceIntentWrite resolves which bundle file a queued surface edit targets
+// and validates it exactly as the direct path does (page specs must compile).
+// It returns a non-zero HTTP status + message instead when the edit cannot be
+// queued. A template-inherited (@fork_of / @shared) or native surface is
+// refused: detaching it means rewriting the spec AND writing a new file, two
+// writes the scheduler would apply independently — a half-applied detach
+// leaves the surface pointing at a file that does not exist.
+func surfaceIntentWrite(ui *appUI, name, markdown, spec string) (rel, content string, status int, msg string) {
+	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
+		return "", "", http.StatusNotFound, "app declares no ui surface"
+	}
+	mdPath, pagePath, ok := resolveSurfacePaths(ui, name)
+	if !ok {
+		return "", "", http.StatusNotFound, "unknown surface"
+	}
+	if pagePath != "" {
+		if spec == "" {
+			return "", "", http.StatusBadRequest,
+				"this surface is a structured page spec — send `spec` (the raw " + pagePath + " text), not markdown"
+		}
+		if _, cerr := compilePageSpec([]byte(spec)); cerr != nil {
+			return "", "", http.StatusUnprocessableEntity, "page spec invalid: " + cerr.Error()
+		}
+		return pagePath, spec, 0, ""
+	}
+	if markdown == "" {
+		return "", "", http.StatusBadRequest, "this surface is markdown — send `markdown`"
+	}
+	if mdPath == "" && ui.Surface != nil && ui.Surface.Native != "" {
+		return "", "", http.StatusBadRequest, "native surfaces are not editable via the API"
+	}
+	if strings.HasPrefix(mdPath, "@") {
+		return "", "", http.StatusBadRequest,
+			"this surface inherits a template (" + mdPath + "); to customise it on a cloud install, " +
+				"point ui.surface at a .ui/<name>.md file in the app config first, then save it"
+	}
+	if mdPath == "" {
+		mdPath = appUIWriteRef("home.md")
+	}
+	if strings.ToLower(filepath.Ext(mdPath)) != ".md" {
+		return "", "", http.StatusBadRequest, "surface must be a .md file"
+	}
+	return mdPath, markdown, 0, ""
 }
 
 // patchXpcloudUISurface rewrites the ui.surface.markdown (or ui.surfaces[name])

@@ -22,7 +22,8 @@ package handler
 // Security: app_action reuses the formActions allowlist (me_form_action.go);
 // app_read/qa_call mirror the directive resolver's scheme/path allowlist
 // (directives.tsx); app_ui_set/app_ui_generate write ONLY to a surface in the
-// caller's OWN tenant install (resolveOwnedAppDir refuses operator-shared apps),
+// caller's OWN tenant install (operator-shared apps are refused; app_ui_set on
+// an install only the scheduler can see is queued as an app_file_write intent),
 // validate page specs through compilePageSpec, and honor the same optimistic
 // lock as the UI editor; run_promote/run_discard shell the same lumid-trajectory
 // CLI the UI uses, HOME-scoped to the tenant. Every mutating tool is in
@@ -492,7 +493,9 @@ func toolAppUIGet(userID, app, surface string) (map[string]any, bool) {
 	if name == "" {
 		name = "home"
 	}
-	ui := readAppUI(appDir)
+	// readAppSpecBytes applies a queued-and-applied spec save (see
+	// me_app_file_intent.go); the surface file gets the same overlay below.
+	ui := parseAppUI(readAppSpecBytes(userID, app, appDir))
 	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
 		return map[string]any{"error": "app declares no ui surface"}, false
 	}
@@ -516,11 +519,25 @@ func toolAppUIGet(userID, app, surface string) (map[string]any, bool) {
 	if err != nil {
 		return map[string]any{"error": err.Error()}, false
 	}
+	if b, deleted, found := appFileOverlay(userID, app, rel); found {
+		if deleted {
+			b = nil
+		}
+		return map[string]any{"app": app, "surface": name, "format": format, "path": rel, "source": string(b), "sha": shaOrEmpty(b)}, true
+	}
 	b, err := os.ReadFile(abs)
 	if err != nil {
 		return map[string]any{"app": app, "surface": name, "format": format, "path": rel, "source": "", "sha": ""}, true
 	}
 	return map[string]any{"app": app, "surface": name, "format": format, "path": rel, "source": string(b), "sha": contentSHA(b)}, true
+}
+
+// shaOrEmpty is contentSHA, except "" for an absent file (the tools' convention).
+func shaOrEmpty(b []byte) string {
+	if b == nil {
+		return ""
+	}
+	return contentSHA(b)
 }
 
 // toolAppUISet writes a surface's source. Mirrors updateAppSurface's checks:
@@ -547,9 +564,24 @@ func toolAppUISet(userID string, args map[string]any) (map[string]any, bool) {
 		name = "home"
 	}
 	// WRITE path must be the caller's OWN tenant install — editing the shared
-	// copy would change the surface for every tenant + the scheduler.
-	appDir, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
+	// copy would change the surface for every tenant + the scheduler. When that
+	// install is on the scheduler's disk (UKS: identity mounts no tenant
+	// volume) the edit is queued as an app_file_write, validated identically.
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		ui := parseAppUI(readAppSpecBytes(userID, app, resolveAppDir(userID, app)))
+		rel, content, status, msg := surfaceIntentWrite(ui, name, markdown, spec)
+		if status != 0 {
+			return map[string]any{"error": msg}, false
+		}
+		format := "markdown"
+		if low := strings.ToLower(rel); strings.HasSuffix(low, ".yaml") || strings.HasSuffix(low, ".yml") {
+			format = "page.yaml"
+		}
+		return queuedToolResult(userID, app, rel, "write", content, baseSHA,
+			map[string]any{"surface": name, "format": format})
+	}
+	if !direct {
 		if shared {
 			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
 		}
@@ -697,44 +729,7 @@ func toolAppPromptList(userID, app string) (map[string]any, bool) {
 	if appDir == "" {
 		return map[string]any{"error": "app not found: " + app}, false
 	}
-	_, owned, _ := resolveOwnedAppDir(userID, app)
-	byName := map[string]*promptInfo{}
-	order := []string{}
-	upsert := func(name string) *promptInfo {
-		if p, has := byName[name]; has {
-			return p
-		}
-		p := &promptInfo{Name: name}
-		byName[name] = p
-		order = append(order, name)
-		return p
-	}
-	for _, repo := range appPromptSkillImports(appDir) {
-		sdir := skillPromptsDir(userID, repo)
-		if sdir == "" {
-			continue
-		}
-		for _, n := range readMdNames(sdir) {
-			p := upsert(n)
-			p.Source = "shared:" + repo
-			p.Editable = owned
-			if b, err := os.ReadFile(filepath.Join(sdir, n)); err == nil {
-				p.SHA = contentSHA(b)
-			}
-		}
-	}
-	for _, n := range readMdNames(localPromptsDir(appDir)) {
-		p := upsert(n)
-		p.Source = "local"
-		p.Editable = owned
-		if b, err := os.ReadFile(filepath.Join(localPromptsDir(appDir), n)); err == nil {
-			p.SHA = contentSHA(b)
-		}
-	}
-	prompts := make([]promptInfo, 0, len(order))
-	for _, n := range order {
-		prompts = append(prompts, *byName[n])
-	}
+	prompts := listAppPrompts(userID, app, appDir, ownerCanEdit(userID, app))
 	return map[string]any{"app": app, "prompts": prompts}, true
 }
 
@@ -750,21 +745,19 @@ func toolAppPromptGet(userID, app, name string) (map[string]any, bool) {
 	if appDir == "" {
 		return map[string]any{"error": "app not found: " + app}, false
 	}
-	path, source := resolvePromptRead(userID, appDir, name)
-	if path == "" {
+	b, source, found, err := readAppPrompt(userID, app, appDir, name)
+	if !found {
 		return map[string]any{"error": "prompt not found: " + name}, false
 	}
-	b, err := os.ReadFile(path)
 	if err != nil {
 		return map[string]any{"error": "cannot read prompt"}, false
 	}
 	if len(b) > promptMaxBytes {
 		b = b[:promptMaxBytes]
 	}
-	_, owned, _ := resolveOwnedAppDir(userID, app)
 	return map[string]any{
 		"app": app, "name": name, "content": string(b),
-		"source": source, "sha": contentSHA(b), "editable": owned,
+		"source": source, "sha": contentSHA(b), "editable": ownerCanEdit(userID, app),
 	}, true
 }
 
@@ -786,8 +779,14 @@ func toolAppPromptSet(userID, app string, args map[string]any) (map[string]any, 
 		return map[string]any{"error": "prompt exceeds 256 KB limit"}, false
 	}
 	baseSHA := strVal(args, "base_sha")
-	appDir, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
+	// Same routing as MeUpdateAppPrompt: queued for the scheduler when the
+	// install is on its disk rather than ours.
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		return queuedToolResult(userID, app, promptDirRel+"/"+name, "write", content, baseSHA,
+			map[string]any{"name": name})
+	}
+	if !direct {
 		if shared {
 			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
 		}
@@ -820,8 +819,12 @@ func toolAppPromptReset(userID, app, name string) (map[string]any, bool) {
 	if !validPromptName(name) {
 		return map[string]any{"error": "valid prompt name required (.md only)"}, false
 	}
-	appDir, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		return queuedToolResult(userID, app, promptDirRel+"/"+name, "delete", "", "",
+			map[string]any{"name": name})
+	}
+	if !direct {
 		if shared {
 			return map[string]any{"error": "this app is operator-shared (read-only) — fork/install your own copy first"}, false
 		}

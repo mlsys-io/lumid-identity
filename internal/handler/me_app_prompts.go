@@ -17,9 +17,11 @@ package handler
 // Security mirrors me_app_ui.go / me_app_config.go exactly:
 //   - GET uses resolveAppDir (tenant-first, operator-shared fallback) so any
 //     installed app's prompts are readable.
-//   - PUT/DELETE use resolveOwnedAppDir — writes land ONLY in the caller's own
+//   - PUT/DELETE use ownerWriteTarget — writes land ONLY in the caller's own
 //     tenant install; an operator-shared bundle is read-only (403). We never
 //     touch the shared skill file (DELETE removes the local override only).
+//     When that install is on the scheduler's disk (UKS), the write is queued
+//     as an app_file_write intent (202) and reads apply its overlay.
 //   - Path-guard via safeAppJoin (no traversal / absolute / NUL), .md-only.
 //   - PUT honors an optimistic lock (base_sha) and writes atomically (tmp+rename).
 
@@ -145,62 +147,96 @@ func MeAppPrompts(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	// Writable only when the caller owns the app (tenant install). A shared app's
+	// Writable when the caller has their own install — on a disk identity can
+	// see (direct) or one only the scheduler can (queued). A shared app's
 	// prompts are read-only here (the user forks/installs first to edit).
-	_, owned, _ := resolveOwnedAppDir(userID, app)
+	prompts := listAppPrompts(userID, app, appDir, ownerCanEdit(userID, app))
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "ok",
+		"data": gin.H{"app": app, "prompts": prompts},
+	})
+}
 
-	type acc struct {
-		info promptInfo
-	}
-	byName := map[string]*acc{}
-	order := []string{}
-	upsert := func(name string) *acc {
-		if a, has := byName[name]; has {
-			return a
-		}
-		a := &acc{info: promptInfo{Name: name}}
-		byName[name] = a
-		order = append(order, name)
-		return a
-	}
-
-	// Inherited shared-skill prompts first (so a later local entry shadows them).
+// listAppPrompts builds the prompt list for an app: inherited shared-skill
+// prompts, shadowed by the app's own prompts/, shadowed by any applied
+// app_file_write overlay (see me_app_file_intent.go). The overlay is what makes
+// an edit — or a newly CREATED prompt — visible when the app's files are only
+// on the scheduler's disk and this pod reads the published bundle.
+func listAppPrompts(userID, app, appDir string, editable bool) []promptInfo {
+	shared := map[string]promptInfo{}
 	for _, repo := range appPromptSkillImports(appDir) {
 		sdir := skillPromptsDir(userID, repo)
 		if sdir == "" {
 			continue
 		}
 		for _, name := range readMdNames(sdir) {
-			a := upsert(name)
-			a.info.Source = "shared:" + repo
+			if _, has := shared[name]; has {
+				continue // first import wins, as in resolvePromptRead
+			}
 			// A shared prompt is editable iff the caller owns the app (editing
 			// creates a LOCAL override; the shared file is never mutated).
-			a.info.Editable = owned
+			p := promptInfo{Name: name, Source: "shared:" + repo, Editable: editable}
 			if b, err := os.ReadFile(filepath.Join(sdir, name)); err == nil {
-				a.info.SHA = contentSHA(b)
+				p.SHA = contentSHA(b)
 			}
+			shared[name] = p
 		}
 	}
-
 	// Local prompts override shared (same name → source flips to "local").
+	local := map[string]promptInfo{}
 	for _, name := range readMdNames(localPromptsDir(appDir)) {
-		a := upsert(name)
-		a.info.Source = "local"
-		a.info.Editable = owned
+		p := promptInfo{Name: name, Source: "local", Editable: editable}
 		if b, err := os.ReadFile(filepath.Join(localPromptsDir(appDir), name)); err == nil {
-			a.info.SHA = contentSHA(b)
+			p.SHA = contentSHA(b)
 		}
+		local[name] = p
 	}
+	// Applied-but-unpublished writes win over the bundle; a delete removes the
+	// local override, so the name falls back to its shared copy (or vanishes).
+	for name, ov := range appFileOverlayNames(userID, app, promptDirRel) {
+		if !validPromptName(name) {
+			continue
+		}
+		if ov.Deleted {
+			delete(local, name)
+			continue
+		}
+		local[name] = promptInfo{Name: name, Source: "local", Editable: editable, SHA: contentSHA(ov.Content)}
+	}
+	for name, p := range local {
+		shared[name] = p
+	}
+	names := make([]string, 0, len(shared))
+	for name := range shared {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]promptInfo, 0, len(names))
+	for _, name := range names {
+		out = append(out, shared[name])
+	}
+	return out
+}
 
-	sort.Strings(order)
-	prompts := make([]promptInfo, 0, len(order))
-	for _, name := range order {
-		prompts = append(prompts, byName[name].info)
+// readAppPrompt returns a prompt's bytes + source, honouring the app_file_write
+// overlay first (an applied edit wins; an applied delete skips the local copy
+// and falls back to the shared one). found=false → no such prompt.
+func readAppPrompt(userID, app, appDir, name string) (b []byte, source string, found bool, err error) {
+	content, deleted, has := appFileOverlay(userID, app, promptDirRel+"/"+name)
+	if has && !deleted {
+		return content, "local", true, nil
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{"app": app, "prompts": prompts},
-	})
+	var p string
+	if has && deleted {
+		p, source = resolveSharedPromptRead(userID, appDir, name)
+	} else {
+		p, source = resolvePromptRead(userID, appDir, name)
+	}
+	if p == "" {
+		return nil, "", false, nil
+	}
+	b, err = os.ReadFile(p)
+	return b, source, true, err
 }
 
 // resolvePromptRead returns the on-disk path + source for a prompt, preferring a
@@ -210,6 +246,11 @@ func resolvePromptRead(userSub, appDir, name string) (path, source string) {
 	if st, err := os.Stat(local); err == nil && !st.IsDir() {
 		return local, "local"
 	}
+	return resolveSharedPromptRead(userSub, appDir, name)
+}
+
+// resolveSharedPromptRead is resolvePromptRead without the local override.
+func resolveSharedPromptRead(userSub, appDir, name string) (path, source string) {
 	for _, repo := range appPromptSkillImports(appDir) {
 		sdir := skillPromptsDir(userSub, repo)
 		if sdir == "" {
@@ -245,12 +286,11 @@ func MeAppPrompt(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "app not found")
 		return
 	}
-	path, source := resolvePromptRead(userID, appDir, name)
-	if path == "" {
+	b, source, found, err := readAppPrompt(userID, app, appDir, name)
+	if !found {
 		fail(c, http.StatusNotFound, 1404, "prompt not found: "+name)
 		return
 	}
-	b, err := os.ReadFile(path)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "cannot read prompt")
 		return
@@ -258,7 +298,6 @@ func MeAppPrompt(c *gin.Context) {
 	if len(b) > promptMaxBytes {
 		b = b[:promptMaxBytes]
 	}
-	_, owned, _ := resolveOwnedAppDir(userID, app)
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
@@ -267,7 +306,7 @@ func MeAppPrompt(c *gin.Context) {
 			"content":  string(b),
 			"source":   source,
 			"sha":      contentSHA(b),
-			"editable": owned,
+			"editable": ownerCanEdit(userID, app),
 			// The bundle-relative path the override is/would be written to.
 			"path": filepath.Join(promptDirRel, name),
 		},
@@ -305,9 +344,15 @@ func MeUpdateAppPrompt(c *gin.Context) {
 	}
 
 	// WRITE path: the caller's OWN tenant install only — never the operator-
-	// shared bundle (read by the scheduler + every other tenant).
-	appDir, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
+	// shared bundle (read by the scheduler + every other tenant). On UKS that
+	// install is on the scheduler's disk, not ours, so the write is queued as an
+	// app_file_write for the process that can see it (me_app_file_intent.go).
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		enqueueAppFileWrite(c, userID, app, promptDirRel+"/"+name, "write", body.Content, body.BaseSHA)
+		return
+	}
+	if !direct {
 		if shared {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return
@@ -367,8 +412,14 @@ func MeDeleteAppPrompt(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid prompt name (.md only)")
 		return
 	}
-	appDir, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
+	// Same routing as the PUT: the scheduler removes the override when the
+	// install is on its disk (op "delete" on a missing file is a no-op there).
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		enqueueAppFileWrite(c, userID, app, promptDirRel+"/"+name, "delete", "", "")
+		return
+	}
+	if !direct {
 		if shared {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return

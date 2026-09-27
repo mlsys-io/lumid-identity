@@ -97,6 +97,33 @@ func contentSHA(b []byte) string {
 
 const configMaxBytes = 64 * 1024 // 64 KB — xpcloud.yaml is always small
 
+// readAppSpecBytes returns the app's spec as the caller should SEE it:
+//
+//  1. an applied app_file_write of .xpcloud.yaml (queued through the scheduler,
+//     see me_app_file_intent.go) — without it the editor would reload the
+//     published spec and show the user their save had vanished;
+//  2. the spec in appDir (tenant tree, operator-shared, or materialised bundle);
+//  3. the caller's xp.io repo (cross-node fallback, see fetchRepoSpecYAML).
+//
+// nil when none has it.
+func readAppSpecBytes(userID, app, appDir string) []byte {
+	if b, deleted, found := appFileOverlay(userID, app, appFileSpecRel); found && !deleted && len(b) > 0 {
+		return b
+	}
+	var b []byte
+	if appDir != "" {
+		if yamlPath, _ := ResolveSpecPath(appDir); yamlPath != "" {
+			b, _ = os.ReadFile(yamlPath)
+		}
+	}
+	if len(b) == 0 {
+		if fetched, ok := fetchRepoSpecYAML(userID, app); ok {
+			b = fetched
+		}
+	}
+	return b
+}
+
 // MeAppConfig — GET /me/apps/:app/config
 func MeAppConfig(c *gin.Context) {
 	userID, ok := currentUserID(c)
@@ -109,19 +136,7 @@ func MeAppConfig(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app")
 		return
 	}
-	var b []byte
-	if appDir := resolveAppDir(userID, app); appDir != "" {
-		if yamlPath, _ := ResolveSpecPath(appDir); yamlPath != "" {
-			b, _ = os.ReadFile(yamlPath)
-		}
-	}
-	// Cross-node fallback: read the spec from the caller's xp.io repo when the
-	// local file isn't visible (identity ≠ scheduler node; see fetchRepoSpecYAML).
-	if len(b) == 0 {
-		if fetched, ok := fetchRepoSpecYAML(userID, app); ok {
-			b = fetched
-		}
-	}
+	b := readAppSpecBytes(userID, app, resolveAppDir(userID, app))
 	if len(b) == 0 {
 		fail(c, http.StatusNotFound, 1404, "xpcloud.yaml not found")
 		return
@@ -175,8 +190,15 @@ func MeUpdateAppConfig(c *gin.Context) {
 
 	// WRITE path: only the caller's own tenant install may be mutated — never
 	// the operator-shared bundle (which the scheduler + every other tenant read).
-	appDir, owned, shared := resolveOwnedAppDir(userID, app)
-	if !owned {
+	// On UKS that install is on the scheduler's disk, which identity does not
+	// mount, so the save is queued for the scheduler; it checks base_sha against
+	// the bytes it can actually see.
+	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
+	if viaIntent {
+		enqueueAppFileWrite(c, userID, app, appFileSpecRel, "write", body.YAML, body.BaseSHA)
+		return
+	}
+	if !direct {
 		if shared {
 			fail(c, http.StatusForbidden, 1403, "this app is operator-shared (read-only) — install your own copy first")
 			return

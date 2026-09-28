@@ -176,19 +176,38 @@ func loopMetricName(userSub, app, loop string) string {
 	if !ok {
 		return ""
 	}
-	m := parseExpManifestBytes(spec)
+	return loopMetricNameFrom(parseExpManifestBytes(spec), loop)
+}
+
+// loopMetricNameFrom is loopMetricName over an already-parsed spec.
+//
+// DECLARATION ORDER, not map order. A loop may feed several experiments
+// (quant-research `backtest` / `backtest_poll` feed backtest_evidence AND
+// backtest_performance, with different metrics). This used to range
+// expLoops(m) — a Go map — so the loop's metric was picked at random per
+// request, and the same stored run scored on one refresh and read
+// "not scored" on the next. The loop's FIRST declared experiment that names a
+// metric wins, which is the one its author listed as primary.
+func loopMetricNameFrom(m expManifest, loop string) string {
 	byExp := map[string]string{}
 	for _, d := range m.Experiments {
 		if d.Metric != nil {
-			if s, ok := d.Metric["name"].(string); ok {
+			if s, ok := d.Metric["name"].(string); ok && s != "" {
 				byExp[d.ID] = s
 			}
 		}
 	}
-	for exp, loops := range expLoops(m) {
-		for _, ln := range loops {
-			if ln == loop {
-				return byExp[exp]
+	for _, l := range m.Loops {
+		if l.Name != loop {
+			continue
+		}
+		ids := append([]string{}, l.Engine.Experiment...)
+		for _, st := range l.Steps {
+			ids = append(ids, st.Experiment...)
+		}
+		for _, id := range ids {
+			if s := byExp[id]; s != "" {
+				return s
 			}
 		}
 	}

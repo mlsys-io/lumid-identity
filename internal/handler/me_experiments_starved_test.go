@@ -44,3 +44,29 @@ func TestMarkStarvedSkipsRowsWithResults(t *testing.T) {
 		t.Fatal("an experiment with results is not starved")
 	}
 }
+
+func TestMarkUndispatched(t *testing.T) {
+	d := &expDecl{Dispatch: map[string]any{"ask": "Which model should the analyst use?"}}
+	row := map[string]any{"n_results": 0}
+	markUndispatched(row, d, nil)
+	if row["starved"] != true || !strings.Contains(row["starved_reason"].(string), "only when dispatched") ||
+		!strings.Contains(row["starved_reason"].(string), "Which model") {
+		t.Fatalf("dispatch-only: %v", row)
+	}
+	for _, c := range []struct {
+		name    string
+		d       *expDecl
+		row     map[string]any
+		feeding []string
+	}{
+		{"has results", d, map[string]any{"n_results": 4}, nil},
+		{"fed by a loop", d, map[string]any{"n_results": 0}, []string{"case_eval"}},
+		{"dispatch.loop", &expDecl{Dispatch: map[string]any{"loop": "backtest"}}, map[string]any{"n_results": 0}, nil},
+		{"no dispatch", &expDecl{}, map[string]any{"n_results": 0}, nil},
+	} {
+		markUndispatched(c.row, c.d, c.feeding)
+		if _, has := c.row["starved"]; has {
+			t.Fatalf("%s: should not be marked", c.name)
+		}
+	}
+}

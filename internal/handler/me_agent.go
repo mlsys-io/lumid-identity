@@ -2136,6 +2136,10 @@ type toolCallResult struct {
 // decide whether MISSED keypoints may be returned.
 const ctxModeKey = "lumid_interview_mode"
 
+// ctxAutoJudgeKey holds the verdict autoJudgeCandidate produced for this turn,
+// so a model-issued app_judge returns it instead of judging the answer twice.
+const ctxAutoJudgeKey = "lumid_auto_judge"
+
 func MeAgentChat(c *gin.Context) {
 	// Stamped BEFORE the turn runs so the recorded cycle's run_ts is when the
 	// user asked, not when the model finished — a 40s answer would otherwise
@@ -5011,6 +5015,20 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 		return toolAppAnswer(c.Request.Context(), userID, role, app, question, caseID)
 
 	case "app_judge":
+		// The server already judged the candidate's answer this turn
+		// (autoJudgeCandidate). Observed 2026-09-28: told so in the prompt, the
+		// model called app_judge anyway — a second 2-3 minute panel run and a
+		// second score for the same answer. Hand back the first verdict.
+		if v, ok := c.Get(ctxAutoJudgeKey); ok {
+			if res, ok := v.(map[string]any); ok && res != nil {
+				out := map[string]any{"already_scored": true,
+					"note": "This answer was already scored by the judge panel this turn; this is that score. Report it — do not score again."}
+				for k, val := range res {
+					out[k] = val
+				}
+				return out, true
+			}
+		}
 		app, _ := args["app"].(string)
 		answer, _ := args["answer"].(string)
 		question, _ := args["question"].(string)

@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestLooksLikeAnswer(t *testing.T) {
@@ -100,5 +103,18 @@ func TestAutoJudgeNoteReportsRealNumbers(t *testing.T) {
 	}
 	if autoJudgeNote(map[string]any{"error": "x"}) != "" {
 		t.Fatal("an errored judge must not claim a score")
+	}
+}
+
+// A model-issued app_judge after the server already judged the answer returns
+// that verdict instead of running the panel again (observed: it re-judged).
+func TestAppJudgeReusesTheTurnsAutoJudge(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("POST", "/", nil)
+	c.Set(ctxAutoJudgeKey, map[string]any{"covered": 5, "total": 13, "score": 5.0 / 13, "subject": "human"})
+	res, ok := dispatchTool(c, "u", "user", "app_judge", map[string]any{"app": "mbb-consultant", "answer": "x"})
+	if !ok || res["already_scored"] != true || res["covered"] != 5 || res["subject"] != "human" {
+		t.Fatalf("res=%v ok=%v", res, ok)
 	}
 }

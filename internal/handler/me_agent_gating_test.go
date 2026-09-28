@@ -235,3 +235,40 @@ func TestUnknownIDStaysUnknown(t *testing.T) {
 		t.Fatal("unknown id resolved to a provider")
 	}
 }
+
+// TestRunDispatchNeedsAsk: a run the user asked for dispatches without a
+// prompt; one they did not ask for (a question, a Discuss click) is gated.
+// The two misses are the 2026-09-28 measurements, verbatim.
+func TestRunDispatchNeedsAsk(t *testing.T) {
+	asked := []string{
+		"run the musk_v1 arm on kol_alpha",
+		"run mbb-ai's case_cycle",
+		"please re-run the backtest",
+		"kick off the morning brief now",
+		"Dispatch the median-panel arm",
+		"can you run it in paper mode?",
+	}
+	for _, m := range asked {
+		if !userAskedToRun(userMsg(m)) {
+			t.Errorf("%q asks to run, but userAskedToRun = false", m)
+		}
+	}
+	notAsked := []string{
+		"Look at the backtest results on the feed. How many are real on all three honesty axes, how many took zero trades, and what is the outcome breakdown? Then tell me which of them are mine.",
+		"Analyze my strategy momentum_30m_demo (id 7, status active, version 1.0.0). What happened in its recent cycles?",
+		"why did the last run fail?",
+		"how did kol_alpha turn out",
+		"show me this run's output",
+		"what does a dry run do",
+	}
+	for _, m := range notAsked {
+		if userAskedToRun(userMsg(m)) {
+			t.Errorf("%q does not ask to run, but userAskedToRun = true", m)
+		}
+	}
+	for name := range runDispatchTools {
+		if destructiveTools[name] {
+			t.Errorf("%q must stay OUT of destructiveTools: non-interactive callers would be blocked", name)
+		}
+	}
+}

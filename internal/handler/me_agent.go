@@ -2711,11 +2711,11 @@ func resolvePromptAndTools(userID, role string, body meAgentChatBody, wantTools 
 				}
 				tools = filterTools(tools, allow)
 			}
-			return p.SystemPrompt + ctxBlock, tools, p.PreferredModel
+			return p.SystemPrompt + ctxBlock + capabilityHint(tools), tools, p.PreferredModel
 		}
 		// Fall through if persona id is invalid — chat still works.
 	}
-	return buildSystemPrompt(userID, role, body.AgentID) + ctxBlock, tools, ""
+	return buildSystemPrompt(userID, role, body.AgentID) + ctxBlock + capabilityHint(tools), tools, ""
 }
 
 // renderViewingContext turns the Studio shell's structured "what the

@@ -96,7 +96,12 @@ func MeStrategies(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
 		return
 	}
+	ok(c, "ok", meStrategiesData(c.Request.Context(), userID))
+}
 
+// meStrategiesData is MeStrategies' body, shared with the chat's app_read
+// (me://strategies) so both read the registry through one tenant-scoped path.
+func meStrategiesData(reqCtx context.Context, userID string) gin.H {
 	data := gin.H{
 		"strategies": []gin.H{},
 		"available":  strategiesDSN() != "",
@@ -104,8 +109,7 @@ func MeStrategies(c *gin.Context) {
 
 	if strategiesDSN() == "" {
 		data["reason"] = "strategy registry not configured (LQT_CORE_DSN unset)"
-		ok(c, "ok", data)
-		return
+		return data
 	}
 
 	// LQT parses the lum.id sub as a UUID to get the tenant. An id that does
@@ -114,11 +118,10 @@ func MeStrategies(c *gin.Context) {
 	tenant, err := uuid.Parse(strings.TrimSpace(userID))
 	if err != nil {
 		data["reason"] = "account id is not a UUID, so it cannot own LQT strategies"
-		ok(c, "ok", data)
-		return
+		return data
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), strategiesOpTimeout)
+	ctx, cancel := context.WithTimeout(reqCtx, strategiesOpTimeout)
 	defer cancel()
 
 	conn, err := strategiesConnect(ctx)
@@ -129,8 +132,7 @@ func MeStrategies(c *gin.Context) {
 		// instead of rendering an empty list that looks like "you have none".
 		data["available"] = false
 		data["reason"] = "strategy registry unreachable"
-		ok(c, "ok", data)
-		return
+		return data
 	}
 	defer func() { _ = conn.Close(context.Background()) }()
 
@@ -154,8 +156,7 @@ func MeStrategies(c *gin.Context) {
 	if err != nil {
 		data["available"] = false
 		data["reason"] = "strategy registry query failed"
-		ok(c, "ok", data)
-		return
+		return data
 	}
 	defer rows.Close()
 
@@ -208,8 +209,7 @@ func MeStrategies(c *gin.Context) {
 	if rows.Err() != nil {
 		data["available"] = false
 		data["reason"] = "strategy registry read interrupted"
-		ok(c, "ok", data)
-		return
+		return data
 	}
 
 	data["strategies"] = out
@@ -261,7 +261,7 @@ func MeStrategies(c *gin.Context) {
 		// path instead of rendering a bare empty table that reads as broken.
 		data["reason"] = "no strategies yet"
 	}
-	ok(c, "ok", data)
+	return data
 }
 
 // recentRejections returns submissions this tenant made that failed to compile,

@@ -180,8 +180,46 @@ func MeComputeJob(c *gin.Context) {
 			out["progress"] = prog
 		}
 	}
+	// The FlowMesh workflow(s) this job dispatched, so a run page can link a
+	// job to the fleet's own view of it. Best-effort like progress, and it
+	// can legitimately be empty (measured 2026-09-20 on one completed job) —
+	// always a list so the caller has one shape to test.
+	wfs, _ := get(base + "/workflows")
+	out["workflows"] = jobWorkflowRefs(wfs)
 	ok(c, "", out)
 }
+
+// jobWorkflowRef is one FlowMesh workflow a Lumilake job dispatched.
+type jobWorkflowRef struct {
+	WorkflowID string `json:"workflow_id"`
+	Status     string `json:"status,omitempty"`
+}
+
+// jobWorkflowRefs extracts {workflow_id, status} from Lumilake's
+// GET /jobs/{id}/workflows payload ({job_id, workflows:[...]}). Ids are
+// validated because the UI builds a link from them.
+func jobWorkflowRefs(m map[string]any) []jobWorkflowRef {
+	out := []jobWorkflowRef{}
+	arr, _ := m["workflows"].([]any)
+	for _, v := range arr {
+		w, isMap := v.(map[string]any)
+		if !isMap {
+			continue
+		}
+		id, _ := w["workflow_id"].(string)
+		if !flowmeshWorkflowRe.MatchString(id) {
+			continue
+		}
+		st, _ := w["status"].(string)
+		out = append(out, jobWorkflowRef{WorkflowID: id, Status: st})
+		if len(out) >= 64 {
+			break
+		}
+	}
+	return out
+}
+
+var flowmeshWorkflowRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
 // callerOwnsComputeJob reports whether this user has a recorded run that ran
 // this exact job on this exact site.

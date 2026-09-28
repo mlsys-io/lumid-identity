@@ -195,12 +195,18 @@ func MeCycleDetail(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
 				"app": app, "loop": loop, "ts": ts, "steps": []any{},
 				"unavailable": why,
+				// The run store answers this even when the cycle dir cannot
+				// be read — it never lived in the dir.
+				"compute_jobs": cycleComputeJobs(userID, app, loop, ts),
 			}})
 			return
 		}
 		fail(c, http.StatusNotFound, 1404, "cycle not found")
 		return
 	}
+	// Fleet jobs this run fanned out to (Lumilake job ids + site + arm), from
+	// the run store — see me_cycle_compute_jobs.go. `[]` when none.
+	data["compute_jobs"] = cycleComputeJobs(userID, app, loop, ts)
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
 }
 

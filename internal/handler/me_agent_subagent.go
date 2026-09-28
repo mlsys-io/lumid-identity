@@ -20,7 +20,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -375,11 +374,10 @@ func runSubAgentLoop(
 			toolCalls = append(toolCalls, toolCallResult{
 				Name: toolName, Args: args, Result: result, OK: callOK,
 			})
-			payload, _ := json.Marshal(result)
 			toolResultBlocks = append(toolResultBlocks, map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": toolID,
-				"content":     string(payload),
+				"content":     toolResultForModel(result),
 				"is_error":    !callOK,
 			})
 		}

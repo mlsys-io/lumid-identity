@@ -2398,8 +2398,7 @@ func MeAgentChat(c *gin.Context) {
 				Result: result,
 				OK:     callOK,
 			})
-			payload, _ := json.Marshal(result)
-			content := string(payload)
+			content := toolResultForModel(result)
 			// On failure, hand the model an UNMISTAKABLE error envelope rather
 			// than the raw result map. Weak models (e.g. kvrun-gemma4) otherwise
 			// paper over a failed tool call with a plausible-sounding answer —

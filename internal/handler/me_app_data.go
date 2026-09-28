@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -239,7 +240,7 @@ func MeAppData(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": res})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": filterAppData(c, res)})
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": filterAppData(c.Request.URL.Query(), res)})
 }
 
 // filterAppData narrows a tool's result by any extra query params.
@@ -268,10 +269,10 @@ func MeAppData(c *gin.Context) {
 //     the unfiltered total, so `?loop=backtest` returned count:945 beside 5
 //     rows and a stat tile bound to `count` showed every loop's runs under a
 //     "Your backtests" label.
-func filterAppData(c *gin.Context, res map[string]any) map[string]any {
+func filterAppData(q url.Values, res map[string]any) map[string]any {
 	filters := map[string]string{}
 	limit := 0
-	for k, v := range c.Request.URL.Query() {
+	for k, v := range q {
 		if k == "tool" || k == "app" || len(v) == 0 || v[0] == "" {
 			continue
 		}

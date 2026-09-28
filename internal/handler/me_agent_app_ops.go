@@ -65,7 +65,7 @@ func appOpsToolDefs() []map[string]any {
 		},
 		{
 			"name":        "app_read",
-			"description": "Read an allowlisted app data source and return its JSON — the same feeds app pages render. Sources: me://gpu-rentals, me://workflows?app=<slug>, me://loops/health, me://apps, me://drafts, me://today, qa://cluster/pricing. Use this to answer 'what are my GPU rentals', 'what's the GPU price', 'how are my workflows'. No approval needed (read-only).",
+			"description": "Read an allowlisted app data source and return its JSON — the same feeds app pages render. Sources: me://strategies (your registered strategies: name -> strategy_id), me://app-data?app=<slug>&tool=<tool>, me://gpu-rentals, me://workflows?app=<slug>, me://loops/health, me://apps, me://drafts, me://today, qa://cluster/pricing. Use this to answer 'what are my GPU rentals', 'what's the GPU price', 'how are my workflows'. No approval needed (read-only).",
 			"input_schema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"source": map[string]any{"type": "string", "description": "e.g. me://gpu-rentals or qa://cluster/pricing"}},
@@ -1192,6 +1192,13 @@ func appReadSource(c *gin.Context, userID, src string) (any, error) {
 			return all, nil
 		case p == "drafts" || strings.HasPrefix(p, "drafts?"):
 			return toolListDrafts(userID, ""), nil
+		// me://strategies — the caller's own registered strategies (name ->
+		// strategy_id). It is the Strategies page's own source, and app_read had
+		// no case for it, so the chat asked to backtest two strategies BY NAME
+		// could not resolve their ids: "source not allowed" (FLB-QR-01). Same
+		// function as GET /api/v1/me/strategies, so the same tenant scoping.
+		case p == "strategies" || strings.HasPrefix(p, "strategies?"):
+			return meStrategiesData(c.Request.Context(), userID), nil
 		// me://app-data?app=<app>&tool=<tool> — an app's OWN declared surfaces.
 		//
 		// This is how every app exposes its domain data (casebook, runs, report,
@@ -1339,15 +1346,85 @@ func appActionsCatalog(userID, app string) map[string]any {
 		}
 	}
 
+	// Structured page specs (ui/*.yaml). The loop above only understands the
+	// fenced ```lumid:``` blocks of markdown surfaces, so an app whose pages
+	// are page.yaml — quant-research's Strategies and Strategy pages are —
+	// reported NO actions and none of its sources: the chat asked what it could
+	// do, was told "nothing", and went looking elsewhere (FLB-QR-01: several
+	// minutes of loops_health / data_catalog / list_workflows instead of the
+	// strategy row's own Backtest). Every `run_loop` action a page declares is
+	// something the chat can do with run_loop_now and the same args.
+	loopActions := []map[string]any{}
+	for _, e := range entries {
+		if e.IsDir() || !(strings.HasSuffix(e.Name(), ".yaml") || strings.HasSuffix(e.Name(), ".yml")) {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(uiDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var doc any
+		if yaml.Unmarshal(raw, &doc) != nil {
+			continue
+		}
+		surface := strings.TrimSuffix(strings.TrimSuffix(e.Name(), ".yaml"), ".yml")
+		collectPageSpecPrimitives(doc, surface, reads, &loopActions)
+	}
+
 	readList := make([]string, 0, len(reads))
 	for s := range reads {
 		readList = append(readList, s)
 	}
-	return map[string]any{
+	sort.Strings(readList)
+	out := map[string]any{
 		"app":      app,
 		"actions":  actions,
 		"reads":    readList,
 		"qa_calls": qaCalls,
+	}
+	if len(loopActions) > 0 {
+		out["loop_actions"] = loopActions
+		out["loop_actions_how"] = "Invoke a loop_action with run_loop_now(app, loop, args): " +
+			"fill the {placeholders} in its args from the row (e.g. strategy_id from the " +
+			"source listed in reads) or from the user's request. Fields are the inputs the " +
+			"page's dialog asks for."
+	}
+	return out
+}
+
+// collectPageSpecPrimitives walks a decoded page.yaml and records every
+// `source:` (a readable data source) and every map carrying `run_loop:` (an
+// action, with the label and fields of the dialog that drives it). A generic
+// walk, not a schema: page specs nest sections → widgets → row_actions, and a
+// walker that knows the nesting is the one that goes stale when it changes.
+func collectPageSpecPrimitives(node any, surface string, reads map[string]bool, loopActions *[]map[string]any) {
+	switch n := node.(type) {
+	case map[string]any:
+		if src, ok := n["source"].(string); ok && src != "" {
+			reads[src] = true
+		}
+		if rl, ok := n["run_loop"].(map[string]any); ok {
+			act := map[string]any{"surface": surface}
+			if l, ok := n["label"].(string); ok {
+				act["label"] = l
+			}
+			for _, k := range []string{"app", "loop", "args"} {
+				if v, ok := rl[k]; ok {
+					act[k] = v
+				}
+			}
+			if f := extractFields(n["fields"]); len(f) > 0 {
+				act["fields"] = f
+			}
+			*loopActions = append(*loopActions, act)
+		}
+		for _, v := range n {
+			collectPageSpecPrimitives(v, surface, reads, loopActions)
+		}
+	case []any:
+		for _, v := range n {
+			collectPageSpecPrimitives(v, surface, reads, loopActions)
+		}
 	}
 }
 

@@ -159,3 +159,19 @@ func TestArmDoesNotWidenOwnership(t *testing.T) {
 		t.Fatal("arm presence let a wrong-site job through")
 	}
 }
+
+func TestJobWorkflowRefsExtractsIdsAndDropsJunk(t *testing.T) {
+	var m map[string]any
+	_ = json.Unmarshal([]byte(`{"job_id":"req-x","workflows":[
+		{"workflow_id":"wfl-abc123","status":"COMPLETED"},
+		{"workflow_id":"../evil"},
+		{"status":"RUNNING"},
+		"nope"]}`), &m)
+	got := jobWorkflowRefs(m)
+	if len(got) != 1 || got[0].WorkflowID != "wfl-abc123" || got[0].Status != "COMPLETED" {
+		t.Errorf("got %#v", got)
+	}
+	if got := jobWorkflowRefs(nil); got == nil || len(got) != 0 {
+		t.Errorf("nil payload = %#v, want []", got)
+	}
+}

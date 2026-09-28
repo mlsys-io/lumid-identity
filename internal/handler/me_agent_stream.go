@@ -364,7 +364,10 @@ func MeAgentChatStream(c *gin.Context) {
 			// unless the user has a persistent "always allow" grant for
 			// this tool (POST tool-approve with always=true; revocable
 			// via DELETE /me/agent/tool-grants/:name).
-			if destructiveTools[tu.name] && !hasToolGrant(userID, tu.name) {
+			// A run the user did not ask for is gated here too (and only here —
+			// see runDispatchTools); dispatchTool's backstop leaves it alone.
+			if (destructiveTools[tu.name] && !hasToolGrant(userID, tu.name)) ||
+				needsRunApproval(tu.name, userID, body.Messages) {
 				approvalID := uuid.New().String()
 				ch, releaseApproval := requestApproval(approvalID)
 				emit(map[string]any{

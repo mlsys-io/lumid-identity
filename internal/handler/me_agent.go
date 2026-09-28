@@ -70,6 +70,75 @@ var (
 	userExecCounts   = map[string][]int64{} // userID → slice of Unix timestamps (last 60s)
 )
 
+// runDispatchTools fire a real cycle of an installed loop (or a declared arm).
+// They are NOT destructive — asking to "run X" must just run X, which is why
+// they stay out of destructiveTools (see the note below). But nothing stopped
+// the model from firing one the user never asked for: measured 2026-09-28, a
+// Discuss click ("Analyze my strategy …") and a read-only question ("look at
+// the backtest results … how many are real …") each made the chat call
+// run_loop_now — an Analyze run and a backtest queued on the reader's install,
+// no prompt. So in the INTERACTIVE stream they ask for approval unless the
+// user's latest message itself asks to run something (userAskedToRun), or the
+// user granted "Always". Non-interactive callers are unchanged: nobody is
+// there to approve, and blocking them is the regression the note describes.
+var runDispatchTools = map[string]bool{
+	"run_loop":                true,
+	"app_run":                 true,
+	"agent_run":               true,
+	"run_loop_now":            true,
+	"dispatch_experiment_arm": true,
+}
+
+// runVerbs are the words that make a message a request to run. "analyze" is
+// deliberately absent: it is also the NAME of a loop, and a question that says
+// "analyze my strategy" is asking for a reading, not for a run.
+var runVerbs = map[string]bool{
+	"run": true, "rerun": true, "re-run": true, "dispatch": true, "fire": true,
+	"launch": true, "execute": true, "trigger": true, "kick": true, "start": true,
+	"restart": true, "retry": true, "queue": true,
+}
+
+// runNounLeads are words that, placed before a run verb, make it a NOUN: "the
+// run", "last run", "why did this run fail". Those are questions about a run.
+var runNounLeads = map[string]bool{
+	"the": true, "a": true, "an": true, "this": true, "that": true, "these": true,
+	"those": true, "last": true, "latest": true, "previous": true, "first": true,
+	"next": true, "my": true, "your": true, "its": true, "each": true, "every": true,
+	"which": true, "what": true, "of": true, "per": true, "one": true, "same": true,
+	"failed": true, "dry": true, "test": true, "cold": true, "warm": true,
+}
+
+var runTokenSplit = regexp.MustCompile(`[^a-z0-9_-]+`)
+
+// userAskedToRun reports whether the latest user message asks for a run: a
+// run verb used as a verb (not preceded by a determiner that makes it a noun).
+func userAskedToRun(msgs []chatMessage) bool {
+	text := ""
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			text = strings.ToLower(msgs[i].Content)
+			break
+		}
+	}
+	toks := runTokenSplit.Split(text, -1)
+	for i, t := range toks {
+		if !runVerbs[t] {
+			continue
+		}
+		if i > 0 && runNounLeads[toks[i-1]] {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// needsRunApproval: an interactive turn is about to dispatch a run the user
+// did not ask for, and has no "Always" grant for it.
+func needsRunApproval(name, userID string, msgs []chatMessage) bool {
+	return runDispatchTools[name] && !userAskedToRun(msgs) && !hasToolGrant(userID, name)
+}
+
 // destructiveTools is the set of tool names that require user approval before
 // execution. Includes both built-in mutating tools and LumidOS ops that push
 // or run live state.
@@ -755,7 +824,7 @@ func MeAgentToolApprove(c *gin.Context) {
 			rctx, rcancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			n, derr := common.Redis.Del(rctx, approvalKey(body.ApprovalID)).Result()
 			if derr == nil && n > 0 {
-				if body.Approved && body.Always && destructiveTools[body.Tool] {
+				if body.Approved && body.Always && (destructiveTools[body.Tool] || runDispatchTools[body.Tool]) {
 					_ = grantTool(userID, body.Tool)
 				}
 				payload := "0"
@@ -777,7 +846,7 @@ func MeAgentToolApprove(c *gin.Context) {
 		fail(c, http.StatusNotFound, 1404, "approval not found (may have timed out)")
 		return
 	}
-	if body.Approved && body.Always && destructiveTools[body.Tool] {
+	if body.Approved && body.Always && (destructiveTools[body.Tool] || runDispatchTools[body.Tool]) {
 		_ = grantTool(userID, body.Tool)
 	}
 	// Non-blocking send: if the waiting stream already gave up (10-min timeout
@@ -2917,7 +2986,7 @@ When the user expresses an intent, prefer doing the work via tools over describi
 
 ATTACHMENTS & GENERAL HELP: when the user attaches a file (PDF, document, spreadsheet, image, text) or pastes content, work with it DIRECTLY — summarize, analyze, extract, translate, or answer questions about it. That is core assistant work, fully in scope. Likewise for ordinary questions, drafting, explanation, and analysis: just help. NEVER preface a reply with a disclaimer that document summarization or general questions are "outside what you do" or that you're "scoped to apps/workflows" — you are a genuinely helpful assistant first, and the app/workflow/codebase tools below are ADDITIONAL powers, not a restriction on what you will answer.
 
-RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL run_loop_now with that app and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call list_apps (or the app's detail) to resolve it, then run it. Firing a run of an already-installed workflow is safe and needs no approval. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
+RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL run_loop_now with that app and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call list_apps (or the app's detail) to resolve it, then run it. Firing a run the user asked for needs no approval. Do NOT fire a run (run_loop_now, run_loop, dispatch_experiment_arm) to answer a question or a "discuss"/"analyze" request — read the existing results (list_runs, run_result, list_experiments, lqt_mailbox_read) instead; a run the user did not ask for pauses on an approval prompt. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
 
 APP-SPECIFIC INPUT (a DSL, a config blob, a case format): the app's own workflow description is the
 authoritative reference — call workflow_detail on that app:workflow and READ its description before

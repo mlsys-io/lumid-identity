@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gopkg.in/yaml.v3"
 
 	"lumid_identity/internal/common"
 )
@@ -650,19 +651,23 @@ func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
 	if err != nil {
 		return map[string]any{"error": "read xpcloud.yaml: " + err.Error()}
 	}
-	// Minimal-touch YAML edit: append the skill name to skill_imports[]
-	// if it's not already there. Round-trip parse would be cleaner but
-	// pulls in a YAML lib for one append; this is good enough for v1.
-	yamlContent := string(b)
-	needle := "community/" + skillName
-	if strings.Contains(yamlContent, needle) {
+	repo := skillName
+	if !strings.Contains(repo, "/") {
+		repo = "community/" + skillName
+	}
+	if !slugRe.MatchString(repo) || strings.Count(repo, "/") != 1 {
+		return map[string]any{"error": "skill_name must be a skill name or owner/name"}
+	}
+	updated, added, err := appendToSkillImports(string(b), repo)
+	if err != nil {
+		return map[string]any{"error": "edit xpcloud.yaml: " + err.Error()}
+	}
+	if !added {
 		return map[string]any{
 			"status": "no-op",
 			"note":   "skill already in skill_imports[]",
 		}
 	}
-	// Append below an existing skill_imports: block; otherwise create one.
-	updated := appendToSkillImports(yamlContent, needle)
 	writePath := SpecWritePath(appDir)
 	if err := os.WriteFile(writePath, []byte(updated), 0o644); err != nil {
 		return map[string]any{"error": "write xpcloud.yaml: " + err.Error()}
@@ -674,7 +679,7 @@ func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
 	}
 	return map[string]any{
 		"slug":  slug,
-		"added": skillName,
+		"added": repo,
 		"note":  "Added to skill_imports[]. Re-install the app (app_update) or run a cycle to pick it up.",
 	}
 }
@@ -976,39 +981,78 @@ func buildTradingXpcloudYaml(slug, intent string) string {
 	return sb.String()
 }
 
-// appendToSkillImports appends `entry` to an existing skill_imports[]
-// block; creates one if missing. Best-effort YAML edit — round-trip
-// parser would be cleaner but a single append is fine for v1.
-func appendToSkillImports(yamlContent, entry string) string {
-	lines := strings.Split(yamlContent, "\n")
-	idx := -1
-	for i, l := range lines {
-		if strings.HasPrefix(strings.TrimSpace(l), "skill_imports:") {
-			idx = i
-			break
-		}
+// appendToSkillImports adds `{repo: <repo>, version: ""}` to the spec's
+// top-level skill_imports[] — the same entry shape the scheduler's add_skill
+// intent writes and appPromptSkillImports reads. Returns added=false when the
+// repo is already imported (bare "owner/name" or {repo: ...} form).
+//
+// This used to be a line-based append of "  - community/<name>". Against the
+// flow-style `skill_imports: []` that published specs carry (quant-research
+// did), that produced
+//
+//	skill_imports: []
+//	  - community/python-repl
+//
+// which is not YAML: the write "succeeded", the spec stopped parsing, and the
+// import never showed up (FLB-QR-04). It also wrote a bare string where
+// readers expect {repo: ...}, and forced a community/ owner. A yaml.v3 node
+// edit keeps key order and comments while producing a well-formed document.
+func appendToSkillImports(yamlContent, repo string) (string, bool, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(yamlContent), &doc); err != nil {
+		return "", false, fmt.Errorf("spec is not valid YAML: %w", err)
 	}
-	newLine := "  - " + entry
-	if idx == -1 {
-		// No skill_imports[] block — append one near the top.
-		return yamlContent + "\nskill_imports:\n" + newLine + "\n"
+	if doc.Kind == 0 {
+		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}}}
 	}
-	// Find the end of the block (next non-indented line OR EOF).
-	insertAt := len(lines)
-	for j := idx + 1; j < len(lines); j++ {
-		stripped := strings.TrimRight(lines[j], " \t\r")
-		if stripped == "" {
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return "", false, fmt.Errorf("spec top level is not a mapping")
+	}
+	root := doc.Content[0]
+	var seq *yaml.Node
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "skill_imports" {
 			continue
 		}
-		if !strings.HasPrefix(stripped, " ") && !strings.HasPrefix(stripped, "\t") && !strings.HasPrefix(stripped, "- ") {
-			insertAt = j
-			break
+		if root.Content[i+1].Kind != yaml.SequenceNode {
+			// `skill_imports:` with a null or scalar value — replace it.
+			root.Content[i+1] = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		}
+		seq = root.Content[i+1]
+		break
+	}
+	if seq == nil {
+		seq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		root.Content = append(root.Content,
+			&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "skill_imports"}, seq)
+	}
+	for _, e := range seq.Content {
+		if e.Kind == yaml.ScalarNode && e.Value == repo {
+			return yamlContent, false, nil
+		}
+		if e.Kind == yaml.MappingNode {
+			for k := 0; k+1 < len(e.Content); k += 2 {
+				if e.Content[k].Value == "repo" && e.Content[k+1].Value == repo {
+					return yamlContent, false, nil
+				}
+			}
 		}
 	}
-	out := append([]string{}, lines[:insertAt]...)
-	out = append(out, newLine)
-	out = append(out, lines[insertAt:]...)
-	return strings.Join(out, "\n")
+	seq.Style = 0 // block style: `[]` would otherwise stay flow and inline the map
+	seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: "repo"},
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: repo},
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: "version"},
+		{Kind: yaml.ScalarNode, Tag: "!!str", Value: "", Style: yaml.DoubleQuotedStyle},
+	}})
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return "", false, err
+	}
+	_ = enc.Close()
+	return buf.String(), true, nil
 }
 
 // ── W4 Improve-surface tools ──────────────────────────────────────

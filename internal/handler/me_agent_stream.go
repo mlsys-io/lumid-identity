@@ -217,6 +217,7 @@ func MeAgentChatStream(c *gin.Context) {
 			Name: "app_judge", Args: map[string]any{"subject": "human", "auto": true}, Result: res, OK: true,
 		})
 		stagedNote += autoJudgeNote(res)
+		c.Set(ctxAutoJudgeKey, res)
 	}
 
 	if !acquireChatStream(userID) {

@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -284,6 +285,41 @@ func MeRunDetail(c *gin.Context) {
 	app, loop, ts := parts[1], parts[2], parts[3]
 
 	cycleDir, _ := resolveCycleDir(userID, app, loop, ts)
+	if cycleDir == "" && safeSeg(loop) && safeSeg(ts) {
+		// The caller's own install lives on the scheduler's volume: have the
+		// scheduler read the cycle dir (me_cycle_read_intent.go).
+		if _, direct, viaIntent, _ := ownerWriteTarget(userID, app); !direct && viaIntent {
+			res, err := cycleFilesViaScheduler(ginReqCtx(c), userID, app, loop, ts, false)
+			switch {
+			case err == nil:
+				summary := parseJSONBytes(res.files["summary.json"])
+				stepErrors := parseJSONBytes(res.files["step_errors.json"])
+				steps := parseJSONBytes(res.files["step_log.json"])
+				if steps == nil {
+					steps = []any{}
+				}
+				c.JSON(http.StatusOK, gin.H{
+					"ret_code": 0, "message": "ok",
+					"data": gin.H{
+						"run_id": runID, "kind": "scheduled", "app": app, "loop": loop, "ts": ts,
+						"steps": steps, "summary": summary, "step_errors": stepErrors,
+						"source": "scheduler", "cycle_dir_ts": res.resolvedTs,
+					},
+				})
+				return
+			case errors.Is(err, errCycleNotOnScheduler):
+				fail(c, http.StatusNotFound, 1404, "cycle not found")
+				return
+			default:
+				c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+					"run_id": runID, "kind": "scheduled", "app": app, "loop": loop, "ts": ts,
+					"steps":       []any{},
+					"unavailable": "per-run step detail could not be read from the scheduler: " + err.Error(),
+				}})
+				return
+			}
+		}
+	}
 	if cycleDir == "" {
 		// "cycle not found" is true and useless: resolveCycleDir scans a disk
 		// this pod does not mount, so it finds nothing for every run that has
@@ -514,6 +550,19 @@ func readStepLog(path string) any {
 	var v any
 	if err := json.Unmarshal(b, &v); err != nil {
 		return []any{}
+	}
+	return v
+}
+
+// parseJSONBytes decodes b, or nil when it is absent or not JSON — the byte
+// twin of readJSONFile, for files the scheduler read for us.
+func parseJSONBytes(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return nil
 	}
 	return v
 }

@@ -385,6 +385,7 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 		markStaleState(row, &d, st)
 		markUnfed(row, &d, loops[d.ID])
 		markStarved(row, userSub, app, loops[d.ID])
+		markUndispatched(row, &d, loops[d.ID])
 		out = append(out, row)
 	}
 	return out
@@ -418,6 +419,29 @@ const starvedRunWindow = 5
 // has not". Measured 2026-09-28: mbb-issue-tree's regression_sweep fired daily
 // for 7 days, failed every time with "no inbox cases match. Run seed_inbox
 // first.", and its experiment card said only "0 results".
+// markUndispatched explains a zero-row experiment that runs ONLY when someone
+// dispatches it (dispatch.ask, no loop lists it) and nobody has. Measured
+// 2026-09-28: mbb-consultant's analyst_local_gpu on three installs carried
+// neither `unfed` (it has a dispatch) nor `starved` (no loop feeds it), so its
+// card said only "0 results".
+func markUndispatched(row gin.H, d *expDecl, feeding []string) {
+	if len(feeding) > 0 || len(d.Dispatch) == 0 {
+		return
+	}
+	if lp, _ := d.Dispatch["loop"].(string); strings.TrimSpace(lp) != "" {
+		return // fed through that loop; its runs are what explain a zero
+	}
+	if n, _ := row["n_results"].(int); n != 0 {
+		return
+	}
+	reason := "it runs only when dispatched, and nothing has dispatched it yet"
+	if ask, _ := d.Dispatch["ask"].(string); strings.TrimSpace(ask) != "" {
+		reason += " — " + strings.TrimSpace(ask)
+	}
+	row["starved"] = true
+	row["starved_reason"] = reason
+}
+
 func markStarved(row gin.H, userSub, app string, feeding []string) {
 	if len(feeding) == 0 || userSub == "" || app == "" || common.DB == nil {
 		return
@@ -797,6 +821,7 @@ func MeAppExperiments(c *gin.Context) {
 					}
 				}
 				markStarved(row, userID, app, loops[d.ID])
+				markUndispatched(row, &d, loops[d.ID])
 				exps = append(exps, row)
 			}
 			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps)})

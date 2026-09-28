@@ -716,6 +716,22 @@ var capabilityScopes = map[string]bool{
 	"flowmesh:tasks:read":      true,
 	"flowmesh:results:read":    true,
 	"flowmesh:ssh":             true,
+	// Sandbox create/delete on sandbox-control (lum.id/sbx, the Research Fleet's
+	// Sandboxes tab) with a PAT. sandbox-control scope-gates PAT writes and
+	// accepts `*`, `sandbox:*`, `sandbox:write` or this tag. The first three are
+	// SERVICE scopes here: parseScope reads `sandbox:write` as (sandbox, write),
+	// every non-admin's default level is read, so canGrant refused all three to
+	// every non-admin — a user could rent a sandbox in Studio (the session JWT is
+	// not scope-gated) and could never do the same over the API. Measured
+	// 2026-09-28: a role=user PAT listed its sandboxes (200) and had no mintable
+	// scope that let it create one.
+	//
+	// Same parity rule as the FlowMesh set above: this is what a signed-in session
+	// may already do, so it changes the CREDENTIAL TYPE, not who may do what.
+	// Three segments on purpose, so it stays opaque to parseScope and never
+	// appears in the access matrix. Per-site limits (which sites, GPU quota,
+	// reserved cards) are still enforced by each sandbox-control and the edge.
+	"sandbox:sandboxes:write": true,
 }
 
 // capabilityCatalog is capabilityScopes made SERVABLE: the same allowlist, plus
@@ -772,6 +788,8 @@ var capabilityCatalog = []capabilityInfo{
 		"List FlowMesh nodes."},
 	{"flowmesh:ssh", "FlowMesh — SSH sessions",
 		"Open an SSH session task on a FlowMesh worker."},
+	{"sandbox:sandboxes:write", "Sandboxes — create and delete",
+		"Create and delete your own Research Fleet sandboxes over the API (lum.id/sbx). Reading them needs no extra scope. Site access and GPU quota are unchanged."},
 }
 
 // The two lists must describe the same set, in both directions. A tag on the

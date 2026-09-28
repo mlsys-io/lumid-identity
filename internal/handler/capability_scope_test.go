@@ -211,3 +211,35 @@ func TestFlowmeshSessionBearerParity(t *testing.T) {
 		}
 	}
 }
+
+// TestSandboxWriteScopeGrantable pins the one PAT scope that lets a plain user
+// create a sandbox over the API. sandbox-control accepts `*`, `sandbox:*`,
+// `sandbox:write` and `sandbox:sandboxes:write`; only the last may be minted by a
+// non-admin, and it must stay opaque to parseScope so it never widens the matrix.
+func TestSandboxWriteScopeGrantable(t *testing.T) {
+	user := models.User{Role: "user", Status: "active"}
+	suspended := models.User{Role: "user", Status: "suspended"}
+	if !canGrant(user, nil, "sandbox:sandboxes:write") {
+		t.Fatalf("role=user must be able to mint sandbox:sandboxes:write")
+	}
+	if canGrant(suspended, nil, "sandbox:sandboxes:write") {
+		t.Fatalf("suspended user must not be able to mint sandbox:sandboxes:write")
+	}
+	if svc, lvl := parseScope("sandbox:sandboxes:write"); svc != "" || lvl != "" {
+		t.Fatalf("sandbox:sandboxes:write must stay opaque to parseScope, got %q/%q", svc, lvl)
+	}
+	// The service-shaped spellings are NOT capability tags: they go through the
+	// access matrix (a plain user's sandbox level is read), so they stay admin-only.
+	// canGrant itself is not called for them here — the matrix path reads the DB.
+	for _, s := range []string{"sandbox:write", "sandbox:*", "sandbox:admin"} {
+		if isCapabilityScope(s) {
+			t.Fatalf("%q must not be a capability tag", s)
+		}
+	}
+	// Near-misses of the tag are neither a tag nor parseable, so nobody can mint them.
+	for _, s := range []string{"sandbox:sandboxes:admin", "sandbox:sandboxes:*", "sandbox:sandboxes:read"} {
+		if canGrant(user, nil, s) {
+			t.Fatalf("%q must not be grantable", s)
+		}
+	}
+}

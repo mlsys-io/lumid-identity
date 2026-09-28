@@ -11,6 +11,7 @@ package handler
 // app_config_set.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -27,7 +28,9 @@ func toolCycleDetail(userID, app, loop, ts string) (map[string]any, bool) {
 		return map[string]any{"error": "app and loop required"}, false
 	}
 	if ts == "" || ts == "latest" {
-		resolved, err := agentLatestCycleTs(userID, app, loop)
+		// resolveLatestCycleTs, not the disk walk: the caller's own install
+		// has no cycle dirs on this pod, and its newest run is in the store.
+		resolved, err := resolveLatestCycleTs(userID, app, loop)
 		if err != nil {
 			return map[string]any{"error": "no runs found for " + app + "/" + loop}, false
 		}
@@ -36,8 +39,11 @@ func toolCycleDetail(userID, app, loop, ts string) (map[string]any, bool) {
 	if !slugRe.MatchString(app) || !slugRe.MatchString(loop) {
 		return map[string]any{"error": "invalid app or loop"}, false
 	}
-	data, found := cycleDetailForUser(userID, app, loop, ts)
+	data, found, why := cycleDetailResolved(context.Background(), userID, app, loop, ts)
 	if !found {
+		if why != "" {
+			return map[string]any{"error": why}, false
+		}
 		return map[string]any{"error": "run not found: " + app + "/" + loop + "/" + ts}, false
 	}
 	return map[string]any(data), true

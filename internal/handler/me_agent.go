@@ -2833,7 +2833,14 @@ func renderViewingContext(ctx map[string]any) string {
 	//
 	// Fails closed: an unrecognised mode renders nothing and the model falls back
 	// to reading the sentence, which is the behaviour we already had.
-	switch str("mode") {
+	// "coach" is the chat menu's name for the same seat ("Train me"); the Work
+	// tab says "interview". Only the explicit choice maps — train_ai and free
+	// are the chat's DEFAULTS and must not turn every app chat into a case.
+	caseMode := str("mode")
+	if caseMode == modeCoach {
+		caseMode = "interview"
+	}
+	switch caseMode {
 	case "interview":
 		cid := str("case_id")
 		fmt.Fprintf(&b, "MODE: interviewer. You RUN the case and the USER answers — do not answer the questions yourself.\n")
@@ -2845,7 +2852,7 @@ func renderViewingContext(ctx map[string]any) string {
 			// and the model stalls trying to reconcile the two.
 			b.WriteString("No case is chosen yet: use `casebook` to list them, ask the user to pick, then case_open(role=interviewer) with the FULL case id they choose.\n")
 		}
-		b.WriteString("Once open: deliver the brief, stop, and wait. Ask the questions in order, one per turn. Release an on-request fact only when their answer touches it. Score each answer with app_judge.\n")
+		b.WriteString("Once open: deliver the brief, stop, and wait. Ask the questions in order, one per turn. Release an on-request fact only when their answer touches it. The server scores each answer with the judge panel before your turn and tells you the result — report it; do not score it yourself.\n")
 	case "benchmark":
 		cid := str("case_id")
 		fmt.Fprintf(&b, "MODE: interviewee. The USER is the interviewer and you answer the case questions.\n")

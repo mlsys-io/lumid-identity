@@ -208,6 +208,16 @@ func MeAgentChatStream(c *gin.Context) {
 		emit(map[string]any{"type": "tool_call", "name": "app_feedback", "result": res})
 		stagedNote = stagedCorrectionNote(res)
 	}
+	// Score the candidate's answer before the model gets a say — see
+	// autoJudgeCandidate. Recorded as this turn's app_judge call, so the cycle
+	// recorder counts it like any other judged turn.
+	if res, ok := autoJudgeCandidate(c.Request.Context(), userID, role, body); ok {
+		emit(map[string]any{"type": "tool_call", "name": "app_judge", "result": res})
+		turnToolCalls = append(turnToolCalls, toolCallResult{
+			Name: "app_judge", Args: map[string]any{"subject": "human", "auto": true}, Result: res, OK: true,
+		})
+		stagedNote += autoJudgeNote(res)
+	}
 
 	if !acquireChatStream(userID) {
 		emit(map[string]any{

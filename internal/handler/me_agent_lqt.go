@@ -264,8 +264,9 @@ func toolLqtMailboxRead(role, userID, endpoint, strategyID string, limit int) (m
 	if spec.crossTenant && role != "super_admin" {
 		return map[string]any{"error": fmt.Sprintf(
 			"%q is a platform-wide feed carrying every tenant's rows, so it is restricted to operators. "+
-				"For this user's own work use endpoint \"strategy_cycles\" with a strategy_id, or the "+
-				"app's own Strategies / Backtest surfaces, which are tenant-scoped.", endpoint)}, false
+				"For this user's own work use endpoint \"strategy_cycles\" with a strategy_id; for their own "+
+				"run results call app_read with source=me://app-data?app=<app>&tool=runs&loop=<loop> "+
+				"(e.g. app=quant-research, loop=backtest) — tenant-scoped, one call.", endpoint)}, false
 	}
 	path := spec.path
 	if spec.needsID {

@@ -98,6 +98,11 @@ func chatCycleMetrics(toolCalls []toolCallResult) map[string]any {
 		}
 		if v, ok := res["score"].(float64); ok {
 			m["score"] = v
+			// The interview/case_eval loops' experiment metric. A judged turn is
+			// ONE question, so its score is that question's score; the run tree
+			// marks a run scored only when this key is present, and a chat turn
+			// recording only `score` read "Not scored" every time.
+			m["avg_question_score"] = v
 		}
 		// The judge already resolves which QUESTION it scored (total_scope — the
 		// matched question id, or "case") and the per-axis breakdown. Both were

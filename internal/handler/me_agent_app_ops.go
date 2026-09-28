@@ -1632,6 +1632,16 @@ func chatMode(ctx map[string]any) string {
 	switch m {
 	case modeCoach, modeFree, modeTrainAI:
 		return m
+	// The Work tab's case browser names the same three seats differently
+	// (CaseBrowser ModeId). Both vocabularies reach this function, and the one
+	// the browser sends was falling through to train_ai — the interviewee seat —
+	// for a user who had just pressed "Interview me".
+	case "interview":
+		return modeCoach
+	case "benchmark":
+		return modeTrainAI
+	case "practice":
+		return modeFree
 	}
 	return modeTrainAI
 }

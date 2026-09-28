@@ -120,3 +120,31 @@ sections:
 		}
 	}
 }
+
+// A `code` widget on an app surface must survive compilation: MeAppUI serves
+// every ui/*.yaml through compilePageSpec, which silently drops unlisted types.
+func TestCodeWidgetCompiles(t *testing.T) {
+	spec := []byte(`
+title: Strategy
+sections:
+- heading: Source
+  widgets:
+  - type: code
+    source: me://strategies/{strategy_id}
+    path: source
+    language: lqts
+    empty: No source text
+`)
+	md, err := compilePageSpec(spec)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !strings.Contains(md, "```lumid:code\n") {
+		t.Fatalf("code widget dropped:\n%s", md)
+	}
+	for _, want := range []string{"source: me://strategies/{strategy_id}", "path: source", "language: lqts", "empty: No source text"} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("missing %q:\n%s", want, md)
+		}
+	}
+}

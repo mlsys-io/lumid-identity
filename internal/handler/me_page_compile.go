@@ -32,9 +32,21 @@ import (
 
 // allowedWidgets — the directive types the compiler will emit. lumid:native is
 // intentionally absent (abandoned).
+//
+// This is the ONE gate for app surfaces, not only for chat-composed pages:
+// MeAppUI compiles every ui/*.yaml surface (the default `page:` and every
+// `surfaces:` entry ending .yaml) through compilePageSpec on serve, and an
+// unlisted type is DROPPED silently — the section just renders without it. So
+// a widget the UI renders must be listed here before any app can use it.
+//
+// `code` is a read-only monospace block (e.g. a strategy's .lqts source):
+//
+//	{ type: code, source: me://strategies/{strategy_id}, path: source,
+//	  language: lqts, empty: "No source text" }
 var allowedWidgets = map[string]bool{
 	"stat": true, "table": true, "chart": true, "list": true,
 	"action": true, "tabs": true, "form": true, "search-table": true,
+	"code": true,
 }
 
 type pageSpecDoc struct {

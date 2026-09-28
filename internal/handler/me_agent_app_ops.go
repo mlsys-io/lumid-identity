@@ -66,7 +66,7 @@ func appOpsToolDefs() []map[string]any {
 		},
 		{
 			"name":        "app_read",
-			"description": "Read an allowlisted app data source and return its JSON — the same feeds app pages render. Sources: me://strategies (your registered strategies: name -> strategy_id), me://app-data?app=<slug>&tool=<tool>, me://gpu-rentals, me://workflows?app=<slug>, me://loops/health, me://apps, me://drafts, me://today, qa://cluster/pricing. Use this to answer 'what are my GPU rentals', 'what's the GPU price', 'how are my workflows'. No approval needed (read-only).",
+			"description": "Read an allowlisted app data source and return its JSON — the same feeds app pages render. Sources: me://strategies (your registered strategies: name -> strategy_id; ?name=<name> lists every version of one name), me://strategies/<strategy_id> (one strategy with its .lqts source text), me://app-data?app=<slug>&tool=<tool>, me://gpu-rentals, me://workflows?app=<slug>, me://loops/health, me://apps, me://drafts, me://today, qa://cluster/pricing. Use this to answer 'what are my GPU rentals', 'what's the GPU price', 'how are my workflows'. No approval needed (read-only).",
 			"input_schema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{"source": map[string]any{"type": "string", "description": "e.g. me://gpu-rentals or qa://cluster/pricing"}},
@@ -1198,8 +1198,38 @@ func appReadSource(c *gin.Context, userID, src string) (any, error) {
 		// no case for it, so the chat asked to backtest two strategies BY NAME
 		// could not resolve their ids: "source not allowed" (FLB-QR-01). Same
 		// function as GET /api/v1/me/strategies, so the same tenant scoping.
+		//
+		// Optional ?name= narrows to every version of one strategy name, the
+		// same filter GET /api/v1/me/strategies?name= applies.
 		case p == "strategies" || strings.HasPrefix(p, "strategies?"):
-			return meStrategiesData(c.Request.Context(), userID), nil
+			name := ""
+			if i := strings.IndexByte(p, '?'); i >= 0 {
+				if vals, err := url.ParseQuery(p[i+1:]); err == nil {
+					name = strings.TrimSpace(vals.Get("name"))
+				}
+			}
+			return meStrategiesData(c.Request.Context(), userID, name), nil
+		// me://strategies/<id> — ONE of the caller's strategies, including its
+		// source text. Same tenant predicate and the same credential redaction
+		// as GET /api/v1/me/strategies/:id (meStrategyDetailData), trimmed to
+		// what a model can use: no program_hex (large bytecode hex) and no
+		// spec_json (the source is its readable part).
+		case strings.HasPrefix(p, "strategies/"):
+			id := strings.TrimPrefix(p, "strategies/")
+			if j := strings.IndexByte(id, '?'); j >= 0 {
+				id = id[:j]
+			}
+			if uid, err := url.PathUnescape(id); err == nil {
+				id = uid
+			}
+			if strings.TrimSpace(id) == "" || strings.Contains(id, "/") {
+				return nil, errReadNotAllowed(src)
+			}
+			d, _, _, msg := meStrategyDetailData(c.Request.Context(), userID, id)
+			if d == nil {
+				return nil, &appOpsError{msg}
+			}
+			return strategyReadSummary(d), nil
 		// me://app-data?app=<app>&tool=<tool> — an app's OWN declared surfaces.
 		//
 		// This is how every app exposes its domain data (casebook, runs, report,
@@ -1329,7 +1359,7 @@ func appActionsCatalog(userID, app string) map[string]any {
 				if sq, ok := body["submit_qa"].(string); ok && sq != "" {
 					qaCalls = append(qaCalls, parseQaRef(sq))
 				}
-			case "table", "stat", "chart", "list", "search-table", "workflow":
+			case "table", "stat", "chart", "list", "search-table", "workflow", "code":
 				if s, ok := body["source"].(string); ok && s != "" {
 					reads[s] = true
 				}

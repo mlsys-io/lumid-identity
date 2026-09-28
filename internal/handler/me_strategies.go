@@ -33,9 +33,12 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -96,12 +99,38 @@ func MeStrategies(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
 		return
 	}
-	ok(c, "ok", meStrategiesData(c.Request.Context(), userID))
+	ok(c, "ok", meStrategiesData(c.Request.Context(), userID, strings.TrimSpace(c.Query("name"))))
+}
+
+// strategiesListQuery builds the list SELECT. `name`, when non-empty, narrows
+// the list to one strategy name — every version the caller registered under it
+// — so a page can show a strategy's history. It is an AND on top of the tenant
+// predicate, never instead of it: the tenant term is always $1 and always the
+// caller's own id, so a name that exists only under another tenant returns an
+// empty list, not their rows. Both values are bound, never interpolated.
+func strategiesListQuery(tenant uuid.UUID, name string) (string, []any) {
+	args := []any{tenant}
+	where := "tenant_id = $1"
+	if name != "" {
+		args = append(args, name)
+		where += fmt.Sprintf(" AND name = $%d", len(args))
+	}
+	args = append(args, strategiesRowCap)
+	q := `
+		SELECT strategy_id, name, kind, model, version, status,
+		       live_enabled, live_enabled_at, region_scope,
+		       program_hash, registered_at, updated_at
+		  FROM core.tenant_strategies
+		 WHERE ` + where + `
+		 ORDER BY updated_at DESC NULLS LAST, registered_at DESC NULLS LAST
+		 LIMIT $` + fmt.Sprint(len(args))
+	return q, args
 }
 
 // meStrategiesData is MeStrategies' body, shared with the chat's app_read
 // (me://strategies) so both read the registry through one tenant-scoped path.
-func meStrategiesData(reqCtx context.Context, userID string) gin.H {
+// nameFilter is optional (see strategiesListQuery).
+func meStrategiesData(reqCtx context.Context, userID, nameFilter string) gin.H {
 	data := gin.H{
 		"strategies": []gin.H{},
 		"available":  strategiesDSN() != "",
@@ -143,16 +172,8 @@ func meStrategiesData(reqCtx context.Context, userID string) gin.H {
 	// tenant_id is bound, never interpolated, and comes from the authenticated
 	// session — a caller cannot ask for another tenant's rows because there is
 	// no request field that reaches this predicate.
-	const q = `
-		SELECT strategy_id, name, kind, model, version, status,
-		       live_enabled, live_enabled_at, region_scope,
-		       program_hash, registered_at, updated_at
-		  FROM core.tenant_strategies
-		 WHERE tenant_id = $1
-		 ORDER BY updated_at DESC NULLS LAST, registered_at DESC NULLS LAST
-		 LIMIT $2`
-
-	rows, err := conn.Query(ctx, q, tenant, strategiesRowCap)
+	q, args := strategiesListQuery(tenant, nameFilter)
+	rows, err := conn.Query(ctx, q, args...)
 	if err != nil {
 		data["available"] = false
 		data["reason"] = "strategy registry query failed"
@@ -213,6 +234,11 @@ func meStrategiesData(reqCtx context.Context, userID string) gin.H {
 	}
 
 	data["strategies"] = out
+	if nameFilter != "" {
+		// Echo the filter so an empty list reads as "no versions of THIS
+		// name", not as an empty registry.
+		data["name"] = nameFilter
+	}
 
 	// REJECTED SUBMISSIONS — the half a student could not see.
 	//
@@ -255,6 +281,8 @@ func meStrategiesData(reqCtx context.Context, userID string) gin.H {
 		// looks like a working empty state.
 		data["available"] = false
 		data["reason"] = "strategy rows could not be decoded — schema mismatch"
+	case len(out) == 0 && nameFilter != "":
+		data["reason"] = "no strategies named " + strconv.Quote(nameFilter)
 	case len(out) == 0:
 		// An empty registry is the expected first state — core.tenant_strategies
 		// has never held a row. Say so, so the workspace can offer the create
@@ -354,29 +382,31 @@ func MeStrategyDetail(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
 		return
 	}
-	id := strings.TrimSpace(c.Param("id"))
-	if id == "" {
-		fail(c, http.StatusBadRequest, 1400, "strategy id required")
+	data, status, code, msg := meStrategyDetailData(c.Request.Context(), userID, c.Param("id"))
+	if data == nil {
+		fail(c, status, code, msg)
 		return
 	}
-	if strategiesDSN() == "" {
-		fail(c, http.StatusServiceUnavailable, 1503, "strategy registry not configured")
-		return
-	}
-	tenant, err := uuid.Parse(strings.TrimSpace(userID))
-	if err != nil {
-		// Cannot own an LQT strategy at all — indistinguishable from not found,
-		// and saying so leaks nothing about whether the id exists elsewhere.
-		fail(c, http.StatusNotFound, 1404, "strategy not found")
-		return
-	}
+	ok(c, "ok", data)
+}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), strategiesOpTimeout)
-	defer cancel()
+// strategyRow is one core.tenant_strategies row as the detail read selects it.
+type strategyRow struct {
+	StrategyID, Name, Kind, Status  string
+	Model, Version                  *string
+	BytecodeHex, SpecJSON, ProgHash string
+}
+
+var errStrategyNotFound = errors.New("strategy not found")
+var errStrategyUnreachable = errors.New("strategy registry unreachable")
+
+// fetchStrategyRow reads one strategy under the tenant predicate. A package
+// var so the response shaping (and its redaction) can be tested without a
+// core DB; production never reassigns it.
+var fetchStrategyRow = func(ctx context.Context, tenant uuid.UUID, id string) (*strategyRow, error) {
 	conn, err := strategiesConnect(ctx)
 	if err != nil {
-		fail(c, http.StatusServiceUnavailable, 1503, "strategy registry unreachable")
-		return
+		return nil, errStrategyUnreachable
 	}
 	defer func() { _ = conn.Close(context.Background()) }()
 
@@ -388,39 +418,187 @@ func MeStrategyDetail(c *gin.Context) {
 		       coalesce(program_hash, '')
 		  FROM core.tenant_strategies
 		 WHERE tenant_id = $1 AND strategy_id = $2`
-
-	var (
-		strategyID, name, kind, status  string
-		model, version                  *string
-		bytecodeHex, specJSON, progHash string
-	)
-	err = conn.QueryRow(ctx, q, tenant, id).Scan(
-		&strategyID, &name, &kind, &model, &version, &status,
-		&bytecodeHex, &specJSON, &progHash)
-	if err != nil {
+	var r strategyRow
+	if err := conn.QueryRow(ctx, q, tenant, id).Scan(
+		&r.StrategyID, &r.Name, &r.Kind, &r.Model, &r.Version, &r.Status,
+		&r.BytecodeHex, &r.SpecJSON, &r.ProgHash); err != nil {
 		// No row for THIS tenant. Deliberately the same answer whether the id
 		// is unknown or belongs to another tenant — distinguishing them would
 		// turn this into an existence oracle over other people's strategies.
-		fail(c, http.StatusNotFound, 1404, "strategy not found")
-		return
+		return nil, errStrategyNotFound
 	}
+	return &r, nil
+}
 
+// meStrategyDetailData is MeStrategyDetail's body, shared with the chat's
+// app_read (me://strategies/<id>) so both go through the same tenant predicate
+// AND the same redaction. On failure data is nil and (status, code, msg) is
+// the error to report.
+func meStrategyDetailData(reqCtx context.Context, userID, rawID string) (gin.H, int, int, string) {
+	id := strings.TrimSpace(rawID)
+	if id == "" {
+		return nil, http.StatusBadRequest, 1400, "strategy id required"
+	}
+	if strategiesDSN() == "" {
+		return nil, http.StatusServiceUnavailable, 1503, "strategy registry not configured"
+	}
+	tenant, err := uuid.Parse(strings.TrimSpace(userID))
+	if err != nil {
+		// Cannot own an LQT strategy at all — indistinguishable from not found,
+		// and saying so leaks nothing about whether the id exists elsewhere.
+		return nil, http.StatusNotFound, 1404, "strategy not found"
+	}
+	ctx, cancel := context.WithTimeout(reqCtx, strategiesOpTimeout)
+	defer cancel()
+	row, err := fetchStrategyRow(ctx, tenant, id)
+	if err != nil {
+		if errors.Is(err, errStrategyUnreachable) {
+			return nil, http.StatusServiceUnavailable, 1503, "strategy registry unreachable"
+		}
+		return nil, http.StatusNotFound, 1404, "strategy not found"
+	}
+	return strategyDetailFromRow(row), 0, 0, ""
+}
+
+// strategyDetailFromRow shapes the detail response. spec_json is REDACTED here
+// and nowhere else, so every caller of the detail gets the redacted body.
+//
+// WHY: the mailbox consumer persisted the submitter's whole `strategy` object
+// as spec_json, and the submit path carries the submitter's own lum.id PAT at
+// strategy.auth.pat (POST /xpio/strategies wraps the field payload under
+// `strategy`). Measured 2026-09-28: a reader's own detail returned their live
+// 76-char PAT in spec_json. It is "their own" token, but this body is rendered
+// in a page, handed to the chat model through app_read, and logged by any
+// tool that fetches it — a bearer credential has no business in any of those.
+// The consumer now strips it before persisting (LQT), and rows written before
+// that fix still carry it, so identity strips it on read regardless.
+func strategyDetailFromRow(r *strategyRow) gin.H {
 	data := gin.H{
-		"strategy_id":  strategyID,
-		"name":         name,
-		"kind":         kind,
-		"model":        model,
-		"version":      version,
-		"status":       status,
-		"program_hash": progHash,
+		"strategy_id":  r.StrategyID,
+		"name":         r.Name,
+		"kind":         r.Kind,
+		"model":        r.Model,
+		"version":      r.Version,
+		"status":       r.Status,
+		"program_hash": r.ProgHash,
+		// The .lqts the researcher wrote — what a strategy workspace shows.
+		// Empty when the strategy was submitted as a JSON model/program with
+		// no source text.
+		"source": "",
 	}
 	// The body, in the shape the backtest API and the mailbox both accept:
 	// program_hex preferred, dsl as the compile-server-side path.
-	if bytecodeHex != "" {
-		data["program_hex"] = bytecodeHex
+	if r.BytecodeHex != "" {
+		data["program_hex"] = r.BytecodeHex
 	}
-	if specJSON != "" {
-		data["spec_json"] = specJSON
+	if r.SpecJSON != "" {
+		spec, src := redactStrategySpec(r.SpecJSON)
+		data["source"] = src
+		if spec != "" {
+			data["spec_json"] = spec
+		}
 	}
-	ok(c, "ok", data)
+	return data
+}
+
+// strategyReadSummary is the chat's view of one strategy: the detail minus
+// program_hex (large, and useless to a model) and spec_json (the source is the
+// readable part of it).
+func strategyReadSummary(d gin.H) gin.H {
+	out := gin.H{}
+	for _, k := range []string{"strategy_id", "name", "kind", "model", "version", "status", "program_hash", "source"} {
+		out[k] = d[k]
+	}
+	return out
+}
+
+// redactStrategySpec parses spec_json, removes every credential-shaped key at
+// any depth, and returns the re-serialized spec plus its source text
+// (spec.dsl, else spec.source; "" when neither is a string).
+//
+// Fail CLOSED: a spec_json that does not parse as JSON cannot be inspected, so
+// it is withheld entirely ("") rather than passed through verbatim.
+func redactStrategySpec(specJSON string) (string, string) {
+	var v any
+	dec := json.NewDecoder(strings.NewReader(specJSON))
+	dec.UseNumber() // keep integer params exact on the round trip
+	if err := dec.Decode(&v); err != nil {
+		return "", ""
+	}
+	v = redactCredentials(v)
+	src := ""
+	if m, isObj := v.(map[string]any); isObj {
+		if s, isStr := m["dsl"].(string); isStr && strings.TrimSpace(s) != "" {
+			src = s
+		} else if s, isStr := m["source"].(string); isStr {
+			src = s
+		}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", src
+	}
+	return string(b), src
+}
+
+// credentialKeys are object keys dropped wherever they appear, compared after
+// lowercasing and removing '_' / '-'. The token family is an explicit list,
+// NOT a "*token" suffix match: prediction-market specs legitimately carry
+// market identifiers such as `token_id` / `yes_token`, and those are not
+// secrets.
+var credentialKeys = map[string]bool{
+	"auth": true, "authorization": true, "pat": true, "jwt": true, "bearer": true,
+	"token": true, "accesstoken": true, "refreshtoken": true, "idtoken": true,
+	"authtoken": true, "apitoken": true, "bearertoken": true, "sessiontoken": true,
+	"pattoken": true, "apikey": true, "privatekey": true, "credential": true,
+	"credentials": true, "cookie": true, "secret": true, "password": true, "passwd": true,
+}
+
+func isCredentialKey(k string) bool {
+	lk := strings.ToLower(strings.TrimSpace(k))
+	if strings.HasSuffix(lk, "_pat") || strings.HasSuffix(lk, "-pat") {
+		return true
+	}
+	n := strings.NewReplacer("_", "", "-", "").Replace(lk)
+	if credentialKeys[n] {
+		return true
+	}
+	return strings.Contains(n, "secret") || strings.Contains(n, "password") ||
+		strings.Contains(n, "passwd") || strings.Contains(n, "authorization")
+}
+
+// looksLikePAT catches a lum.id / Runmesh PAT under a key the list above does
+// not name — defense in depth for a field someone invents later.
+func looksLikePAT(s string) bool {
+	s = strings.TrimSpace(s)
+	return strings.HasPrefix(s, "lm_pat_") || strings.HasPrefix(s, "rm_pat_")
+}
+
+func redactCredentials(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if isCredentialKey(k) {
+				delete(t, k)
+				continue
+			}
+			if s, isStr := val.(string); isStr && looksLikePAT(s) {
+				delete(t, k)
+				continue
+			}
+			t[k] = redactCredentials(val)
+		}
+		return t
+	case []any:
+		for i, val := range t {
+			if s, isStr := val.(string); isStr && looksLikePAT(s) {
+				t[i] = "[redacted]"
+				continue
+			}
+			t[i] = redactCredentials(val)
+		}
+		return t
+	default:
+		return v
+	}
 }

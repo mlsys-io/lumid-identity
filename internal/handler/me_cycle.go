@@ -14,7 +14,6 @@ package handler
 // merged view the UI can render as collapsible step cards.
 
 import (
-	"bufio"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -94,9 +93,11 @@ func MeCyclesList(c *gin.Context) {
 				if b, err := os.ReadFile(cj); err == nil {
 					var raw map[string]any
 					if json.Unmarshal(b, &raw) == nil {
-						if v, ok := raw["ok"].(bool); ok {
-							item.OK = v
-						}
+						// The same rule the run store's `ok` follows, so this
+						// list, /me/runs and the detail agree about one cycle
+						// (cycle.json alone says ok:true beside step errors).
+						sidecar, _ := os.ReadFile(filepath.Join(cyclesRoot, lp.Name(), td.Name(), "step_errors.json"))
+						item.OK = cycleOutcomeOK(raw, sidecar)
 						if v, ok := raw["duration_s"].(float64); ok {
 							item.Duration = v
 						}
@@ -183,14 +184,14 @@ func MeCycleDetail(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid app or loop")
 		return
 	}
-	data, found := cycleDetailForUser(userID, app, loop, ts)
+	// Disk first, then — for the caller's own install, which lives on the
+	// scheduler's volume — the scheduler reads the cycle dir for us
+	// (cycleDetailResolved). Only when neither can see it does the answer say
+	// so; "cycle not found" alone would read as a missing run rather than an
+	// unreadable volume.
+	data, found, why := cycleDetailResolved(ginReqCtx(c), userID, app, loop, ts)
 	if !found {
-		// "cycle not found" is true and useless: cycleDetailForUser scans
-		// tenantAppsDir and operatorHome DIRECTLY (not even resolveAppDir's
-		// materialised cache), so on this pod it finds nothing for every cycle
-		// that has ever run. Name the cause, or the drill-down reads as a
-		// missing run rather than an unmountable volume.
-		if why := unavailableReason(resolveAppDir(userID, app), "per-step cycle detail"); why != "" {
+		if why != "" {
 			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
 				"app": app, "loop": loop, "ts": ts, "steps": []any{},
 				"unavailable": why,
@@ -230,124 +231,12 @@ func cycleDetailForUser(userID, app, loop, ts string) (gin.H, bool) {
 	if cycleDir == "" {
 		return nil, false
 	}
-
-	// Headline cycle.json
-	cycleSummary := map[string]any{}
-	if b, err := os.ReadFile(filepath.Join(cycleDir, "cycle.json")); err == nil {
-		_ = json.Unmarshal(b, &cycleSummary)
-	}
-
-	// Prompt audit — per-step sha + preview.
-	prompts := map[string]map[string]string{} // step_id → {sha, preview}
-	if f, err := os.Open(filepath.Join(cycleDir, "prompt_audit.jsonl")); err == nil {
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			var row map[string]any
-			if json.Unmarshal(scanner.Bytes(), &row) != nil {
-				continue
-			}
-			sid, _ := row["step_id"].(string)
-			if sid == "" {
-				continue
-			}
-			sha, _ := row["prompt_sha256"].(string)
-			preview, _ := row["instructions_preview"].(string)
-			prompts[sid] = map[string]string{"sha": sha, "preview": preview}
-		}
-		f.Close()
-	}
-
-	// Steps — each <stepID>.json
-	steps := []cycleStep{}
-	entries, _ := os.ReadDir(cycleDir)
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		if e.Name() == "cycle.json" {
-			continue
-		}
-		sid := strings.TrimSuffix(e.Name(), ".json")
-		b, err := os.ReadFile(filepath.Join(cycleDir, e.Name()))
-		if err != nil {
-			continue
-		}
-		var raw map[string]any
-		if json.Unmarshal(b, &raw) != nil {
-			continue
-		}
-		step := cycleStep{StepID: sid, OK: true}
-		if skill, ok := raw["skill"].(string); ok {
-			step.Skill = skill
-		}
-		if stage, ok := raw["stage"].(string); ok {
-			step.Stage = stage
-		}
-		if okv, exists := raw["ok"].(bool); exists {
-			step.OK = okv
-		}
-		if errv, exists := raw["error"].(string); exists {
-			step.Error = errv
-		}
-		if d, exists := raw["duration_s"].(float64); exists {
-			step.Duration = d
-		}
-		// Output: include the full dict for the UI, plus a short
-		// summary line for the collapsed view.
-		if out, exists := raw["output"].(map[string]any); exists {
-			step.Output = out
-			step.OutputSummary = summarizeOutput(out)
-		}
-		// Some skills return a flat shape — use raw as the output.
-		if step.Output == nil {
-			step.Output = raw
-			step.OutputSummary = summarizeOutput(raw)
-		}
-		if pa, ok := prompts[sid]; ok {
-			step.PromptSHA = pa["sha"]
-			step.PromptPreview = pa["preview"]
-		}
-		steps = append(steps, step)
-	}
-	// Sort steps by id (skill convention uses lexicographic order).
-	sort.Slice(steps, func(i, j int) bool {
-		return steps[i].StepID < steps[j].StepID
-	})
-
-	// Sidecar artifacts — some apps (e.g. auto-sysresearch) write the real
-	// per-stage content as standalone files instead of into cycle.json:
-	// observations.json (observe), proposal.json (hypothesize), result(s)/
-	// patterns/analysis (act/analyze), improvement (learn). Surface them as a
-	// map so the per-stage inspector can render the actual artifact.
-	files := map[string]any{}
-	for _, name := range []string{
-		"observations", "proposal", "result", "results", "patterns",
-		"analysis", "improvement", "plan", "variant", "benchmark",
-	} {
-		p := filepath.Join(cycleDir, name+".json")
-		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Size() < 256*1024 {
-			if b, err := os.ReadFile(p); err == nil {
-				var v any
-				if json.Unmarshal(b, &v) == nil {
-					files[name] = v
-				}
-			}
-		}
-	}
-
-	return gin.H{
-		"app":     app,
-		"loop":    loop,
-		"ts":      ts,
-		"summary": cycleSummary,
-		"steps":   steps,
-		"files":   files,
-		// What the cycle LEARNED — memories its learn stage wrote, by time
-		// window. Surfaces the synthesized insight (banks), not just the
-		// mechanical run, so a dot drill-in shows "learned: <memory>".
-		"memories_learned": memoriesLearnedInCycle(userID, app, loop, ts),
-	}, true
+	data := cycleDetailFromFiles(app, loop, ts, readCycleDirFiles(cycleDir))
+	// What the cycle LEARNED — memories its learn stage wrote, by time
+	// window. Surfaces the synthesized insight (banks), not just the
+	// mechanical run, so a dot drill-in shows "learned: <memory>".
+	data["memories_learned"] = memoriesLearnedInCycle(userID, app, loop, ts)
+	return data, true
 }
 
 // kpiPair is one named numeric extracted from a cycle, in stable order.

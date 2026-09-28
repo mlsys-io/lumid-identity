@@ -14,7 +14,10 @@ package handler
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,6 +91,13 @@ func MeCycleLog(c *gin.Context) {
 			}
 			ts = newest
 		}
+		// No cycle dirs on this pod (the caller's install is on the
+		// scheduler's volume): the newest run in the store names it.
+		if ts == "latest" || ts == "" {
+			if id, err := resolveLatestCycleTs(userID, app, loop); err == nil {
+				ts = id
+			}
+		}
 	}
 	// Conversation mode: a specific cycle's session — its LLM turns (the AI
 	// generation) merged with its journal stage/tool events, newest-relevant
@@ -128,7 +138,23 @@ func MeCycleLog(c *gin.Context) {
 			// Empty because the transcript is unreachable, or empty because
 			// nothing was said? They mean opposite things and read identically.
 			if why := unavailableReason(appDir, "this cycle's LLM transcript"); why != "" {
-				resp["unavailable"] = why
+				// The caller's own install: the scheduler reads the cycle's
+				// LLM turns for us. Journal stage events are not included —
+				// the journal is app-wide and large; the turns are the session.
+				if rows, running, err, tried := cycleTranscriptViaScheduler(ginReqCtx(c), userID, app, loop, ts); tried {
+					switch {
+					case err == nil:
+						resp["rows"], resp["running"], resp["source"] = rows, running, "scheduler"
+						why = ""
+					case errors.Is(err, errCycleNotOnScheduler):
+						why = ""
+					default:
+						why = "this cycle's LLM transcript could not be read from the scheduler: " + err.Error()
+					}
+				}
+				if why != "" {
+					resp["unavailable"] = why
+				}
 			}
 		}
 		ok(c, "ok", resp)
@@ -252,4 +278,31 @@ func digitsOnlyTs(s string) string {
 		}
 	}
 	return string(b)
+}
+
+// cycleTranscriptViaScheduler reads one cycle's LLM turns
+// (.llm_conversation.jsonl) from the caller's own install on the scheduler.
+// tried=false when the app is not the caller's scheduler-side install, so the
+// caller keeps its own "not available" answer.
+func cycleTranscriptViaScheduler(ctx context.Context, userID, app, loop, ts string) (rows []map[string]any, running bool, err error, tried bool) {
+	if _, direct, viaIntent, _ := ownerWriteTarget(userID, app); direct || !viaIntent || !safeSeg(loop) || !safeSeg(ts) {
+		return nil, false, nil, false
+	}
+	res, err := cycleFilesViaScheduler(ctx, userID, app, loop, ts, true)
+	if err != nil {
+		return nil, false, err, true
+	}
+	rows = []map[string]any{}
+	sc := bufio.NewScanner(bytes.NewReader(res.files[".llm_conversation.jsonl"]))
+	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		var row map[string]any
+		if json.Unmarshal(sc.Bytes(), &row) == nil {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) > cycleLogTailCap {
+		rows = rows[len(rows)-cycleLogTailCap:]
+	}
+	return rows, res.running, nil, true
 }

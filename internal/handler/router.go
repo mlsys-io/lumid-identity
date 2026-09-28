@@ -173,6 +173,10 @@ func Register(r *gin.Engine) {
 			admin.POST("/invitation-codes", AdminInviteMint)
 			admin.GET("/invitation-codes", AdminInviteList)
 			admin.DELETE("/invitation-codes/:code", AdminInviteRevoke)
+			// Signup OTP read-back for e2e TEST addresses only (lumid-e2e-…@yao.lu
+			// by default) — lets the nightly fresh-user journey register from a
+			// GitHub runner without a kubeconfig. See admin_e2e_otp.go.
+			admin.GET("/e2e/signup-otp", AdminE2ESignupOTP)
 
 			// Canonical user management + access matrix + audit.
 			admin.GET("/users", AdminUsersList)

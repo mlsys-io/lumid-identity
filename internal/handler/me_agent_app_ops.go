@@ -42,6 +42,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1215,9 +1216,14 @@ func appReadSource(c *gin.Context, userID, src string) (any, error) {
 		//
 		// Same allowlist and the same per-caller scoping as MeAppData (the tools
 		// take userID), so this adds no reachable data — only the path to it.
-		// Extra query params are ignored rather than applied: MeAppData's
-		// filterAppData narrows by them off a gin.Context, and re-implementing
-		// that filter here is how the two copies start to disagree.
+		//
+		// Extra params go through the SAME filterAppData the HTTP route uses.
+		// They used to be dropped, so `&loop=backtest` returned every loop's
+		// runs: 2,241 rows / 1.56 MB for a reader asking about backtests, and
+		// deepseek answered that tool result with an empty turn (2026-09-28).
+		// Without an explicit limit the row arrays keep the newest
+		// appReadDefaultLimit; `total` carries the pre-cap count so the model
+		// can say how many exist and narrow the query instead.
 		case p == "app-data" || strings.HasPrefix(p, "app-data?"):
 			q := ""
 			if i := strings.IndexByte(p, '?'); i >= 0 {
@@ -1248,7 +1254,10 @@ func appReadSource(c *gin.Context, userID, src string) (any, error) {
 			// flattening it to a 500 — the text ("app not found: x") is the
 			// useful signal. Same here.
 			res, _ := fn(userID, app)
-			return res, nil
+			if vals.Get("limit") == "" {
+				vals.Set("limit", strconv.Itoa(appReadDefaultLimit))
+			}
+			return filterAppData(vals, res), nil
 		default:
 			return nil, errReadNotAllowed(src)
 		}

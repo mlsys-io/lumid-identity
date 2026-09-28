@@ -293,6 +293,16 @@ func MeAgentChatStream(c *gin.Context) {
 		}
 	}()
 
+	// sawText: did any turn stream answer text? A turn that ends after tool
+	// calls with none used to send a bare `done`, which the UI renders as the
+	// tool chips and nothing else — an answer that silently never came.
+	sawText := false
+	emitTurn := func(ev map[string]any) bool {
+		if ev["type"] == "text" {
+			sawText = true
+		}
+		return emit(ev)
+	}
 	for i := 0; i < maxToolLoopIterations; i++ {
 		// Stop the moment the client is gone — otherwise the loop keeps making
 		// upstream LLM calls and dispatching (possibly destructive) tools for a
@@ -322,7 +332,7 @@ func MeAgentChatStream(c *gin.Context) {
 			}
 		}
 		stopReason, toolUses, assistantBlocks, inTok, outTok, err := streamOneAnthropicTurn(
-			ctx, provider, apiKey, req, emit,
+			ctx, provider, apiKey, req, emitTurn,
 		)
 		totalInputTokens += inTok
 		totalOutputTokens += outTok
@@ -336,6 +346,12 @@ func MeAgentChatStream(c *gin.Context) {
 			break
 		}
 		if stopReason != "tool_use" || len(toolUses) == 0 {
+			if !sawText && len(turnToolCalls) > 0 {
+				log.Printf("[me-agent] empty answer after tools provider=%s user=%s stop=%q tools=%d in_tok=%d",
+					provider.id, userID, stopReason, len(turnToolCalls), totalInputTokens)
+				emit(map[string]any{"type": "error", "message": "The model ran the tools above but returned no answer. " +
+					"Ask again, ideally narrower (one loop, a date range), or pick a different model."})
+			}
 			break // done — final text already emitted as deltas
 		}
 
@@ -423,7 +439,7 @@ func MeAgentChatStream(c *gin.Context) {
 				}
 			}
 			emit(ev)
-			payload, _ := json.Marshal(result)
+			content := toolResultForModel(result)
 			// Same shape the non-stream handler collects, so one cycle recorder
 			// serves both paths — the UI streams, so wiring only the JSON handler
 			// would have recorded nothing in practice.
@@ -433,7 +449,7 @@ func MeAgentChatStream(c *gin.Context) {
 			toolResultBlocks = append(toolResultBlocks, map[string]any{
 				"type":        "tool_result",
 				"tool_use_id": tu.id,
-				"content":     string(payload),
+				"content":     content,
 				"is_error":    !callOK,
 			})
 		}

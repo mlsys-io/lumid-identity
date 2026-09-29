@@ -157,3 +157,20 @@ func TestMachineManagedCacheRowsNeverReachTheCycleEnv(t *testing.T) {
 			"skipping them by name is what leaked __lumilake_compute_pat_cache")
 	}
 }
+
+// A command loop that submits to Lumilake itself declares `compute: lumilake`
+// and is served; one that declares nothing, or an unknown service, is not.
+func TestCommandLoopDeclaringComputeGetsTheCredential(t *testing.T) {
+	yes := []byte("loops:\n- name: case_eval\n  engine: {type: command, module: case_eval}\n  compute: lumilake\n")
+	if !specDeclaresComputeEngine(yes) {
+		t.Fatal("a command loop declaring compute: lumilake got no credential")
+	}
+	no := []byte("loops:\n- name: case_eval\n  engine: {type: command, module: case_eval}\n")
+	if specDeclaresComputeEngine(no) {
+		t.Fatal("a command loop that declares nothing was minted a credential")
+	}
+	odd := []byte("loops:\n- name: x\n  engine: {type: command}\n  compute: flowmesh\n")
+	if specDeclaresComputeEngine(odd) {
+		t.Fatal("compute: flowmesh is declared-but-unimplemented and must not mint")
+	}
+}

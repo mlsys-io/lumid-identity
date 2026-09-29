@@ -146,7 +146,7 @@ func specDeclaresComputeEngine(spec []byte) bool {
 		return false
 	}
 	for _, l := range append(append([]rawComputeLoop{}, doc.Loops...), doc.Workflows...) {
-		if computeEngineTypes[strings.TrimSpace(l.Engine.Type)] {
+		if computeEngineTypes[strings.TrimSpace(l.Engine.Type)] || computeEngineTypes[strings.TrimSpace(l.Compute)] {
 			return true
 		}
 	}
@@ -157,6 +157,14 @@ type rawComputeLoop struct {
 	Engine struct {
 		Type string `yaml:"type"`
 	} `yaml:"engine"`
+	// Compute declares that a COMMAND loop submits to a compute service itself
+	// (e.g. `compute: lumilake`). Added 2026-09-29: mbb-consultant's case_eval
+	// is `engine.type: command` and calls Lumilake when an arm names a
+	// `lumilake:<site>:<model>` analyst, so this gate — which read only
+	// engine.type — never minted it a credential and every scheduled GPU-lane
+	// cycle failed. Declared, not sniffed, for the same reason the gate asks
+	// the spec at all.
+	Compute string `yaml:"compute"`
 }
 
 // mintComputePAT returns a fresh scoped PAT for userSub, or "" if minting

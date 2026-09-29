@@ -34,6 +34,7 @@ var toolDataScopes = map[string][]string{
 	"delete_loop":        {"loops", "workflows", "apps"},
 	// app lifecycle
 	"install_app":           {"apps", "workflows", "loops"},
+	"agent_install":         {"apps", "workflows", "loops"}, // canonical name; install_app is hidden
 	"uninstall_app":         {"apps", "workflows", "loops"},
 	"fork_app":              {"apps"},
 	"app_update":            {"apps", "workflows"},

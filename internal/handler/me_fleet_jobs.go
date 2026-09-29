@@ -164,6 +164,19 @@ func detectFleetFormat(workflow string) string {
 	return ""
 }
 
+// declaredWorkflowInputs is a Lumilake workflow's own top-level `inputs:` map,
+// or {} when it declares none. Never nil: a nil map would reach the server as
+// `inputs: null`.
+func declaredWorkflowInputs(workflow string) map[string]any {
+	var top struct {
+		Inputs map[string]any `yaml:"inputs"`
+	}
+	if yaml.Unmarshal([]byte(workflow), &top) != nil || top.Inputs == nil {
+		return map[string]any{}
+	}
+	return top.Inputs
+}
+
 func fleetKindOf(format string) string {
 	if format == fleetFormatLumilake {
 		return fleetKindLL
@@ -351,13 +364,13 @@ func MeFleetJobRun(c *gin.Context) {
 			call.url += "/validate"
 		}
 	} else {
-		// Not `item["inputs"] == nil`: a nil map stored in an interface is a
-		// typed nil, which never equals nil — the default never applied and
-		// Lumilake got `inputs: null` (422 "Input should be a valid
-		// dictionary") for every run that sent no inputs.
+		// Lumilake requires non-empty inputs keyed by the workflow's declared
+		// inputs (422 "inputs is required" otherwise), and a workflow carries
+		// defaults in its own top-level `inputs:` block — which is what the
+		// SDK's optimize_workflow falls back to as well. A caller's inputs win.
 		inputs := b.Inputs
-		if inputs == nil {
-			inputs = map[string]any{}
+		if len(inputs) == 0 {
+			inputs = declaredWorkflowInputs(b.Workflow)
 		}
 		item := map[string]any{"workflow": b.Workflow, "inputs": inputs}
 		if !b.DryRun {

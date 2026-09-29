@@ -370,6 +370,10 @@ func runSubAgentLoop(
 			toolName, _ := tu["name"].(string)
 			toolID, _ := tu["id"].(string)
 			args, _ := tu["input"].(map[string]any)
+			// Record the tool that ran (see the main loop in me_agent.go).
+			if resolved, resolvedArgs, err := resolveCanonicalTool(toolName, args); err == nil {
+				toolName, args = resolved, resolvedArgs
+			}
 			result, callOK := dispatchTool(c, userID, "user", toolName, args)
 			toolCalls = append(toolCalls, toolCallResult{
 				Name: toolName, Args: args, Result: result, OK: callOK,

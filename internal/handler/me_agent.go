@@ -2391,6 +2391,12 @@ func MeAgentChat(c *gin.Context) {
 			toolName, _ := tu["name"].(string)
 			toolID, _ := tu["id"].(string)
 			args, _ := tu["input"].(map[string]any)
+			// Record the tool that RAN, as the stream does: a canonical name
+			// (workflow_run, run_get, …) resolves to its implementing tool, and
+			// every surface should name the same one (me_agent_canonical.go).
+			if resolved, resolvedArgs, err := resolveCanonicalTool(toolName, args); err == nil {
+				toolName, args = resolved, resolvedArgs
+			}
 
 			result, callOK := dispatchTool(c, userID, role, toolName, args)
 			toolCalls = append(toolCalls, toolCallResult{

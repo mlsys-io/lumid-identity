@@ -1497,6 +1497,7 @@ var controlIntentPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bexperiment_status\b`),
 	// the tool by name — an explicit instruction should always route.
 	regexp.MustCompile(`\bdispatch_experiment_arm\b`),
+	regexp.MustCompile(`\b(workflow_run|workflow_get|run_get|run_feedback)\b`),
 	regexp.MustCompile(`\blist_experiments\b`),
 	regexp.MustCompile(`\bdefine_experiment\b`),
 	regexp.MustCompile(`\badd_experiment_arm\b`),
@@ -2684,7 +2685,7 @@ func min(a, b int) int {
 //   - app_answer   — the "Ask the app" affordance sets tool_choice to it, and
 //     tool_choice is validated with toolAvailable(), so filtering
 //     it out turns that button into a silently ignored request.
-//   - run_loop_now — the system prompt REQUIRES calling it in the same turn the
+//   - workflow_run — the system prompt REQUIRES calling it in the same turn the
 //     user asks to run a workflow.
 //   - remember_about_me, data_catalog,
 //     data_query, query_findata, web_search, web_fetch, deep_research —
@@ -2707,9 +2708,8 @@ var simpleModeTools = map[string]bool{
 	// delegation
 	"spawn_agent": true, "spawn_agents": true,
 	// the user's own apps + workflows (read + run, not authoring)
-	"list_workflows": true, "workflow_detail": true, "loops_health": true,
-	"list_runs": true, "run_detail": true, "run_loop_now": true, "run_result": true, "pause_workflow": true,
-	"dispatch_experiment_arm": true, "list_experiments": true, "define_experiment": true,
+	"pause_workflow":   true,
+	"list_experiments": true, "define_experiment": true,
 	"add_experiment_arm": true,
 	// Simple mode is the DEFAULT surface. Without these it could define an
 	// experiment, add an arm and dispatch it, and then not read the result
@@ -2720,6 +2720,9 @@ var simpleModeTools = map[string]bool{
 	"agent_marketplace": true, "search_marketplace": true,
 	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
 	"show_app_surface": true, "give_feedback": true,
+	// the verb contract (me_agent_canonical.go): workflows and runs
+	"workflow_run": true, "workflow_get": true, "workflow_define": true, "workflow_cancel": true,
+	"run_get": true, "run_feedback": true,
 	// account self-service
 	"account_set_profile": true, "account_list_pat": true, "account_revoke_pat": true,
 }
@@ -2925,6 +2928,9 @@ func buildToolDefsForRole(role string) []map[string]any {
 	// app_action/qa_call) are available to every role — gated by the
 	// formActions + scheme/path allowlists + approval, not by role.
 	defs := append(buildToolDefs(), appOpsToolDefs()...)
+	// The verb contract's names (me_agent_canonical.go); the tools they
+	// supersede are dropped below for every role.
+	defs = append(defs, canonicalToolDefs()...)
 	// Account self-service (own tokens/profile) — available to every role.
 	defs = append(defs, accountToolDefs()...)
 	// Media GENERATION (generate_image / text_to_speech) was removed 2026-09-15.
@@ -2953,11 +2959,26 @@ func buildToolDefsForRole(role string) []map[string]any {
 	}
 	// Operator control-plane (ops-agent healthcheck/remediate) is super_admin-only
 	// — the model never sees it for any lesser role; dispatch re-checks too.
+	defs = withoutSupersededTools(defs)
 	if role == "super_admin" {
 		defs = append(defs, operatorToolDefs()...)
 		return defs
 	}
 	return withoutHostScopeTwins(defs)
+}
+
+// withoutSupersededTools drops the tools a canonical one replaces
+// (supersededChatTools). Unlike host-scope twins these are the SAME job under
+// two names for every caller, operator included, so nobody sees both.
+func withoutSupersededTools(defs []map[string]any) []map[string]any {
+	out := defs[:0:0]
+	for _, d := range defs {
+		if name, _ := d["name"].(string); supersededChatTools[name] != "" {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // hostScopeTwins maps a tool hidden from non-operators to the tool that
@@ -2980,9 +3001,9 @@ var hostScopeTwins = map[string]string{
 	"xp_agents":    "knowledge_agents",
 	"xp_memories":  "knowledge_memories",
 	"xp_status":    "knowledge_agents",
-	"list_loops":   "loops_health",
-	"loop_status":  "loops_health",
-	"run_loop":     "run_loop_now",
+	"list_loops":   "workflow_get",
+	"loop_status":  "workflow_get",
+	"run_loop":     "workflow_run",
 	"loop_history": "list_recent_cycles",
 }
 
@@ -3034,10 +3055,10 @@ When the user expresses an intent, prefer doing the work via tools over describi
 
 ATTACHMENTS & GENERAL HELP: when the user attaches a file (PDF, document, spreadsheet, image, text) or pastes content, work with it DIRECTLY — summarize, analyze, extract, translate, or answer questions about it. That is core assistant work, fully in scope. Likewise for ordinary questions, drafting, explanation, and analysis: just help. NEVER preface a reply with a disclaimer that document summarization or general questions are "outside what you do" or that you're "scoped to apps/workflows" — you are a genuinely helpful assistant first, and the app/workflow/codebase tools below are ADDITIONAL powers, not a restriction on what you will answer.
 
-RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL run_loop_now with that app and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call agent_list (or agent_detail) to resolve it, then run it. Firing a run the user asked for needs no approval. Do NOT fire a run (run_loop_now, run_loop, dispatch_experiment_arm) to answer a question or a "discuss"/"analyze" request — read the existing results (list_runs, run_result, list_experiments, lqt_mailbox_read) instead; a run the user did not ask for pauses on an approval prompt. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
+RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL workflow_run with that agent and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call workflow_get (or agent_list) to resolve it, then run it. Firing a run the user asked for needs no approval. Do NOT fire a run (workflow_run) to answer a question or a "discuss"/"analyze" request — read the existing results (run_get, list_experiments, lqt_mailbox_read) instead; a run the user did not ask for pauses on an approval prompt. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
 
 APP-SPECIFIC INPUT (a DSL, a config blob, a case format): the app's own workflow description is the
-authoritative reference — call workflow_detail on that app:workflow and READ its description before
+authoritative reference — call workflow_get with that agent and workflow and READ its description before
 you write anything in that format. Do not reconstruct the syntax from memory and do not search the
 filesystem for the project's source: the repo is NOT in your sandbox, a 2026-08-29 walk burned 121s
 globbing for it before answering from memory anyway, and every such answer invented a different
@@ -4421,6 +4442,15 @@ func buildToolDefs() []map[string]any {
 // Returns (result, ok). result is always a JSON-able map; on failure
 // it contains {"error": "..."} and ok is false.
 func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any) (map[string]any, bool) {
+	// Canonical names resolve to their implementing tool before anything
+	// keyed on the name runs (me_agent_canonical.go). The stream resolves
+	// earlier still, ahead of its approval gate; resolving an old name is a
+	// no-op, so doing it twice is safe.
+	resolved, resolvedArgs, err := resolveCanonicalTool(name, args)
+	if err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
+	name, args = resolved, resolvedArgs
 	// Approval backstop — destructive tools must NOT execute unless they were
 	// approved. The streaming handler runs the interactive approval gate and
 	// then sets "approved_tool" on the context before calling us; an "always

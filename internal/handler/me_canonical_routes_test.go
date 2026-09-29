@@ -1,0 +1,84 @@
+package handler
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+)
+
+// Registering every route must not panic: gin rejects two wildcards with
+// different names in one path position (e.g. /agents/:agent vs /agents/:app)
+// at startup, and only at startup.
+func TestRegisterDoesNotPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Register panicked: %v", r)
+		}
+	}()
+	Register(gin.New())
+}
+
+func TestCanonicalRoutesExistAndOldOnesAreDeprecated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	Register(r)
+	want := map[string]bool{
+		"GET /api/v1/me/agents/:agent/workflows/:workflow":         true,
+		"PATCH /api/v1/me/agents/:agent/workflows/:workflow":       true,
+		"DELETE /api/v1/me/agents/:agent/workflows/:workflow":      true,
+		"POST /api/v1/me/agents/:agent/workflows/:workflow/run":    true,
+		"POST /api/v1/me/agents/:agent/workflows/:workflow/cancel": true,
+		"POST /api/v1/me/runs/:run_id/feedback":                    true,
+	}
+	for _, ri := range r.Routes() {
+		delete(want, ri.Method+" "+ri.Path)
+	}
+	for missing := range want {
+		t.Errorf("route not registered: %s", missing)
+	}
+
+	// An old route still works and names its successor. Unauthenticated, so the
+	// handler itself answers 401 — the header is set before it runs.
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/me/loops/qr/backtest/run", strings.NewReader("{}")))
+	if w.Header().Get("Deprecation") != "true" ||
+		!strings.Contains(w.Header().Get("Link"), "/api/v1/me/agents/:agent/workflows/:workflow/run") {
+		t.Errorf("old run route headers = %v", w.Header())
+	}
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/me/agents/qr/workflows/backtest/run", strings.NewReader("{}")))
+	if w.Header().Get("Deprecation") != "" || w.Code == http.StatusNotFound {
+		t.Errorf("canonical run route: code=%d headers=%v", w.Code, w.Header())
+	}
+}
+
+func TestWorkflowRunRejectsUnknownMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/w/:agent/:workflow/run", MeWorkflowRun)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/w/a/b/run", strings.NewReader(`{"mode":"later"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("mode later = %d, want 400", w.Code)
+	}
+}
+
+func TestRunFeedbackRejectsUnknownVerdict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/runs/:run_id/feedback", MeRunFeedback)
+	for body, want := range map[string]int{
+		`{"verdict":"meh"}`:     http.StatusBadRequest,
+		`{"verdict":"promote"}`: http.StatusBadRequest, // run id is not scheduled:…
+	} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/runs/n8n:x/feedback", strings.NewReader(body)))
+		if w.Code != want {
+			t.Errorf("%s = %d, want %d", body, w.Code, want)
+		}
+	}
+}

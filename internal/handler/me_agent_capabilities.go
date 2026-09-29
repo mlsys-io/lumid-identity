@@ -26,7 +26,7 @@ type chatCapability struct {
 var chatCapabilities = []chatCapability{
 	{"Query FinData (markets, prices, SQL)", []string{"query_findata", "data_query"}, "the Data Warehouse chat"},
 	{"Resolve the user's registered strategies (name -> strategy_id)", []string{"app_read"}, "Quant Research → Strategies"},
-	{"Submit backtests / run an app's workflows", []string{"run_loop_now"}, "the app's own page (e.g. a strategy row's Backtest)"},
+	{"Submit backtests / run an app's workflows", []string{"workflow_run"}, "the app's own page (e.g. a strategy row's Backtest)"},
 	{"Read LQT decision history for a strategy (strategy_cycles)", []string{"lqt_mailbox_read"}, "a strategy's Discuss chat in Quant Research (full tool view)"},
 	{"Deploy a strategy to LQT", []string{"lqt_mailbox_submit"}, "Quant Research → Strategies → Register"},
 	{"Add a shared skill to an installed app", []string{"add_skill_to_workflow"}, "the marketplace's 'Add to app…'"},

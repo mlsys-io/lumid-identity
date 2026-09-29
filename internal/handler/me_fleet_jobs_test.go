@@ -197,6 +197,11 @@ func fleetCallAPI(t *testing.T, method, path, body, tok string) (int, map[string
 	fleetRouter().ServeHTTP(w, r)
 	var env map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	// Every response, success or failure, is the ret_code envelope the SPA
+	// and SDK parse.
+	if _, has := env["ret_code"]; !has {
+		t.Errorf("%s %s: response is not the ret_code envelope: %s", method, path, w.Body.String())
+	}
 	data, _ := env["data"].(map[string]any)
 	if data == nil {
 		data = env

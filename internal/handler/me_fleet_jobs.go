@@ -417,7 +417,9 @@ func MeFleetJobRun(c *gin.Context) {
 			"job "+id.String()+" started but could not be recorded: "+err.Error())
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"code": 0, "msg": "", "data": fleetJobView(row)})
+	// 202, in the same envelope ok() writes: a client parsing ret_code must not
+	// have to special-case the one route that accepts rather than completes.
+	c.JSON(http.StatusAccepted, gin.H{"ret_code": 0, "message": "", "data": fleetJobView(row)})
 }
 
 // fleetClip bounds a string to a column size, with no ellipsis appended.

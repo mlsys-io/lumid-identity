@@ -183,7 +183,7 @@ func fleetRouter() *gin.Engine {
 	return r
 }
 
-func fleetCallAPI(t *testing.T, method, path, body, tok string) (int, map[string]any) {
+func fleetServe(t *testing.T, h http.Handler, method, path, body, tok string) *httptest.ResponseRecorder {
 	t.Helper()
 	var r *http.Request
 	if body == "" {
@@ -194,7 +194,13 @@ func fleetCallAPI(t *testing.T, method, path, body, tok string) (int, map[string
 	}
 	r.Header.Set("Authorization", "Bearer "+tok)
 	w := httptest.NewRecorder()
-	fleetRouter().ServeHTTP(w, r)
+	h.ServeHTTP(w, r)
+	return w
+}
+
+func fleetCallAPI(t *testing.T, method, path, body, tok string) (int, map[string]any) {
+	t.Helper()
+	w := fleetServe(t, fleetRouter(), method, path, body, tok)
 	var env map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &env)
 	// Every response, success or failure, is the ret_code envelope the SPA

@@ -293,6 +293,10 @@ func Register(r *gin.Engine) {
 			// intent; the scheduler holds the PVC and does the edit.
 			me.POST("/apps/:app/experiments", MeAppExperimentUpsert)
 			me.PATCH("/apps/:app/experiments/:id", MeAppExperimentUpsert)
+			// A study (experiments compared on one metric) defined — and with
+			// ?run=1 run — in one call. Same patch_experiment intent as above,
+			// validated against the agent's workflow (me_studies.go).
+			me.POST("/agents/:agent/studies", MeStudyDefine)
 			// The LIFECYCLE. Separate from the upsert because these are not
 			// edits to a definition — they are decisions about a study, and
 			// conclude/checkpoint/fork/revert each mean something the

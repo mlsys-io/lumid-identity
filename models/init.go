@@ -31,6 +31,7 @@ var AllTables = []interface{}{
 	&MeAppSignal{},
 	&MeAppRun{},
 	&MeComputeJobClaim{},
+	&MeFleetJob{},
 	&MeAppExperiment{},
 	&MeAppProposal{},
 	&MeAppSpec{},

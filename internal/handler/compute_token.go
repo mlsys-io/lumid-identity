@@ -74,10 +74,10 @@ const (
 // computeEngineTypes — engine types whose runtime submits to a compute service
 // and therefore needs a scoped token.
 //
-// `flowmesh` is NOT here. It is declared-but-unimplemented: LumidOS #102 makes
-// `gate_workflow_contract` reject it at publish, and the runtime refuses it at
-// dispatch. Minting a credential for a path that cannot run would hand out a
-// live token for nothing.
+// `flowmesh` is NOT here, deliberately: that engine submits through the
+// Research Fleet API (/me/fleet/jobs, me_fleet_jobs.go) with the caller's own
+// session or PAT, and identity mints the upstream credential per request. A
+// standing lumilake:jobs:write PAT would be a live token for nothing.
 var computeEngineTypes = map[string]bool{
 	"lumilake": true,
 }

@@ -247,6 +247,14 @@ func callerOwnsComputeJob(sub, site, jobID string) bool {
 		First(&claim).Error; err == nil {
 		return claim.UserSub == sub
 	}
+	// A job run through the Research Fleet API (me_fleet_jobs.go) is owned by
+	// its fleet row, so the canvas can follow it like a claimed one.
+	var fleet models.MeFleetJob
+	if err := common.DB.
+		Where("site = ? AND kind = ? AND native_id = ?", site, fleetKindLL, jobID).
+		First(&fleet).Error; err == nil {
+		return fleet.UserSub == sub
+	}
 
 	var rows []models.MeAppRun
 	if err := common.DB.

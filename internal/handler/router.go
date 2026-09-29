@@ -254,6 +254,13 @@ func Register(r *gin.Engine) {
 			// The other jobs from the same run — what a switcher across
 			// parallel arms needs in order to name what it is drawing.
 			me.GET("/compute/jobs/:site/:job_id/siblings", MeComputeJobSiblings)
+			// Research Fleet jobs: run / get / cancel for FlowMesh compute
+			// graphs and Lumilake workflows, one id form and one status
+			// vocabulary (me_fleet_jobs.go). Writes run as the caller.
+			me.POST("/fleet/jobs", MeFleetJobRun)
+			me.GET("/fleet/jobs", MeFleetJobList)
+			me.GET("/fleet/jobs/:id", MeFleetJobGet)
+			me.POST("/fleet/jobs/:id/cancel", MeFleetJobCancel)
 			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
 			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)
@@ -286,6 +293,10 @@ func Register(r *gin.Engine) {
 			// intent; the scheduler holds the PVC and does the edit.
 			me.POST("/apps/:app/experiments", MeAppExperimentUpsert)
 			me.PATCH("/apps/:app/experiments/:id", MeAppExperimentUpsert)
+			// A study (experiments compared on one metric) defined — and with
+			// ?run=1 run — in one call. Same patch_experiment intent as above,
+			// validated against the agent's workflow (me_studies.go).
+			me.POST("/agents/:agent/studies", MeStudyDefine)
 			// The LIFECYCLE. Separate from the upsert because these are not
 			// edits to a definition — they are decisions about a study, and
 			// conclude/checkpoint/fork/revert each mean something the

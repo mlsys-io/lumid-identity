@@ -148,6 +148,14 @@ type registerReq struct {
 // Verification code (6-digit OTP) must match what /send-verification-code
 // put in Redis under `identity:otp:<email>` within 10 minutes.
 //
+// invitation_code is validated against `invitation_codes` (see
+// consumeInvitationCodeTx): it must exist, not be revoked or expired, and
+// have a use left. A use is consumed atomically in the same transaction
+// that creates the user, so concurrent signups can't overspend a code's
+// max_uses. Before 2026-09-29 this field was stored as-is with no check at
+// all — the browser only required it to be non-empty, so any string passed
+// the invite gate.
+//
 // During shadow we also INSERT into LQA's tbl_user if legacy is
 // enabled, so lumid.market keeps working for the new user until
 // Phase 3 cuts LQA over. Dual-write is a short-lived bridge; it's
@@ -197,6 +205,30 @@ func RegisterHandler(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "hash password")
 		return
 	}
+
+	tx := common.DB.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// Validate + consume the invitation code in the SAME transaction as the
+	// user create below: if user creation fails after this point, the
+	// rollback returns the seat instead of burning it on a signup that never
+	// happened.
+	inv, err := consumeInvitationCodeTx(tx, req.InvitationCode)
+	if err != nil {
+		tx.Rollback()
+		var invErr *invitationCodeError
+		if ok := errors.As(err, &invErr); ok {
+			fail(c, http.StatusBadRequest, 1007, invErr.msg)
+			return
+		}
+		fail(c, http.StatusInternalServerError, 1500, "invitation code: "+err.Error())
+		return
+	}
+
 	u := &models.User{
 		ID:                 uuid.NewString(),
 		Email:              req.Email,
@@ -205,16 +237,56 @@ func RegisterHandler(c *gin.Context) {
 		Name:               req.Name,
 		Role:               "user",
 		Status:             "active",
-		InvitationCodeUsed: req.InvitationCode,
+		InvitationCodeUsed: strings.TrimSpace(req.InvitationCode),
 	}
-	if err := common.DB.Create(u).Error; err != nil {
+	if err := tx.Create(u).Error; err != nil {
+		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 1500, "create user: "+err.Error())
 		return
 	}
 	// Identity row for the local-password provider.
-	common.DB.Create(&models.Identity{UserID: u.ID, Provider: "local", ProviderSub: u.Email})
+	if err := tx.Create(&models.Identity{UserID: u.ID, Provider: "local", ProviderSub: u.Email}).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusInternalServerError, 1500, "create identity: "+err.Error())
+		return
+	}
 
-	// Dual-write to LQA during shadow.
+	// Record the redemption and apply the code's scopes, exactly as the Google
+	// path does on redeem (RedeemInvitationCodeHandler): a password signup with
+	// a scoped code used to get the seat but never the grants. Same transaction,
+	// so a failure here returns the seat too. A brand-new user has no grants to
+	// downgrade, so each scope is a plain insert.
+	if err := tx.Create(&models.InvitationRedemption{
+		ID: uuid.NewString(), UserID: u.ID, Code: inv.Code,
+		Scopes: strings.TrimSpace(inv.Scopes),
+	}).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusInternalServerError, 1500, "record redemption: "+err.Error())
+		return
+	}
+	for _, raw := range strings.Fields(inv.Scopes) {
+		svc, lvl := parseScope(raw)
+		if svc == "" || svc == "*" {
+			continue
+		}
+		if err := tx.Create(&models.UserAccessGrant{
+			ID: uuid.NewString(), UserID: u.ID, Service: svc,
+			Level: lvl, GrantedBy: "invite:" + inv.Code,
+		}).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 1500, "apply grant: "+err.Error())
+			return
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		fail(c, http.StatusInternalServerError, 1500, "commit: "+err.Error())
+		return
+	}
+
+	// Dual-write to LQA during shadow. This is a separate DB connection (and
+	// on the real cluster a separate host), so it cannot join the identity
+	// transaction above; it stays best-effort, same as before this fix.
 	if config.G.Legacy.Enabled && common.LegacyDB != nil {
 		common.LegacyDB.Exec(`
 			INSERT INTO tbl_user (email, username, password_hash, role, status, invitation_code, create_time, update_time)

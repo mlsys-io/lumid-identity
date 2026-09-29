@@ -2955,8 +2955,46 @@ func buildToolDefsForRole(role string) []map[string]any {
 	// — the model never sees it for any lesser role; dispatch re-checks too.
 	if role == "super_admin" {
 		defs = append(defs, operatorToolDefs()...)
+		return defs
 	}
-	return defs
+	return withoutHostScopeTwins(defs)
+}
+
+// hostScopeTwins maps a tool hidden from non-operators to the tool that
+// replaces it. Each pair is two names for one job; a model shown both picks the
+// wrong one about as often as the right one (the audit behind LumidOS
+// docs/architecture/VERBS.md found 11 such pairs). Hidden names still dispatch,
+// so an in-flight prompt that names one keeps working; they are only no longer
+// advertised (VERBS.md stage 2, "hide"). super_admin keeps the full catalog.
+var hostScopeTwins = map[string]string{
+	// Same-scope twins: both answer for the caller's tenant (the LumidOS bridge
+	// carries X-Lumid-Tenant-Sub). The agent_* name is canonical (GLOSSARY.md:
+	// the installable unit is an *agent*) and is the one Simple mode — the
+	// default surface — already advertises.
+	"list_apps":        "agent_list",
+	"install_app":      "agent_install",
+	"list_marketplace": "agent_marketplace",
+	"xp_marketplace":   "agent_marketplace",
+	// Operator-host twins: these read the schedule server's own state, not the
+	// caller's; each has a tenant-scoped replacement.
+	"xp_agents":    "knowledge_agents",
+	"xp_memories":  "knowledge_memories",
+	"xp_status":    "knowledge_agents",
+	"list_loops":   "loops_health",
+	"loop_status":  "loops_health",
+	"run_loop":     "run_loop_now",
+	"loop_history": "list_recent_cycles",
+}
+
+func withoutHostScopeTwins(defs []map[string]any) []map[string]any {
+	out := defs[:0:0]
+	for _, d := range defs {
+		if name, _ := d["name"].(string); hostScopeTwins[name] != "" {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // buildSystemPrompt assembles the assistant's persona + a snapshot
@@ -2996,7 +3034,7 @@ When the user expresses an intent, prefer doing the work via tools over describi
 
 ATTACHMENTS & GENERAL HELP: when the user attaches a file (PDF, document, spreadsheet, image, text) or pastes content, work with it DIRECTLY — summarize, analyze, extract, translate, or answer questions about it. That is core assistant work, fully in scope. Likewise for ordinary questions, drafting, explanation, and analysis: just help. NEVER preface a reply with a disclaimer that document summarization or general questions are "outside what you do" or that you're "scoped to apps/workflows" — you are a genuinely helpful assistant first, and the app/workflow/codebase tools below are ADDITIONAL powers, not a restriction on what you will answer.
 
-RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL run_loop_now with that app and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call list_apps (or the app's detail) to resolve it, then run it. Firing a run the user asked for needs no approval. Do NOT fire a run (run_loop_now, run_loop, dispatch_experiment_arm) to answer a question or a "discuss"/"analyze" request — read the existing results (list_runs, run_result, list_experiments, lqt_mailbox_read) instead; a run the user did not ask for pauses on an approval prompt. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
+RUNNING A WORKFLOW: when the user explicitly asks to run, trigger, fire, or kick off a workflow (e.g. "run mbb-ai's case_cycle", "run the morning brief now", "run it in paper mode"), CALL run_loop_now with that app and workflow in the same turn — do NOT just describe where to watch it, and do NOT route them to the Workflows tab instead of running. If you don't know the exact workflow name, call agent_list (or agent_detail) to resolve it, then run it. Firing a run the user asked for needs no approval. Do NOT fire a run (run_loop_now, run_loop, dispatch_experiment_arm) to answer a question or a "discuss"/"analyze" request — read the existing results (list_runs, run_result, list_experiments, lqt_mailbox_read) instead; a run the user did not ask for pauses on an approval prompt. After the tool returns a queued run, confirm in one line what you ran and link the workflow so they can watch it (see Linking into the Studio below).
 
 APP-SPECIFIC INPUT (a DSL, a config blob, a case format): the app's own workflow description is the
 authoritative reference — call workflow_detail on that app:workflow and READ its description before
@@ -3012,14 +3050,14 @@ VOCABULARY: in replies, always say "app", "workflow", and "run" — never intern
 
 The user already has these apps installed in their tenant: ` + tenantList + `
 
-When you don't know an app's slug, call list_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent run of the most likely workflow and tell them you did so — they can refine later.
+When you don't know an agent's slug, call agent_marketplace first. When the user gives ambiguous feedback ("today was off"), capture it as a feedback note on the most recent run of the most likely workflow and tell them you did so — they can refine later.
 
 ## Creating a new workflow — roll it out as a conversation, one clear step at a time
 When the user wants to build a new workflow/app (e.g. they say "create a workflow" or "new intent"), GUIDE them — never dump a pre-baked template, and do NOT assume crypto trading. Walk these steps, each as its own short turn:
   1. ASK what it should do, in plain words: what should it watch (observe), what decision or output it should make, and how often it should run. One or two brief questions — don't interrogate.
   2. COMPOSE: once you have enough, call compose_workflow with their intent (and a name if they gave one).
   3. PRESENT THE PIPELINE CLEARLY: from the compose result, lay out the assembled steps as a NUMBERED list, one per line, in the form "N. <Stage> — <skill>: <what this step does>". Then state the schedule and the goal in one line each. Every step must be legible so they know exactly what will run.
-  4. CONFIRM + INSTALL: ask "Want me to install it?" — on yes, call install_app with the draft slug, then offer to run the first cycle.
+  4. CONFIRM + INSTALL: ask "Want me to install it?" — on yes, call agent_install with the draft slug, then offer to run the first cycle.
 Keep each turn tight and concrete. Adapt the domain to whatever they describe — research, monitoring, annotation, trading, anything.
 
 ## Linking into the Studio

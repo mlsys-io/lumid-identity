@@ -363,3 +363,21 @@ func fleetUserSub(t *testing.T, tok string) string {
 	}
 	return sub
 }
+
+// A Lumilake run with no inputs must send {} — the deployed server 422s on null
+// ("data.0.inputs: Input should be a valid dictionary"), which is how this was
+// found: every dry run from the SDK without inputs failed on all three sites.
+func TestFleetLumilakeRunWithoutInputsSendsEmptyMap(t *testing.T) {
+	fake, owner, _ := fleetTestSetup(t)
+	code, out := fleetCallAPI(t, "POST", "/api/v1/me/fleet/jobs",
+		`{"workflow":"name: w\ninputs: {}\nops: []\n","site":"office"}`, owner)
+	if code != http.StatusAccepted {
+		t.Fatalf("run = %d %v", code, out)
+	}
+	var sent map[string]any
+	_ = json.Unmarshal([]byte(fake.body[0]), &sent)
+	item := sent["data"].([]any)[0].(map[string]any)
+	if inputs, isMap := item["inputs"].(map[string]any); !isMap || len(inputs) != 0 {
+		t.Fatalf("inputs sent as %#v, want {}", item["inputs"])
+	}
+}

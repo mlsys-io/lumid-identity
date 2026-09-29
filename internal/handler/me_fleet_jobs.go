@@ -351,10 +351,15 @@ func MeFleetJobRun(c *gin.Context) {
 			call.url += "/validate"
 		}
 	} else {
-		item := map[string]any{"workflow": b.Workflow, "inputs": b.Inputs}
-		if item["inputs"] == nil {
-			item["inputs"] = map[string]any{}
+		// Not `item["inputs"] == nil`: a nil map stored in an interface is a
+		// typed nil, which never equals nil — the default never applied and
+		// Lumilake got `inputs: null` (422 "Input should be a valid
+		// dictionary") for every run that sent no inputs.
+		inputs := b.Inputs
+		if inputs == nil {
+			inputs = map[string]any{}
 		}
+		item := map[string]any{"workflow": b.Workflow, "inputs": inputs}
 		if !b.DryRun {
 			loc := b.OutputLocation
 			if loc == nil {

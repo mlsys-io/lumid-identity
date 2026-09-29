@@ -71,14 +71,24 @@ func TestRunFeedbackRejectsUnknownVerdict(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.POST("/runs/:run_id/feedback", MeRunFeedback)
-	for body, want := range map[string]int{
-		`{"verdict":"meh"}`:     http.StatusBadRequest,
-		`{"verdict":"promote"}`: http.StatusBadRequest, // run id is not scheduled:…
+	w0 := httptest.NewRecorder()
+	r.ServeHTTP(w0, httptest.NewRequest(http.MethodPost, "/runs/n8n:x/feedback", strings.NewReader(`{}`)))
+	if w0.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated feedback = %d, want 401", w0.Code)
+	}
+	for _, tc := range []struct {
+		id, verdict string
+		ok          bool
+	}{
+		{"scheduled:a:b:t", "promote", true},
+		{"scheduled:a::t", "discard", true}, // workflow may be empty
+		{"n8n:x", "succeeded", true},        // MeRunMark judges the id itself
+		{"n8n:x", "promote", false},
+		{"scheduled:a:b:t", "meh", false},
 	} {
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/runs/n8n:x/feedback", strings.NewReader(body)))
-		if w.Code != want {
-			t.Errorf("%s = %d, want %d", body, w.Code, want)
+		_, err := feedbackTarget(tc.id, tc.verdict)
+		if (err == nil) != tc.ok {
+			t.Errorf("feedbackTarget(%q, %q) err=%v, want ok=%v", tc.id, tc.verdict, err, tc.ok)
 		}
 	}
 }

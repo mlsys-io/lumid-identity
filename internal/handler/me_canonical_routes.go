@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -70,6 +71,12 @@ func MeWorkflowRun(c *gin.Context) {
 // promote|discard mark it the chosen branch or grey it out (was
 // /apps/:app/runs/:ts/promote|discard).
 func MeRunFeedback(c *gin.Context) {
+	// Authenticate before reading the body: the delegates check too, but a
+	// caller with no credential must get 401, not a 400 about their JSON.
+	if _, authed := currentUserID(c); !authed {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
 	var body struct {
 		Verdict string `json:"verdict"`
 		Note    string `json:"note"`
@@ -78,26 +85,39 @@ func MeRunFeedback(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body")
 		return
 	}
-	switch body.Verdict {
-	case "succeeded", "failed":
+	parts, err := feedbackTarget(c.Param("run_id"), body.Verdict)
+	if err != nil {
+		fail(c, http.StatusBadRequest, 1400, err.Error())
+		return
+	}
+	if parts == nil { // succeeded | failed
 		b, _ := json.Marshal(map[string]string{"state": body.Verdict, "note": body.Note})
 		c.Request.Body = io.NopCloser(bytes.NewReader(b))
 		MeRunMark(c)
-	case "promote", "discard":
-		parts := strings.SplitN(c.Param("run_id"), ":", 4)
-		if len(parts) != 4 || parts[0] != "scheduled" {
-			fail(c, http.StatusBadRequest, 1400,
-				"promote/discard need a scheduled run id: scheduled:<agent>:<workflow>:<ts>")
-			return
-		}
-		c.Params = append(c.Params, gin.Param{Key: "app", Value: parts[1]}, gin.Param{Key: "ts", Value: parts[3]})
-		q := c.Request.URL.Query()
-		q.Set("loop", parts[2])
-		c.Request.URL.RawQuery = q.Encode()
-		meRunMark(c, body.Verdict)
-	default:
-		fail(c, http.StatusBadRequest, 1400, "verdict must be succeeded, failed, promote or discard")
+		return
 	}
+	c.Params = append(c.Params, gin.Param{Key: "app", Value: parts[1]}, gin.Param{Key: "ts", Value: parts[3]})
+	q := c.Request.URL.Query()
+	q.Set("loop", parts[2])
+	c.Request.URL.RawQuery = q.Encode()
+	meRunMark(c, body.Verdict)
+}
+
+// feedbackTarget validates a verdict against a run id. For promote|discard it
+// returns the id's parts (scheduled:<agent>:<workflow>:<ts>); for
+// succeeded|failed, nil (MeRunMark parses the id itself).
+func feedbackTarget(runID, verdict string) ([]string, error) {
+	switch verdict {
+	case "succeeded", "failed":
+		return nil, nil
+	case "promote", "discard":
+		parts := strings.SplitN(runID, ":", 4)
+		if len(parts) != 4 || parts[0] != "scheduled" {
+			return nil, fmt.Errorf("promote/discard need a scheduled run id: scheduled:<agent>:<workflow>:<ts>")
+		}
+		return parts, nil
+	}
+	return nil, fmt.Errorf("verdict must be succeeded, failed, promote or discard")
 }
 
 // deprecatedRoute marks a superseded route: RFC 8594-style Deprecation and a

@@ -364,20 +364,33 @@ func fleetUserSub(t *testing.T, tok string) string {
 	return sub
 }
 
-// A Lumilake run with no inputs must send {} — the deployed server 422s on null
-// ("data.0.inputs: Input should be a valid dictionary"), which is how this was
-// found: every dry run from the SDK without inputs failed on all three sites.
-func TestFleetLumilakeRunWithoutInputsSendsEmptyMap(t *testing.T) {
+// Lumilake 422s both `inputs: null` and `inputs: {}` ("inputs is required").
+// With no inputs in the request, the workflow's own declared `inputs:` are
+// sent — found on production, where a no-inputs dry run failed on all sites.
+func TestFleetLumilakeRunWithoutInputsSendsTheDeclaredOnes(t *testing.T) {
 	fake, owner, _ := fleetTestSetup(t)
 	code, out := fleetCallAPI(t, "POST", "/api/v1/me/fleet/jobs",
-		`{"workflow":"name: w\ninputs: {}\nops: []\n","site":"office"}`, owner)
+		`{"workflow":"name: w\ninputs:\n  Stock: [NVDA]\nops: []\n","site":"office"}`, owner)
 	if code != http.StatusAccepted {
 		t.Fatalf("run = %d %v", code, out)
 	}
 	var sent map[string]any
 	_ = json.Unmarshal([]byte(fake.body[0]), &sent)
 	item := sent["data"].([]any)[0].(map[string]any)
-	if inputs, isMap := item["inputs"].(map[string]any); !isMap || len(inputs) != 0 {
-		t.Fatalf("inputs sent as %#v, want {}", item["inputs"])
+	inputs, _ := item["inputs"].(map[string]any)
+	if stock, _ := inputs["Stock"].([]any); len(stock) != 1 || stock[0] != "NVDA" {
+		t.Fatalf("inputs sent as %#v, want the declared {Stock: [NVDA]}", item["inputs"])
+	}
+}
+
+func TestDeclaredWorkflowInputs(t *testing.T) {
+	if got := declaredWorkflowInputs("ops: []\n"); got == nil || len(got) != 0 {
+		t.Errorf("no inputs block = %#v, want {}", got)
+	}
+	if got := declaredWorkflowInputs("not: [yaml"); got == nil {
+		t.Error("unparseable workflow must still give a non-nil map")
+	}
+	if got := declaredWorkflowInputs("inputs:\n  A: [x]\n"); len(got) != 1 {
+		t.Errorf("declared = %#v", got)
 	}
 }

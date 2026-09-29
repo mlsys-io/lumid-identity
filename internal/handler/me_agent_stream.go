@@ -387,6 +387,21 @@ func MeAgentChatStream(c *gin.Context) {
 				})
 				continue
 			}
+			// Canonical names become the tool that implements them BEFORE the
+			// gate below, which is keyed on the name (me_agent_canonical.go):
+			// run_feedback must ask for approval exactly as run_promote does.
+			if resolved, resolvedArgs, err := resolveCanonicalTool(tu.name, tu.input); err != nil {
+				result := map[string]any{"error": err.Error()}
+				emit(map[string]any{"type": "tool_call", "name": tu.name, "args": tu.input, "result": result, "ok": false})
+				payload, _ := json.Marshal(result)
+				toolResultBlocks = append(toolResultBlocks, map[string]any{
+					"type": "tool_result", "tool_use_id": tu.id,
+					"content": string(payload), "is_error": true,
+				})
+				continue
+			} else {
+				tu.name, tu.input = resolved, resolvedArgs
+			}
 			// For destructive tools: pause and wait for user approval —
 			// unless the user has a persistent "always allow" grant for
 			// this tool (POST tool-approve with always=true; revocable

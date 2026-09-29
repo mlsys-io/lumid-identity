@@ -297,6 +297,15 @@ func Register(r *gin.Engine) {
 			// ?run=1 run — in one call. Same patch_experiment intent as above,
 			// validated against the agent's workflow (me_studies.go).
 			me.POST("/agents/:agent/studies", MeStudyDefine)
+			// Workflows and runs in the verb contract's shape
+			// (me_canonical_routes.go); the routes above that they supersede
+			// answer with a Deprecation header naming these.
+			me.GET("/agents/:agent/workflows/:workflow", MeWorkflowGet)
+			me.PATCH("/agents/:agent/workflows/:workflow", withParams(MeLoopPatch, agentWorkflowParams))
+			me.DELETE("/agents/:agent/workflows/:workflow", withParams(MeLoopDelete, agentWorkflowParams))
+			me.POST("/agents/:agent/workflows/:workflow/run", MeWorkflowRun)
+			me.POST("/agents/:agent/workflows/:workflow/cancel", withParams(MeLoopStop, agentWorkflowParams))
+			me.POST("/runs/:run_id/feedback", MeRunFeedback)
 			// The LIFECYCLE. Separate from the upsert because these are not
 			// edits to a definition — they are decisions about a study, and
 			// conclude/checkpoint/fork/revert each mean something the
@@ -344,9 +353,9 @@ func Register(r *gin.Engine) {
 			me.GET("/gpu-rentals", MeGpuRentalsList)
 
 			// Per-loop control.
-			me.PATCH("/loops/:app/:loop", MeLoopPatch)
-			me.POST("/loops/:app/:loop/run", MeLoopRunNow)
-			me.POST("/loops/:app/:loop/stop", MeLoopStop)
+			me.PATCH("/loops/:app/:loop", deprecatedRoute("/api/v1/me/agents/:agent/workflows/:workflow"), MeLoopPatch)
+			me.POST("/loops/:app/:loop/run", deprecatedRoute("/api/v1/me/agents/:agent/workflows/:workflow/run"), MeLoopRunNow)
+			me.POST("/loops/:app/:loop/stop", deprecatedRoute("/api/v1/me/agents/:agent/workflows/:workflow/cancel"), MeLoopStop)
 			me.GET("/loops/health", MeLoopsHealth)
 
 			// Per-(app, key) secrets.
@@ -521,13 +530,13 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/loops/:loop/metric-series", MeLoopMetricSeries)
 			// Branching-runtime ops + recommender (thin shims over the
 			// lumid-trajectory CLI; HOME bound to the caller's tenant root).
-			me.GET("/apps/:app/next-actions", MeNextActions)         // recommender: what to do next
-			me.GET("/apps/:app/loops/:loop/lineage", MeLoopLineage)  // branch tree (parent_run_id edges)
-			me.POST("/apps/:app/loops/:loop/enqueue", MeLoopEnqueue) // Phase C: fan-out variants → trajectory queue
-			me.POST("/apps/:app/runs/:ts/promote", MeRunPromote)     // mark chosen branch
-			me.POST("/apps/:app/runs/:ts/discard", MeRunDiscard)     // grey out a run
+			me.GET("/apps/:app/next-actions", MeNextActions)                                                                              // recommender: what to do next
+			me.GET("/apps/:app/loops/:loop/lineage", MeLoopLineage)                                                                       // branch tree (parent_run_id edges)
+			me.POST("/apps/:app/loops/:loop/enqueue", deprecatedRoute("/api/v1/me/agents/:agent/workflows/:workflow/run"), MeLoopEnqueue) // Phase C: fan-out variants → trajectory queue
+			me.POST("/apps/:app/runs/:ts/promote", deprecatedRoute("/api/v1/me/runs/:run_id/feedback"), MeRunPromote)                     // mark chosen branch
+			me.POST("/apps/:app/runs/:ts/discard", deprecatedRoute("/api/v1/me/runs/:run_id/feedback"), MeRunDiscard)                     // grey out a run
 			// Hard-remove a single workflow (loop) from one of the caller's apps.
-			me.DELETE("/apps/:app/loops/:loop", MeLoopDelete)
+			me.DELETE("/apps/:app/loops/:loop", deprecatedRoute("/api/v1/me/agents/:agent/workflows/:workflow"), MeLoopDelete)
 			// Direct workflow compose (composer wizard — instant, no chat LLM).
 			me.POST("/workflows/compose", MeComposeWorkflow)
 			// Server-truth validation of a composed draft (manifest_lint +
@@ -572,7 +581,7 @@ func Register(r *gin.Engine) {
 			// for live "lights" in /studio/runs.
 			me.GET("/runs", MeRuns)
 			me.GET("/runs/:run_id", MeRunDetail)
-			me.POST("/runs/:run_id/mark", MeRunMark)
+			me.POST("/runs/:run_id/mark", deprecatedRoute("/api/v1/me/runs/:run_id/feedback"), MeRunMark)
 			me.GET("/runs/stream", MeRunsStream)
 
 			// Fleet — P4. Cross-workflow rollup: per-workflow health +

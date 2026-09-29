@@ -254,6 +254,13 @@ func Register(r *gin.Engine) {
 			// The other jobs from the same run — what a switcher across
 			// parallel arms needs in order to name what it is drawing.
 			me.GET("/compute/jobs/:site/:job_id/siblings", MeComputeJobSiblings)
+			// Research Fleet jobs: run / get / cancel for FlowMesh compute
+			// graphs and Lumilake workflows, one id form and one status
+			// vocabulary (me_fleet_jobs.go). Writes run as the caller.
+			me.POST("/fleet/jobs", MeFleetJobRun)
+			me.GET("/fleet/jobs", MeFleetJobList)
+			me.GET("/fleet/jobs/:id", MeFleetJobGet)
+			me.POST("/fleet/jobs/:id/cancel", MeFleetJobCancel)
 			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
 			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)

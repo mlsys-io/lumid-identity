@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -593,8 +594,8 @@ func fleetStatusView(c *gin.Context, id fleetJobID, row *models.MeFleetJob, bear
 		out["error"] = e
 	}
 	if id.Kind == fleetKindFM {
-		if tasks, isList := rec["tasks"].([]any); isList {
-			out["tasks"] = len(tasks)
+		if ids := fleetWorkflowTaskIDs(rec); len(ids) > 0 {
+			out["tasks"] = len(ids)
 		}
 	} else if prog, _, pc := fleetGet(c, base+"/api/v1/jobs/"+id.Native+"/progress", bearer); pc == http.StatusOK {
 		// Best-effort, as on the canvas route: a readable job with an
@@ -642,18 +643,16 @@ func fleetResultView(c *gin.Context, id fleetJobID, bearer string) {
 		fail(c, http.StatusConflict, 1409, "job has not finished; read view=status until terminal")
 		return
 	}
-	tasks, _ := wf["tasks"].([]any)
+	names := fleetTaskStageNames(c, base, id.Native, bearer)
 	results := []gin.H{}
 	metrics := map[string]any{}
-	for _, t := range tasks {
-		tm, isMap := t.(map[string]any)
-		taskID, _ := tm["task_id"].(string)
-		if !isMap || !fleetNativeFM.MatchString(taskID) {
+	for _, taskID := range fleetWorkflowTaskIDs(wf) {
+		if !fleetNativeFM.MatchString(taskID) {
 			continue
 		}
 		res, _, rc := fleetGet(c, base+"/api/v1/results/"+taskID, bearer)
 		entry := gin.H{"task_id": taskID}
-		if name, isStr := tm["name"].(string); isStr {
+		if name := names[taskID]; name != "" {
 			entry["name"] = name
 		}
 		if rc == http.StatusOK {
@@ -672,6 +671,61 @@ func fleetResultView(c *gin.Context, id fleetJobID, bearer string) {
 		}
 	}
 	ok(c, "", gin.H{"id": id.String(), "outputs": results, "metrics": metrics})
+}
+
+// fleetWorkflowTaskIDs reads a FlowMesh workflow record's task ids: the
+// server's `task_ids`, or the ids of a `tasks` list of task objects.
+func fleetWorkflowTaskIDs(wf map[string]any) []string {
+	var ids []string
+	if list, isList := wf["task_ids"].([]any); isList {
+		for _, v := range list {
+			if id, isStr := v.(string); isStr {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	}
+	list, _ := wf["tasks"].([]any)
+	for _, t := range list {
+		if tm, isMap := t.(map[string]any); isMap {
+			if id, isStr := tm["task_id"].(string); isStr {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
+// fleetTaskStageNames maps each task of a FlowMesh workflow to its stage name,
+// the part of `task.metadata.name` after the workflow name ("wf:score" ->
+// "score"). Best-effort: an unreadable listing leaves results unnamed.
+func fleetTaskStageNames(c *gin.Context, base, workflowID, bearer string) map[string]string {
+	b, code := fleetDo(c.Request.Context(), fleetCall{
+		method: http.MethodGet, url: base + "/api/v1/tasks?workflow_id=" + url.QueryEscape(workflowID), bearer: bearer,
+	})
+	names := map[string]string{}
+	if code != http.StatusOK {
+		return names
+	}
+	var tasks []struct {
+		TaskID string `json:"task_id"`
+		Task   struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"task"`
+	}
+	if json.Unmarshal(b, &tasks) != nil {
+		return names
+	}
+	for _, t := range tasks {
+		name := t.Task.Metadata.Name
+		if i := strings.LastIndex(name, ":"); i >= 0 {
+			name = name[i+1:]
+		}
+		names[t.TaskID] = name
+	}
+	return names
 }
 
 func fleetLogsView(c *gin.Context, id fleetJobID, bearer string) {

@@ -390,6 +390,7 @@ func MeAgentChatStream(c *gin.Context) {
 			// Canonical names become the tool that implements them BEFORE the
 			// gate below, which is keyed on the name (me_agent_canonical.go):
 			// run_feedback must ask for approval exactly as run_promote does.
+			noteModelToolName(tu.name, userID) // counted by the name the model chose
 			if resolved, resolvedArgs, err := resolveCanonicalTool(tu.name, tu.input); err != nil {
 				result := map[string]any{"error": err.Error()}
 				emit(map[string]any{"type": "tool_call", "name": tu.name, "args": tu.input, "result": result, "ok": false})

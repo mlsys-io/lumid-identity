@@ -2394,6 +2394,7 @@ func MeAgentChat(c *gin.Context) {
 			// Record the tool that RAN, as the stream does: a canonical name
 			// (workflow_run, run_get, …) resolves to its implementing tool, and
 			// every surface should name the same one (me_agent_canonical.go).
+			noteModelToolName(toolName, userID) // counted by the name the model chose
 			if resolved, resolvedArgs, err := resolveCanonicalTool(toolName, args); err == nil {
 				toolName, args = resolved, resolvedArgs
 			}
@@ -2725,7 +2726,7 @@ var simpleModeTools = map[string]bool{
 	"agent_list": true, "agent_detail": true, "agent_install": true, "uninstall_app": true,
 	"agent_marketplace": true, "search_marketplace": true,
 	"app_read": true, "app_answer": true, "app_actions": true, "app_action": true,
-	"show_app_surface": true, "give_feedback": true,
+	"show_app_surface": true,
 	// the verb contract (me_agent_canonical.go): workflows and runs
 	"workflow_run": true, "workflow_get": true, "workflow_define": true, "workflow_cancel": true,
 	"run_get": true, "run_feedback": true,
@@ -3451,7 +3452,7 @@ func buildToolDefs() []map[string]any {
 			// the agent apologised and re-answered, and staged nothing. The user
 			// then found Review empty, which reads as the feature being broken
 			// when in fact the tool was never called.
-			"description": "REQUIRED the moment the user says an answer was wrong, missed something, or should have been different — including a bare 'wrong', 'no', or 'that's not right'. Stages their correction for human review so it can shape later answers. Re-answering is NOT a substitute and does not record anything: if you only apologise and try again, the correction is lost and the user's Review queue stays empty. Pass the context too — case_id, the question, and the answer being corrected — or the reviewer sees a bare sentence with nothing to judge it against. Call this FIRST, then re-answer if useful. Do NOT use give_feedback — that scores a scheduled cycle run and needs a loop + timestamp.",
+			"description": "REQUIRED the moment the user says an answer was wrong, missed something, or should have been different — including a bare 'wrong', 'no', or 'that's not right'. Stages their correction for human review so it can shape later answers. Re-answering is NOT a substitute and does not record anything: if you only apologise and try again, the correction is lost and the user's Review queue stays empty. Pass the context too — case_id, the question, and the answer being corrected — or the reviewer sees a bare sentence with nothing to judge it against. Call this FIRST, then re-answer if useful. Do NOT use run_feedback — that scores a scheduled cycle run and needs a loop + timestamp.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -3541,7 +3542,7 @@ func buildToolDefs() []map[string]any {
 		},
 		{
 			"name":        "list_recent_cycles",
-			"description": "List the most recent cycle timestamps for a loop. Useful before give_feedback to find the right ts.",
+			"description": "List the most recent cycle timestamps for a loop. Useful before run_feedback to find the right ts.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

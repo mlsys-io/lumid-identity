@@ -32,6 +32,7 @@ var AllTables = []interface{}{
 	&MeAppRun{},
 	&MeComputeJobClaim{},
 	&MeFleetJob{},
+	&DeprecatedUse{},
 	&MeAppExperiment{},
 	&MeAppProposal{},
 	&MeAppSpec{},

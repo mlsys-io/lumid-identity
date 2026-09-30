@@ -31,6 +31,12 @@ func TestResolveCanonicalTool(t *testing.T) {
 			"run_result", map[string]any{"job_id": "0b6c1f7e-1111-4222-8333-944445555666"}},
 		{"run_feedback", map[string]any{"id": "scheduled:qr:b:20260930T010203Z", "verdict": "promote"},
 			"run_promote", map[string]any{"app": "qr", "loop": "b", "ts": "20260930T010203Z"}},
+		{"run_feedback", map[string]any{"id": "scheduled:qr:b:latest", "verdict": "bad", "note": "missed fees"},
+			"give_feedback", map[string]any{"app": "qr", "loop": "b", "ts": "latest", "rating": -1, "note": "missed fees"}},
+		{"run_feedback", map[string]any{"id": "scheduled:qr:b:T1", "verdict": "revamp", "step_id": "s2", "step_instructions": "use 5m bars"},
+			"review_action", map[string]any{"app": "qr", "loop": "b", "decision": "revamp", "step_id": "s2", "step_instructions": "use 5m bars"}},
+		{"run_feedback", map[string]any{"id": "scheduled:qr:b:T1", "verdict": "branch", "note": "try wider stops", "config": map[string]any{"stop": 2.0}},
+			"branch_run", map[string]any{"app": "qr", "loop": "b", "from_ts": "T1", "note": "try wider stops", "variant": map[string]any{"stop": 2.0}}},
 		{"list_apps", map[string]any{"x": 1}, "list_apps", map[string]any{"x": 1}}, // other names pass through
 	}
 	for _, tc := range cases {
@@ -49,6 +55,8 @@ func TestResolveCanonicalToolRejectsMalformedCalls(t *testing.T) {
 		{"workflow_run", map[string]any{"agent": "qr"}},
 		{"workflow_run", map[string]any{"agent": "qr", "mode": "queue", "study": "s"}},
 		{"run_feedback", map[string]any{"id": "scheduled:qr:b:ts", "verdict": "succeeded"}},
+		{"run_feedback", map[string]any{"id": "scheduled:qr:b:ts", "verdict": "revamp"}},
+		{"run_feedback", map[string]any{"id": "scheduled:qr:b:ts", "verdict": "branch"}},
 		{"run_feedback", map[string]any{"id": "not-a-run", "verdict": "discard"}},
 	} {
 		if _, _, err := resolveCanonicalTool(tc.name, tc.args); err == nil {
@@ -63,6 +71,12 @@ func TestCanonicalToolsInheritGating(t *testing.T) {
 	name, _, _ := resolveCanonicalTool("run_feedback", map[string]any{"id": "scheduled:a:b:c", "verdict": "discard"})
 	if !destructiveTools[name] {
 		t.Errorf("run_feedback resolves to %s, which is not approval-gated", name)
+	}
+	for _, v := range []string{"approve", "branch"} {
+		name, _, _ := resolveCanonicalTool("run_feedback", map[string]any{"id": "scheduled:a:b:c", "verdict": v, "note": "n"})
+		if !destructiveTools[name] {
+			t.Errorf("run_feedback(%s) resolves to %s, which is not approval-gated", v, name)
+		}
 	}
 	name, _, _ = resolveCanonicalTool("workflow_run", map[string]any{"agent": "a", "workflow": "b"})
 	if !runDispatchTools[name] {

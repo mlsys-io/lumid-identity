@@ -370,6 +370,7 @@ func runSubAgentLoop(
 			toolName, _ := tu["name"].(string)
 			toolID, _ := tu["id"].(string)
 			args, _ := tu["input"].(map[string]any)
+			noteModelToolName(toolName, userID) // counted by the name the model chose
 			// Record the tool that ran (see the main loop in me_agent.go).
 			if resolved, resolvedArgs, err := resolveCanonicalTool(toolName, args); err == nil {
 				toolName, args = resolved, resolvedArgs

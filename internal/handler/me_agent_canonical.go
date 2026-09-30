@@ -13,12 +13,14 @@ import (
 //	workflow_define  enable / pause / reschedule
 //	workflow_cancel  stop an in-flight run
 //	run_get          the runs list, one run, or a queued job's result
-//	run_feedback     promote or discard a run
+//	run_feedback     every verdict on a run: rate it, promote/discard it,
+//	                 approve/revamp/dismiss its held step, branch from it
 //
 // They replace run_loop_now, dispatch_experiment_arm, stop_loop, patch_loop,
 // list_workflows, workflow_detail, loops_health, list_runs, run_detail,
-// run_result, run_promote and run_discard, which stay dispatchable (an
-// in-flight prompt that names one keeps working) but are no longer advertised.
+// run_result, run_promote, run_discard, give_feedback, review_action and
+// branch_run, which stay dispatchable (an in-flight prompt that names one keeps
+// working) but are no longer advertised.
 //
 // RESOLVED FIRST, NOT RE-IMPLEMENTED. Each canonical call is translated into
 // the old tool it stands for BEFORE any gate runs — run approval
@@ -106,13 +108,24 @@ func canonicalToolDefs() []map[string]any {
 			},
 		},
 		{
-			"name":        "run_feedback",
-			"description": "Record a verdict on a run: \"promote\" marks it the chosen branch, \"discard\" greys it out. Needs the user's approval.",
+			"name": "run_feedback",
+			"description": "Record the user's verdict on a run. Call it whenever the user says something evaluative about a result — quote them in `note`. " +
+				"verdict good|bad|neutral rates the run (the ts part of the id may be \"latest\"); " +
+				"promote marks it the chosen branch, discard greys it out; " +
+				"approve|revamp|dismiss answers the run's held step (revamp needs step_instructions); " +
+				"branch starts a new experiment from this run, `note` saying what it should explore and `config` its overrides. " +
+				"promote, discard, approve/revamp/dismiss and branch need the user's approval.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"id":      str("run id: scheduled:<agent>:<workflow>:<ts>"),
-					"verdict": map[string]any{"type": "string", "enum": []string{"promote", "discard"}},
+					"id": str("run id: scheduled:<agent>:<workflow>:<ts>"),
+					"verdict": map[string]any{"type": "string", "enum": []string{
+						"good", "bad", "neutral", "promote", "discard", "approve", "revamp", "dismiss", "branch"}},
+					"note":              str("the user's words: why, or (branch) what the new experiment should explore"),
+					"step_id":           str("approve|revamp|dismiss: the held step"),
+					"step_instructions": str("revamp: the new instructions for that step"),
+					"outbox_ref":        str("approve: the held item's outbox ref"),
+					"config":            obj("branch: config overrides for the new experiment"),
 				},
 				"required": []string{"id", "verdict"},
 			},
@@ -135,6 +148,9 @@ var supersededChatTools = map[string]string{
 	"run_result":              "run_get",
 	"run_promote":             "run_feedback",
 	"run_discard":             "run_feedback",
+	"give_feedback":           "run_feedback",
+	"review_action":           "run_feedback",
+	"branch_run":              "run_feedback",
 }
 
 func argStr(args map[string]any, k string) string {
@@ -209,14 +225,35 @@ func resolveCanonicalTool(name string, args map[string]any) (string, map[string]
 		}
 	case "run_feedback":
 		verdict := argStr(args, "verdict")
-		if verdict != "promote" && verdict != "discard" {
-			return "", nil, fmt.Errorf("run_feedback verdict must be promote or discard")
-		}
 		parts := strings.SplitN(argStr(args, "id"), ":", 4)
-		if len(parts) != 4 || parts[0] != "scheduled" {
+		if len(parts) != 4 || parts[0] != "scheduled" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
 			return "", nil, fmt.Errorf("run_feedback needs a scheduled run id: scheduled:<agent>:<workflow>:<ts>")
 		}
-		return "run_" + verdict, map[string]any{"app": parts[1], "loop": parts[2], "ts": parts[3]}, nil
+		app, loop, ts := parts[1], parts[2], parts[3]
+		switch verdict {
+		case "promote", "discard":
+			return "run_" + verdict, map[string]any{"app": app, "loop": loop, "ts": ts}, nil
+		case "good", "bad", "neutral":
+			rating := map[string]int{"good": 1, "bad": -1, "neutral": 0}[verdict]
+			return "give_feedback", map[string]any{"app": app, "loop": loop, "ts": ts, "rating": rating, "note": argStr(args, "note")}, nil
+		case "approve", "revamp", "dismiss":
+			if verdict == "revamp" && argStr(args, "step_instructions") == "" {
+				return "", nil, fmt.Errorf("run_feedback verdict \"revamp\" needs step_instructions")
+			}
+			copyArgs(out, args, "step_id", "step_instructions", "outbox_ref")
+			out["app"], out["loop"], out["decision"] = app, loop, verdict
+			return "review_action", out, nil
+		case "branch":
+			if argStr(args, "note") == "" {
+				return "", nil, fmt.Errorf("run_feedback verdict \"branch\" needs a note saying what to explore")
+			}
+			out = map[string]any{"app": app, "loop": loop, "from_ts": ts, "note": argStr(args, "note")}
+			if cfg, ok := args["config"].(map[string]any); ok && len(cfg) > 0 {
+				out["variant"] = cfg
+			}
+			return "branch_run", out, nil
+		}
+		return "", nil, fmt.Errorf("run_feedback verdict must be good, bad, neutral, promote, discard, approve, revamp, dismiss or branch")
 	}
 	return name, args, nil
 }

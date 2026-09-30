@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -105,7 +106,14 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && p == "/fm/home/api/v1/workflows/validate":
 		_, _ = w.Write([]byte(`{"valid":true}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/workflows/wfl-abc123":
-		_, _ = w.Write([]byte(`{"status":"DONE","tasks":[{"task_id":"tsk-1","name":"score"}]}`))
+		// The shape FlowMesh v0.1.10 returns: task ids, not task objects.
+		_, _ = w.Write([]byte(`{"workflow_id":"wfl-abc123","task_ids":["tsk-0","tsk-1"],"status":"DONE",` +
+			`"dispatched_tasks":[],"completed_tasks":["tsk-0","tsk-1"],"failed_tasks":[],"cancelled_tasks":[]}`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/tasks" && r.URL.Query().Get("workflow_id") == "wfl-abc123":
+		_, _ = w.Write([]byte(`[{"task_id":"tsk-0","task":{"metadata":{"name":"two-stage:prep"}}},` +
+			`{"task_id":"tsk-1","task":{"metadata":{"name":"two-stage:score"}}}]`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-0":
+		_, _ = w.Write([]byte(`{"task_type":"echo","items":[{"output":"x"}]}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-1":
 		_, _ = w.Write([]byte(`{"task_type":"python","value":{"ok":1},"metrics":{"score":0.75}}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/workflows/wfl-abc123/logs":
@@ -240,8 +248,12 @@ func TestFleetFlowMeshRunGetResultLogsCancel(t *testing.T) {
 
 	code, res := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs/home:fm:wfl-abc123?view=result", "", owner)
 	metrics, _ := res["metrics"].(map[string]any)
-	if code != 200 || metrics["score"] != 0.75 {
+	outputs, _ := res["outputs"].([]any)
+	if code != 200 || metrics["score"] != 0.75 || len(outputs) != 2 {
 		t.Fatalf("result = %d %v", code, res)
+	}
+	if last, _ := outputs[1].(map[string]any); last["task_id"] != "tsk-1" || last["name"] != "score" {
+		t.Errorf("python output = %v, want task tsk-1 named score", outputs[1])
 	}
 
 	code, logs := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs/home:fm:wfl-abc123?view=logs", "", owner)
@@ -392,5 +404,21 @@ func TestDeclaredWorkflowInputs(t *testing.T) {
 	}
 	if got := declaredWorkflowInputs("inputs:\n  A: [x]\n"); len(got) != 1 {
 		t.Errorf("declared = %#v", got)
+	}
+}
+
+func TestFleetWorkflowTaskIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wf   map[string]any
+		want []string
+	}{
+		{"task_ids", map[string]any{"task_ids": []any{"tsk-a", "tsk-b"}}, []string{"tsk-a", "tsk-b"}},
+		{"tasks", map[string]any{"tasks": []any{map[string]any{"task_id": "tsk-a"}}}, []string{"tsk-a"}},
+		{"neither", map[string]any{"status": "DONE"}, nil},
+	} {
+		if got := fleetWorkflowTaskIDs(tc.wf); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

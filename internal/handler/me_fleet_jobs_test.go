@@ -334,6 +334,12 @@ func TestFleetLumilakeRunStatusResultTrace(t *testing.T) {
 	if code != 200 || st["status"] != "running" || st["progress"] == nil {
 		t.Fatalf("status = %d %v", code, st)
 	}
+	// Read as the caller too: Lumilake grants a job read to its submitter only.
+	for i, call := range fake.calls {
+		if strings.HasPrefix(call, "GET /ll/office/api/v1/jobs/") && !strings.HasPrefix(fake.auth[i], "Bearer lm_pat_") {
+			t.Errorf("%s went upstream with %q, want the caller's PAT", call, fake.auth[i])
+		}
+	}
 	if code, _ := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs/office:ll:req-zzzzzz999999?view=result", "", owner); code != 409 {
 		t.Errorf("unfinished result = %d, want 409", code)
 	}

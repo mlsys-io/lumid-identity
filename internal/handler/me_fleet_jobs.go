@@ -205,17 +205,19 @@ func fleetWriteBearer(userID, kind string) (string, error) {
 	return tok, nil
 }
 
-// fleetReadBearer: FlowMesh reads go as the caller (the site filters by
-// principal); Lumilake reads use the read-only service token, because a
-// jobs:write PAT is not a read grant there and ownership is enforced here.
+// fleetReadBearer: reads go as the caller. Lumilake authorizes a job read per
+// job, and grants it to the principal that submitted it; the read-only service
+// token is refused on a user's job (403 "read on job/<id> denied"). It remains
+// the fallback when no caller credential can be minted.
 func fleetReadBearer(userID, kind string) (string, error) {
-	if kind == fleetKindLL {
-		if tok := strings.TrimSpace(os.Getenv(computeStatusTokenEnv)); tok != "" {
-			return tok, nil
-		}
-		return "", fmt.Errorf("%w: set %s", errFleetCredential, computeStatusTokenEnv)
+	tok, err := fleetWriteBearer(userID, kind)
+	if err == nil || kind != fleetKindLL {
+		return tok, err
 	}
-	return fleetWriteBearer(userID, kind)
+	if svc := strings.TrimSpace(os.Getenv(computeStatusTokenEnv)); svc != "" {
+		return svc, nil
+	}
+	return "", fmt.Errorf("%w: set %s", errFleetCredential, computeStatusTokenEnv)
 }
 
 type fleetCall struct {

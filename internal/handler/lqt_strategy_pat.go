@@ -256,6 +256,6 @@ func invalidateIntentPATCaches(userSub, name string) {
 		common.DB.Where("user_sub = ? AND `key` = ?", userSub, lqtStrategyPATCacheKey).Delete(&models.AppSecret{})
 	case computePATName:
 		common.DB.Where("user_sub = ? AND `key` IN ?", userSub,
-			[]string{computePATCacheKey, computePATCacheKeyV1}).Delete(&models.AppSecret{})
+			append([]string{computePATCacheKey}, computePATLegacyKeys...)).Delete(&models.AppSecret{})
 	}
 }

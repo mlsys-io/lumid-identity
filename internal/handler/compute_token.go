@@ -65,14 +65,17 @@ const (
 	// Cached under the app the token is for, so a user running two
 	// compute-bearing apps does not have one app's cache answer for the other.
 	//
-	// _v2 since the token gained its FlowMesh scopes (2026-09-30). A token
-	// cached under the old key carries lumilake:jobs:write alone and fails every
-	// job at FlowMesh for up to two hours, so it must be re-minted, not served.
-	computePATCacheKey = "__lumilake_compute_pat_cache_v2"
+	// Bumped whenever computeScopes grows, so a cached token missing a scope is
+	// re-minted rather than served for up to two hours: _v2 added the FlowMesh
+	// scopes, _v3 lumilake:jobs:read (2026-10-01).
+	computePATCacheKey = "__lumilake_compute_pat_cache_v3"
+)
 
-	// The pre-v2 key. Dropped on a cache miss so its row does not outlive the
-	// token it holds; revoke clears it too.
-	computePATCacheKeyV1 = "__lumilake_compute_pat_cache"
+// computePATLegacyKeys are the earlier cache keys. Dropped on a cache miss so
+// their rows do not outlive the tokens they hold; revoke clears them too.
+var computePATLegacyKeys = []string{"__lumilake_compute_pat_cache", "__lumilake_compute_pat_cache_v2"}
+
+const (
 
 	// Re-mint once the cached token is within this of expiry, so a cycle never
 	// receives a credential that dies mid-run. A fleet job can run for tens of
@@ -94,7 +97,11 @@ const (
 // token could run. The FlowMesh half matches fleetFlowMeshScopes, the set a
 // direct FlowMesh submit already gets: workflows and their tasks and results,
 // nothing on nodes or workers.
-var computeScopes = append([]string{computeScope}, fleetFlowMeshScopes...)
+//
+// lumilake:jobs:read lets the fleet API read a user's job AS that user: Lumilake
+// authorizes a job read per job, and the service token is not granted on jobs
+// it did not submit (403 "read on job/<id> denied", measured on home).
+var computeScopes = append([]string{computeScope, "lumilake:jobs:read"}, fleetFlowMeshScopes...)
 
 // computeEngineTypes — engine types whose runtime submits to a compute service
 // and therefore needs a scoped token.
@@ -250,8 +257,8 @@ func computePATCached(userSub, app string) string {
 		miss = "no cache row: " + err.Error()
 	}
 	log.Printf("[compute-pat] cache MISS for %s/%s — %s (minting)", userSub, app, miss)
-	common.DB.Where("user_sub = ? AND app_slug = ? AND `key` = ?",
-		userSub, app, computePATCacheKeyV1).Delete(&models.AppSecret{})
+	common.DB.Where("user_sub = ? AND app_slug = ? AND `key` IN ?",
+		userSub, app, computePATLegacyKeys).Delete(&models.AppSecret{})
 
 	tok := mintComputePAT(userSub)
 	if tok == "" {

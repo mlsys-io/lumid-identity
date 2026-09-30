@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -319,6 +320,11 @@ func TestFleetLumilakeRunStatusResultTrace(t *testing.T) {
 	if item["hardware"] != nil || item["output_location"] == nil {
 		t.Errorf("data[0] = %v", item)
 	}
+	// Per user: Lumilake gives an S3 prefix to the first principal to write it.
+	loc, _ := item["output_location"].(map[string]any)
+	if p, _ := loc["prefix"].(string); !regexp.MustCompile(`^fleet-jobs/[^/]+/$`).MatchString(p) {
+		t.Errorf("output_location = %v, want the caller's own fleet-jobs/<sub>/", loc)
+	}
 	// Written as the caller (their compute PAT), not the service read token.
 	if a := fake.auth[0]; a == "Bearer svc-read-token" || !strings.HasPrefix(a, "Bearer lm_pat_") {
 		t.Errorf("Lumilake write went upstream with %q", a)
@@ -420,5 +426,12 @@ func TestFleetWorkflowTaskIDs(t *testing.T) {
 		if got := fleetWorkflowTaskIDs(tc.wf); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestFleetOutputPrefixIsPerUser(t *testing.T) {
+	a, b := fleetOutputPrefix("u-a"), fleetOutputPrefix("u-b")
+	if a == b || a != "fleet-jobs/u-a/" {
+		t.Errorf("prefixes %q %q: want distinct, per-user, slash-terminated", a, b)
 	}
 }

@@ -377,8 +377,7 @@ func MeFleetJobRun(c *gin.Context) {
 		if !b.DryRun {
 			loc := b.OutputLocation
 			if loc == nil {
-				// The deployed server accepts only s3/db outputs.
-				loc = map[string]any{"type": "s3", "prefix": "fleet-jobs/"}
+				loc = map[string]any{"type": "s3", "prefix": fleetOutputPrefix(sub)}
 			}
 			item["output_location"] = loc
 		}
@@ -442,6 +441,13 @@ func MeFleetJobRun(c *gin.Context) {
 }
 
 // fleetClip bounds a string to a column size, with no ellipsis appended.
+// fleetOutputPrefix is a Lumilake job's default output location for one user.
+// The deployed server accepts only s3/db outputs, and authorizes an S3 prefix by
+// exact id, claimed by the first principal to write it: one shared prefix would
+// belong to whoever ran the first job, and every other user would get
+// "403 write on object-prefix/... denied".
+func fleetOutputPrefix(sub string) string { return "fleet-jobs/" + sub + "/" }
+
 func fleetClip(s string, n int) string {
 	if len(s) <= n {
 		return s

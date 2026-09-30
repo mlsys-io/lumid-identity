@@ -85,10 +85,34 @@ func TestRunFeedbackRejectsUnknownVerdict(t *testing.T) {
 		{"n8n:x", "succeeded", true},        // MeRunMark judges the id itself
 		{"n8n:x", "promote", false},
 		{"scheduled:a:b:t", "meh", false},
+		{"scheduled:a:b:latest", "good", true},
+		{"scheduled:a:b:t", "revamp", true},
+		{"scheduled:a:b:t", "branch", true},
+		{"scheduled:a::t", "good", false}, // a rating lands in one workflow's run
+		{"n8n:x", "branch", false},
 	} {
 		_, err := feedbackTarget(tc.id, tc.verdict)
 		if (err == nil) != tc.ok {
 			t.Errorf("feedbackTarget(%q, %q) err=%v, want ok=%v", tc.id, tc.verdict, err, tc.ok)
+		}
+	}
+}
+
+// Each verdict reaches the handler that records it, with that handler's body.
+// The delegates are replaced by recorders so only the routing is under test.
+func TestRunFeedbackRoutesEachVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		verdict, kind string
+		agent, wf, ts string
+	}{
+		{"good", "rating", "qr", "backtest", "20260930T010203Z"},
+		{"revamp", "review", "qr", "backtest", "20260930T010203Z"},
+		{"branch", "branch", "qr", "backtest", "20260930T010203Z"},
+		{"discard", "branch-state", "qr", "backtest", "20260930T010203Z"},
+	} {
+		got, err := feedbackTarget("scheduled:"+tc.agent+":"+tc.wf+":"+tc.ts, tc.verdict)
+		if err != nil || got != (feedbackRoute{tc.kind, tc.agent, tc.wf, tc.ts}) {
+			t.Errorf("%s -> %+v %v", tc.verdict, got, err)
 		}
 	}
 }

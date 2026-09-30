@@ -386,8 +386,9 @@ func Register(r *gin.Engine) {
 			me.POST("/apps/lumid-outlook-pa/test-send", MeOutlookPATestSend)
 
 			// Cycle-level feedback (Hook 2 keystone). Same backend
-			// for clickable UI + conversational-agent give_feedback tool.
-			me.POST("/cycles/feedback", MeCycleFeedback)
+			// for clickable UI + conversational-agent give_feedback tool. Superseded by
+			// POST /runs/:run_id/feedback {verdict: good|bad|neutral}.
+			me.POST("/cycles/feedback", deprecatedRoute("/api/v1/me/runs/:run_id/feedback"), MeCycleFeedback)
 
 			// Improvement ledger — every change to an intent across
 			// the six axes (examples/standard/recipe/pieces/memory/
@@ -524,7 +525,7 @@ func Register(r *gin.Engine) {
 			// Variant trajectory tree (baseline → per-cycle variants → champion trunk).
 			me.GET("/apps/:app/trajectory", MeTrajectory)
 			// Trajectory control-signal channel (right-click "branch from here").
-			me.POST("/apps/:app/trajectory/signal", MeTrajectorySignal)
+			me.POST("/apps/:app/trajectory/signal", deprecatedRoute("/api/v1/me/runs/:run_id/feedback"), MeTrajectorySignal)
 			me.GET("/apps/:app/trajectory/signals", MeTrajectorySignals)
 			// Goal-metric trajectory across cycles (improvement over iterations).
 			me.GET("/apps/:app/loops/:loop/metric-series", MeLoopMetricSeries)
@@ -544,7 +545,7 @@ func Register(r *gin.Engine) {
 			me.POST("/workflows/validate", MeValidateWorkflow)
 			// Engine-revamp human checkpoint — approve/revamp a cycle's
 			// held actions; writes the engine's side files for next cycle.
-			me.POST("/cycles/:app/:loop/:ts/review", MeCycleReview)
+			me.POST("/cycles/:app/:loop/:ts/review", deprecatedRoute("/api/v1/me/runs/:run_id/feedback"), MeCycleReview)
 
 			// Workstream E — skills as a first-class surface: inventory
 			// (used_by + versions + CI health), catalog discovery, detail.
@@ -692,6 +693,9 @@ func Register(r *gin.Engine) {
 			// super_admin-only pages. Returns 200 if the session cookie or
 			// bearer token belongs to a super_admin, otherwise 401/403.
 			superAdmin.GET("/super-check", SuperAdminCheck)
+			// Use counts of superseded routes + chat tools: what VERBS.md stage 3
+			// (remove after two releases with zero use) is decided on.
+			superAdmin.GET("/deprecations", AdminDeprecations)
 			superAdmin.GET("/oauth-clients", AdminOAuthClientsList)
 			// Reset the per-user SHORT-window quota clock. super_admin, not admin:
 			// it hands capacity back to users, which is a budget decision.

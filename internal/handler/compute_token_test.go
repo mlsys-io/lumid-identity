@@ -143,7 +143,7 @@ func TestGateAsksForTheSpecRatherThanAssumingItIsThere(t *testing.T) {
 // than depending on whoever adds it remembering this loop. This test asserts
 // the rule, not the two keys that exist today.
 func TestMachineManagedCacheRowsNeverReachTheCycleEnv(t *testing.T) {
-	for _, k := range []string{lqtStrategyPATCacheKey, computePATCacheKey, computePATCacheKeyV1} {
+	for _, k := range append([]string{lqtStrategyPATCacheKey, computePATCacheKey}, computePATLegacyKeys...) {
 		if !strings.HasPrefix(k, "__") {
 			t.Fatalf("cache key %q must start with __ or the prefix skip misses it", k)
 		}
@@ -184,7 +184,7 @@ func TestComputePATCanSubmitThroughToFlowMesh(t *testing.T) {
 	for _, s := range computeScopes {
 		has[s] = true
 	}
-	for _, want := range []string{"lumilake:jobs:write", "flowmesh:workflows:write",
+	for _, want := range []string{"lumilake:jobs:write", "lumilake:jobs:read", "flowmesh:workflows:write",
 		"flowmesh:workflows:read", "flowmesh:tasks:read", "flowmesh:results:read"} {
 		if !has[want] {
 			t.Errorf("compute PAT lacks %q; scopes = %v", want, computeScopes)
@@ -201,14 +201,17 @@ func TestComputePATCanSubmitThroughToFlowMesh(t *testing.T) {
 	}
 }
 
-// A token cached before the FlowMesh scopes existed must not be served: it
-// fails every job for up to two hours. Bumping the key is what forces the
-// re-mint, so the two keys must differ and both must be machine-managed.
+// A token cached before the scope set last grew must not be served: it fails
+// every job (or every read) for up to two hours. Bumping the key is what forces
+// the re-mint, so the current key must differ from every earlier one and all
+// must be machine-managed.
 func TestPreFlowMeshCachedTokenIsNotServed(t *testing.T) {
-	if computePATCacheKey == computePATCacheKeyV1 {
-		t.Fatal("cache key must change with the scope set, or old single-scope tokens keep being served")
+	for _, old := range computePATLegacyKeys {
+		if computePATCacheKey == old {
+			t.Fatalf("cache key %q reused: old tokens with fewer scopes keep being served", old)
+		}
 	}
-	for _, k := range []string{computePATCacheKey, computePATCacheKeyV1} {
+	for _, k := range append([]string{computePATCacheKey}, computePATLegacyKeys...) {
 		if !strings.HasPrefix(k, "__") {
 			t.Errorf("%q must be __-prefixed so it is never injected into a cycle env", k)
 		}

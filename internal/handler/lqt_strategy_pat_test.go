@@ -137,7 +137,7 @@ func TestStrategyCyclesRequiresAnID(t *testing.T) {
 // (443 on one account). Both now go through patScopesColumn; pin the stored
 // form so a change to one side cannot silently re-open the gap.
 func TestIntentPATScopeColumnMatchesWhatMintStores(t *testing.T) {
-	for _, scope := range []string{lqtStrategyScope, computeScope} {
+	for _, scope := range []string{lqtStrategyScope, computeScope} { // computeScope: pre-v2 rows
 		got := patScopesColumn([]string{scope})
 		if got != scope {
 			t.Fatalf("patScopesColumn(%q) = %q; mint stores the bare scope for a single-scope PAT", scope, got)

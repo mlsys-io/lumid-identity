@@ -54,8 +54,9 @@ const (
 	// TTL rather than inventing a second number.
 	computePATTTL = 2 * time.Hour
 
-	// The ONLY scope. Not `lumilake:admin`: a run needs to submit a job, and
-	// nothing here should be able to administer the fleet.
+	// The scope that authorises the Lumilake submit. Not `lumilake:admin`: a
+	// run needs to submit a job, and nothing here should be able to administer
+	// the fleet. The full scope list is computeScopes below.
 	computeScope = "lumilake:jobs:write"
 
 	// The display name of every auto-minted compute PAT; prune and revoke match on it.
@@ -63,13 +64,37 @@ const (
 
 	// Cached under the app the token is for, so a user running two
 	// compute-bearing apps does not have one app's cache answer for the other.
-	computePATCacheKey = "__lumilake_compute_pat_cache"
+	//
+	// _v2 since the token gained its FlowMesh scopes (2026-09-30). A token
+	// cached under the old key carries lumilake:jobs:write alone and fails every
+	// job at FlowMesh for up to two hours, so it must be re-minted, not served.
+	computePATCacheKey = "__lumilake_compute_pat_cache_v2"
+
+	// The pre-v2 key. Dropped on a cache miss so its row does not outlive the
+	// token it holds; revoke clears it too.
+	computePATCacheKeyV1 = "__lumilake_compute_pat_cache"
 
 	// Re-mint once the cached token is within this of expiry, so a cycle never
 	// receives a credential that dies mid-run. A fleet job can run for tens of
 	// minutes, so this is generous on purpose.
 	computePATRenewBefore = 25 * time.Minute
 )
+
+// computeScopes is everything the compute PAT carries.
+//
+// LUMILAKE SUBMITS TO FLOWMESH AS THE CALLER. It forwards the bearer it was
+// given, and FlowMesh checks scopes in its own permission layer, exactly as
+// Lumilake does. With lumilake:jobs:write alone, Lumilake accepted every job
+// and every job then failed at FlowMesh with
+//
+//	403 kind-level write on workflow requires 'flowmesh:workflows:write'
+//
+// Measured 2026-09-30 on home, office and cloud, through /me/fleet/jobs, for a
+// plain LLM graph as much as a Python one: no Lumilake job submitted with this
+// token could run. The FlowMesh half matches fleetFlowMeshScopes, the set a
+// direct FlowMesh submit already gets: workflows and their tasks and results,
+// nothing on nodes or workers.
+var computeScopes = append([]string{computeScope}, fleetFlowMeshScopes...)
 
 // computeEngineTypes — engine types whose runtime submits to a compute service
 // and therefore needs a scoped token.
@@ -172,12 +197,13 @@ type rawComputeLoop struct {
 func mintComputePAT(userSub string) string {
 	// Same accretion as the deploy PAT: without this, every renewal left one
 	// expired row behind for good.
-	pruneExpiredIntentPATs(userSub, computePATName, computeScope)
+	pruneExpiredIntentPATs(userSub, computePATName, computeScopes...)
+	pruneExpiredIntentPATs(userSub, computePATName, computeScope) // pre-v2 rows
 	exp := time.Now().Add(computePATTTL)
 	tok, _, err := mintPATForUser(
 		userSub,
 		computePATName,
-		[]string{computeScope},
+		computeScopes,
 		&exp,
 		"intent",
 	)
@@ -224,6 +250,8 @@ func computePATCached(userSub, app string) string {
 		miss = "no cache row: " + err.Error()
 	}
 	log.Printf("[compute-pat] cache MISS for %s/%s — %s (minting)", userSub, app, miss)
+	common.DB.Where("user_sub = ? AND app_slug = ? AND `key` = ?",
+		userSub, app, computePATCacheKeyV1).Delete(&models.AppSecret{})
 
 	tok := mintComputePAT(userSub)
 	if tok == "" {

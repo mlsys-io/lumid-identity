@@ -228,17 +228,17 @@ func attachLQTStrategyPAT(action, userSub string, p map[string]any) {
 }
 
 // pruneExpiredIntentPATs deletes this user's already-expired auto-minted PATs
-// of one kind (name + scope). Called opportunistically on mint so the table
+// of one kind (name + scopes). Called opportunistically on mint so the table
 // does not accrete one dead row per mint forever. Only ever touches rows this
-// code created (name + source + scope all match) and only ones already past
+// code created (name + source + scopes all match) and only ones already past
 // expiry, so it can never revoke a credential anyone is using.
 //
 // The scope is compared through patScopesColumn — the same serialisation mint
 // uses. The first version compared a JSON array and deleted nothing, ever.
-func pruneExpiredIntentPATs(userSub, name, scope string) {
+func pruneExpiredIntentPATs(userSub, name string, scopes ...string) {
 	res := common.DB.
 		Where("user_id = ? AND name = ? AND source = ? AND scopes = ? AND expires_at IS NOT NULL AND expires_at < ?",
-			userSub, name, "intent", patScopesColumn([]string{scope}), time.Now()).
+			userSub, name, "intent", patScopesColumn(scopes), time.Now()).
 		Delete(&models.Token{})
 	if res.Error != nil {
 		log.Printf("[intent-pat] prune failed for %s (%s): %v", userSub, name, res.Error)
@@ -255,6 +255,7 @@ func invalidateIntentPATCaches(userSub, name string) {
 	case lqtStrategyPATName:
 		common.DB.Where("user_sub = ? AND `key` = ?", userSub, lqtStrategyPATCacheKey).Delete(&models.AppSecret{})
 	case computePATName:
-		common.DB.Where("user_sub = ? AND `key` = ?", userSub, computePATCacheKey).Delete(&models.AppSecret{})
+		common.DB.Where("user_sub = ? AND `key` IN ?", userSub,
+			[]string{computePATCacheKey, computePATCacheKeyV1}).Delete(&models.AppSecret{})
 	}
 }

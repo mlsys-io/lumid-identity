@@ -143,7 +143,7 @@ func TestGateAsksForTheSpecRatherThanAssumingItIsThere(t *testing.T) {
 // than depending on whoever adds it remembering this loop. This test asserts
 // the rule, not the two keys that exist today.
 func TestMachineManagedCacheRowsNeverReachTheCycleEnv(t *testing.T) {
-	for _, k := range []string{lqtStrategyPATCacheKey, computePATCacheKey} {
+	for _, k := range []string{lqtStrategyPATCacheKey, computePATCacheKey, computePATCacheKeyV1} {
 		if !strings.HasPrefix(k, "__") {
 			t.Fatalf("cache key %q must start with __ or the prefix skip misses it", k)
 		}
@@ -172,5 +172,45 @@ func TestCommandLoopDeclaringComputeGetsTheCredential(t *testing.T) {
 	odd := []byte("loops:\n- name: x\n  engine: {type: command}\n  compute: flowmesh\n")
 	if specDeclaresComputeEngine(odd) {
 		t.Fatal("compute: flowmesh is declared-but-unimplemented and must not mint")
+	}
+}
+
+// Lumilake forwards the caller's bearer to FlowMesh, and FlowMesh checks its own
+// scopes. A compute PAT with lumilake:jobs:write alone was accepted by Lumilake
+// and then refused at FlowMesh ("kind-level write on workflow requires
+// 'flowmesh:workflows:write'") for every job on every site, 2026-09-30.
+func TestComputePATCanSubmitThroughToFlowMesh(t *testing.T) {
+	has := map[string]bool{}
+	for _, s := range computeScopes {
+		has[s] = true
+	}
+	for _, want := range []string{"lumilake:jobs:write", "flowmesh:workflows:write",
+		"flowmesh:workflows:read", "flowmesh:tasks:read", "flowmesh:results:read"} {
+		if !has[want] {
+			t.Errorf("compute PAT lacks %q; scopes = %v", want, computeScopes)
+		}
+	}
+	for s := range has {
+		if strings.HasSuffix(s, ":admin") || strings.Contains(s, "nodes") || strings.Contains(s, "workers") {
+			t.Errorf("compute PAT must not carry %q: it submits jobs, it does not run the fleet", s)
+		}
+	}
+	// prune matches the stored column exactly; pin it to what mint stores.
+	if got := patScopesColumn(computeScopes); got != strings.Join(computeScopes, " ") {
+		t.Errorf("scope column %q is not the space-joined list mint stores", got)
+	}
+}
+
+// A token cached before the FlowMesh scopes existed must not be served: it
+// fails every job for up to two hours. Bumping the key is what forces the
+// re-mint, so the two keys must differ and both must be machine-managed.
+func TestPreFlowMeshCachedTokenIsNotServed(t *testing.T) {
+	if computePATCacheKey == computePATCacheKeyV1 {
+		t.Fatal("cache key must change with the scope set, or old single-scope tokens keep being served")
+	}
+	for _, k := range []string{computePATCacheKey, computePATCacheKeyV1} {
+		if !strings.HasPrefix(k, "__") {
+			t.Errorf("%q must be __-prefixed so it is never injected into a cycle env", k)
+		}
 	}
 }

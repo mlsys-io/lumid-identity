@@ -56,6 +56,31 @@ type experimentWriteBody struct {
 	MinSamples  *int              `json:"min_samples,omitempty"`
 	Baseline    map[string]any    `json:"baseline,omitempty"`
 	Dispatch    map[string]any    `json:"dispatch,omitempty"`
+
+	// computeGraph: the workflow runs a compute graph (loopRunsComputeGraph), so
+	// the scope rule does not apply. Set by the caller from the agent's spec,
+	// never from the request.
+	computeGraph bool
+}
+
+// computeGraphEngines run a declared compute graph: the same graph every run.
+var computeGraphEngines = map[string]bool{"flowmesh": true, "lumilake": true}
+
+// loopRunsComputeGraph reports whether the agent's workflow `loop` runs a compute
+// graph. A study on one counts runs of that graph, so its runs are the
+// population and no dataset scope applies. An unreadable spec answers false, so
+// the scope rule stays on whenever this cannot be checked.
+func loopRunsComputeGraph(userID, app, loop string) bool {
+	workflows, ok := agentWorkflows(userID, app)
+	if !ok {
+		return false
+	}
+	for _, w := range workflows {
+		if w.Name == loop {
+			return computeGraphEngines[w.Engine.Type]
+		}
+	}
+	return false
 }
 
 // validateExperimentShape enforces the one rule that separates the two kinds of
@@ -63,6 +88,9 @@ type experimentWriteBody struct {
 //
 //	workflow   = a loop. no metric, no scope.
 //	experiment = a loop + a METRIC + a dataset/case SCOPE.
+//
+// The scope is waived for a loop that runs a compute graph (b.computeGraph): it
+// runs one declared graph every time, so its runs are the population.
 //
 // Both halves are load-bearing and both have failed in production. Without a
 // metric there is nothing to aggregate. Without a scope, min_samples counts over
@@ -84,7 +112,7 @@ func validateExperimentShape(b *experimentWriteBody) []string {
 		problems = append(problems,
 			"`metric.name` is required: a loop WITHOUT a metric is a workflow, not an experiment")
 	}
-	if strings.TrimSpace(b.DatasetID) == "" && len(b.Cases) == 0 {
+	if strings.TrimSpace(b.DatasetID) == "" && len(b.Cases) == 0 && !b.computeGraph {
 		problems = append(problems,
 			"a scope is required: set `dataset_id` or `cases[]`, or min_samples counts over an undefined population")
 	}
@@ -295,6 +323,7 @@ func MeAppExperimentUpsert(c *gin.Context) {
 		hydratePatchBody(&body, decl)
 	}
 
+	body.computeGraph = loopRunsComputeGraph(userID, app, body.Loop)
 	problems := validateExperimentShape(&body)
 	_, modelWarnings := validateExperimentModels(&body)
 	if len(problems) > 0 {

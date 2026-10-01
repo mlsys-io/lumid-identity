@@ -4638,7 +4638,7 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 				caseList = append(caseList, t)
 			}
 		}
-		if ds == "" && len(caseList) == 0 {
+		if ds == "" && len(caseList) == 0 && !loopRunsComputeGraph(userID, app, loop) {
 			return map[string]any{"error": "a scope is required — give dataset_id or cases. " +
 				"A threshold counted over an undefined population cannot be interpreted."}, false
 		}

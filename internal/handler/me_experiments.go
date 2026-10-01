@@ -824,12 +824,14 @@ func MeAppExperiments(c *gin.Context) {
 				markUndispatched(row, &d, loops[d.ID])
 				exps = append(exps, row)
 			}
-			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps)})
+			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps),
+				"definitions": pendingStudyDefinitions(userID, app, experimentIDSet(exps))})
 			return
 		}
 		// Not resolvable anywhere — graceful empty (the app may still be
 		// installing); the UI renders a clean empty state, not a console 404.
-		ok(c, "ok", gin.H{"experiments": []gin.H{}, "count": 0})
+		ok(c, "ok", gin.H{"experiments": []gin.H{}, "count": 0,
+			"definitions": pendingStudyDefinitions(userID, app, nil)})
 		return
 	}
 	exps := loadAppExperimentsFor(userID, app, appDir)
@@ -843,7 +845,10 @@ func MeAppExperiments(c *gin.Context) {
 			localIDs = append(localIDs, id)
 		}
 	}
-	resp := gin.H{"experiments": exps, "count": len(exps)}
+	resp := gin.H{"experiments": exps, "count": len(exps),
+		// Definitions still on their way to the scheduler, or refused by it:
+		// without them a refused study is indistinguishable from a slow one.
+		"definitions": pendingStudyDefinitions(userID, app, experimentIDSet(exps))}
 	if d := experimentDivergenceFor(userID, app, localIDs); d != nil {
 		resp["divergence"] = d
 	}
@@ -868,9 +873,25 @@ func MeAppExperiment(c *gin.Context) {
 		return
 	}
 	detail, found := loadExperimentDetailFor(userID, app, appDir, id)
+	def, hasDef := studyDefinitionStates(userID, app)[id]
 	if !found {
-		fail(c, http.StatusNotFound, 1404, "experiment not found")
+		switch {
+		case hasDef && def.Status == "defining":
+			c.JSON(http.StatusAccepted, gin.H{"ret_code": 0, "message": "study is still being defined",
+				"data": gin.H{"definition": def}})
+		case hasDef && def.Status == "failed":
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"ret_code": 1422,
+				"message": "study " + id + " was not defined: " + def.Error,
+				"data":    gin.H{"definition": def}})
+		default:
+			fail(c, http.StatusNotFound, 1404, "experiment not found")
+		}
 		return
+	}
+	if hasDef && def.Status != "defined" {
+		// A later edit of an existing study is still pending, or was refused:
+		// the study below is the last definition that DID apply.
+		detail["definition"] = def
 	}
 	ok(c, "ok", detail)
 }
@@ -1125,4 +1146,15 @@ func storedExpState(userSub, app, experimentID string) map[string]any {
 		st["state_updated_at"] = row.UpdatedAt.UTC().Format(time.RFC3339)
 	}
 	return st
+}
+
+// experimentIDSet is the set of ids in an experiments listing.
+func experimentIDSet(exps []gin.H) map[string]bool {
+	set := map[string]bool{}
+	for _, e := range exps {
+		if id, _ := e["id"].(string); id != "" {
+			set[id] = true
+		}
+	}
+	return set
 }

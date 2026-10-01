@@ -99,3 +99,17 @@ func TestLumilakeScopesAreGrantableCapabilityTags(t *testing.T) {
 		t.Error("lumilake:write must remain a matrix-gated service scope, not a capability tag")
 	}
 }
+
+// A study on a compute-graph workflow counts runs of one declared graph, so its
+// runs are the population: no dataset scope. Everything else still needs one.
+func TestComputeGraphStudiesNeedNoScope(t *testing.T) {
+	base := experimentWriteBody{ID: "scale", Loop: "score_graph", Metric: &experimentMetric{Name: "score"}}
+	graph := base
+	graph.computeGraph = true
+	if p := validateExperimentShape(&graph); len(p) != 0 {
+		t.Errorf("compute-graph study refused: %v", p)
+	}
+	if p := validateExperimentShape(&base); len(p) != 1 || !strings.Contains(p[0], "scope") {
+		t.Errorf("non-graph study without a scope: %v, want the scope problem", p)
+	}
+}

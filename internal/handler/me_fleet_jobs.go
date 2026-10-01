@@ -602,8 +602,15 @@ func fleetStatusView(c *gin.Context, id fleetJobID, row *models.MeFleetJob, bear
 		out["error"] = e
 	}
 	if id.Kind == fleetKindFM {
-		if ids := fleetWorkflowTaskIDs(rec); len(ids) > 0 {
+		ids := fleetWorkflowTaskIDs(rec)
+		if len(ids) > 0 {
 			out["tasks"] = len(ids)
+		}
+		if status == "failed" && out["error"] == nil {
+			if step, msg := fleetFirstFailure(ids, fleetTaskListing(c, base, id.Native, bearer)); msg != "" {
+				out["error"] = msg
+				out["failed_step"] = step
+			}
 		}
 	} else if prog, _, pc := fleetGet(c, base+"/api/v1/jobs/"+id.Native+"/progress", bearer); pc == http.StatusOK {
 		// Best-effort, as on the canvas route: a readable job with an
@@ -651,7 +658,7 @@ func fleetResultView(c *gin.Context, id fleetJobID, bearer string) {
 		fail(c, http.StatusConflict, 1409, "job has not finished; read view=status until terminal")
 		return
 	}
-	names := fleetTaskStageNames(c, base, id.Native, bearer)
+	tasks := fleetTaskListing(c, base, id.Native, bearer)
 	results := []gin.H{}
 	metrics := map[string]any{}
 	for _, taskID := range fleetWorkflowTaskIDs(wf) {
@@ -660,8 +667,9 @@ func fleetResultView(c *gin.Context, id fleetJobID, bearer string) {
 		}
 		res, _, rc := fleetGet(c, base+"/api/v1/results/"+taskID, bearer)
 		entry := gin.H{"task_id": taskID}
-		if name := names[taskID]; name != "" {
-			entry["name"] = name
+		task := tasks[taskID]
+		if task.Name != "" {
+			entry["name"] = task.Name
 		}
 		if rc == http.StatusOK {
 			entry["result"] = res
@@ -670,6 +678,9 @@ func fleetResultView(c *gin.Context, id fleetJobID, bearer string) {
 					metrics[k] = v
 				}
 			}
+		} else if task.Error != "" {
+			// A failed step has no result; what it does have is the reason.
+			entry["error"] = task.Error
 		} else {
 			entry["error"] = fmt.Sprintf("result unavailable (%d)", rc)
 		}
@@ -704,36 +715,74 @@ func fleetWorkflowTaskIDs(wf map[string]any) []string {
 	return ids
 }
 
-// fleetTaskStageNames maps each task of a FlowMesh workflow to its stage name,
-// the part of `task.metadata.name` after the workflow name ("wf:score" ->
-// "score"). Best-effort: an unreadable listing leaves results unnamed.
-func fleetTaskStageNames(c *gin.Context, base, workflowID, bearer string) map[string]string {
+// fleetTask is what the result and status views need from one FlowMesh task:
+// its stage name (the part of `task.metadata.name` after the workflow name,
+// "wf:score" -> "score"), its native status, and why it failed.
+type fleetTask struct {
+	Name   string
+	Status string
+	Error  string
+}
+
+// fleetErrorMax bounds a step's failure text: a traceback is useful, a
+// megabyte of one is not.
+const fleetErrorMax = 2000
+
+// fleetTaskListing reads every task of a FlowMesh workflow in one call.
+// Best-effort: an unreadable listing leaves results unnamed and failures
+// unexplained, never the view itself broken.
+func fleetTaskListing(c *gin.Context, base, workflowID, bearer string) map[string]fleetTask {
 	b, code := fleetDo(c.Request.Context(), fleetCall{
 		method: http.MethodGet, url: base + "/api/v1/tasks?workflow_id=" + url.QueryEscape(workflowID), bearer: bearer,
 	})
-	names := map[string]string{}
+	out := map[string]fleetTask{}
 	if code != http.StatusOK {
-		return names
+		return out
 	}
 	var tasks []struct {
-		TaskID string `json:"task_id"`
-		Task   struct {
+		TaskID    string  `json:"task_id"`
+		Status    string  `json:"status"`
+		Error     *string `json:"error"`
+		LastError *string `json:"last_error"`
+		Task      struct {
 			Metadata struct {
 				Name string `json:"name"`
 			} `json:"metadata"`
 		} `json:"task"`
 	}
 	if json.Unmarshal(b, &tasks) != nil {
-		return names
+		return out
 	}
 	for _, t := range tasks {
 		name := t.Task.Metadata.Name
 		if i := strings.LastIndex(name, ":"); i >= 0 {
 			name = name[i+1:]
 		}
-		names[t.TaskID] = name
+		msg := ""
+		if t.Error != nil {
+			msg = *t.Error
+		}
+		if msg == "" && t.LastError != nil {
+			msg = *t.LastError
+		}
+		if len(msg) > fleetErrorMax {
+			msg = msg[:fleetErrorMax] + "…"
+		}
+		out[t.TaskID] = fleetTask{Name: name, Status: t.Status, Error: msg}
 	}
-	return names
+	return out
+}
+
+// fleetFirstFailure names the first failed step, in workflow order, and why —
+// so a failed job says what broke without the caller reading its logs.
+func fleetFirstFailure(ids []string, tasks map[string]fleetTask) (string, string) {
+	for _, id := range ids {
+		t, found := tasks[id]
+		if found && t.Error != "" && strings.EqualFold(t.Status, "FAILED") {
+			return t.Name, t.Error
+		}
+	}
+	return "", ""
 }
 
 func fleetLogsView(c *gin.Context, id fleetJobID, bearer string) {

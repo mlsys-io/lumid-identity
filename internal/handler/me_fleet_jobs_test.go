@@ -102,6 +102,8 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	p := r.URL.Path
 	switch {
+	case r.Method == "POST" && p == "/fm/home/api/v1/workflows" && strings.Contains(string(b), "will-fail"):
+		_, _ = w.Write([]byte(`{"workflow_id":"wfl-fail01","status":"PENDING"}`))
 	case r.Method == "POST" && p == "/fm/home/api/v1/workflows":
 		_, _ = w.Write([]byte(`{"workflow_id":"wfl-abc123","status":"PENDING","tasks":[{"task_id":"tsk-1"}]}`))
 	case r.Method == "POST" && p == "/fm/home/api/v1/workflows/validate":
@@ -113,6 +115,13 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && p == "/fm/home/api/v1/tasks" && r.URL.Query().Get("workflow_id") == "wfl-abc123":
 		_, _ = w.Write([]byte(`[{"task_id":"tsk-0","task":{"metadata":{"name":"two-stage:prep"}}},` +
 			`{"task_id":"tsk-1","task":{"metadata":{"name":"two-stage:score"}}}]`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/workflows/wfl-fail01":
+		_, _ = w.Write([]byte(`{"workflow_id":"wfl-fail01","task_ids":["tsk-f0","tsk-f1"],"status":"FAILED"}`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/tasks" && r.URL.Query().Get("workflow_id") == "wfl-fail01":
+		_, _ = w.Write([]byte(`[{"task_id":"tsk-f0","status":"DONE","error":null,"task":{"metadata":{"name":"wf:prep"}}},` +
+			`{"task_id":"tsk-f1","status":"FAILED","error":"python task failed: ValueError: boom","task":{"metadata":{"name":"wf:score"}}}]`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-f0":
+		_, _ = w.Write([]byte(`{"task_type":"echo"}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-0":
 		_, _ = w.Write([]byte(`{"task_type":"echo","items":[{"output":"x"}]}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-1":
@@ -439,5 +448,43 @@ func TestFleetOutputPrefixIsPerUser(t *testing.T) {
 	a, b := fleetOutputPrefix("u-a"), fleetOutputPrefix("u-b")
 	if a == b || a != "fleet-jobs/u-a/" {
 		t.Errorf("prefixes %q %q: want distinct, per-user, slash-terminated", a, b)
+	}
+}
+
+func TestFleetFirstFailure(t *testing.T) {
+	tasks := map[string]fleetTask{
+		"a": {Name: "prep", Status: "DONE"},
+		"b": {Name: "score", Status: "FAILED", Error: "python task failed: ValueError: boom"},
+		"c": {Name: "late", Status: "FAILED", Error: "upstream failed"},
+		"d": {Name: "quiet", Status: "FAILED"},
+	}
+	// Workflow order decides, not map order: the first failure is the cause,
+	// later ones are usually its consequence.
+	if step, msg := fleetFirstFailure([]string{"a", "d", "b", "c"}, tasks); step != "score" || msg != "python task failed: ValueError: boom" {
+		t.Errorf("first failure = %q %q, want score's own error", step, msg)
+	}
+	if step, msg := fleetFirstFailure([]string{"a"}, tasks); step != "" || msg != "" {
+		t.Errorf("no failure reported %q %q", step, msg)
+	}
+}
+
+func TestFleetFailedStepSaysWhy(t *testing.T) {
+	_, owner, _ := fleetTestSetup(t)
+	if code, job := fleetCallAPI(t, "POST", "/api/v1/me/fleet/jobs",
+		`{"workflow":"apiVersion: flowmesh/v1\nkind: Workflow\nmetadata: {name: will-fail}\nspec:\n  stages: []\n"}`, owner); code != http.StatusAccepted || job["id"] != "home:fm:wfl-fail01" {
+		t.Fatalf("run = %d %v", code, job)
+	}
+
+	code, st := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs/home:fm:wfl-fail01", "", owner)
+	if code != 200 || st["status"] != "failed" || st["failed_step"] != "score" || st["error"] != "python task failed: ValueError: boom" {
+		t.Fatalf("status = %d %v, want the failing step and its error", code, st)
+	}
+	code, res := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs/home:fm:wfl-fail01?view=result", "", owner)
+	outputs, _ := res["outputs"].([]any)
+	if code != 200 || len(outputs) != 2 {
+		t.Fatalf("result = %d %v", code, res)
+	}
+	if o, _ := outputs[1].(map[string]any); o["name"] != "score" || o["error"] != "python task failed: ValueError: boom" {
+		t.Errorf("failed step output = %v, want its error instead of 'result unavailable'", o)
 	}
 }

@@ -18,7 +18,7 @@ func TestStudyDefinitionStates(t *testing.T) {
 		t.Helper()
 		row := models.MeAppIntent{
 			ID: id, Action: "patch_experiment", UserSub: user, Status: status, Result: result,
-			Payload: `{"app":"python-study-e2e","experiment":"` + exp + `"}`,
+			Payload: `{"app":"python-study-e2e","experiment":"` + exp + `","loop":"score_graph"}`,
 		}
 		if err := db.Create(&row).Error; err != nil {
 			t.Fatal(err)
@@ -37,7 +37,8 @@ func TestStudyDefinitionStates(t *testing.T) {
 	if st["scale"].Status != "defining" {
 		t.Errorf("scale = %+v: the later pending definition supersedes the earlier failure", st["scale"])
 	}
-	if d := st["refused"]; d.Status != "failed" || d.Error != "loop 'score_graph' not locatable — refusing" {
+	if d := st["refused"]; d.Status != "failed" || d.Workflow != "score_graph" ||
+		d.Error != "loop 'score_graph' not locatable — refusing" {
 		t.Errorf("refused = %+v, want failed with the scheduler's reason", d)
 	}
 	if st["fine"].Status != "defined" {

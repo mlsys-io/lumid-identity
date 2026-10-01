@@ -21,6 +21,7 @@ const studyDefinitionWindow = 7 * 24 * time.Hour
 
 type studyDefinition struct {
 	ID       string    `json:"id"`
+	Workflow string    `json:"workflow,omitempty"`
 	Status   string    `json:"status"` // defining | failed | defined
 	Error    string    `json:"error,omitempty"`
 	IntentID string    `json:"intent_id"`
@@ -42,6 +43,7 @@ func studyDefinitionStates(userID, app string) map[string]studyDefinition {
 		var p struct {
 			App        string `json:"app"`
 			Experiment string `json:"experiment"`
+			Loop       string `json:"loop"`
 		}
 		if json.Unmarshal([]byte(r.Payload), &p) != nil || p.App != app || p.Experiment == "" {
 			continue
@@ -49,7 +51,7 @@ func studyDefinitionStates(userID, app string) map[string]studyDefinition {
 		if _, seen := out[p.Experiment]; seen {
 			continue // rows are newest first: the first one is the latest
 		}
-		d := studyDefinition{ID: p.Experiment, IntentID: r.ID, At: r.CreatedAt}
+		d := studyDefinition{ID: p.Experiment, Workflow: p.Loop, IntentID: r.ID, At: r.CreatedAt}
 		switch r.Status {
 		case "done":
 			d.Status = "defined"

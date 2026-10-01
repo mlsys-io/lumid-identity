@@ -186,6 +186,11 @@ func MeStudyDefine(c *gin.Context) {
 		Arms: b.Experiments, Criteria: b.Criteria, MinSamples: b.MinSamples, Baseline: b.Baseline,
 	}
 	workflows, readable := agentWorkflows(userID, agent)
+	for _, w := range workflows {
+		if w.Name == b.Workflow {
+			exp.computeGraph = computeGraphEngines[w.Engine.Type]
+		}
+	}
 	problems := validateExperimentShape(&exp)
 	// validateExperimentShape speaks the old words; say them in the new ones.
 	for i, p := range problems {

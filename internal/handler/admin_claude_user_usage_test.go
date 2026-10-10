@@ -36,6 +36,7 @@ func setupAdminClaudeUsageDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open mysql: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.User{}, &models.Token{}, &models.UsageEvent{}, &models.ClaudePoolWindow{}); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}

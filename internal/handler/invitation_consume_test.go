@@ -32,6 +32,7 @@ func inviteTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.InvitationCode{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

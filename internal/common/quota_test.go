@@ -34,6 +34,7 @@ func connectTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.UsageEvent{}, &models.ClaudePoolWindow{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

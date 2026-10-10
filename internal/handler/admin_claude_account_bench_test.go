@@ -40,6 +40,7 @@ func setupAccountBenchDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open mysql: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.ClaudeQuotaToken{}); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}

@@ -60,6 +60,7 @@ func setupLegacyDeleteDBs(t *testing.T) (*gorm.DB, *gorm.DB) {
 	if err != nil {
 		t.Fatalf("open mysql: %v", err)
 	}
+	releaseTestDBOnCleanup(t, admin)
 	for _, db := range []string{legacyTestIdentityDB, legacyTestLQADB} {
 		admin.Exec("DROP DATABASE IF EXISTS " + db)
 		if err := admin.Exec("CREATE DATABASE " + db).Error; err != nil {
@@ -71,6 +72,7 @@ func setupLegacyDeleteDBs(t *testing.T) (*gorm.DB, *gorm.DB) {
 	if err != nil {
 		t.Fatalf("open identity db: %v", err)
 	}
+	releaseTestDBOnCleanup(t, idb)
 	if err := idb.AutoMigrate(&models.User{}, &models.Session{}, &models.Token{},
 		&models.Identity{}, &models.PasswordReset{}, &models.UserAccessGrant{},
 		&models.OAuthCode{}, &models.SSHKey{}, &models.AuditLog{}); err != nil {
@@ -81,6 +83,7 @@ func setupLegacyDeleteDBs(t *testing.T) (*gorm.DB, *gorm.DB) {
 	if err != nil {
 		t.Fatalf("open lqa db: %v", err)
 	}
+	releaseTestDBOnCleanup(t, ldb)
 	// Column set mirrors what findUserOrMirror / introspectLegacyLQA read.
 	if err := ldb.Exec(`CREATE TABLE tbl_user (
 		id BIGINT AUTO_INCREMENT PRIMARY KEY,

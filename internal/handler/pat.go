@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -295,7 +296,23 @@ func patScopesColumn(scopes []string) string {
 	return strings.Join(scopes, " ")
 }
 
+// errPATUserNotFound — the user a PAT would be minted for does not exist.
+//
+// A PAT for a missing user is a live credential row that can never introspect
+// active, so every consumer answers it 401 and the caller reads that as an
+// auth bug. Measured 2026-10-10: scheduled quant-research cycles for 38 deleted
+// users were still minting lqt:strategy PATs on every fetch, and 2,317
+// backtests/week died `401 missing or invalid bearer` at the LQT gateway.
+var errPATUserNotFound = errors.New("user not found")
+
 func mintPATForUser(userID, name string, scopes []string, expiresAt *time.Time, source string) (string, *models.Token, error) {
+	var n int64
+	if err := common.DB.Model(&models.User{}).Where("id = ?", userID).Count(&n).Error; err != nil {
+		return "", nil, fmt.Errorf("user lookup: %s", err.Error())
+	}
+	if n == 0 {
+		return "", nil, errPATUserNotFound
+	}
 	// 32 bytes of entropy → 64 hex chars, prefixed lm_pat_live_.
 	raw, err := randHex(32)
 	if err != nil {

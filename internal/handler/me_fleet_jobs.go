@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -792,6 +793,12 @@ func fleetLogsView(c *gin.Context, id fleetJobID, bearer string) {
 	}
 	url := fmt.Sprintf("%s/api/v1/workflows/%s/logs?limit=%d", fleetSiteBase(id.Kind, id.Site), id.Native, limit)
 	b, code := fleetDo(c.Request.Context(), fleetCall{method: http.MethodGet, url: url, bearer: bearer})
+	if code == http.StatusNotFound {
+		if archived, found := fleetArchivedLogs(c, id, bearer, limit); found {
+			ok(c, "", gin.H{"id": id.String(), "logs": archived, "archived": true})
+			return
+		}
+	}
 	if code < 200 || code >= 300 {
 		failUpstream(c, code, b)
 		return
@@ -801,6 +808,77 @@ func fleetLogsView(c *gin.Context, id fleetJobID, bearer string) {
 		lines = string(b)
 	}
 	ok(c, "", gin.H{"id": id.String(), "logs": lines})
+}
+
+// fleetArchivedTaskMax bounds the per-task archive reads one logs view makes.
+const fleetArchivedTaskMax = 50
+
+// fleetArchivedLogs rebuilds a finished workflow's logs from its tasks' archived
+// logs.jsonl files. FlowMesh keeps the live workflow stream only
+// LOG_STREAM_TTL_SEC (an hour) after close and archives per task, never per
+// workflow, so without this every run's logs view 404s an hour after it ends.
+// Entries keep the live response's {entries:[{cursor, event}]} shape, ordered
+// by event time, newest `limit`.
+func fleetArchivedLogs(c *gin.Context, id fleetJobID, bearer string, limit int) (gin.H, bool) {
+	base := fleetSiteBase(id.Kind, id.Site)
+	tasks := fleetTaskListing(c, base, id.Native, bearer)
+	if len(tasks) == 0 {
+		return nil, false
+	}
+	taskIDs := make([]string, 0, len(tasks))
+	for t := range tasks {
+		taskIDs = append(taskIDs, t)
+	}
+	sort.Strings(taskIDs)
+	truncated := len(taskIDs) > fleetArchivedTaskMax
+	if truncated {
+		taskIDs = taskIDs[:fleetArchivedTaskMax]
+	}
+	type entry struct {
+		Cursor string         `json:"cursor"`
+		Event  map[string]any `json:"event"`
+	}
+	var entries []entry
+	found := false
+	for _, t := range taskIDs {
+		b, code := fleetDo(c.Request.Context(), fleetCall{
+			method: http.MethodGet, url: base + "/api/v1/results/" + url.PathEscape(t) + "/logs", bearer: bearer,
+		})
+		if code != http.StatusOK {
+			continue
+		}
+		found = true
+		for n, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			ev := map[string]any{}
+			if json.Unmarshal([]byte(line), &ev) != nil {
+				ev = map[string]any{"message": line, "level": "INFO", "stream": "system"}
+			}
+			if _, has := ev["task_id"]; !has {
+				ev["task_id"] = t
+			}
+			entries = append(entries, entry{Cursor: fmt.Sprintf("archived:%s:%d", t, n), Event: ev})
+		}
+	}
+	if !found {
+		return nil, false
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		ti, _ := entries[i].Event["ts"].(string)
+		tj, _ := entries[j].Event["ts"].(string)
+		return ti < tj
+	})
+	if len(entries) > limit {
+		entries = entries[len(entries)-limit:]
+	}
+	out := gin.H{"entries": entries}
+	if truncated {
+		out["truncated_tasks"] = len(tasks) - fleetArchivedTaskMax
+	}
+	return out, true
 }
 
 // fleetTraceView lists the FlowMesh workflows a Lumilake job dispatched, as

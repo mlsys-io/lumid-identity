@@ -117,6 +117,9 @@ func mintLQTStrategyPAT(userSub string) string {
 		"intent",
 	)
 	if err != nil {
+		// Said out loud: a silent miss here sends the cycle to the gateway with
+		// a fallback credential, and the 401 that comes back names nothing.
+		log.Printf("[lqt-strategy-pat] mint failed for %s: %v", userSub, err)
 		return ""
 	}
 	return tok

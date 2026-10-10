@@ -78,6 +78,7 @@ func TestCycleComputeJobsIsOwnerScoped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open mysql: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.MeAppRun{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

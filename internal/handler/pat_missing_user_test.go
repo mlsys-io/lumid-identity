@@ -23,6 +23,7 @@ func TestMintPATForUserRefusesMissingUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open mysql: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.User{}, &models.Token{}); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}

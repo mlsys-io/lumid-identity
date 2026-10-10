@@ -24,6 +24,7 @@ func setupLockDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open mysql: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	sqlDB, _ := db.DB()
 	sqlDB.SetMaxIdleConns(8)
 	sqlDB.SetMaxOpenConns(8)

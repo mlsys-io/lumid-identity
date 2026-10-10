@@ -163,6 +163,7 @@ func TestResetAllExecutesAgainstARealDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.ClaudePoolWindow{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

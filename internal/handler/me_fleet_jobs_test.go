@@ -277,6 +277,7 @@ func TestFleetFlowMeshRunGetResultLogsCancel(t *testing.T) {
 	if code != 200 || logs["logs"] == nil {
 		t.Fatalf("logs = %d %v", code, logs)
 	}
+	assertFleetLogsFallBackToTaskArchives(t, owner)
 
 	// Another user: 404, not 403 — no oracle for job ids.
 	if code, _ := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs/home:fm:wfl-abc123", "", other); code != 404 {
@@ -498,8 +499,10 @@ func TestFleetFailedStepSaysWhy(t *testing.T) {
 
 // FlowMesh drops a workflow's live log stream an hour after it closes and only
 // archives per task, so the logs view must rebuild from the task archives.
-func TestFleetLogsFallBackToTaskArchives(t *testing.T) {
-	_, owner, _ := fleetTestSetup(t)
+// Called from TestFleetFlowMeshRunGetResultLogsCancel: a test of its own would
+// open another MySQL pool and push CI past max_connections.
+func assertFleetLogsFallBackToTaskArchives(t *testing.T, owner string) {
+	t.Helper()
 	db := common.DB
 	var tok models.Token
 	if err := db.Where("lookup_key = ?", patLookupKey(owner)).First(&tok).Error; err != nil {

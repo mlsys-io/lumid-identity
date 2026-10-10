@@ -128,6 +128,13 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"task_type":"python","value":{"ok":1},"metrics":{"score":0.75}}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/workflows/wfl-abc123/logs":
 		_, _ = w.Write([]byte(`[{"message":"hello"}]`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/tasks" && r.URL.Query().Get("workflow_id") == "wfl-old001":
+		_, _ = w.Write([]byte(`[{"task_id":"tsk-o1","status":"FAILED"},{"task_id":"tsk-o0","status":"DONE"},{"task_id":"tsk-o2","status":"DONE"}]`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-o0/logs":
+		_, _ = w.Write([]byte(`{"ts":"2026-10-10T01:00:00Z","stream":"stdout","message":"prep ran"}` + "\n"))
+	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-o1/logs":
+		_, _ = w.Write([]byte(`{"ts":"2026-10-10T01:00:05Z","stream":"stdout","message":"PROBE-STDOUT hello"}` + "\n" +
+			`{"ts":"2026-10-10T01:00:06Z","stream":"stderr","message":"ValueError: boom"}` + "\n"))
 	case r.Method == "POST" && p == "/fm/home/api/v1/workflows/wfl-abc123/cancel":
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	case r.Method == "POST" && p == "/ll/office/api/v1/jobs":
@@ -486,5 +493,35 @@ func TestFleetFailedStepSaysWhy(t *testing.T) {
 	}
 	if o, _ := outputs[1].(map[string]any); o["name"] != "score" || o["error"] != "python task failed: ValueError: boom" {
 		t.Errorf("failed step output = %v, want its error instead of 'result unavailable'", o)
+	}
+}
+
+// FlowMesh drops a workflow's live log stream an hour after it closes and only
+// archives per task, so the logs view must rebuild from the task archives.
+func TestFleetLogsFallBackToTaskArchives(t *testing.T) {
+	_, owner, _ := fleetTestSetup(t)
+	db := common.DB
+	var tok models.Token
+	if err := db.Where("lookup_key = ?", patLookupKey(owner)).First(&tok).Error; err != nil {
+		t.Fatalf("owner token: %v", err)
+	}
+	if err := db.Create(&models.MeFleetJob{UserSub: tok.UserID, Site: "home", Kind: "fm", NativeID: "wfl-old001"}).Error; err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	t.Cleanup(func() { db.Where("native_id = ?", "wfl-old001").Delete(&models.MeFleetJob{}) })
+
+	code, res := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs/home:fm:wfl-old001?view=logs&limit=2", "", owner)
+	if code != 200 || res["archived"] != true {
+		t.Fatalf("logs = %d %v", code, res)
+	}
+	logs, _ := res["logs"].(map[string]any)
+	entries, _ := logs["entries"].([]any)
+	if len(entries) != 2 {
+		t.Fatalf("entries = %v, want the newest 2 of 3", entries)
+	}
+	first, _ := entries[0].(map[string]any)["event"].(map[string]any)
+	last, _ := entries[1].(map[string]any)["event"].(map[string]any)
+	if first["message"] != "PROBE-STDOUT hello" || last["message"] != "ValueError: boom" || last["task_id"] != "tsk-o1" {
+		t.Errorf("entries out of order or missing task ids: %v", entries)
 	}
 }

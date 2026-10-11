@@ -2995,8 +2995,9 @@ func withoutSupersededTools(defs []map[string]any) []map[string]any {
 // so an in-flight prompt that names one keeps working; they are only no longer
 // advertised (VERBS.md stage 2, "hide"). super_admin keeps the full catalog.
 var hostScopeTwins = map[string]string{
-	// Same-scope twins: both answer for the caller's tenant (the LumidOS bridge
-	// carries X-Lumid-Tenant-Sub). The agent_* name is canonical (GLOSSARY.md:
+	// Same-scope twins: both answer for the caller's tenant — natively, in
+	// me_agent_native_apps.go (NOT via the LumidOS bridge, which ignores the
+	// tenant header and runs as the operator). The agent_* name is canonical (GLOSSARY.md:
 	// the installable unit is an *agent*) and is the one Simple mode — the
 	// default surface — already advertises.
 	"list_apps":        "agent_list",
@@ -4473,6 +4474,11 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 			return map[string]any{"error": "this action requires explicit user approval, which was not granted on this request"}, false
 		}
 	}
+	// App read tools (+ install) answer natively, scoped to the caller —
+	// never through the operator-scoped LumidOS bridge (me_agent_native_apps.go).
+	if res, okRes, handled := nativeAppTool(c, userID, name, args); handled {
+		return res, okRes
+	}
 	switch name {
 	case "list_apps":
 		return toolListApps(userID), true
@@ -5617,6 +5623,15 @@ func dispatchTool(c *gin.Context, userID, role, name string, args map[string]any
 	// canonical name is normalized to its legacy app_* wire name first, since
 	// the schedule server still dispatches on app_*.
 	if lumidosToolNames[name] {
+		if !bridgeAllowed(role) {
+			// The bridge runs as the operator (see bridgeAllowed). Fail closed.
+			return map[string]any{
+				"error":     "tool " + name + " is not available in chat for your account",
+				"retryable": false,
+				"hint": "Use the tenant-scoped tools instead (agent_list, agent_install, " +
+					"agent_marketplace, workflow_get, workflow_run, knowledge_agents), or the Studio Library.",
+			}, false
+		}
 		return dispatchLumidosTool(userID, agentToolWireName(name), args)
 	}
 

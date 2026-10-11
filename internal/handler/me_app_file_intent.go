@@ -33,6 +33,7 @@ package handler
 // completed after it (that replaced the tree the write was applied to).
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -155,10 +156,23 @@ func appFilePathErrMsg(rel string) string {
 		"ui/<name>.yaml and .xpcloud.yaml are writable. Point the surface at a .ui/ file in the app config first."
 }
 
-// enqueueAppFileWrite queues the write and answers 202. Like MeLoopPatch it
-// makes no claim that the write landed — `saved:false`, poll the intent. `sha`
-// is what the file WILL hash to once applied, so the editor can chain its next
-// base_sha without a reload.
+// enqueueAppFileWrite queues the write, then waits (bounded) for the
+// scheduler's answer before responding.
+//
+// It used to answer 202 unconditionally the moment the row was inserted —
+// "saved:false, poll the intent" — which was honest only as long as SOME
+// picker build eventually completed the row. A picker with no dispatch case
+// for app_file_write marks it "failed" within one claim cycle, every single
+// time, and the 202 had already gone out promising a write that could never
+// land: the editor believed it saved, and the next GET 404'd. A write that is
+// going to fail generally fails fast (claim, dispatch, "unknown action"), so
+// awaiting it for up to readIntentDefaultTimeout turns that guaranteed-wrong
+// 202 into the real answer — 200 once it is actually done, or an error with
+// the scheduler's own message when it is not — while a picker that is merely
+// slow still gets today's 202/poll contract: unknown is not failure.
+//
+// `sha` is what the file WILL hash to once applied, so the editor can chain
+// its next base_sha without a reload, whichever response code comes back.
 func enqueueAppFileWrite(c *gin.Context, userSub, app, rel, op, content, baseSHA string) {
 	id, norm, err := queueAppFileWrite(userSub, app, rel, op, content, baseSHA)
 	if err != nil {
@@ -177,13 +191,78 @@ func enqueueAppFileWrite(c *gin.Context, userSub, app, rel, op, content, baseSHA
 	if op == "write" {
 		sha = contentSHA([]byte(content))
 	}
-	c.JSON(http.StatusAccepted, gin.H{
-		"ret_code": 0, "message": "queued",
+	queuedResp := func() {
+		c.JSON(http.StatusAccepted, gin.H{
+			"ret_code": 0, "message": "queued",
+			"data": gin.H{
+				"app": app, "path": norm, "intent_id": id, "status": "pending",
+				"queued": true, "saved": false, "sha": sha,
+			},
+		})
+	}
+
+	status, result, werr := awaitIntentResult(ginReqCtx(c), id, readIntentDefaultTimeout)
+	if werr != nil {
+		// Timed out or the request was cancelled: still genuinely unknown —
+		// the row is untouched and the picker may yet complete it. This is
+		// the one case where 202 remains the honest answer.
+		queuedResp()
+		return
+	}
+	// readIntentData parses the picker's {ok, data} / {ok:false, error}
+	// envelope on its own terms — it does not just trust the row's status
+	// string, so a row the picker marked "done" with ok:false (should not
+	// happen given InternalMeIntentResult, but this is the response that
+	// tells a caller whether their file actually changed) is still reported
+	// as a failure, not a save.
+	if _, perr := readIntentData(status, result); perr != nil {
+		fail(c, http.StatusBadGateway, 1502, "save failed: "+perr.Error())
+		return
+	}
+	// status == "done" and the envelope says ok:true: the overlay
+	// (appFileOverlays) now has this row.
+	c.JSON(http.StatusOK, gin.H{
+		"ret_code": 0, "message": "saved",
 		"data": gin.H{
-			"app": app, "path": norm, "intent_id": id, "status": "pending",
-			"queued": true, "saved": false, "sha": sha,
+			"app": app, "path": norm, "intent_id": id, "status": "done",
+			"queued": false, "saved": true, "sha": sha,
 		},
 	})
+}
+
+// awaitIntentResult polls an already-inserted intent row until the picker
+// marks it "done" or "failed", or ctx/timeout runs out first. Unlike
+// runReadIntent's doReadIntent, it never deletes the row: a write intent IS
+// the overlay's durable record (appFileOverlays later selects status="done"
+// rows by action+app), where a read intent is disposable bookkeeping.
+func awaitIntentResult(ctx context.Context, id string, timeout time.Duration) (status, result string, err error) {
+	if common.DB == nil {
+		return "", "", errors.New("no database")
+	}
+	if timeout <= 0 {
+		timeout = readIntentDefaultTimeout
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(readIntentPollEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		case <-deadline.C:
+			return "", "", errReadIntentTimeout
+		case <-tick.C:
+		}
+		var row models.MeAppIntent
+		if err := common.DB.Select("id", "status", "result").Where("id = ?", id).Take(&row).Error; err != nil {
+			continue // transient; the deadline bounds this
+		}
+		if row.Status != "done" && row.Status != "failed" {
+			continue
+		}
+		return row.Status, row.Result, nil
+	}
 }
 
 // queuedToolResult is the chat-tool twin of enqueueAppFileWrite's 202. It says

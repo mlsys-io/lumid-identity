@@ -51,6 +51,39 @@ func unavailableReason(appDir, what string) string {
 	if runtimeArtifactsReachable(appDir) {
 		return "" // readable and empty: the answer is honestly "nothing yet"
 	}
+	return unavailableSentence(what)
+}
+
+// cycleArtifactsReachable is runtimeArtifactsReachable narrowed to one
+// specific (loop, ts) cycle, instead of "does this app have ANY cycles
+// visible at all". An app can have one loop (or one site — a cloud-scheduled
+// "sweep") fully visible on this pod while a DIFFERENT loop, or a run the
+// on-prem scheduler produced, is not: the coarse, app-wide check cannot tell
+// those apart from the one being asked about, and called the second case
+// "genuinely empty" because the first case made data/cycles exist.
+func cycleArtifactsReachable(appDir, loop, ts string) bool {
+	if appDir == "" || loop == "" || ts == "" {
+		return false
+	}
+	p, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "cycles", loop, ts))
+	if _, err := os.Stat(p); err == nil {
+		return true
+	}
+	return false
+}
+
+// unavailableReasonForCycle is unavailableReason narrowed the same way: the
+// reason a caller asking about one specific run should get when THAT run's
+// directory is not visible here, even if the app has other cycles (another
+// loop, another site) that are.
+func unavailableReasonForCycle(appDir, loop, ts, what string) string {
+	if cycleArtifactsReachable(appDir, loop, ts) {
+		return ""
+	}
+	return unavailableSentence(what)
+}
+
+func unavailableSentence(what string) string {
 	return what + " is not available on this deployment: it lives in the app's " +
 		"cycle directory on the scheduler's volume, which this service does not " +
 		"mount. Run history and outputs are served from the run store instead; " +

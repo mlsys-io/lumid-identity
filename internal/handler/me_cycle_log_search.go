@@ -20,7 +20,10 @@ package handler
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -71,20 +74,153 @@ func MeCycleLogSearch(c *gin.Context) {
 	}
 
 	matches, capped := searchCycleLog(appDir, loop, ts, q, kind)
+	var unavailable string
+	if len(matches) == 0 {
+		// "no matches" and "the transcript is unreachable" are opposite answers
+		// and looked identical: one means your term is not there, the other
+		// means nothing was searched. Scope the reachability check to THIS
+		// (loop, ts) cycle, not "does this app have any cycles visible at all" —
+		// an app with some cycles visible (a different loop, a different site)
+		// can still be missing the one being asked about, and the coarse,
+		// app-wide check called that "genuinely empty" (200 with 0 matches for a
+		// run this pod never saw, indistinguishable from the term not being
+		// there).
+		if why := unavailableReasonForCycle(appDir, loop, ts, "the cycle transcript this searches"); why != "" {
+			// Before giving up: this may be the caller's OWN install, whose
+			// cycle dir lives on the scheduler (home/office k3s) rather than
+			// on this pod. MeCycleLog's conversation view already bridges that
+			// gap for the transcript via cycle_read; do the same here instead
+			// of reporting "unavailable" for a run the scheduler can actually
+			// produce. The journal/"stage" source is intentionally skipped —
+			// cycle_read only returns the one cycle dir's files, not the
+			// app-wide journal.jsonl (see cycleTranscriptViaScheduler).
+			if rm, rc, err, tried := searchCycleViaScheduler(ginReqCtx(c), userID, app, loop, ts, q, kind); tried {
+				switch {
+				case err == nil:
+					matches, capped = rm, rc
+					why = ""
+				case errors.Is(err, errCycleNotOnScheduler):
+					why = ""
+				default:
+					why = "the cycle transcript this searches could not be read from the scheduler: " + err.Error()
+				}
+			}
+			unavailable = why
+		}
+	}
 	resp := gin.H{
 		"app": app, "loop": loop, "ts": ts,
 		"q": q, "type": kind,
 		"matches": matches, "count": len(matches), "capped": capped,
 	}
-	if len(matches) == 0 {
-		// "no matches" and "the transcript is unreachable" are opposite answers
-		// and looked identical: one means your term is not there, the other
-		// means nothing was searched.
-		if why := unavailableReason(appDir, "the cycle transcript this searches"); why != "" {
-			resp["unavailable"] = why
-		}
+	if unavailable != "" {
+		resp["unavailable"] = unavailable
 	}
 	ok(c, "ok", resp)
+}
+
+// searchCycleViaScheduler is searchCycleLog's counterpart for a cycle this
+// pod cannot see on disk: it fetches the caller's own cycle dir from the
+// scheduler (the same bridge MeCycleLog's conversation view uses) and
+// searches the LLM transcript + step errors in memory. tried=false when the
+// app is not the caller's own scheduler-side install (an operator-shared
+// app, or genuinely absent everywhere), so the caller keeps its own
+// "not available" answer.
+func searchCycleViaScheduler(ctx context.Context, userID, app, loop, ts, q, kind string) (matches []searchMatch, capped bool, err error, tried bool) {
+	if _, direct, viaIntent, _ := ownerWriteTarget(userID, app); direct || !viaIntent || !safeSeg(loop) || !safeSeg(ts) {
+		return nil, false, nil, false
+	}
+	res, err := cycleFilesViaScheduler(ctx, userID, app, loop, ts, true)
+	if err != nil {
+		return nil, false, err, true
+	}
+	m, c := searchCycleFiles(res.files, q, kind)
+	return m, c, nil, true
+}
+
+// searchCycleFiles mirrors searchCycleLog's "llm" and "error" sources against
+// files already read into memory (e.g. fetched from the scheduler via
+// cycle_read) instead of this pod's disk. There is no "stage" source here:
+// the scheduler read returns only the one cycle dir's files, never the
+// app-wide journal.jsonl.
+func searchCycleFiles(files cycleFiles, q, kind string) ([]searchMatch, bool) {
+	needle := strings.ToLower(q)
+	matches := []searchMatch{}
+	idx := 0
+	capped := false
+	add := func(ts, event, field, full string) bool {
+		if len(matches) >= cycleSearchMatchCap {
+			capped = true
+			return false
+		}
+		matches = append(matches, searchMatch{
+			Ts: ts, Event: event, Field: field,
+			Snippet: searchSnippet(full, needle), Index: idx,
+		})
+		idx++
+		return true
+	}
+
+	wantLLM := kind == "" || kind == "llm"
+	wantError := kind == "" || kind == "error"
+
+	if wantLLM && !capped {
+		scanCycleFilesJSONL(files[".llm_conversation.jsonl"], func(r map[string]any) bool {
+			rts := asStr(r["ts"])
+			event := asStr(r["event"])
+			if event == "" {
+				event = "llm"
+			}
+			for _, field := range []string{"prompt", "response", "thinking", "skill"} {
+				v := asStr(r[field])
+				if v != "" && strings.Contains(strings.ToLower(v), needle) {
+					if !add(rts, event, field, v) {
+						return false
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	if wantError && !capped {
+		for _, se := range parseStepErrorsForSearch(files["step_errors.json"]) {
+			combined := se.Step + " " + se.Skill + " " + se.Error
+			if !strings.Contains(strings.ToLower(combined), needle) {
+				continue
+			}
+			full := se.Error
+			if full == "" {
+				full = se.Step
+			}
+			if !add(se.Ts, "error", "error", full) {
+				break
+			}
+		}
+	}
+	return matches, capped
+}
+
+// scanCycleFilesJSONL is scanCycleSearchJSONL for bytes already in memory.
+func scanCycleFilesJSONL(b []byte, fn func(map[string]any) bool) {
+	if len(b) == 0 {
+		return
+	}
+	sc := bufio.NewScanner(bytes.NewReader(b))
+	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			continue
+		}
+		var row map[string]any
+		if json.Unmarshal([]byte(line), &row) != nil {
+			continue
+		}
+		if !fn(row) {
+			return
+		}
+	}
 }
 
 // searchCycleLog greps one cycle's transcript + journal + step errors for q
@@ -223,6 +359,16 @@ type stepErrorSearch struct {
 func readStepErrorsForSearch(path string) []stepErrorSearch {
 	b, err := os.ReadFile(path)
 	if err != nil {
+		return nil
+	}
+	return parseStepErrorsForSearch(b)
+}
+
+// parseStepErrorsForSearch is readStepErrorsForSearch's parse half, usable on
+// bytes already in memory (the scheduler's cycle_read response) as well as a
+// file read off disk.
+func parseStepErrorsForSearch(b []byte) []stepErrorSearch {
+	if len(b) == 0 {
 		return nil
 	}
 	var arr []stepErrorSearch

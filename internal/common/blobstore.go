@@ -9,6 +9,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,16 @@ import (
 
 // Blobs is the global blobstore instance. nil = disabled (DB-only mode).
 var Blobs *BlobStore
+
+// ColdBlobs is the cold tier for session blobs: the NAS MinIO on tank that
+// turns idle for more than the cold cutoff are moved to (2026-10-19). Read
+// ONLY as a fallback when a key is missing from Blobs, and deleted alongside
+// it; never written by the request path. nil = no cold tier.
+var ColdBlobs *BlobStore
+
+// ErrNotFound is returned by Get when the object does not exist, so a caller
+// can tell "moved to the cold tier" apart from a transient store failure.
+var ErrNotFound = errors.New("blob not found")
 
 // BlobStore is a thin SigV4 S3 client for PUT/GET of gzip blobs.
 type BlobStore struct {
@@ -33,13 +44,28 @@ type BlobStore struct {
 	client *http.Client
 }
 
-// InitBlobStore reads S3_SESSIONS_* env vars and initialises Blobs.
+// InitBlobStore reads S3_SESSIONS_* env vars and initialises Blobs, and
+// S3_SESSIONS_COLD_* for the optional cold tier (ColdBlobs).
 // Called once from main before the HTTP server starts.
 func InitBlobStore() {
-	raw := os.Getenv("S3_SESSIONS_ENDPOINT")
-	if raw == "" {
+	Blobs = blobStoreFromEnv("S3_SESSIONS")
+	if Blobs == nil {
 		log.Print("blobstore: S3_SESSIONS_ENDPOINT not set — session blobs stored in DB")
 		return
+	}
+	log.Printf("blobstore: s3 enabled bucket=%s region=%s prefix=%s", Blobs.bucket, Blobs.region, Blobs.prefix)
+	ColdBlobs = blobStoreFromEnv("S3_SESSIONS_COLD")
+	if ColdBlobs != nil {
+		log.Printf("blobstore: cold tier enabled host=%s bucket=%s region=%s", ColdBlobs.host, ColdBlobs.bucket, ColdBlobs.region)
+	}
+}
+
+// blobStoreFromEnv builds a store from <env>_ENDPOINT/_REGION/_KEY/_SECRET/
+// _BUCKET, or returns nil when <env>_ENDPOINT is unset.
+func blobStoreFromEnv(env string) *BlobStore {
+	raw := os.Getenv(env + "_ENDPOINT")
+	if raw == "" {
+		return nil
 	}
 	scheme := "https"
 	host := strings.TrimPrefix(raw, "https://")
@@ -49,7 +75,7 @@ func InitBlobStore() {
 	}
 	host = strings.TrimRight(host, "/")
 
-	region := os.Getenv("S3_SESSIONS_REGION")
+	region := os.Getenv(env + "_REGION")
 	if region == "" {
 		// Extract region from UpCloud hostnames:
 		//   objectstorage.{region}.upcloudobjects.com → last segment before ".upcloudobjects.com"
@@ -66,17 +92,16 @@ func InitBlobStore() {
 		}
 	}
 
-	Blobs = &BlobStore{
+	return &BlobStore{
 		host:   host,
 		scheme: scheme,
 		region: region,
-		key:    os.Getenv("S3_SESSIONS_KEY"),
-		secret: os.Getenv("S3_SESSIONS_SECRET"),
-		bucket: os.Getenv("S3_SESSIONS_BUCKET"),
+		key:    os.Getenv(env + "_KEY"),
+		secret: os.Getenv(env + "_SECRET"),
+		bucket: os.Getenv(env + "_BUCKET"),
 		prefix: "claude-sessions/",
 		client: &http.Client{Timeout: 30 * time.Second},
 	}
-	log.Printf("blobstore: s3 enabled bucket=%s region=%s prefix=%s", Blobs.bucket, region, Blobs.prefix)
 }
 
 // TurnBlobKey returns the S3 key prefix for a given conv_key + turn_index.
@@ -203,7 +228,7 @@ func (b *BlobStore) s3get(objKey string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 404 {
-		return nil, fmt.Errorf("not found: %s", objKey)
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, objKey)
 	}
 	if resp.StatusCode >= 300 {
 		rb, _ := io.ReadAll(resp.Body)

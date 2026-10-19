@@ -1,6 +1,7 @@
 package common
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -135,5 +136,39 @@ func TestPutArchiveUsesArchivePrefixNotSessionPrefix(t *testing.T) {
 	}
 	if !strings.Contains(gotPath, "claude-sessions/") {
 		t.Errorf("Put path = %q, want the claude-sessions/ prefix", gotPath)
+	}
+}
+
+// The cold-tier fallback hinges on telling "object is not here" apart from a
+// failing store: only the former means "look in the cold tier".
+func TestGetMissingIsErrNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	if _, err := testBlobStore(t, srv).Get("conv/0/response.gz"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("404 Get err = %v, want ErrNotFound", err)
+	}
+
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer broken.Close()
+	if _, err := testBlobStore(t, broken).Get("conv/0/response.gz"); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("503 Get err = %v, want a non-ErrNotFound error", err)
+	}
+}
+
+func TestBlobStoreFromEnvCold(t *testing.T) {
+	if b := blobStoreFromEnv("S3_TEST_UNSET"); b != nil {
+		t.Fatalf("unset endpoint should give nil store, got %+v", b)
+	}
+	t.Setenv("S3_TEST_COLD_ENDPOINT", "http://100.115.66.10:5105/")
+	t.Setenv("S3_TEST_COLD_REGION", "us-east-1")
+	t.Setenv("S3_TEST_COLD_BUCKET", "claude-sessions")
+	b := blobStoreFromEnv("S3_TEST_COLD")
+	if b == nil || b.scheme != "http" || b.host != "100.115.66.10:5105" || b.region != "us-east-1" ||
+		b.bucket != "claude-sessions" || b.prefix != "claude-sessions/" {
+		t.Fatalf("cold store parsed wrong: %+v", b)
 	}
 }

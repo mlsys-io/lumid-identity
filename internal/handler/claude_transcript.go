@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -551,9 +552,14 @@ func putTurnBlobs(blobKey string, metaJSON, deltaJSON, response json.RawMessage)
 
 // getTurnBlobs retrieves the three gzip blobs from S3 and returns
 // (requestMetaJSON, newMessagesJSON, responseJSON). Each may be nil on error.
+// A blob missing from the hot store is read from the cold tier (ColdBlobs),
+// where turns of sessions idle past the cold cutoff were moved.
 func getTurnBlobs(blobKey string) (meta, msgs, resp []byte) {
 	fetch := func(suffix string) []byte {
 		raw, err := common.Blobs.Get(blobKey + "/" + suffix)
+		if errors.Is(err, common.ErrNotFound) && common.ColdBlobs != nil {
+			raw, err = common.ColdBlobs.Get(blobKey + "/" + suffix)
+		}
 		if err != nil {
 			log.Printf("blobstore: get %s/%s: %v", blobKey, suffix, err)
 			return nil
@@ -568,12 +574,20 @@ func getTurnBlobs(blobKey string) (meta, msgs, resp []byte) {
 // caller can tell an incomplete erasure from a clean one instead of assuming
 // success — this is the exact gap that let DELETE /claude-sessions/:conv
 // remove only the DB index while leaving the real content behind in S3.
+// The cold tier is erased too: a turn lives in exactly one of the two stores,
+// and Delete treats the other's 404 as success.
 func deleteTurnBlobs(blobKey string) int {
 	failed := 0
 	for _, suffix := range []string{"request_meta.gz", "new_messages.gz", "response.gz"} {
-		if err := common.Blobs.Delete(blobKey + "/" + suffix); err != nil {
-			log.Printf("blobstore: delete %s/%s: %v", blobKey, suffix, err)
-			failed++
+		for _, store := range []*common.BlobStore{common.Blobs, common.ColdBlobs} {
+			if store == nil {
+				continue
+			}
+			if err := store.Delete(blobKey + "/" + suffix); err != nil {
+				log.Printf("blobstore: delete %s/%s: %v", blobKey, suffix, err)
+				failed++
+				break
+			}
 		}
 	}
 	return failed

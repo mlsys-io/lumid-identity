@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -14,6 +16,13 @@ import (
 
 func main() {
 	cfgPath := flag.String("c", "configs/identity.yaml", "path to config yaml")
+	// One-shot mode for the monthly CronJob: move idle sessions' recording
+	// blobs to the cold tier, then exit. See handler/claude_sessions_cold_sweep.go.
+	sweepCold := flag.Bool("sweep-cold-sessions", false, "move idle Claude session blobs to the cold tier and exit")
+	coldAfter := flag.Duration("cold-after", 30*24*time.Hour, "with -sweep-cold-sessions: idle age that makes a session cold")
+	sweepWorkers := flag.Int("sweep-workers", 16, "with -sweep-cold-sessions: sessions moved concurrently")
+	sweepLimit := flag.Int("sweep-limit", 0, "with -sweep-cold-sessions: max sessions this run (0 = all)")
+	sweepDryRun := flag.Bool("sweep-dry-run", false, "with -sweep-cold-sessions: count only")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -23,6 +32,18 @@ func main() {
 
 	if err := common.OpenDB(cfg); err != nil {
 		log.Fatalf("open db: %v", err)
+	}
+	if *sweepCold {
+		// Deliberately before AutoMigrate and every loop below: a batch run
+		// must not migrate the schema or start the server's background work.
+		common.InitBlobStore()
+		if _, err := handler.SweepColdSessions(handler.ColdSweepOptions{
+			ColdAfter: *coldAfter, Workers: *sweepWorkers, Limit: *sweepLimit, DryRun: *sweepDryRun,
+		}); err != nil {
+			log.Printf("cold sweep FAILED: %v", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if err := models.AutoMigrate(common.DB); err != nil {
 		log.Fatalf("automigrate: %v", err)

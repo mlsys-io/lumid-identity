@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ type fakeS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	deletes []string
+	corrupt bool // GET returns altered bytes (verification-failure tests)
 }
 
 func newFakeS3(t *testing.T) (*fakeS3, *httptest.Server) {
@@ -29,7 +31,13 @@ func newFakeS3(t *testing.T) (*fakeS3, *httptest.Server) {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
+			if f.corrupt {
+				b = append(append([]byte{}, b...), 'x')
+			}
 			w.Write(b)
+		case http.MethodPut:
+			b, _ := io.ReadAll(r.Body)
+			f.objects[r.URL.Path] = b
 		case http.MethodDelete:
 			f.deletes = append(f.deletes, r.URL.Path)
 			if _, ok := f.objects[r.URL.Path]; !ok {

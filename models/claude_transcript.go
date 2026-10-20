@@ -54,6 +54,11 @@ type ClaudeSession struct {
 	ToolUseCount  int       `gorm:"column:tool_use_count;not null;default:0"                   json:"tool_use_count"`
 	FirstTs       time.Time `gorm:"column:first_ts"                                            json:"first_ts"`
 	LastTs        time.Time `gorm:"column:last_ts;index:idx_csess_user_last,priority:2"        json:"last_ts"`
+	// ColdAt is when the cold sweep last moved this session's blobs to the cold
+	// tier. A session is swept again only if it resumed afterwards
+	// (last_ts > cold_at), so a monthly run touches new idle sessions, not every
+	// session ever moved. NULL = never swept.
+	ColdAt *time.Time `gorm:"column:cold_at" json:"cold_at,omitempty"`
 }
 
 func (ClaudeSession) TableName() string { return "claude_sessions" }

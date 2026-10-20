@@ -14,7 +14,8 @@ package handler
 // every object of a session verified are that session's hot keys deleted, and
 // only those exact keys — never a prefix — so a session that resumes mid-sweep
 // keeps its new turns in the hot store. Re-running is safe: a hot 404 whose
-// cold copy exists counts as already moved.
+// cold copy exists counts as already moved. A session that finished cleanly is
+// stamped cold_at and skipped by later runs unless it resumes (last_ts > cold_at).
 
 import (
 	"bytes"
@@ -63,6 +64,7 @@ func SweepColdSessions(opt ColdSweepOptions) (ColdSweepStats, error) {
 
 	q := common.DB.Model(&models.ClaudeSession{}).
 		Where("last_ts < ?", cutoff).
+		Where("cold_at IS NULL OR cold_at < last_ts").
 		Where("EXISTS (SELECT 1 FROM claude_session_turns t WHERE t.conv_key = claude_sessions.conv_key AND t.blob_key <> '')").
 		Order("last_ts")
 	if opt.Limit > 0 {
@@ -135,8 +137,8 @@ func moveSessionToCold(conv string) (moved bool, objects, nbytes int64, err erro
 			data, err := common.Blobs.Get(rel)
 			if errors.Is(err, common.ErrNotFound) {
 				// Not in hot: fine only if the cold tier already holds it.
-				if _, cerr := common.ColdBlobs.Get(rel); cerr != nil {
-					return false, objects, nbytes, fmt.Errorf("%s missing from both tiers: %v", rel, cerr)
+				if ok, cerr := common.ColdBlobs.Exists(rel); cerr != nil || !ok {
+					return false, objects, nbytes, fmt.Errorf("%s missing from both tiers (cold err: %v)", rel, cerr)
 				}
 				continue
 			}
@@ -164,6 +166,13 @@ func moveSessionToCold(conv string) (moved bool, objects, nbytes int64, err erro
 			// space; the next run sees both and deletes it again.
 			return true, objects, nbytes, fmt.Errorf("hot delete %s: %w", rel, err)
 		}
+	}
+	now := time.Now().UTC()
+	if err := common.DB.Model(&models.ClaudeSession{}).Where("conv_key = ?", conv).
+		Update("cold_at", now).Error; err != nil {
+		// The move itself is complete; only the skip marker is missing, so the
+		// next run re-checks this session cheaply (hot 404 + cold HEAD).
+		return len(toDelete) > 0, objects, nbytes, fmt.Errorf("stamp cold_at: %w", err)
 	}
 	return len(toDelete) > 0, objects, nbytes, nil
 }

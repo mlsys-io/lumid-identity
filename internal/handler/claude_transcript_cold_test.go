@@ -35,6 +35,10 @@ func newFakeS3(t *testing.T) (*fakeS3, *httptest.Server) {
 				b = append(append([]byte{}, b...), 'x')
 			}
 			w.Write(b)
+		case http.MethodHead:
+			if _, ok := f.objects[r.URL.Path]; !ok {
+				w.WriteHeader(http.StatusNotFound)
+			}
 		case http.MethodPut:
 			b, _ := io.ReadAll(r.Body)
 			f.objects[r.URL.Path] = b

@@ -120,6 +120,26 @@ func (b *BlobStore) Get(relKey string) ([]byte, error) {
 	return b.s3get(b.prefix + relKey)
 }
 
+// Exists reports whether claude-sessions/{relKey} is present (HEAD, no body).
+func (b *BlobStore) Exists(relKey string) (bool, error) {
+	req, err := b.signedRequest("HEAD", b.prefix+relKey, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == 404:
+		return false, nil
+	case resp.StatusCode >= 300:
+		return false, fmt.Errorf("s3 HEAD %s: %d", relKey, resp.StatusCode)
+	}
+	return true, nil
+}
+
 // Delete removes claude-sessions/{relKey}. A missing object is not an error —
 // S3 DELETE is idempotent (204/404 both mean "gone"), and the caller (session
 // deletion) must not fail just because a blob was already removed or never

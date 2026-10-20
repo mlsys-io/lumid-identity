@@ -100,9 +100,26 @@ func TestColdSweepMovesIdleSessionsOnly(t *testing.T) {
 		t.Fatalf("moved turn does not read back: %q", resp)
 	}
 
+	// A clean run stamps cold_at, so the next run does not revisit the session.
+	st, err = SweepColdSessions(ColdSweepOptions{ColdAfter: 30 * 24 * time.Hour, Workers: 2})
+	if err != nil || st.Sessions != 0 {
+		t.Fatalf("re-run = %+v, %v; want the swept session skipped", st, err)
+	}
+
+	// Without the marker (e.g. moved by hand), a re-run finds it already cold
+	// via hot 404 + cold HEAD and stamps it.
+	db.Model(&models.ClaudeSession{}).Where("conv_key = ?", "sweepold000000000000000000000001").Update("cold_at", nil)
 	st, err = SweepColdSessions(ColdSweepOptions{ColdAfter: 30 * 24 * time.Hour, Workers: 2})
 	if err != nil || st.AlreadyCold != 1 || st.Moved != 0 {
-		t.Fatalf("re-run = %+v, %v; want one already-cold session and no error", st, err)
+		t.Fatalf("unmarked re-run = %+v, %v; want one already-cold session and no error", st, err)
+	}
+
+	// A session that resumed after its move (last_ts > cold_at) is swept again.
+	db.Model(&models.ClaudeSession{}).Where("conv_key = ?", "sweepold000000000000000000000001").
+		Update("cold_at", time.Now().Add(-50*24*time.Hour))
+	st, err = SweepColdSessions(ColdSweepOptions{ColdAfter: 30 * 24 * time.Hour, Workers: 2})
+	if err != nil || st.Sessions != 1 {
+		t.Fatalf("resumed re-run = %+v, %v; want the session revisited", st, err)
 	}
 }
 

@@ -248,7 +248,33 @@ func appFileOverlays(userSub, app string) map[string]appFileOverlayEntry {
 		Where("user_sub = ? AND action IN ? AND status = ?", userSub, []string{"install", "update"}, "done").
 		Order("completed_at desc").Limit(200).
 		Find(&resets).Error
-	return overlaysFromIntents(writes, resets, app)
+	out := overlaysFromIntents(writes, resets, app)
+	// A spec overlay is only "what the user last saved" until the install moves
+	// on without them. patch_experiment, experiment_control, app_update and the
+	// operator's bulk tenant refresh all rewrite .xpcloud.yaml on the
+	// scheduler's disk and re-echo it to me_app_specs — but only an
+	// install/update INTENT row resets an overlay above, and none of those
+	// leave one. So the overlay outlived the file it described: the YAML
+	// editor and Manage kept serving a 10-06 save (a custom loop, no study
+	// binding) for a tenant whose install had since gained the binding and
+	// then, on 10-10, lost both to an update (LQ-20261006-04/-05). Every save
+	// from that editor carried a stale base_sha and conflicted, forever.
+	// The echo is written before the write's intent completes, so a write's own
+	// echo never supersedes it; only a LATER change to the install does.
+	if e, ok := out[appFileSpecRel]; ok {
+		if st := storedAppSpec(userSub, app); st != nil && specEchoSupersedes(e.At, st.UpdatedAt) {
+			delete(out, appFileSpecRel)
+		}
+	}
+	return out
+}
+
+// specEchoSupersedes reports whether an echoed install spec (me_app_specs,
+// stamped echoAt) is newer than an applied spec write (completed writeAt) —
+// i.e. the scheduler changed the file after the write landed, so the write's
+// bytes no longer describe the install.
+func specEchoSupersedes(writeAt, echoAt time.Time) bool {
+	return !echoAt.IsZero() && echoAt.After(writeAt)
 }
 
 // overlaysFromIntents is the precedence decision, split from the queries so it

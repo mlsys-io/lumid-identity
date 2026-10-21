@@ -713,8 +713,15 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 		if covered[app] {
 			continue
 		}
-		spec, ok := fetchRepoSpecYAML(userID, app)
-		if !ok {
+		// The SAME spec the config editor and Manage read (readAppSpecBytes):
+		// the user's applied save, else the install's echoed spec, else the
+		// published one. This read only the PUBLISHED spec, so a loop the user
+		// added to their own install was listed in Manage, ran, and appeared
+		// in global Runs — yet the Workflows page and the New-study picker
+		// showed only the 13 shipped loops, and the run's deep link fell back
+		// to another workflow (LQ-20261006-04).
+		spec := readAppSpecBytes(userID, app, "")
+		if len(spec) == 0 {
 			continue
 		}
 		loops, err := readYamlLoopsBytes(spec)

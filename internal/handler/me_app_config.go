@@ -103,7 +103,9 @@ const configMaxBytes = 64 * 1024 // 64 KB — xpcloud.yaml is always small
 //     see me_app_file_intent.go) — without it the editor would reload the
 //     published spec and show the user their save had vanished;
 //  2. the spec in appDir (tenant tree, operator-shared, or materialised bundle);
-//  3. the caller's xp.io repo (cross-node fallback, see fetchRepoSpecYAML).
+//  3. the installed spec the scheduler echoed (me_app_specs) — what a
+//     materialised appDir would have overlaid, for callers that pass none;
+//  4. the caller's xp.io repo (cross-node fallback, see fetchRepoSpecYAML).
 //
 // nil when none has it.
 func readAppSpecBytes(userID, app, appDir string) []byte {
@@ -114,6 +116,11 @@ func readAppSpecBytes(userID, app, appDir string) []byte {
 	if appDir != "" {
 		if yamlPath, _ := ResolveSpecPath(appDir); yamlPath != "" {
 			b, _ = os.ReadFile(yamlPath)
+		}
+	}
+	if len(b) == 0 {
+		if st := storedAppSpec(userID, app); st != nil {
+			b = []byte(st.SpecYAML)
 		}
 	}
 	if len(b) == 0 {

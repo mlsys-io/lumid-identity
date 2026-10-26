@@ -56,8 +56,9 @@ func main() {
 	if err := handler.EnsureDefaultClaudePool(common.DB); err != nil {
 		log.Fatalf("seed default claude pool: %v", err)
 	}
-	if err := common.OpenRedis(cfg); err != nil {
-		log.Fatalf("open redis: %v", err)
+	if err := common.OpenRedis(cfg, 30*time.Second); err != nil {
+		// Not fatal: login/introspection don't need Redis and the client reconnects lazily.
+		log.Printf("WARN redis unreachable at startup (%v); continuing degraded — OTP/cool-downs fail until it returns, rate limits fail open", err)
 	}
 	if err := common.LoadKeys(cfg); err != nil {
 		log.Fatalf("load signing keys: %v", err)

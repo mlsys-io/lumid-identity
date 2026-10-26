@@ -52,6 +52,8 @@ func meCORS() gin.HandlerFunc {
 // shadow each other.
 func Register(r *gin.Engine) {
 	r.GET("/healthz", Healthz)
+	r.GET("/livez", Livez)
+	r.GET("/readyz", Readyz)
 	r.GET("/version", Version)
 
 	// OIDC / OAuth2 — the cross-subsystem contract

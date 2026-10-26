@@ -51,6 +51,8 @@ func meCORS() gin.HandlerFunc {
 // routing deterministically and we don't use wildcards that could
 // shadow each other.
 func Register(r *gin.Engine) {
+	// First, so it bounds every route registered below (health probes are exempt inside).
+	r.Use(MaxInFlight(maxInFlightFromEnv()))
 	r.GET("/healthz", Healthz)
 	r.GET("/livez", Livez)
 	r.GET("/readyz", Readyz)

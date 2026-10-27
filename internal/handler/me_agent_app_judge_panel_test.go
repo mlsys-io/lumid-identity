@@ -210,7 +210,7 @@ func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
 	// identity still counts it against the window at claudeWeightNonClaude
 	// (poolCapApplies is unconditional and ClaudePoolUsage has no model
 	// filter), so admitting it here does not hide its spend.
-	permitted := map[string]bool{"deepseek-v4-flash": true, "qwen3.8-27b": true}
+	permitted := map[string]bool{"deepseek-v4.1-flash": true, "qwen3.8-27b": true}
 	for _, p := range llmProviders {
 		rest, ok := strings.CutPrefix(p.upstreamModel, "lumid-llm/")
 		if !ok {
@@ -218,7 +218,7 @@ func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
 		}
 		if !permitted[rest] {
 			t.Errorf("provider %q routes in-house at %q, but claude-proxy forwards only "+
-				"deepseek-v4-flash/qwen3.8-27b among non-Anthropic models in this lane — "+
+				"deepseek-v4.1-flash/qwen3.8-27b among non-Anthropic models in this lane — "+
 				"every call through it is refused for all roles",
 				p.id, rest)
 		}

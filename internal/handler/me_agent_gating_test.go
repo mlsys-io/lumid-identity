@@ -132,11 +132,11 @@ func TestFirstToolCapableProvider(t *testing.T) {
 		role   string
 		wantID string
 	}{
-		// deepseek-v4-flash is in-house on our own GPUs — the default for
+		// deepseek-v4.1-flash is in-house on our own GPUs — the default for
 		// everyone. The METERED lanes (qwen, Claude) are the ones behind admin.
-		{"user", "deepseek-v4-flash"},
-		{"admin", "deepseek-v4-flash"},
-		{"super_admin", "deepseek-v4-flash"},
+		{"user", "deepseek-v4.1-flash"},
+		{"admin", "deepseek-v4.1-flash"},
+		{"super_admin", "deepseek-v4.1-flash"},
 	}
 	for _, c := range cases {
 		t.Run(c.role, func(t *testing.T) {
@@ -162,7 +162,7 @@ func TestProviderAllowed(t *testing.T) {
 	var gemma, sonnet, opus, fable llmProvider
 	for _, p := range llmProviders {
 		switch p.id {
-		case "deepseek-v4-flash":
+		case "deepseek-v4.1-flash":
 			gemma = p
 		case "claude-code-sonnet":
 			sonnet = p
@@ -173,7 +173,7 @@ func TestProviderAllowed(t *testing.T) {
 		}
 	}
 	if gemma.id == "" || sonnet.id == "" || opus.id == "" || fable.id == "" {
-		t.Fatalf("expected deepseek-v4-flash + claude-code-{sonnet,opus,fable} in llmProviders")
+		t.Fatalf("expected deepseek-v4.1-flash + claude-code-{sonnet,opus,fable} in llmProviders")
 	}
 
 	cases := []struct {
@@ -270,5 +270,13 @@ func TestRunDispatchNeedsAsk(t *testing.T) {
 		if destructiveTools[name] {
 			t.Errorf("%q must stay OUT of destructiveTools: non-interactive callers would be blocked", name)
 		}
+	}
+}
+
+// deepseek-v4-flash was retired 2026-10-27; saved selections must still land on
+// the in-house chip (now deepseek-v4.1-flash) instead of erroring.
+func TestRetiredDeepseekV4IDResolvesToV41(t *testing.T) {
+	if got := modelIDAliases["deepseek-v4-flash"]; got != "deepseek-v4.1-flash" {
+		t.Fatalf(`modelIDAliases["deepseek-v4-flash"] = %q`, got)
 	}
 }

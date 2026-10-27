@@ -933,10 +933,12 @@ var llmProviders = []llmProvider{
 		// loudly: LUMID_LLM_BACKENDS is an allowlist but unknown ids fall through
 		// to the OpenRouter catch-all, so a stale value here silently bills
 		// OpenRouter and can return an empty completion instead of erroring.
-		id:                  "deepseek-v4-flash",
-		displayName:         "DeepSeek-V4-Flash (Chat · Lumid GPU)",
+		// 2026-10-27: DeepSeek-V4-Flash RETIRED -> DeepSeek-V4.1-Flash (vLLM TP4
+		// on NUS s0's 4x H200, 1M ctx). The old id resolves via modelIDAliases.
+		id:                  "deepseek-v4.1-flash",
+		displayName:         "DeepSeek-V4.1-Flash (Chat · Lumid GPU)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "deepseek-v4-flash",
+		upstreamModel:       "deepseek-v4.1-flash",
 		authHeader:          "Authorization",
 		authPrefix:          "Bearer ",
 		keyFn:               kvrunPAT,
@@ -1088,9 +1090,9 @@ var llmProviders = []llmProvider{
 		// could never answer. deepseek-v4-flash is the in-house model this lane
 		// was reaching for, and it is the one claude-proxy allows.
 		id:                "claude-code-qwen35",
-		displayName:       "DeepSeek-V4-Flash (Code · Lumid GPU)",
+		displayName:       "DeepSeek-V4.1-Flash (Code · Lumid GPU)",
 		endpoint:          "",
-		upstreamModel:     "lumid-llm/deepseek-v4-flash",
+		upstreamModel:     "lumid-llm/deepseek-v4.1-flash",
 		authHeader:        "",
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
@@ -1831,7 +1833,9 @@ func resolveProvider(modelID, role string) llmProvider {
 var modelIDAliases = map[string]string{
 	// Gemma-4 was retired long ago; the id outlived it because personas persist
 	// it. Upstream moved Gemma-4 -> Qwen3.8-27B -> DeepSeek-V4-Flash.
-	"kvrun-gemma4": "deepseek-v4-flash",
+	"kvrun-gemma4": "deepseek-v4.1-flash",
+	// deepseek-v4-flash retired 2026-10-27; saved chats/personas still name it.
+	"deepseek-v4-flash": "deepseek-v4.1-flash",
 }
 
 // providerByID finds a provider by exact id, then by alias. Exact first, so an
@@ -3231,9 +3235,9 @@ func buildToolDefs() []map[string]any {
 					"experiment":    map[string]any{"type": "string", "description": "id of an EXISTING experiment (list_experiments shows them)"},
 					"arm":           map[string]any{"type": "string", "description": "arm id, slug-shaped (e.g. panel_median3). An existing id REPLACES that arm."},
 					"description":   map[string]any{"type": "string", "description": "what this arm changes, in one line"},
-					"analyst_model": map[string]any{"type": "string", "description": "model that PRODUCES the answer. A gateway alias (deepseek-v4-flash), or lumilake:<site>:<huggingface-id> to run it on a GPU site."},
+					"analyst_model": map[string]any{"type": "string", "description": "model that PRODUCES the answer. A gateway alias (deepseek-v4.1-flash), or lumilake:<site>:<huggingface-id> to run it on a GPU site."},
 					"judge_model":   map[string]any{"type": "string", "description": "model that SCORES it"},
-					"judge_panel":   map[string]any{"type": "string", "description": "comma-separated judge seats, e.g. 'deepseek-v4-flash,qwen3.8-27b'. The panel is the instrument — changing it between arms makes them incomparable."},
+					"judge_panel":   map[string]any{"type": "string", "description": "comma-separated judge seats, e.g. 'deepseek-v4.1-flash,qwen3.8-27b'. The panel is the instrument — changing it between arms makes them incomparable."},
 					"config":        map[string]any{"type": "string", "description": "JSON object of any other arm keys, for apps that are not model-shaped (e.g. {\"prompt_variant\": \"cards_v2\"})"},
 				},
 				"required": []string{"app", "experiment", "arm"},

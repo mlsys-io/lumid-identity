@@ -428,7 +428,10 @@ func ClassifyProvider(model string) LlmProvider {
 	if strings.HasPrefix(m, "claude-") {
 		return ProviderClaude
 	}
-	if m == "deepseek-v4-flash" {
+	// deepseek-v4.1-flash (NUS s0 H200s) replaced deepseek-v4-flash on
+	// 2026-10-27. The retired id stays on-prem so historical usage rows keep
+	// their classification.
+	if m == "deepseek-v4.1-flash" || m == "deepseek-v4-flash" {
 		return ProviderOnPrem
 	}
 	// THAT DAY ARRIVED 2026-08-27 and all three edits moved together, as the

@@ -571,7 +571,7 @@ func AdminClaudePoolUpdate(c *gin.Context) {
 		               LIMIT  10`, id).Scan(&stranded)
 		if len(stranded) > 0 {
 			resp["warning"] = fmt.Sprintf(
-				"on-prem denied for %d role=user member(s) (%s) — their claude-sonnet/haiku is rewritten to deepseek-v4-flash before the model gate and pooled Sonnet is admin-only, so they now have NO usable model. Raise their role, move them to another pool, or re-enable on-prem.",
+				"on-prem denied for %d role=user member(s) (%s) — their claude-sonnet/haiku is rewritten to deepseek-v4.1-flash before the model gate and pooled Sonnet is admin-only, so they now have NO usable model. Raise their role, move them to another pool, or re-enable on-prem.",
 				len(stranded), strings.Join(stranded, ", "))
 		}
 	}

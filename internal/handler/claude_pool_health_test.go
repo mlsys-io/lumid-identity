@@ -29,7 +29,7 @@ func TestSnapshotIsExhausted(t *testing.T) {
 			"healthy on both windows",
 			&models.ClaudeQuotaSnapshot{
 				Ts: now, FiveHourPct: 15, SevenDayPct: 40,
-				FiveHourReset: now.Add(2 * time.Hour), SevenDayReset: now.Add(3 * 24 * time.Hour),
+				FiveHourReset: models.ResetPtr(now.Add(2 * time.Hour)), SevenDayReset: models.ResetPtr(now.Add(3 * 24 * time.Hour)),
 			},
 			false,
 		},
@@ -37,7 +37,7 @@ func TestSnapshotIsExhausted(t *testing.T) {
 			"7d at 98%, reset still in the future — exhausted (this is ac5's live shape)",
 			&models.ClaudeQuotaSnapshot{
 				Ts: now, FiveHourPct: 0, SevenDayPct: 98,
-				FiveHourReset: now.Add(2 * time.Hour), SevenDayReset: now.Add(20 * time.Hour),
+				FiveHourReset: models.ResetPtr(now.Add(2 * time.Hour)), SevenDayReset: models.ResetPtr(now.Add(20 * time.Hour)),
 			},
 			true,
 		},
@@ -45,7 +45,7 @@ func TestSnapshotIsExhausted(t *testing.T) {
 			"7d was 98% but the reset already passed — window rolled, no longer exhausted",
 			&models.ClaudeQuotaSnapshot{
 				Ts: now.Add(-6 * time.Minute), FiveHourPct: 0, SevenDayPct: 98,
-				FiveHourReset: now.Add(2 * time.Hour), SevenDayReset: now.Add(-time.Minute),
+				FiveHourReset: models.ResetPtr(now.Add(2 * time.Hour)), SevenDayReset: models.ResetPtr(now.Add(-time.Minute)),
 			},
 			false,
 		},

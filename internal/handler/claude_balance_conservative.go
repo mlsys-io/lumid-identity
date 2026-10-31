@@ -114,11 +114,31 @@ func expiringFirstOrder(rows []models.ClaudeQuotaToken) ([]string, bool) {
 		case !okj:
 			return true
 		}
-		if !si.SevenDayReset.Equal(sj.SevenDayReset) {
-			return si.SevenDayReset.Before(sj.SevenDayReset)
+		// Reset columns are nullable (NULL ⇒ unknown). A row can now EXIST with
+		// NULL resets — the probe returned utilization but no reset header — and
+		// that is the same "unknown" this function already sorts LAST for a
+		// missing row. Do not let ResetAt's zero fallback decide it: the zero
+		// instant is the smallest possible time, so a naive compare puts the
+		// account whose reset we know NOTHING about at the head of the queue and
+		// spends the use-it-or-lose-it budget on it first, ahead of an account
+		// with 48 hours left. Unknown stays last, exactly as documented above.
+		i7, j7 := models.ResetAt(si.SevenDayReset), models.ResetAt(sj.SevenDayReset)
+		switch {
+		case i7.IsZero() && !j7.IsZero():
+			return false // i's reset unknown → after j
+		case !i7.IsZero() && j7.IsZero():
+			return true // j's reset unknown → after i
+		case !i7.Equal(j7):
+			return i7.Before(j7)
 		}
-		if !si.FiveHourReset.Equal(sj.FiveHourReset) {
-			return si.FiveHourReset.Before(sj.FiveHourReset)
+		i5, j5 := models.ResetAt(si.FiveHourReset), models.ResetAt(sj.FiveHourReset)
+		switch {
+		case i5.IsZero() && !j5.IsZero():
+			return false
+		case !i5.IsZero() && j5.IsZero():
+			return true
+		case !i5.Equal(j5):
+			return i5.Before(j5)
 		}
 		return pos[out[i]] < pos[out[j]]
 	})

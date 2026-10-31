@@ -114,11 +114,13 @@ func expiringFirstOrder(rows []models.ClaudeQuotaToken) ([]string, bool) {
 		case !okj:
 			return true
 		}
-		if !si.SevenDayReset.Equal(sj.SevenDayReset) {
-			return si.SevenDayReset.Before(sj.SevenDayReset)
+		// Reset columns are nullable (NULL ⇒ unknown), so compare through
+		// ResetAt rather than dereferencing.
+		if i7, j7 := models.ResetAt(si.SevenDayReset), models.ResetAt(sj.SevenDayReset); !i7.Equal(j7) {
+			return i7.Before(j7)
 		}
-		if !si.FiveHourReset.Equal(sj.FiveHourReset) {
-			return si.FiveHourReset.Before(sj.FiveHourReset)
+		if i5, j5 := models.ResetAt(si.FiveHourReset), models.ResetAt(sj.FiveHourReset); !i5.Equal(j5) {
+			return i5.Before(j5)
 		}
 		return pos[out[i]] < pos[out[j]]
 	})

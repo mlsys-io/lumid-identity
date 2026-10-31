@@ -35,18 +35,18 @@ func TestExhaustedSnapshotStillTrue(t *testing.T) {
 		},
 		{
 			name: "ac9 shape: 7d spent, reset days away",
-			snap: &models.ClaudeQuotaSnapshot{SevenDayPct: 98, SevenDayReset: future},
+			snap: &models.ClaudeQuotaSnapshot{SevenDayPct: 98, SevenDayReset: models.ResetPtr(future)},
 			want: true,
 			why:  "this is the row ac9@yao.lu was re-probed ~90 times to re-read before it was revoked",
 		},
 		{
 			name: "5h spent, reset ahead",
-			snap: &models.ClaudeQuotaSnapshot{FiveHourPct: 99.5, FiveHourReset: future},
+			snap: &models.ClaudeQuotaSnapshot{FiveHourPct: 99.5, FiveHourReset: models.ResetPtr(future)},
 			want: true,
 		},
 		{
 			name: "spent but the window already rolled",
-			snap: &models.ClaudeQuotaSnapshot{SevenDayPct: 100, SevenDayReset: past},
+			snap: &models.ClaudeQuotaSnapshot{SevenDayPct: 100, SevenDayReset: models.ResetPtr(past)},
 			want: false,
 			why:  "the reset passed, so the old number says nothing — go find out what is true now",
 		},
@@ -58,18 +58,18 @@ func TestExhaustedSnapshotStillTrue(t *testing.T) {
 		},
 		{
 			name: "healthy account is always probeable",
-			snap: &models.ClaudeQuotaSnapshot{FiveHourPct: 10, SevenDayPct: 40, FiveHourReset: future, SevenDayReset: future},
+			snap: &models.ClaudeQuotaSnapshot{FiveHourPct: 10, SevenDayPct: 40, FiveHourReset: models.ResetPtr(future), SevenDayReset: models.ResetPtr(future)},
 			want: false,
 		},
 		{
 			name: "just under the lease exclusion is not exhausted",
-			snap: &models.ClaudeQuotaSnapshot{SevenDayPct: leaseExhaustPct - 0.1, SevenDayReset: future},
+			snap: &models.ClaudeQuotaSnapshot{SevenDayPct: leaseExhaustPct - 0.1, SevenDayReset: models.ResetPtr(future)},
 			want: false,
 			why:  "the account can still be leased, so its quota must stay fresh for routing",
 		},
 		{
 			name: "idle-but-warning ac9 (7d=98 exactly) is at the boundary and suppressed",
-			snap: &models.ClaudeQuotaSnapshot{FiveHourPct: 0, SevenDayPct: leaseExhaustPct, SevenDayReset: future},
+			snap: &models.ClaudeQuotaSnapshot{FiveHourPct: 0, SevenDayPct: leaseExhaustPct, SevenDayReset: models.ResetPtr(future)},
 			want: true,
 		},
 	}
@@ -87,7 +87,7 @@ func TestExhaustedSnapshotStillTrue(t *testing.T) {
 // the reset the account becomes probeable again, with no other state involved.
 func TestExhaustedSuppressionEndsExactlyAtReset(t *testing.T) {
 	reset := time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)
-	snap := &models.ClaudeQuotaSnapshot{SevenDayPct: 98, SevenDayReset: reset}
+	snap := &models.ClaudeQuotaSnapshot{SevenDayPct: 98, SevenDayReset: models.ResetPtr(reset)}
 
 	if !exhaustedSnapshotStillTrue(snap, reset.Add(-time.Second)) {
 		t.Fatal("must still be suppressed one second before the reset")

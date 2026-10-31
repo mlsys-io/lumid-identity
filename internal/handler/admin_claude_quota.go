@@ -664,11 +664,14 @@ func fetchClaudeUsage(token string) (*models.ClaudeQuotaSnapshot, error) {
 	if u, err := strconv.ParseFloat(get("anthropic-ratelimit-unified-7d-utilization"), 64); err == nil {
 		snap.SevenDayPct = u * 100
 	}
+	// An absent or unparsable reset header leaves these nil → NULL in the row.
+	// Do NOT fall back to time.Time{}: that is '0000-00-00', which MySQL rejects
+	// (Error 1292) and which took the whole snapshot down with it.
 	if ts, err := strconv.ParseInt(get("anthropic-ratelimit-unified-5h-reset"), 10, 64); err == nil {
-		snap.FiveHourReset = time.Unix(ts, 0)
+		snap.FiveHourReset = models.ResetPtr(time.Unix(ts, 0))
 	}
 	if ts, err := strconv.ParseInt(get("anthropic-ratelimit-unified-7d-reset"), 10, 64); err == nil {
-		snap.SevenDayReset = time.Unix(ts, 0)
+		snap.SevenDayReset = models.ResetPtr(time.Unix(ts, 0))
 	}
 
 	fiveStatus := get("anthropic-ratelimit-unified-5h-status")
@@ -698,14 +701,14 @@ func fetchClaudeUsage(token string) (*models.ClaudeQuotaSnapshot, error) {
 			Percent:  int(snap.FiveHourPct),
 			IsActive: true,
 			Severity: severityFromStatus(fiveStatus, snap.FiveHourPct),
-			ResetsAt: snap.FiveHourReset.Format(time.RFC3339),
+			ResetsAt: models.ResetAt(snap.FiveHourReset).Format(time.RFC3339),
 		},
 		{
 			Kind:     "seven_day",
 			Percent:  int(snap.SevenDayPct),
 			IsActive: true,
 			Severity: severityFromStatus(sevenStatus, snap.SevenDayPct),
-			ResetsAt: snap.SevenDayReset.Format(time.RFC3339),
+			ResetsAt: models.ResetAt(snap.SevenDayReset).Format(time.RFC3339),
 		},
 	}
 	raw, _ := json.Marshal(map[string]interface{}{
@@ -885,8 +888,8 @@ func fillFromSnap(res *quotaResult, snap *models.ClaudeQuotaSnapshot) {
 	res.Ts = snap.Ts
 	res.FiveHourPct = snap.FiveHourPct
 	res.SevenDayPct = snap.SevenDayPct
-	res.FiveHourReset = snap.FiveHourReset
-	res.SevenDayReset = snap.SevenDayReset
+	res.FiveHourReset = models.ResetAt(snap.FiveHourReset)
+	res.SevenDayReset = models.ResetAt(snap.SevenDayReset)
 	res.Severity = snap.Severity
 	if snap.Raw != "" {
 		var raw map[string]json.RawMessage
@@ -941,8 +944,8 @@ func AdminClaudeQuota(c *gin.Context) {
 			// the true post-reset number (the fresh snapshot gets a future
 			// reset and caches normally again).
 			now := time.Now()
-			resetPassed := (!snap.FiveHourReset.IsZero() && now.After(snap.FiveHourReset)) ||
-				(!snap.SevenDayReset.IsZero() && now.After(snap.SevenDayReset))
+			r5, r7 := models.ResetAt(snap.FiveHourReset), models.ResetAt(snap.SevenDayReset)
+			resetPassed := (!r5.IsZero() && now.After(r5)) || (!r7.IsZero() && now.After(r7))
 			cacheHit := snapErr == nil && time.Since(snap.Ts) < quotaCacheTTL && !resetPassed
 
 			if cacheHit {
@@ -1919,8 +1922,8 @@ func InternalClaudeTokenLease(c *gin.Context) {
 			// origin change. `hrw < pull` selects a pull-sized stable subset,
 			// and because hrw is fixed per (user, account) the same users move
 			// first every time rather than the assignment churning.
-			if !s.SevenDayReset.IsZero() && s.SevenDayPct < resetBiasMaxPct {
-				hrsLeft := time.Until(s.SevenDayReset).Hours()
+			if r7 := models.ResetAt(s.SevenDayReset); !r7.IsZero() && s.SevenDayPct < resetBiasMaxPct {
+				hrsLeft := time.Until(r7).Hours()
 				if hrsLeft < 0 {
 					hrsLeft = 0
 				}
@@ -1938,14 +1941,14 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// Legacy ordering (no user_sub): soonest 7d reset first. Key = seconds
 		// until the 7d window resets (due-now → 0 → highest priority), with the
 		// 5h reset as a sub-second tiebreaker that can never override it.
-		if !s.SevenDayReset.IsZero() {
-			r7 := time.Until(s.SevenDayReset).Seconds()
+		if sd := models.ResetAt(s.SevenDayReset); !sd.IsZero() {
+			r7 := time.Until(sd).Seconds()
 			if r7 < 0 {
 				r7 = 0
 			}
 			r5 := 0.0
-			if !s.FiveHourReset.IsZero() {
-				if v := time.Until(s.FiveHourReset).Seconds(); v > 0 {
+			if fh := models.ResetAt(s.FiveHourReset); !fh.IsZero() {
+				if v := time.Until(fh).Seconds(); v > 0 {
 					r5 = v
 				}
 			}
@@ -2754,10 +2757,10 @@ func InternalClaudeQuotaReport(c *gin.Context) {
 		Raw:         body.Raw,
 	}
 	if t, err := time.Parse(time.RFC3339, body.FiveHourReset); err == nil {
-		snap.FiveHourReset = t
+		snap.FiveHourReset = models.ResetPtr(t)
 	}
 	if t, err := time.Parse(time.RFC3339, body.SevenDayReset); err == nil {
-		snap.SevenDayReset = t
+		snap.SevenDayReset = models.ResetPtr(t)
 	}
 	if err := common.DB.Create(&snap).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "insert snapshot: "+err.Error())
@@ -3109,8 +3112,9 @@ func exhaustedSnapshotStillTrue(snap *models.ClaudeQuotaSnapshot, now time.Time)
 	if snap == nil {
 		return false
 	}
-	spent := func(pct float64, reset time.Time) bool {
-		return pct >= leaseExhaustPct && !reset.IsZero() && reset.After(now)
+	spent := func(pct float64, reset *time.Time) bool {
+		r := models.ResetAt(reset)
+		return pct >= leaseExhaustPct && !r.IsZero() && r.After(now)
 	}
 	return spent(snap.FiveHourPct, snap.FiveHourReset) ||
 		spent(snap.SevenDayPct, snap.SevenDayReset)
@@ -3159,8 +3163,8 @@ func sweepStaleSnapshots() {
 		}
 		var snap models.ClaudeQuotaSnapshot
 		if common.DB.Where("email = ?", row.Email).Order("ts DESC").First(&snap).Error == nil {
-			resetPassed := (!snap.FiveHourReset.IsZero() && now.After(snap.FiveHourReset)) ||
-				(!snap.SevenDayReset.IsZero() && now.After(snap.SevenDayReset))
+			r5, r7 := models.ResetAt(snap.FiveHourReset), models.ResetAt(snap.SevenDayReset)
+			resetPassed := (!r5.IsZero() && now.After(r5)) || (!r7.IsZero() && now.After(r7))
 			// Known out of quota, window not yet rolled: the answer cannot have
 			// changed, so do not go ask for it again.
 			if exhaustedSnapshotStillTrue(&snap, now) {

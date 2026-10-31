@@ -190,10 +190,18 @@ type ClaudeQuotaSnapshot struct {
 	Email string    `gorm:"column:email;size:255;index:idx_cqs_email_ts,priority:1;not null" json:"email"`
 	Ts    time.Time `gorm:"column:ts;index:idx_cqs_email_ts,priority:2;autoCreateTime"       json:"ts"`
 	// Active window summary
-	FiveHourPct   float64   `gorm:"column:five_hour_pct;not null;default:0"  json:"five_hour_pct"`
-	SevenDayPct   float64   `gorm:"column:seven_day_pct;not null;default:0"  json:"seven_day_pct"`
-	FiveHourReset time.Time `gorm:"column:five_hour_reset"  json:"five_hour_reset"`
-	SevenDayReset time.Time `gorm:"column:seven_day_reset"  json:"seven_day_reset"`
+	FiveHourPct float64 `gorm:"column:five_hour_pct;not null;default:0"  json:"five_hour_pct"`
+	SevenDayPct float64 `gorm:"column:seven_day_pct;not null;default:0"  json:"seven_day_pct"`
+	// POINTERS DELIBERATELY (2026-10-31). Anthropic omits the -reset headers on
+	// some responses, so "we don't know when it resets" is a real state and NULL
+	// is how it is stored. As a bare time.Time, GORM wrote the Go zero value,
+	// which MySQL rendered as '0000-00-00' and rejected under NO_ZERO_DATE +
+	// STRICT_TRANS_TABLES — Error 1292 killed EVERY snapshot row whose probe
+	// lacked a reset header, so the quota dashboard silently stopped updating
+	// instead of recording partial data. nil ⇒ NULL ⇒ unknown; callers that used
+	// to test !IsZero() must use resetTime() to stay nil-safe.
+	FiveHourReset *time.Time `gorm:"column:five_hour_reset;default:null"  json:"five_hour_reset,omitempty"`
+	SevenDayReset *time.Time `gorm:"column:seven_day_reset;default:null"  json:"seven_day_reset,omitempty"`
 	// Active severity (normal / warning / critical)
 	Severity string `gorm:"column:severity;size:16;not null;default:'normal'" json:"severity"`
 	// Full raw payload for debugging / dashboard enrichment
@@ -201,3 +209,23 @@ type ClaudeQuotaSnapshot struct {
 }
 
 func (ClaudeQuotaSnapshot) TableName() string { return "claude_quota_snapshots" }
+
+// ResetAt dereferences a nullable reset column, giving the zero time.Time for
+// NULL. Read sites use this so a snapshot with an unknown reset behaves exactly
+// as it did when the column was a bare time.Time — the difference is only that
+// the unknown is now storable.
+func ResetAt(p *time.Time) time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	return *p
+}
+
+// ResetPtr is the inverse, for building a snapshot: a zero time.Time becomes
+// nil so it persists as NULL rather than '0000-00-00'.
+func ResetPtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}

@@ -92,7 +92,7 @@ func seedDoomedAccount(t *testing.T, db *gorm.DB, email string) {
 		// time, and these columns are NOT NULL-able datetimes.
 		if err := db.Create(&models.ClaudeQuotaSnapshot{
 			Email: email, Ts: now.Add(-time.Duration(i+1) * time.Hour), SevenDayPct: 40,
-			FiveHourReset: now.Add(time.Hour), SevenDayReset: now.Add(72 * time.Hour),
+			FiveHourReset: models.ResetPtr(now.Add(time.Hour)), SevenDayReset: models.ResetPtr(now.Add(72 * time.Hour)),
 		}).Error; err != nil {
 			t.Fatalf("seed snapshot: %v", err)
 		}

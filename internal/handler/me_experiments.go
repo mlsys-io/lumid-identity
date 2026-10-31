@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,17 @@ type expManifest struct {
 		Steps []struct {
 			Experiment expRef `yaml:"experiment"`
 		} `yaml:"steps"`
+		// The loop's OWN metric declaration. A command-engine loop commonly
+		// names its primary metric here and attaches no experiment at all
+		// (measured 2026-10-30, `qa_custom_analyze_20261030`:
+		// `metrics: {primary: strategies_analyzed}` + `engine.experiment:` on
+		// a study that was never published). The runner reads exactly this
+		// key when it decides what to record as `primary_metric`, so it is
+		// the authoritative name for anything that loop emits — ignoring it
+		// made every such run resolve no metric and read as unmeasured.
+		Metrics struct {
+			Primary string `yaml:"primary"`
+		} `yaml:"metrics"`
 	} `yaml:"loops"`
 }
 
@@ -355,6 +367,12 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			"n_results", "variants", "best_variant", "baseline_value",
 			"delta", "delta_pp", "criteria_met", "criteria_reason",
 			"verdict", "updated_at", "metric", "higher_is_better",
+			// The ROW COUNTS evaluate() already computes. They were written
+			// into state.json since the drop was made countable and were then
+			// dropped here, so the UI's "N of M rows" chip (it reads
+			// n_rows_total/rows_dropped) could never render and the API
+			// answered null for a fact it had in hand.
+			"n_rows_total", "rows_dropped", "rows_out_of_scope",
 			// Instrument/definition honesty, written by experiments.evaluate():
 			// `comparable:false` means the ranking was withheld because the arms
 			// were measured under different instruments — the client must not
@@ -384,7 +402,7 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 		}
 		markStaleState(row, &d, st)
 		markUnfed(row, &d, loops[d.ID])
-		markStarved(row, userSub, app, loops[d.ID])
+		markStarved(row, userSub, app, specMetricName(&d), loops[d.ID])
 		markUndispatched(row, &d, loops[d.ID])
 		out = append(out, row)
 	}
@@ -401,7 +419,7 @@ func markUnfed(row gin.H, d *expDecl, feeding []string) {
 	if len(feeding) > 0 || len(d.Dispatch) > 0 {
 		return
 	}
-	if n, _ := row["n_results"].(int); n != 0 {
+	if rowNResults(row) != 0 {
 		return
 	}
 	// Its OWN field, not n_zero_reason: that one means "rows exist but none
@@ -412,6 +430,29 @@ func markUnfed(row gin.H, d *expDecl, feeding []string) {
 
 // starvedRunWindow is how many of a feeding loop's newest runs markStarved reads.
 const starvedRunWindow = 5
+
+// rowNResults reads a row's result count as written by either path.
+//
+// The disk/self-reported path fills it from json.Unmarshal into map[string]any,
+// where every number is a float64; only expStateFromRuns builds an int. Every
+// zero-marker therefore asserted `.(int)` and got (0, false) for the real
+// shape — the "this experiment has results, say nothing" guard never fired, so
+// a study with hundreds of rows and no feeding loop was labelled `unfed`.
+func rowNResults(row gin.H) int {
+	switch n := row["n_results"].(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return 0
+}
 
 // markStarved explains a zero-row experiment that a loop DOES feed, but whose
 // feeding loops either never ran or failed every recent run. markUnfed covers
@@ -431,7 +472,7 @@ func markUndispatched(row gin.H, d *expDecl, feeding []string) {
 	if lp, _ := d.Dispatch["loop"].(string); strings.TrimSpace(lp) != "" {
 		return // fed through that loop; its runs are what explain a zero
 	}
-	if n, _ := row["n_results"].(int); n != 0 {
+	if rowNResults(row) != 0 {
 		return
 	}
 	reason := "it runs only when dispatched, and nothing has dispatched it yet"
@@ -442,11 +483,11 @@ func markUndispatched(row gin.H, d *expDecl, feeding []string) {
 	row["starved_reason"] = reason
 }
 
-func markStarved(row gin.H, userSub, app string, feeding []string) {
+func markStarved(row gin.H, userSub, app, metricName string, feeding []string) {
 	if len(feeding) == 0 || userSub == "" || app == "" || common.DB == nil {
 		return
 	}
-	if n, _ := row["n_results"].(int); n != 0 {
+	if rowNResults(row) != 0 {
 		return
 	}
 	var runs []models.MeAppRun
@@ -458,7 +499,105 @@ func markStarved(row gin.H, userSub, app string, feeding []string) {
 	if starved, reason := starvedReason(runs, feeding); starved {
 		row["starved"] = true
 		row["starved_reason"] = reason
+		return
 	}
+	// A run succeeded, so `starved` is silent — correctly, the loop is not the
+	// fault. But an experiment can still have no rows after a healthy run, and
+	// that is the one zero the card could not describe.
+	markUnrecorded(row, runs, feeding, metricName)
+}
+
+// markUnrecorded explains the zero that no other marker covers: the feeding
+// loop ran and SUCCEEDED, the experiment's state was then recomputed, and the
+// ledger is still empty.
+//
+// Measured 2026-10-30 against production: study `qa_custom_coverage_20261030`
+// stayed at 0 results across two successful runs of
+// `qa_custom_analyze_20261030`, while each run's own recorded blob carried
+// `"strategies_analyzed": 3` and `primary_metric:
+// {name: strategies_analyzed, value: 3}`. The state was written at
+// 14:29:24.047 — the same instant as the run — so this was not a stale
+// snapshot: evaluate() genuinely found an EMPTY ledger. The module
+// (commands/analyze.py) never calls experiments.record_result, so no row was
+// ever appended, and state then emitted `n_zero_reason: null` — which the card
+// renders as "Declared, no results yet", i.e. exactly the generic message the
+// regression report rejects.
+//
+// The distinguishing evidence is all server-side, so this is decided here
+// rather than guessed in the UI:
+//
+//   - n_results == 0 and metric_keys_seen empty  → the ledger has no rows at
+//     all (not "rows that lack the metric"; that zero already has a reason)
+//   - the newest feeding run is ok               → the loop itself worked
+//   - state_updated_at is at/after that run      → evaluate() had already seen
+//     the ledger as of that run, so the emptiness is post-run, not staleness
+func markUnrecorded(row gin.H, runs []models.MeAppRun, feeding []string, metricName string) {
+	if metricName == "" || len(runs) == 0 || !runs[0].Ok {
+		return
+	}
+	if keys, ok := row["metric_keys_seen"].([]any); ok && len(keys) > 0 {
+		return // rows exist; their zero is n_zero_reason's to explain
+	}
+	if keys, ok := row["metric_keys_seen"].([]string); ok && len(keys) > 0 {
+		return
+	}
+	// Any existing reason wins: state_stale and the SDK's own n_zero_reason
+	// describe a sharper fact than this one.
+	if s, _ := row["n_zero_reason"].(string); strings.TrimSpace(s) != "" {
+		return
+	}
+	when, ok := stateUpdatedAt(row)
+	if !ok {
+		// No state at all → evaluate() has never run for this study, which is
+		// genuinely "not yet", not "ran and recorded nothing".
+		return
+	}
+	runAt := time.Unix(int64(runs[0].RunTs), 0).UTC()
+	// evaluate() runs AFTER the cycle it summarises, so the state must be at
+	// or after the run. In practice it can land a second EARLIER — the live
+	// row for this study has state 14:29:23Z against run 14:29:24Z, because
+	// the run timestamp is stamped at cycle close while state is written from
+	// evaluate()'s own clock — so a minute of slack, not zero.
+	if when.Add(time.Minute).Before(runAt) {
+		return
+	}
+	loop := runs[0].Loop
+	whenTxt := runAt.Format(time.RFC3339)
+	reason := fmt.Sprintf(
+		"%s ran successfully at %s but recorded no result row for this study",
+		loop, whenTxt)
+	if v := metricFromBlob(runs[0].Metrics, metricName); v != nil {
+		reason += fmt.Sprintf(
+			" — its own output carries %s=%s, so the measurement exists and the study cannot see it.",
+			metricName, strconv.FormatFloat(*v, 'f', -1, 64))
+		reason += fmt.Sprintf(
+			" A study collects rows only from loops that call experiments.record_result(); %s does not.",
+			loop)
+	} else {
+		reason += fmt.Sprintf(
+			" and its output carries no %s, so this loop does not compute the declared metric.", metricName)
+	}
+	row["n_zero_reason"] = reason
+	// Its own flag so the badge can say WHICH zero this is: n_zero_reason
+	// otherwise renders as "metric mismatch", and this one is not a mismatch —
+	// the declared name is right, the loop just never records a row.
+	row["unrecorded"] = true
+}
+
+// stateUpdatedAt parses the state's own computation timestamp. The blob's
+// `updated_at` is evaluate()'s own clock and comes first; `state_updated_at`
+// is the transport stamp identity adds (or copies) and is the fallback.
+func stateUpdatedAt(row gin.H) (time.Time, bool) {
+	for _, k := range []string{"updated_at", "state_updated_at"} {
+		s, _ := row[k].(string)
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 // starvedReason is markStarved's decision, split out so it is testable
@@ -820,7 +959,7 @@ func MeAppExperiments(c *gin.Context) {
 						row[k] = v
 					}
 				}
-				markStarved(row, userID, app, loops[d.ID])
+				markStarved(row, userID, app, mname, loops[d.ID])
 				markUndispatched(row, &d, loops[d.ID])
 				exps = append(exps, row)
 			}

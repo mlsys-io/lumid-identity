@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -200,6 +201,12 @@ func loopMetricNameFrom(m expManifest, loop string) string {
 	for _, l := range m.Loops {
 		if l.Name != loop {
 			continue
+		}
+		// The loop's own `metrics.primary` outranks the experiment's metric:
+		// it is the name the RUNNER records under `primary_metric`, so it is
+		// the one guaranteed to be present in this loop's own output.
+		if s := strings.TrimSpace(l.Metrics.Primary); s != "" {
+			return s
 		}
 		ids := append([]string{}, l.Engine.Experiment...)
 		for _, st := range l.Steps {

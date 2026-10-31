@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 
 	"lumid_identity/models"
 )
@@ -39,9 +42,46 @@ func TestStarvedReason(t *testing.T) {
 
 func TestMarkStarvedSkipsRowsWithResults(t *testing.T) {
 	row := map[string]any{"n_results": 3}
-	markStarved(row, "sub", "app", []string{"l"})
+	markStarved(row, "sub", "app", "m", []string{"l"})
 	if _, has := row["starved"]; has {
 		t.Fatal("an experiment with results is not starved")
+	}
+}
+
+// Every marker's "this one has results, say nothing" guard read n_results as
+// an int. The state blob is json.Unmarshal'ed into map[string]any, where the
+// number is a float64 — so the guard never fired on the shape production
+// actually sends, and a study with hundreds of rows and no feeding loop was
+// labelled unfed.
+func TestZeroMarkersReadNResultsFromTheStateShape(t *testing.T) {
+	for name, n := range map[string]any{
+		"float64 (disk/self-report shape)": float64(350),
+		"int (expStateFromRuns shape)":     int(350),
+		"json.Number":                      json.Number("350"),
+		"absent":                           nil,
+	} {
+		want := 0
+		if n != nil {
+			want = 350
+		}
+		row := gin.H{"n_results": n}
+		if got := rowNResults(row); got != want {
+			t.Errorf("%s: rowNResults = %d, want %d", name, got, want)
+		}
+	}
+
+	row := gin.H{"n_results": float64(350)}
+	markUnfed(row, &expDecl{}, nil)
+	if _, has := row["unfed"]; has {
+		t.Error("350 rows read as unfed — the guard is still dead for the real shape")
+	}
+	markUndispatched(row, &expDecl{Dispatch: map[string]any{"ask": "q"}}, nil)
+	if _, has := row["starved"]; has {
+		t.Error("350 rows read as undispatched")
+	}
+	markStarved(row, "sub", "app", "m", []string{"l"})
+	if _, has := row["starved"]; has {
+		t.Error("350 rows read as starved")
 	}
 }
 

@@ -214,6 +214,12 @@ func (ClaudeQuotaSnapshot) TableName() string { return "claude_quota_snapshots" 
 // NULL. Read sites use this so a snapshot with an unknown reset behaves exactly
 // as it did when the column was a bare time.Time — the difference is only that
 // the unknown is now storable.
+//
+// TEST VIA THIS, NEVER VIA `p == nil`. Rows written before the column was
+// nullable carry '0000-00-00', which the driver scans as a NON-nil pointer to
+// the zero instant. So both "no reset known" representations — NULL and the
+// legacy zero date — answer ResetAt(...).IsZero(), and only that test is
+// correct for both.
 func ResetAt(p *time.Time) time.Time {
 	if p == nil {
 		return time.Time{}
@@ -221,10 +227,26 @@ func ResetAt(p *time.Time) time.Time {
 	return *p
 }
 
-// ResetPtr is the inverse, for building a snapshot: a zero time.Time becomes
-// nil so it persists as NULL rather than '0000-00-00'.
+// mysqlDateTimeMin / mysqlDateTimeMax bound what MySQL's DATETIME can hold.
+// A value outside them is not a reset time — it is a parseless header or a bad
+// claim — and storing it fails the INSERT outright ("year is not in the range
+// [1, 9999]"), which loses the WHOLE snapshot row. That is the same class of
+// failure this nullable change exists to end, so ResetPtr drops such values
+// rather than letting them through.
+var (
+	mysqlDateTimeMin = time.Date(1000, 1, 1, 0, 0, 0, 0, time.UTC)
+	mysqlDateTimeMax = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+)
+
+// ResetPtr is the inverse, for building a snapshot: a zero or out-of-MySQL-range
+// time becomes nil so it persists as NULL rather than as a value that cannot be
+// stored.
 func ResetPtr(t time.Time) *time.Time {
 	if t.IsZero() {
+		return nil
+	}
+	u := t.UTC()
+	if u.Before(mysqlDateTimeMin) || u.After(mysqlDateTimeMax) {
 		return nil
 	}
 	return &t

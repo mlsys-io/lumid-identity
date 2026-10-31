@@ -43,7 +43,6 @@ func setupTombstoneDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open mysql: %v", err)
 	}
-	releaseTestDBOnCleanup(t, db)
 	if err := db.AutoMigrate(&models.ClaudeQuotaToken{}, &models.ClaudeQuotaSnapshot{}); err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}
@@ -89,7 +88,7 @@ func seedDoomedAccount(t *testing.T, db *gorm.DB, email string) {
 	}
 	for i := 0; i < 2; i++ {
 		// Reset timestamps must be real: MySQL strict mode rejects the zero
-		// time, and these columns are NOT NULL-able datetimes.
+		// time, and these columns were NOT NULL-able datetimes (nullable since 2026-10-31).
 		if err := db.Create(&models.ClaudeQuotaSnapshot{
 			Email: email, Ts: now.Add(-time.Duration(i+1) * time.Hour), SevenDayPct: 40,
 			FiveHourReset: models.ResetPtr(now.Add(time.Hour)), SevenDayReset: models.ResetPtr(now.Add(72 * time.Hour)),

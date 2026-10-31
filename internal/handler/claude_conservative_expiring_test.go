@@ -91,3 +91,39 @@ func TestExpiringFirstSortsUnknownResetsLast(t *testing.T) {
 		t.Fatalf("order = %v, want the account WITH a snapshot first", got)
 	}
 }
+
+// The NULL-reset variant of unknown, which the row-missing test above does not
+// reach. Since 2026-10-31 a snapshot CAN exist with NULL reset columns (the
+// probe returned utilization but no reset header), and that row used to sort
+// FIRST — models.ResetAt maps NULL to the zero instant, the smallest possible
+// time — spending the use-it-or-lose-it budget on the account whose reset is
+// unknown, ahead of one with 48h left. Unknown must sort last either way.
+func TestExpiringFirstSortsNullResetsLast(t *testing.T) {
+	db := setupClaudePoolTestDB(t)
+	now := time.Now().UTC()
+	for _, q := range []struct {
+		email        string
+		fiveHour, sd *time.Time
+	}{
+		{"cexp-null@x", nil, nil},
+		{"cexp-known2@x", ptrT(now.Add(time.Hour)), ptrT(now.Add(48 * time.Hour))},
+	} {
+		db.Exec(`DELETE FROM claude_quota_snapshots WHERE email = ?`, q.email)
+		db.Exec(`INSERT INTO claude_quota_snapshots (email, ts, five_hour_pct, seven_day_pct, five_hour_reset, seven_day_reset)
+		         VALUES (?, ?, 0, 0, ?, ?)`, q.email, now, q.fiveHour, q.sd)
+		email := q.email
+		t.Cleanup(func() { db.Exec(`DELETE FROM claude_quota_snapshots WHERE email = ?`, email) })
+	}
+
+	got, ok := expiringFirstOrder([]models.ClaudeQuotaToken{
+		tok("cexp-null@x", "nightly-dk", 0), tok("cexp-known2@x", "nightly-dk", 1)})
+	if !ok {
+		t.Fatal("rule did not apply")
+	}
+	if got[0] != "cexp-known2@x" {
+		t.Fatalf("order = %v, want the account WITH a known reset first; a NULL "+
+			"reset is unknown and must sort last", got)
+	}
+}
+
+func ptrT(t time.Time) *time.Time { return &t }

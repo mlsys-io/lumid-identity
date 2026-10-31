@@ -111,6 +111,16 @@ func cycleRowFromStore(r models.MeAppRun) (cycleListItem, bool) {
 		if v, ok := m["parent_run_id"].(string); ok {
 			item.ParentRunID = v
 		}
+		// The run's OWN declared metric, as the runner recorded it.
+		//
+		// The runs table scored a run from the trajectory endpoint alone, so a
+		// run that recorded `{"primary_metric":{"name":"forward_submit_rate",
+		// "value":1}}` read `no metric` whenever that fetch failed — and a
+		// measured, passing run looked unmeasured (LQ-20261030-02). Both the
+		// NAME and the VALUE are already in this blob; dropping them forced
+		// one caller to re-derive them, which is what made the display depend
+		// on a second request at all.
+		item.KeyMetric = primaryMetricFromBlob(m)
 	}
 	// StepCount and Running stay zero/false on purpose. The store has no
 	// per-step rows, and a run still in flight has not reported yet — claiming
@@ -163,6 +173,29 @@ func runRowsFromDB(userSub string, since, until time.Time) []RunRow {
 		}
 	}
 	return out
+}
+
+// primaryMetricFromBlob lifts the `primary_metric` object the runner writes into
+// every cycle summary: `{"name": "<declared metric>", "value": <float>}`.
+//
+// It is the ONE part of the metrics blob whose meaning is self-describing — the
+// runner names it, the name is the loop's own `metrics.primary`, and the value
+// is what that name measured. Nothing here has to guess an app's metric name, so
+// it stays app-agnostic. Returns nil when the run recorded none (a loop with no
+// declared metric, or a run that never reached the analysis step).
+func primaryMetricFromBlob(m map[string]any) *cycleKeyMetric {
+	pm, ok := m["primary_metric"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	name, _ := pm["name"].(string)
+	v, ok := pm["value"].(float64)
+	if !ok {
+		// JSON numbers arrive as float64; anything else (nil, string, bool)
+		// is not a measurement and must stay absent rather than read as 0.
+		return nil
+	}
+	return &cycleKeyMetric{Name: name, Value: v}
 }
 
 // runRowFromStore builds ONE RunRow from ONE store row.

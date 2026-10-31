@@ -48,6 +48,20 @@ type cycleListItem struct {
 	// a flat linear chain. Empty for ordinary (root) runs.
 	ParentRunID string `json:"parent_run_id,omitempty"`
 	BranchLabel string `json:"branch_label,omitempty"`
+	// KeyMetric — the run's own declared metric value, as the runner recorded
+	// it (`primary_metric` in the cycle summary). Optional and omitted when the
+	// run recorded none, so a list row never implies a measurement that does
+	// not exist. The Runs table reads it as the fallback for the metric column,
+	// which otherwise depended on the trajectory endpoint answering.
+	KeyMetric *cycleKeyMetric `json:"key_metric,omitempty"`
+}
+
+// cycleKeyMetric is a named measurement: which metric, and what it measured.
+// The name travels with the value because the table's column header is generic
+// ("Metric") and a bare number with no name cannot be checked by the reader.
+type cycleKeyMetric struct {
+	Name  string  `json:"name,omitempty"`
+	Value float64 `json:"value"`
 }
 
 // MeCyclesList serves GET /api/v1/me/cycles?app=&loop=&limit=
@@ -118,6 +132,10 @@ func MeCyclesList(c *gin.Context) {
 						if v, ok := raw["branch_label"].(string); ok {
 							item.BranchLabel = v
 						}
+						// Same fallback the run store provides: a cycle.json that
+						// recorded its declared metric answers the table's Metric
+						// column without a second request.
+						item.KeyMetric = primaryMetricFromBlob(raw)
 					}
 				} else if st, serr := os.Stat(filepath.Join(cyclesRoot, lp.Name(), td.Name())); serr == nil &&
 					time.Since(st.ModTime()) < 2*time.Hour {

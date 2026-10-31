@@ -72,6 +72,17 @@ type expManifest struct {
 		Steps []struct {
 			Experiment expRef `yaml:"experiment"`
 		} `yaml:"steps"`
+		// The loop's OWN metric declaration. A command-engine loop commonly
+		// names its primary metric here and attaches no experiment at all
+		// (measured 2026-10-30, `qa_custom_analyze_20261030`:
+		// `metrics: {primary: strategies_analyzed}` + `engine.experiment:` on
+		// a study that was never published). The runner reads exactly this
+		// key when it decides what to record as `primary_metric`, so it is
+		// the authoritative name for anything that loop emits — ignoring it
+		// made every such run resolve no metric and read as unmeasured.
+		Metrics struct {
+			Primary string `yaml:"primary"`
+		} `yaml:"metrics"`
 	} `yaml:"loops"`
 }
 

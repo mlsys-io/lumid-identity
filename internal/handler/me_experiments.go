@@ -400,13 +400,33 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 				row[k] = v
 			}
 		}
-		markStaleState(row, &d, st)
-		markUnfed(row, &d, loops[d.ID])
-		markStarved(row, userSub, app, specMetricName(&d), loops[d.ID])
-		markUndispatched(row, &d, loops[d.ID])
+		markZeroReasons(row, userSub, app, &d, st, loops[d.ID])
 		out = append(out, row)
 	}
 	return out
+}
+
+// markZeroReasons runs the whole zero-marker ladder over one experiment row.
+//
+// It exists because the ladder was written out twice — once on the disk path
+// (loadAppExperimentsFor) and once on the cross-node fallback in
+// MeAppExperiments — and the copies had already drifted: the fallback ran
+// markStarved and markUndispatched but never markUnfed, so a tenant install
+// whose ledger identity cannot read rendered an unfed experiment as the bare
+// "no results yet" the markers exist to replace. One list, called from both,
+// is the only version of this that stays correct.
+//
+// st may be nil (no state at all — the cross-node fallback has no ledger); the
+// ladder is built so that a nil state simply means "nothing to compare", not a
+// reason to skip the markers that read the DECLARATION and the run store.
+func markZeroReasons(row gin.H, userSub, app string, d *expDecl, st map[string]any, feeding []string) {
+	if st == nil {
+		st = map[string]any{}
+	}
+	markStaleState(row, d, st)
+	markUnfed(row, d, feeding)
+	markStarved(row, userSub, app, specMetricName(d), feeding)
+	markUndispatched(row, d, feeding)
 }
 
 // markUnfed explains a zero-row experiment that NO loop can ever feed: no
@@ -959,8 +979,12 @@ func MeAppExperiments(c *gin.Context) {
 						row[k] = v
 					}
 				}
-				markStarved(row, userID, app, mname, loops[d.ID])
-				markUndispatched(row, &d, loops[d.ID])
+				// nil state: the runtime ledger is PVC-only and unreadable
+				// here, so the markers that read the DECLARATION and the run
+				// store must still run. Dropping markUnfed from this list is
+				// how an unfed experiment on a tenant install ended up with
+				// no reason at all.
+				markZeroReasons(row, userID, app, &d, nil, loops[d.ID])
 				exps = append(exps, row)
 			}
 			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps),

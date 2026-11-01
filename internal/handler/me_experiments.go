@@ -400,13 +400,63 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 				row[k] = v
 			}
 		}
-		markStaleState(row, &d, st)
-		markUnfed(row, &d, loops[d.ID])
-		markStarved(row, userSub, app, specMetricName(&d), loops[d.ID])
-		markUndispatched(row, &d, loops[d.ID])
+		markZeroReasons(row, userSub, app, &d, st, loops[d.ID])
 		out = append(out, row)
 	}
 	return out
+}
+
+// markZeroReasons runs the whole zero-marker ladder over one experiment row.
+//
+// It exists because the ladder was written out twice — once on the disk path
+// (loadAppExperimentsFor) and once on the cross-node fallback in
+// MeAppExperiments — and the copies had already drifted: the fallback ran
+// markStarved and markUndispatched but never markUnfed, so a tenant install
+// whose ledger identity cannot read rendered an unfed experiment as the bare
+// "no results yet" the markers exist to replace. One list, called from both,
+// is the only version of this that stays correct.
+//
+// st may be nil (no state at all — the cross-node fallback has no ledger); the
+// ladder is built so that a nil state simply means "nothing to compare", not a
+// reason to skip the markers that read the DECLARATION and the run store.
+func markZeroReasons(row gin.H, userSub, app string, d *expDecl, st map[string]any, feeding []string) {
+	if st == nil {
+		st = map[string]any{}
+	}
+	markStaleState(row, d, st)
+	markUnfed(row, d, feeding)
+	markStarved(row, userSub, app, specMetricName(d), feederLoops(d, feeding))
+	markUndispatched(row, d, feeding)
+}
+
+// feederLoops is every loop whose runs could explain this experiment's zero:
+// the ones that list it under engine.experiment / steps, plus the one its
+// dispatch names.
+//
+// They are not the same set, and using only the first is a real hole. Measured
+// 2026-11-01 on mbb-consultant/analyst_local_gpu: it declares
+// `dispatch.loop: case_eval`, but case_eval's own `engine.experiment` names
+// judge_panel_parity and not this arm. So feeding was empty, markStarved
+// returned immediately, markUnfed abstained (a dispatch exists) and
+// markUndispatched abstained (the dispatch names a loop) — every marker
+// passed, and the card said "0 results" while case_eval had failed its last
+// twenty runs with "analyst call failed: HTTP Error 503". Reading the dispatch
+// loop's runs turns that into the sentence the operator needs.
+func feederLoops(d *expDecl, feeding []string) []string {
+	if d == nil {
+		return feeding
+	}
+	lp, _ := d.Dispatch["loop"].(string)
+	lp = strings.TrimSpace(lp)
+	if lp == "" {
+		return feeding
+	}
+	for _, f := range feeding {
+		if f == lp {
+			return feeding
+		}
+	}
+	return append(append([]string{}, feeding...), lp)
 }
 
 // markUnfed explains a zero-row experiment that NO loop can ever feed: no
@@ -651,6 +701,37 @@ func runErrorText(metrics string) string {
 				}
 			}
 			if s := pick(strings.Join(parts, "; ")); s != "" {
+				return s
+			}
+		}
+		// A per-item FAILURE list, the shape a batch loop writes: one entry
+		// per case that failed, each with its own error. Measured 2026-11-01 —
+		// mbb-consultant/case_eval failed 78 runs this way ("analyst call
+		// failed: HTTP Error 503: Service Unavailable") while its `flags` and
+		// `error` were both null, so the card's reason carried no cause at all.
+		if fails, ok := ce["failures"].([]any); ok && len(fails) > 0 {
+			seen := map[string]bool{}
+			parts := make([]string, 0, len(fails))
+			for _, f := range fails {
+				fm, ok := f.(map[string]any)
+				if !ok {
+					continue
+				}
+				s, _ := fm["error"].(string)
+				s = strings.TrimSpace(s)
+				if s == "" || seen[s] {
+					continue // the same 503 on twelve cases is one fact
+				}
+				seen[s] = true
+				parts = append(parts, s)
+				if len(parts) == 3 {
+					break
+				}
+			}
+			if s := pick(strings.Join(parts, "; ")); s != "" {
+				if len(fails) > len(parts) {
+					s += fmt.Sprintf(" (%d failed items)", len(fails))
+				}
 				return s
 			}
 		}
@@ -959,8 +1040,12 @@ func MeAppExperiments(c *gin.Context) {
 						row[k] = v
 					}
 				}
-				markStarved(row, userID, app, mname, loops[d.ID])
-				markUndispatched(row, &d, loops[d.ID])
+				// nil state: the runtime ledger is PVC-only and unreadable
+				// here, so the markers that read the DECLARATION and the run
+				// store must still run. Dropping markUnfed from this list is
+				// how an unfed experiment on a tenant install ended up with
+				// no reason at all.
+				markZeroReasons(row, userID, app, &d, nil, loops[d.ID])
 				exps = append(exps, row)
 			}
 			ok(c, "ok", gin.H{"experiments": exps, "count": len(exps),

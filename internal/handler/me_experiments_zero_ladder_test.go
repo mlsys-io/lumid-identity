@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -55,5 +56,41 @@ func TestZeroLadderLeavesAFedExperimentAlone(t *testing.T) {
 	}
 	if row["verdict"] != "v" {
 		t.Fatalf("the row was altered: %v", row)
+	}
+}
+
+// A dispatch that names a loop the experiment is NOT declared under still has
+// runs that explain the zero. Before feederLoops, feeding stayed empty (the
+// loop lists a different experiment), so markStarved returned immediately,
+// markUnfed abstained on the dispatch, and markUndispatched abstained on the
+// loop name — every marker passed and the card said only "no results yet".
+func TestDispatchLoopRunsExplainTheZero(t *testing.T) {
+	d := &expDecl{ID: "analyst_local_gpu", Metric: map[string]any{"name": "avg_question_score"},
+		Dispatch: map[string]any{"loop": "case_eval"}}
+	got := feederLoops(d, nil)
+	if len(got) != 1 || got[0] != "case_eval" {
+		t.Fatalf("the dispatch loop's runs were not reachable: %v", got)
+	}
+	// Declared feeder and dispatch agreeing must not duplicate the loop.
+	both := feederLoops(d, []string{"case_eval"})
+	if len(both) != 1 {
+		t.Fatalf("a loop named twice was listed twice: %v", both)
+	}
+}
+
+// The reason must carry the CAUSE, not just the fact. case_eval reports its
+// failures as command_engine.failures[] with error/flags/error all null, so
+// the card read "failed its last 5 run(s)" and stopped.
+func TestRunErrorTextReadsPerItemFailures(t *testing.T) {
+	blob := `{"command_engine":{"failures":[
+		{"case":"a","error":"analyst call failed: HTTP Error 503: Service Unavailable"},
+		{"case":"b","error":"analyst call failed: HTTP Error 503: Service Unavailable"},
+		{"case":"c","error":"judge returned no scores"}]}}`
+	got := runErrorText(blob)
+	if !strings.Contains(got, "503") || !strings.Contains(got, "judge returned no scores") {
+		t.Fatalf("per-item failures were not distilled: %q", got)
+	}
+	if strings.Count(got, "503") != 1 {
+		t.Fatalf("the same error was repeated once per case: %q", got)
 	}
 }

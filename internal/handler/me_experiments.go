@@ -425,8 +425,38 @@ func markZeroReasons(row gin.H, userSub, app string, d *expDecl, st map[string]a
 	}
 	markStaleState(row, d, st)
 	markUnfed(row, d, feeding)
-	markStarved(row, userSub, app, specMetricName(d), feeding)
+	markStarved(row, userSub, app, specMetricName(d), feederLoops(d, feeding))
 	markUndispatched(row, d, feeding)
+}
+
+// feederLoops is every loop whose runs could explain this experiment's zero:
+// the ones that list it under engine.experiment / steps, plus the one its
+// dispatch names.
+//
+// They are not the same set, and using only the first is a real hole. Measured
+// 2026-11-01 on mbb-consultant/analyst_local_gpu: it declares
+// `dispatch.loop: case_eval`, but case_eval's own `engine.experiment` names
+// judge_panel_parity and not this arm. So feeding was empty, markStarved
+// returned immediately, markUnfed abstained (a dispatch exists) and
+// markUndispatched abstained (the dispatch names a loop) — every marker
+// passed, and the card said "0 results" while case_eval had failed its last
+// twenty runs with "analyst call failed: HTTP Error 503". Reading the dispatch
+// loop's runs turns that into the sentence the operator needs.
+func feederLoops(d *expDecl, feeding []string) []string {
+	if d == nil {
+		return feeding
+	}
+	lp, _ := d.Dispatch["loop"].(string)
+	lp = strings.TrimSpace(lp)
+	if lp == "" {
+		return feeding
+	}
+	for _, f := range feeding {
+		if f == lp {
+			return feeding
+		}
+	}
+	return append(append([]string{}, feeding...), lp)
 }
 
 // markUnfed explains a zero-row experiment that NO loop can ever feed: no
@@ -671,6 +701,37 @@ func runErrorText(metrics string) string {
 				}
 			}
 			if s := pick(strings.Join(parts, "; ")); s != "" {
+				return s
+			}
+		}
+		// A per-item FAILURE list, the shape a batch loop writes: one entry
+		// per case that failed, each with its own error. Measured 2026-11-01 —
+		// mbb-consultant/case_eval failed 78 runs this way ("analyst call
+		// failed: HTTP Error 503: Service Unavailable") while its `flags` and
+		// `error` were both null, so the card's reason carried no cause at all.
+		if fails, ok := ce["failures"].([]any); ok && len(fails) > 0 {
+			seen := map[string]bool{}
+			parts := make([]string, 0, len(fails))
+			for _, f := range fails {
+				fm, ok := f.(map[string]any)
+				if !ok {
+					continue
+				}
+				s, _ := fm["error"].(string)
+				s = strings.TrimSpace(s)
+				if s == "" || seen[s] {
+					continue // the same 503 on twelve cases is one fact
+				}
+				seen[s] = true
+				parts = append(parts, s)
+				if len(parts) == 3 {
+					break
+				}
+			}
+			if s := pick(strings.Join(parts, "; ")); s != "" {
+				if len(fails) > len(parts) {
+					s += fmt.Sprintf(" (%d failed items)", len(fails))
+				}
 				return s
 			}
 		}

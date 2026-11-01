@@ -213,11 +213,14 @@ func RegisterHandler(c *gin.Context) {
 		}
 	}()
 
-	// Validate + consume the invitation code in the SAME transaction as the
-	// user create below: if user creation fails after this point, the
-	// rollback returns the seat instead of burning it on a signup that never
-	// happened.
-	inv, err := consumeInvitationCodeTx(tx, req.InvitationCode)
+	// Registration is OPEN (operator decision 2026-11-01): a code is optional.
+	// When one IS given it is still validated + consumed in the SAME transaction as
+	// the user create below (cohort codes carry scopes), so if user creation fails
+	// the rollback returns the seat instead of burning it.
+	var inv *models.InvitationCode
+	if strings.TrimSpace(req.InvitationCode) != "" {
+		inv, err = consumeInvitationCodeTx(tx, req.InvitationCode)
+	}
 	if err != nil {
 		tx.Rollback()
 		var invErr *invitationCodeError
@@ -256,22 +259,24 @@ func RegisterHandler(c *gin.Context) {
 	// a scoped code used to get the seat but never the grants. Same transaction,
 	// so a failure here returns the seat too. A brand-new user has no grants to
 	// downgrade, so each scope is a plain insert.
-	if err := tx.Create(&models.InvitationRedemption{
-		ID: uuid.NewString(), UserID: u.ID, Code: inv.Code,
-		Scopes: strings.TrimSpace(inv.Scopes),
-	}).Error; err != nil {
-		tx.Rollback()
-		fail(c, http.StatusInternalServerError, 1500, "record redemption: "+err.Error())
-		return
+	if inv != nil {
+		if err := tx.Create(&models.InvitationRedemption{
+			ID: uuid.NewString(), UserID: u.ID, Code: inv.Code,
+			Scopes: strings.TrimSpace(inv.Scopes),
+		}).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 1500, "record redemption: "+err.Error())
+			return
+		}
 	}
-	for _, raw := range strings.Fields(inv.Scopes) {
+	for _, raw := range strings.Fields(scopesOf(inv)) {
 		svc, lvl := parseScope(raw)
 		if svc == "" || svc == "*" {
 			continue
 		}
 		if err := tx.Create(&models.UserAccessGrant{
 			ID: uuid.NewString(), UserID: u.ID, Service: svc,
-			Level: lvl, GrantedBy: "invite:" + inv.Code,
+			Level: lvl, GrantedBy: "invite:" + inv.Code, // only reached when inv != nil (scopesOf(nil) == "")
 		}).Error; err != nil {
 			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 1500, "apply grant: "+err.Error())
@@ -473,3 +478,11 @@ var _ = sha256.Size
 
 // Compile-time assertion for context use in Gin helpers.
 var _ context.Context
+
+// scopesOf returns an invitation's scopes, or "" when the signup used no code.
+func scopesOf(inv *models.InvitationCode) string {
+	if inv == nil {
+		return ""
+	}
+	return inv.Scopes
+}

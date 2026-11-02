@@ -596,13 +596,29 @@ func markUnrecorded(row gin.H, runs []models.MeAppRun, feeding []string, metricN
 	if s, _ := row["n_zero_reason"].(string); strings.TrimSpace(s) != "" {
 		return
 	}
+	runAt := time.Unix(int64(runs[0].RunTs), 0).UTC()
+	// The loop's own account wins over the guess below. forward_test DOES call
+	// record_result, but only for a scoped read (an unscoped one mixes
+	// strategies and is evidence for none), so "a study collects rows only from
+	// loops that call experiments.record_result(); forward_test does not" would
+	// be false. A loop that skipped recording on purpose says why in
+	// metrics.experiment_skip_reason, and that sentence is the one the card
+	// needs. Checked before the state test: a loop that explains itself needs
+	// no state to be believed, and a study whose only runs skipped never gets
+	// a ledger row for evaluate() to summarise.
+	if skip := stringFromBlob(runs[0].Metrics, "experiment_skip_reason"); skip != "" {
+		row["n_zero_reason"] = fmt.Sprintf(
+			"%s ran successfully at %s but recorded no result row for this study: %s",
+			runs[0].Loop, runAt.Format(time.RFC3339), skip)
+		row["unrecorded"] = true
+		return
+	}
 	when, ok := stateUpdatedAt(row)
 	if !ok {
 		// No state at all → evaluate() has never run for this study, which is
 		// genuinely "not yet", not "ran and recorded nothing".
 		return
 	}
-	runAt := time.Unix(int64(runs[0].RunTs), 0).UTC()
 	// evaluate() runs AFTER the cycle it summarises, so the state must be at
 	// or after the run. In practice it can land a second EARLIER — the live
 	// row for this study has state 14:29:23Z against run 14:29:24Z, because
@@ -632,6 +648,42 @@ func markUnrecorded(row gin.H, runs []models.MeAppRun, feeding []string, metricN
 	// otherwise renders as "metric mismatch", and this one is not a mismatch —
 	// the declared name is right, the loop just never records a row.
 	row["unrecorded"] = true
+}
+
+// stringFromBlob finds the first non-empty string value under key in a run's
+// metrics blob, breadth-first (shallowest wins), depth-bounded like
+// metricFromBlobPath. "" when absent, blank, or the blob does not parse.
+func stringFromBlob(metricsJSON, key string) string {
+	if key == "" || metricsJSON == "" {
+		return ""
+	}
+	var doc any
+	if json.Unmarshal([]byte(metricsJSON), &doc) != nil {
+		return ""
+	}
+	level := []any{doc}
+	for depth := 0; depth < 12 && len(level) > 0; depth++ {
+		var next []any
+		for _, n := range level {
+			m, ok := n.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+			keys := make([]string, 0, len(m))
+			for k := range m {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				next = append(next, m[k])
+			}
+		}
+		level = next
+	}
+	return ""
 }
 
 // stateUpdatedAt parses the state's own computation timestamp. The blob's

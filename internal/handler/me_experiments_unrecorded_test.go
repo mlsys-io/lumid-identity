@@ -160,3 +160,67 @@ func TestUnrecordedSaysWhenTheLoopDoesNotComputeTheMetric(t *testing.T) {
 		t.Errorf("got %q — its output has no such value, so recording is not the fault", reason)
 	}
 }
+
+// quant-research/forward_evidence: forward_test DOES call record_result, but
+// only for a scoped read. An unscoped run skips on purpose and says why in
+// metrics.experiment_skip_reason. The card must carry that sentence — not the
+// generic "forward_test does not call record_result", which would be false —
+// and it must do so even when the study has no state yet (a study whose only
+// runs skipped never gets a ledger row for evaluate() to summarise).
+func TestUnrecordedPrefersTheLoopsOwnSkipReason(t *testing.T) {
+	runTs := time.Date(2026, 11, 2, 3, 0, 0, 0, time.UTC).Unix()
+	runs := []models.MeAppRun{{
+		Loop: "forward_test", RunTs: runTs, Ok: true,
+		Metrics: `{"forward_submit_rate":1,"experiment_rows":0,` +
+			`"experiment_skip_reason":"unscoped read (no strategy_id) mixes strategies, so it is evidence for none — run with args.strategy_id to record a row"}`,
+	}}
+	for name, row := range map[string]gin.H{
+		"no state": {"n_results": 0, "metric_keys_seen": []any{}, "n_zero_reason": nil},
+		"fresh state": {"n_results": 0, "metric_keys_seen": []any{}, "n_zero_reason": nil,
+			"state_updated_at": "2026-11-02T03:00:00Z"},
+	} {
+		markUnrecorded(row, runs, []string{"forward_test"}, "forward_submit_rate")
+		reason, _ := row["n_zero_reason"].(string)
+		if !strings.Contains(reason, "unscoped read") || !strings.Contains(reason, "forward_test") {
+			t.Errorf("%s: reason %q does not carry the loop's own skip reason", name, reason)
+		}
+		if strings.Contains(reason, "does not.") {
+			t.Errorf("%s: reason %q claims the loop never records — false for forward_test", name, reason)
+		}
+		if row["unrecorded"] != true {
+			t.Errorf("%s: unrecorded flag missing", name)
+		}
+	}
+}
+
+// The skip reason must not override a sharper existing reason, nor fire on a
+// failed run (that is starvation's sentence).
+func TestSkipReasonRespectsExistingReasonAndFailedRuns(t *testing.T) {
+	runTs := time.Date(2026, 11, 2, 3, 0, 0, 0, time.UTC).Unix()
+	blob := `{"experiment_skip_reason":"x"}`
+	row := gin.H{"n_results": 0, "metric_keys_seen": []any{}, "n_zero_reason": "state is stale"}
+	markUnrecorded(row, []models.MeAppRun{{Loop: "l", RunTs: runTs, Ok: true, Metrics: blob}}, []string{"l"}, "m")
+	if row["n_zero_reason"] != "state is stale" {
+		t.Errorf("existing reason overwritten: %v", row["n_zero_reason"])
+	}
+	row = gin.H{"n_results": 0, "metric_keys_seen": []any{}}
+	markUnrecorded(row, []models.MeAppRun{{Loop: "l", RunTs: runTs, Ok: false, Metrics: blob}}, []string{"l"}, "m")
+	if _, set := row["n_zero_reason"]; set {
+		t.Errorf("failed run produced an unrecorded reason: %v", row["n_zero_reason"])
+	}
+}
+
+func TestStringFromBlob(t *testing.T) {
+	for blob, want := range map[string]string{
+		`{"experiment_skip_reason":" top "}`:                   "top",
+		`{"command_engine":{"experiment_skip_reason":"deep"}}`: "deep",
+		`{"experiment_skip_reason":3}`:                         "",
+		`{"experiment_skip_reason":"  "}`:                      "",
+		`not json`:                                             "",
+		``:                                                     "",
+	} {
+		if got := stringFromBlob(blob, "experiment_skip_reason"); got != want {
+			t.Errorf("stringFromBlob(%q) = %q, want %q", blob, got, want)
+		}
+	}
+}

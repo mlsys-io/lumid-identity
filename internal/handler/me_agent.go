@@ -906,6 +906,14 @@ type llmProvider struct {
 	// GPU models are free at the margin, so they carry a generous backstop
 	// rather than the tight Anthropic-cost default.
 	dailyBudgetTokens int
+	// simpleTools — always send this model Studio's curated SIMPLE tool set
+	// (simpleModeTools) instead of the full catalog, whatever view the caller is in.
+	// For small on-prem models where the full catalog (~121 tools, ~14k tokens, ~90%
+	// of every turn's prefix) makes the first turn of a chat slow: Flint on the n5-max
+	// Strix Halo box prefills ~950 tok/s, so a ~17.5k-token prefix cost ~18 s before the
+	// first token. Applied after the role filter (it can only narrow), and to the
+	// provider actually serving the turn (i.e. after autoRouteForTurn).
+	simpleTools bool
 }
 
 // First entry is the default (defaultProvider() returns llmProviders[0]).
@@ -1036,6 +1044,8 @@ var llmProviders = []llmProvider{
 		minRole:             "user",
 		maxOutputTokens:     8192,
 		dailyBudgetTokens:   -1, // on-prem only, never billed
+		// Curated core tools only: cuts the per-turn prefix roughly in half on this box.
+		simpleTools: true,
 	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a
@@ -2240,6 +2250,9 @@ func MeAgentChat(c *gin.Context) {
 		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
+	if provider.simpleTools {
+		body.Simple = true // this model always gets the curated core (see llmProvider.simpleTools)
+	}
 	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body, true)
 	systemPrompt := basePrompt + modeSystemSuffix(body.Mode)
 	toolCalls := []toolCallResult{}

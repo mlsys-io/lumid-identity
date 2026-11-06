@@ -211,7 +211,7 @@ func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
 	// (poolCapApplies is unconditional and ClaudePoolUsage has no model
 	// filter), so admitting it here does not hide its spend.
 	// 2026-11-06: flint was added and REMOVED the same day (operator: "doesn't work well").
-	permitted := map[string]bool{"deepseek-v4.1-flash": true, "qwen3.8-27b": true}
+	permitted := map[string]bool{"deepseek-v4.1-flash": true, "qwen3.8-27b": true, "qwen3.8-flash-next": true}
 	for _, p := range llmProviders {
 		rest, ok := strings.CutPrefix(p.upstreamModel, "lumid-llm/")
 		if !ok {

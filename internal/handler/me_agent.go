@@ -1181,6 +1181,29 @@ var llmProviders = []llmProvider{
 		minRole:           "user",
 		dailyBudgetTokens: 1_500_000, // finite: still one physical tier, overflow is billed
 	},
+	{
+		// Flint 40B in the Claude Code harness (2026-11-06). Same wiring as claude-code-qwen38:
+		// claude-sandbox strips the "lumid-llm/" prefix and sends bare `flint` to claude-proxy,
+		// which permits it because SELF_HOSTED_MODELS names flint (deploy_infra #418, with a
+		// flintProfile: pool-exempt, 8192-token budget ceiling). Verified through lum.id/claude
+		// with a Claude Code-shaped tool request -> proper tool_use block.
+		//
+		// Free and unbilled: `flint` has no OpenRouter fallback, so dailyBudgetTokens -1.
+		// CAVEAT, stated plainly: Claude Code's prefix is ~45k tokens and Flint on the n5-max
+		// Strix Halo box prefills ~950 tok/s, so the FIRST turn of a session waits ~45-50 s
+		// (warm turns are fast while the 4-slot prompt cache holds). A small, fast coding model,
+		// not a replacement for the qwen/deepseek lanes.
+		id:                "claude-code-flint",
+		displayName:       "Flint 40B (Code · Lumid GPU)",
+		endpoint:          "",
+		upstreamModel:     "lumid-llm/flint",
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "user",
+		dailyBudgetTokens: -1, // on-prem only, never billed
+	},
 	// claude-opus and claude-haiku (direct Anthropic API) are registered only
 	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.
 	// The claude-code-* sandbox providers cover Anthropic models instead.

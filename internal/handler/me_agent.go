@@ -1018,6 +1018,26 @@ var llmProviders = []llmProvider{
 		maxOutputTokens:   8192,   // matches skills/llm.py's gateway floor
 		dailyBudgetTokens: 1_500_000,
 	},
+	{
+		// Qwen3.8-Flash-Next (125B-A6B MoE) on gmk via Gufo 0.30, lum.id/llm `qwen3.8-flash-next`
+		// (added 2026-11-06). 4 sessions x 32k context on one Strix Halo box; measured c1 55 tok/s,
+		// c4 22.4 tok/s/stream. The 32k window is why simpleTools is on: the full catalog is ~15k
+		// tokens of every turn's prefix. Reads images (BF16 mmproj; verified red/blue test image).
+		// No OpenRouter fallback, so a saturated box queues rather than bills: dailyBudgetTokens -1.
+		id:                  "lumid-flash-next",
+		displayName:         "Qwen3.8 Flash-Next (Chat · Lumid GPU)",
+		endpoint:            lumidLLMBase() + "/v1/messages",
+		upstreamModel:       "qwen3.8-flash-next",
+		authHeader:          "Authorization",
+		authPrefix:          "Bearer ",
+		keyFn:               kvrunPAT,
+		addAnthropicVersion: false,
+		supportsVision:      true,
+		minRole:             "user",
+		maxOutputTokens:     4096, // matches claude-proxy's flashNextBudgetCeiling; 32k window
+		dailyBudgetTokens:   -1,   // on-prem only, never billed
+		simpleTools:         true,
+	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a
 	// per-user ephemeral PAT. minRole mirrors the pool's own model matrix
@@ -1151,6 +1171,22 @@ var llmProviders = []llmProvider{
 		supportsVision:    false,
 		minRole:           "user",
 		dailyBudgetTokens: 1_500_000, // finite: still one physical tier, overflow is billed
+	},
+	{
+		// Qwen3.8-Flash-Next in the Claude Code harness (2026-11-06). Same wiring as
+		// claude-code-qwen38: claude-sandbox strips "lumid-llm/" and claude-proxy permits the bare
+		// id because SELF_HOSTED_MODELS names it (deploy_infra #421; flashNextProfile, 4096-token
+		// budget ceiling). Caveat: 32k context per session, so long agent sessions hit the window.
+		id:                "claude-code-flash-next",
+		displayName:       "Qwen3.8 Flash-Next (Code · Lumid GPU)",
+		endpoint:          "",
+		upstreamModel:     "lumid-llm/qwen3.8-flash-next",
+		authHeader:        "",
+		authPrefix:        "",
+		keyFn:             claudeCodeKeyFn,
+		supportsVision:    false,
+		minRole:           "user",
+		dailyBudgetTokens: -1, // on-prem only, never billed
 	},
 	// claude-opus and claude-haiku (direct Anthropic API) are registered only
 	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.

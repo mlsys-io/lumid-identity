@@ -651,6 +651,7 @@ func Register(r *gin.Engine) {
 			// these for the SoC-routed models; see soc_keys.go.
 			internal.GET("/soc-keys", InternalSocKeys)
 			internal.POST("/soc-keys/bench", InternalSocKeyBench)
+			internal.POST("/soc-keys/usage", InternalSocKeyUsage)
 			// Pool-wide account bench — claude-proxy reports a 401/403 here so
 			// the cooldown applies across every proxy replica, not just the pod
 			// that saw the failure.
@@ -753,6 +754,7 @@ func Register(r *gin.Engine) {
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
 			// SoC LLM gateway key pool (lum.id/code "SoC API keys" panel).
 			adminQuota.GET("/soc-keys", AdminSocKeysList)
+			adminQuota.GET("/soc-keys/usage", AdminSocKeysUsage)
 			adminQuota.POST("/soc-keys", AdminSocKeyAdd)
 			adminQuota.DELETE("/soc-keys/:id", AdminSocKeyDelete)
 			adminQuota.POST("/soc-keys/:id/reset", AdminSocKeyReset)

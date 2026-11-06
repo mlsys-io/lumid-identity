@@ -31,3 +31,20 @@ type SocAPIKey struct {
 	CreatedAt  time.Time  `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt  time.Time  `gorm:"autoUpdateTime" json:"updated_at"`
 }
+
+// SocKeyUsage — per-minute serving metrics of the SoC relay, one row per
+// (key, model, minute), summed across claude-proxy replicas on upsert. KeyID 0
+// = the proxy's fallback key. Drives the TKPS view on lum.id/code.
+type SocKeyUsage struct {
+	KeyID     uint      `gorm:"primaryKey;autoIncrement:false" json:"key_id"`
+	Model     string    `gorm:"type:varchar(64);primaryKey"    json:"model"`
+	Minute    time.Time `gorm:"primaryKey;index"               json:"minute"`
+	Requests  int       `json:"requests"`
+	Errors    int       `json:"errors"`
+	Streams   int       `json:"streams"`
+	InTokens  int64     `json:"in_tokens"`
+	OutTokens int64     `json:"out_tokens"`
+	GenMs     int64     `json:"gen_ms"`
+	TTFTMs    int64     `gorm:"column:ttft_ms" json:"ttft_ms"`
+	Estimated int       `json:"estimated"`
+}

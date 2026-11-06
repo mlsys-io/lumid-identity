@@ -647,6 +647,10 @@ func Register(r *gin.Engine) {
 			// Claude account-pool lease — claude-proxy (lum.id/claude) asks
 			// for the healthiest pooled account's access token.
 			internal.POST("/claude-token/lease", InternalClaudeTokenLease)
+			// SoC LLM gateway key pool (soclaas) — claude-proxy rotates across
+			// these for the SoC-routed models; see soc_keys.go.
+			internal.GET("/soc-keys", InternalSocKeys)
+			internal.POST("/soc-keys/bench", InternalSocKeyBench)
 			// Pool-wide account bench — claude-proxy reports a 401/403 here so
 			// the cooldown applies across every proxy replica, not just the pod
 			// that saw the failure.
@@ -747,6 +751,11 @@ func Register(r *gin.Engine) {
 			adminQuota.GET("/claude-account-users", AdminClaudeAccountUsers)
 			adminQuota.POST("/claude-token", AdminClaudeTokenAdd)
 			adminQuota.DELETE("/claude-token/:email", AdminClaudeTokenDelete)
+			// SoC LLM gateway key pool (lum.id/code "SoC API keys" panel).
+			adminQuota.GET("/soc-keys", AdminSocKeysList)
+			adminQuota.POST("/soc-keys", AdminSocKeyAdd)
+			adminQuota.DELETE("/soc-keys/:id", AdminSocKeyDelete)
+			adminQuota.POST("/soc-keys/:id/reset", AdminSocKeyReset)
 			// Forensic snapshots taken at quarantine and at each re-add that
 			// clears one — survives the re-add that would otherwise erase them.
 			adminQuota.GET("/claude-token/:email/history", AdminClaudeTokenHistory)

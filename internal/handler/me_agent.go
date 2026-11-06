@@ -1018,35 +1018,6 @@ var llmProviders = []llmProvider{
 		maxOutputTokens:   8192,   // matches skills/llm.py's gateway floor
 		dailyBudgetTokens: 1_500_000,
 	},
-	{
-		// flint — Recursive Flint 39.8B-A2.5B (Apache-2.0, 2026-10-21), a mixture-of-experts coding/agent model
-		// with only ~2.5B active parameters per token, served on the n5-max Strix Halo box (llama.cpp,
-		// unsloth UD-IQ3_XXS) as lum.id/llm model `flint`. Added 2026-11-06 when the dense qwen3.8-27b
-		// proved too slow on Strix Halo (~0.5 req/s there) and n5-max was moved to a model that suits
-		// the chip. Measured through lum.id/llm: ~47 tok/s single stream, ~35 tok/s per stream at 4
-		// concurrent (slowest 29.5), 0.3 s TTFT alone, ~1.4 s at 4; /v1/messages tool_use works.
-		//
-		// NO OpenRouter fallback: `flint` is not in LUMID_LLM_OPENROUTER_MODEL_MAP, so a saturated
-		// box queues or errors and NEVER bills — hence no daily budget (the gateway rate limit is
-		// the abuse guard). One small box (4 slots): a fast extra chat option, not a primary.
-		//
-		// NOT multimodal (no mmproj); autoRouteForTurn sends image turns to a vision chip instead.
-		// KEEP upstreamModel IN SYNC WITH THE GATEWAY — see the deepseek note above.
-		id:                  "lumid-flint",
-		displayName:         "Flint 40B (Chat · Lumid GPU)",
-		endpoint:            lumidLLMBase() + "/v1/messages",
-		upstreamModel:       "flint",
-		authHeader:          "Authorization",
-		authPrefix:          "Bearer ",
-		keyFn:               kvrunPAT,
-		addAnthropicVersion: false,
-		supportsVision:      false,
-		minRole:             "user",
-		maxOutputTokens:     8192,
-		dailyBudgetTokens:   -1, // on-prem only, never billed
-		// Curated core tools only: cuts the per-turn prefix roughly in half on this box.
-		simpleTools: true,
-	},
 	// claude-code-* — real Claude Code sessions in the in-cluster
 	// claude-sandbox, model access through the POOLED account proxy with a
 	// per-user ephemeral PAT. minRole mirrors the pool's own model matrix
@@ -1180,29 +1151,6 @@ var llmProviders = []llmProvider{
 		supportsVision:    false,
 		minRole:           "user",
 		dailyBudgetTokens: 1_500_000, // finite: still one physical tier, overflow is billed
-	},
-	{
-		// Flint 40B in the Claude Code harness (2026-11-06). Same wiring as claude-code-qwen38:
-		// claude-sandbox strips the "lumid-llm/" prefix and sends bare `flint` to claude-proxy,
-		// which permits it because SELF_HOSTED_MODELS names flint (deploy_infra #418, with a
-		// flintProfile: pool-exempt, 8192-token budget ceiling). Verified through lum.id/claude
-		// with a Claude Code-shaped tool request -> proper tool_use block.
-		//
-		// Free and unbilled: `flint` has no OpenRouter fallback, so dailyBudgetTokens -1.
-		// CAVEAT, stated plainly: Claude Code's prefix is ~45k tokens and Flint on the n5-max
-		// Strix Halo box prefills ~950 tok/s, so the FIRST turn of a session waits ~45-50 s
-		// (warm turns are fast while the 4-slot prompt cache holds). A small, fast coding model,
-		// not a replacement for the qwen/deepseek lanes.
-		id:                "claude-code-flint",
-		displayName:       "Flint 40B (Code · Lumid GPU)",
-		endpoint:          "",
-		upstreamModel:     "lumid-llm/flint",
-		authHeader:        "",
-		authPrefix:        "",
-		keyFn:             claudeCodeKeyFn,
-		supportsVision:    false,
-		minRole:           "user",
-		dailyBudgetTokens: -1, // on-prem only, never billed
 	},
 	// claude-opus and claude-haiku (direct Anthropic API) are registered only
 	// when ANTHROPIC_API_KEY is set. Without it they 503 immediately.

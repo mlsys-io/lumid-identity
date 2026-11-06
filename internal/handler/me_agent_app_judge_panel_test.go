@@ -210,9 +210,8 @@ func TestInHouseCodeChipsNameAServableModel(t *testing.T) {
 	// identity still counts it against the window at claudeWeightNonClaude
 	// (poolCapApplies is unconditional and ClaudePoolUsage has no model
 	// filter), so admitting it here does not hide its spend.
-	// 2026-11-06: flint added — claude-proxy SELF_HOSTED_MODELS is now "deepseek-v4.1-flash,qwen3.8-27b,flint"
-	// (deploy_infra #418, flintProfile), with a real on-prem backend (n5-max) and NO OpenRouter fallback.
-	permitted := map[string]bool{"deepseek-v4.1-flash": true, "qwen3.8-27b": true, "flint": true}
+	// 2026-11-06: flint was added and REMOVED the same day (operator: "doesn't work well").
+	permitted := map[string]bool{"deepseek-v4.1-flash": true, "qwen3.8-27b": true}
 	for _, p := range llmProviders {
 		rest, ok := strings.CutPrefix(p.upstreamModel, "lumid-llm/")
 		if !ok {

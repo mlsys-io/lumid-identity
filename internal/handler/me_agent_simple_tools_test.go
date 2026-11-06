@@ -5,23 +5,13 @@ import (
 	"testing"
 )
 
-// Flint (small on-prem model on Strix Halo) must always get the curated SIMPLE
-// tool set: the full catalog made its first turn wait ~18 s on prefill.
-func TestFlintChipUsesSimpleTools(t *testing.T) {
-	var found bool
+// No chip uses simpleTools after Flint's removal (2026-11-06); the mechanism stays for small
+// on-prem models. The default chip must never be slimmed.
+func TestDefaultChipKeepsFullCatalog(t *testing.T) {
 	for _, p := range llmProviders {
-		if p.id == "lumid-flint" {
-			found = true
-			if !p.simpleTools {
-				t.Fatalf("lumid-flint must set simpleTools")
-			}
-		}
 		if p.id == defaultProvider().id && p.simpleTools {
 			t.Fatalf("the default chip %q must keep the full catalog", p.id)
 		}
-	}
-	if !found {
-		t.Fatalf("lumid-flint chip missing")
 	}
 }
 

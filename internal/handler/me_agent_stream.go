@@ -276,6 +276,9 @@ func MeAgentChatStream(c *gin.Context) {
 		anthMsgs = append(anthMsgs, chatMessageToAnthropic(m, provider))
 	}
 
+	if provider.simpleTools {
+		body.Simple = true // this model always gets the curated core (see llmProvider.simpleTools)
+	}
 	basePrompt, tools, _ := resolvePromptAndTools(userID, role, body, true)
 	systemPrompt := basePrompt + modeSystemSuffix(body.Mode) + stagedNote
 	totalInputTokens := 0

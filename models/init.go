@@ -54,6 +54,8 @@ var AllTables = []interface{}{
 	&MePersona{},
 	&ClaudePool{},
 	&ClaudePoolMember{},
+	&SocAPIKey{},
+	&SocKeyUsage{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

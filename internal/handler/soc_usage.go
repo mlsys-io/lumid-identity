@@ -8,7 +8,9 @@ package handler
 //           tok/s, per-stream decode tok/s, avg TTFT) + per-key totals today (SGT).
 
 import (
+	"encoding/json"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -174,5 +176,40 @@ func AdminSocKeysUsage(c *gin.Context) {
 		Select("key_id, SUM(requests) requests, SUM(errors) errors, SUM(in_tokens) in_tokens, SUM(out_tokens) out_tokens").
 		Where("minute >= ?", sgtDayStart(now).UTC()).Group("key_id").Scan(&today)
 
-	ok(c, "ok", gin.H{"series": series, "summary": summary, "keys_today": today, "minutes": minutes})
+	ok(c, "ok", gin.H{"series": series, "summary": summary, "keys_today": today, "minutes": minutes, "live": fetchSocRelayLive()})
+}
+
+// socRelayLive is claude-proxy's SoC relay /status: what is running RIGHT NOW,
+// read from the per-key Redis locks (one in-flight request per key), so it is
+// cluster-wide whichever proxy replica answers.
+type socRelayLive struct {
+	Streams    map[string]int `json:"streams"`
+	BusyKeys   []uint         `json:"busy_keys"`
+	Waiting    int64          `json:"waiting"`
+	Source     string         `json:"source"`
+	ObservedAt time.Time      `json:"observed_at"`
+}
+
+var socRelayClient = &http.Client{Timeout: 2 * time.Second}
+
+// fetchSocRelayLive is best-effort: nil when the relay is unreachable, so the
+// usage view never fails because of it.
+func fetchSocRelayLive() *socRelayLive {
+	url := os.Getenv("SOC_RELAY_STATUS_URL")
+	if url == "" {
+		url = "http://claude-proxy-soc.lumid.svc.cluster.local:8081/status"
+	}
+	resp, err := socRelayClient.Get(url)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var out socRelayLive
+	if json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return nil
+	}
+	return &out
 }

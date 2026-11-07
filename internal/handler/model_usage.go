@@ -9,6 +9,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"lumid_identity/internal/common"
@@ -89,8 +90,77 @@ func AdminModelUsage(c *gin.Context) {
 		return
 	}
 	var live gin.H
-	if l := fetchSocRelayLive(); l != nil {
+	if source == "onprem" {
+		if st := fetchOnpremStats(); st.Available {
+			streams := map[string]int{}
+			for _, b := range st.Backends {
+				if !onpremSampled(b) {
+					continue
+				}
+				streams[b.Label] += int(b.Inflight)
+			}
+			live = gin.H{"streams": streams, "observed_at": time.Now().UTC(), "source": "lumid-llm"}
+		}
+	} else if l := fetchSocRelayLive(); l != nil {
 		live = gin.H{"streams": l.ClaudeStreams, "observed_at": l.ObservedAt, "source": l.Source}
 	}
 	ok(c, "ok", gin.H{"series": series, "summary": summarizeUsage(series, now), "minutes": minutes, "live": live})
+}
+
+// onpremSampled: real on-prem GPU backends only — the SoC relay is lumid-llm's
+// tier 0 too, but it is not a GPU and has its own (keyed) throughput view.
+func onpremSampled(b onpremBackendStats) bool {
+	return !strings.Contains(b.URL, "claude-proxy-soc")
+}
+
+// StartOnpremThroughputSampler snapshots lumid-llm's per-backend stats once a
+// minute into model_usage_minutes (source "onprem", model = backend label), so
+// on-prem GPUs get the same per-minute series as the Claude pool and SoC.
+// lumid-llm only exposes a rolling tok/s + current in-flight, so the row for the
+// minute that just ended carries out_tokens = tok_s*60, requests = qps*60 and
+// gen_ms = in-flight*60000 (=> "tok/s per stream" = tok_s / in-flight); no TTFT.
+// Every identity replica runs it; the upsert REPLACES (a snapshot, not a sum),
+// so two replicas writing the same minute cannot double-count.
+func StartOnpremThroughputSampler() {
+	go func() {
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			sampleOnprem(time.Now().UTC())
+		}
+	}()
+}
+
+func sampleOnprem(now time.Time) {
+	st := fetchOnpremStats()
+	if !st.Available || common.DB == nil {
+		return
+	}
+	minute := now.Truncate(time.Minute).Add(-time.Minute)
+	rows := []models.ModelUsageMinute{}
+	for _, b := range st.Backends {
+		if !onpremSampled(b) || b.Label == "" {
+			continue
+		}
+		r := models.ModelUsageMinute{Source: "onprem", Model: b.Label, Minute: minute}
+		if b.TokS != nil {
+			r.OutTokens = int64(*b.TokS * 60)
+		}
+		if b.QPS != nil {
+			r.Requests = int(*b.QPS*60 + 0.5)
+		}
+		inflight := int64(b.Inflight)
+		if inflight == 0 && r.OutTokens > 0 {
+			inflight = 1
+		}
+		r.GenMs = inflight * 60000
+		if !b.Healthy {
+			r.Errors = 1
+		}
+		rows = append(rows, r)
+	}
+	if len(rows) == 0 {
+		return
+	}
+	common.DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(&rows)
 }

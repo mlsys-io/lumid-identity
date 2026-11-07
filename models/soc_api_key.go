@@ -48,3 +48,20 @@ type SocKeyUsage struct {
 	TTFTMs    int64     `gorm:"column:ttft_ms" json:"ttft_ms"`
 	Estimated int       `json:"estimated"`
 }
+
+// ModelUsageMinute — per-minute serving metrics per (source, model), summed
+// across claude-proxy replicas. source "claude" = the Anthropic account pool
+// (lum.id/code Throughput). SoC traffic keeps its own per-key table above.
+type ModelUsageMinute struct {
+	Source    string    `gorm:"type:varchar(32);primaryKey" json:"source"`
+	Model     string    `gorm:"type:varchar(96);primaryKey" json:"model"`
+	Minute    time.Time `gorm:"primaryKey;index"            json:"minute"`
+	Requests  int       `json:"requests"`
+	Errors    int       `json:"errors"`
+	Streams   int       `json:"streams"`
+	InTokens  int64     `json:"in_tokens"`
+	OutTokens int64     `json:"out_tokens"`
+	GenMs     int64     `json:"gen_ms"`
+	TTFTMs    int64     `gorm:"column:ttft_ms" json:"ttft_ms"`
+	Estimated int       `json:"estimated"`
+}

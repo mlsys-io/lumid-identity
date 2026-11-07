@@ -145,6 +145,12 @@ func InternalUsageCharge(c *gin.Context) {
 				"five_hour_pct": res.FiveHourPct, "seven_day_pct": res.SevenDayPct,
 				"five_hour_reset": res.FiveHourReset, "seven_day_reset": res.SevenDayReset,
 				"recording": recordingEnabled(body.UserSub),
+				// Per-admin Opus cap (claude-proxy refuses Opus when opus_exhausted).
+				// This map is built field by field, so new ChargeRes fields must be
+				// added HERE too — omitting them silently disabled the Opus cap in prod.
+				"opus_five_hour_used": res.OpusFiveHourUsed, "opus_seven_day_used": res.OpusSevenDayUsed,
+				"opus_five_hour_limit": res.OpusFiveHourLimit, "opus_seven_day_limit": res.OpusSevenDayLimit,
+				"opus_exhausted": res.OpusExhausted, "opus_window": res.OpusWindow, "opus_reset": res.OpusReset,
 			},
 		})
 		return

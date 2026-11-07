@@ -225,6 +225,17 @@ type ChargeRes struct {
 	// with no charge yet to open a fresh one).
 	FiveHourReset string `json:"five_hour_reset,omitempty"`
 	SevenDayReset string `json:"seven_day_reset,omitempty"`
+	// kind=claude_proxy, users with an Opus cap only (role=admin): Opus-only usage
+	// in the same windows, the caps, and whether Opus is exhausted. The overall
+	// verdict (Allowed) is NOT affected — claude-proxy refuses only Opus requests
+	// when OpusExhausted, so the user keeps Sonnet/Haiku.
+	OpusFiveHourUsed  int    `json:"opus_five_hour_used,omitempty"`
+	OpusSevenDayUsed  int    `json:"opus_seven_day_used,omitempty"`
+	OpusFiveHourLimit int    `json:"opus_five_hour_limit,omitempty"`
+	OpusSevenDayLimit int    `json:"opus_seven_day_limit,omitempty"`
+	OpusExhausted     bool   `json:"opus_exhausted,omitempty"`
+	OpusWindow        string `json:"opus_window,omitempty"` // "short" | "7d": which cap is hit
+	OpusReset         string `json:"opus_reset,omitempty"`  // RFC3339: when that window resets
 }
 
 // poolCapApplies reports whether a model's usage counts against the per-user
@@ -553,6 +564,51 @@ func ClaudePoolLimitsForRole(role string) (short, sevenD int) {
 // window aggregate. A short TTL is the right trade: the only thing a stale entry
 // can do is bill one user at the wrong tier for under a minute, and role changes
 // are rare and administrative.
+type opusState struct {
+	used5, used7, cap5, cap7 int
+	exhausted                bool
+	window                   string
+	reset                    time.Time
+}
+
+// ClaudeOpusLimitsForRole returns the per-user Opus cap (weighted units, short
+// window / 7d) for a role, or 0,0 when Opus is not separately capped.
+//
+// Operator decision 2026-11-07: role=admin gets an Opus-only cap INSIDE the
+// overall pool cap (Opus was ~99% of admin spend; the top admin drew 364M units
+// of Opus in 7 days against a 500M overall cap). super_admin is exempt; role=user
+// cannot call Opus at all (modelAllowed). Env-tunable:
+// LUMID_QUOTA_CLAUDE_OPUS_ADMIN_SHORT_TOKENS / _7D_TOKENS (default 15M / 150M).
+func ClaudeOpusLimitsForRole(role string) (short, sevenD int) {
+	if role != "admin" {
+		return 0, 0
+	}
+	return envIntPos("LUMID_QUOTA_CLAUDE_OPUS_ADMIN_SHORT_TOKENS", 15_000_000),
+		envIntPos("LUMID_QUOTA_CLAUDE_OPUS_ADMIN_7D_TOKENS", 150_000_000)
+}
+
+// userRole returns the user's role through the same 1-minute cache the pool
+// limits use ("" when unknown).
+func userRole(db *gorm.DB, userSub string) string {
+	if db == nil || userSub == "" {
+		return ""
+	}
+	roleCacheMu.Lock()
+	e, ok := roleCache[userSub]
+	roleCacheMu.Unlock()
+	if ok && time.Now().Before(e.exp) {
+		return e.role
+	}
+	var role string
+	if err := db.Raw(`SELECT role FROM users WHERE id = ?`, userSub).Scan(&role).Error; err != nil || role == "" {
+		return ""
+	}
+	roleCacheMu.Lock()
+	roleCache[userSub] = roleCacheEntry{role: role, exp: time.Now().Add(roleCacheTTL)}
+	roleCacheMu.Unlock()
+	return role
+}
+
 var (
 	roleCacheMu  sync.Mutex
 	roleCache    = map[string]roleCacheEntry{}
@@ -690,10 +746,14 @@ func claudePoolFarFuture(now time.Time) time.Time {
 // idle: no anchor yet, or its window fully expired with no charge since to
 // open a fresh one — in both cases Used is 0.
 type ClaudePoolStatus struct {
-	FiveHourUsed  int
-	SevenDayUsed  int
-	FiveHourReset time.Time
-	SevenDayReset time.Time
+	FiveHourUsed int
+	SevenDayUsed int
+	// Opus-only share of the two sums above (model LIKE 'claude-opus%'), same
+	// windows, same weighting. Feeds the per-admin Opus cap (ClaudeOpusLimitsForUser).
+	OpusFiveHourUsed int
+	OpusSevenDayUsed int
+	FiveHourReset    time.Time
+	SevenDayReset    time.Time
 }
 
 // formatPoolReset renders a ClaudePoolStatus reset instant for ChargeRes —
@@ -757,21 +817,27 @@ func ClaudePoolUsage(db *gorm.DB, userSub string, now time.Time) (ClaudePoolStat
 	}
 
 	var row struct {
-		FiveTokens  int
-		SevenTokens int
+		FiveTokens      int
+		SevenTokens     int
+		OpusFiveTokens  int
+		OpusSevenTokens int
 	}
 	w := ClaudeWeightedTokensSQL("")
 	if err := db.Raw(fmt.Sprintf(`
 		SELECT
 		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS five_tokens,
-		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS seven_tokens
+		  COALESCE(SUM(CASE WHEN ts >= ? THEN %[1]s ELSE 0 END), 0) AS seven_tokens,
+		  COALESCE(SUM(CASE WHEN ts >= ? AND model LIKE 'claude-opus%%' THEN %[1]s ELSE 0 END), 0) AS opus_five_tokens,
+		  COALESCE(SUM(CASE WHEN ts >= ? AND model LIKE 'claude-opus%%' THEN %[1]s ELSE 0 END), 0) AS opus_seven_tokens
 		FROM   usage_events
 		WHERE  user_sub = ? AND kind = 'claude_proxy' AND model LIKE 'claude-%%' AND ts >= ?`, w),
-		fiveBound, sevenBound, userSub, scanBound).Scan(&row).Error; err != nil {
+		fiveBound, sevenBound, fiveBound, sevenBound, userSub, scanBound).Scan(&row).Error; err != nil {
 		return status, err
 	}
 	status.FiveHourUsed = row.FiveTokens
 	status.SevenDayUsed = row.SevenTokens
+	status.OpusFiveHourUsed = row.OpusFiveTokens
+	status.OpusSevenDayUsed = row.OpusSevenTokens
 	return status, nil
 }
 
@@ -811,6 +877,7 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 	deny := ""
 	var fivePct, sevenPct *float64
 	var fiveReset, sevenReset time.Time
+	var opus *opusState
 	switch req.Kind {
 	case "claude_proxy":
 		// Fixed 5h/7d windows (not midnight-daily) — mirrors the Anthropic
@@ -852,6 +919,20 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		p5 := float64(used5+tok) / float64(cap5) * 100
 		p7 := float64(used7+tok) / float64(cap7) * 100
 		fivePct, sevenPct = &p5, &p7
+		if o5, o7 := ClaudeOpusLimitsForRole(userRole(db, req.UserSub)); o5 > 0 || o7 > 0 {
+			opusTok := 0
+			if strings.HasPrefix(strings.ToLower(req.Model), "claude-opus") {
+				opusTok = tok
+			}
+			ou5, ou7 := status.OpusFiveHourUsed+opusTok, status.OpusSevenDayUsed+opusTok
+			opus = &opusState{used5: ou5, used7: ou7, cap5: o5, cap7: o7}
+			switch {
+			case o7 > 0 && ou7 >= o7:
+				opus.exhausted, opus.window, opus.reset = true, "7d", sevenReset
+			case o5 > 0 && ou5 >= o5:
+				opus.exhausted, opus.window, opus.reset = true, "short", fiveReset
+			}
+		}
 	case "cycle_start":
 		n := req.Count
 		if n <= 0 {
@@ -895,6 +976,12 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		SevenDayPct:   sevenPct,
 		FiveHourReset: formatPoolReset(fiveReset),
 		SevenDayReset: formatPoolReset(sevenReset),
+	}
+	if opus != nil {
+		res.OpusFiveHourUsed, res.OpusSevenDayUsed = opus.used5, opus.used7
+		res.OpusFiveHourLimit, res.OpusSevenDayLimit = opus.cap5, opus.cap7
+		res.OpusExhausted, res.OpusWindow = opus.exhausted, opus.window
+		res.OpusReset = formatPoolReset(opus.reset)
 	}
 	// OVERSPEND: a non-dry-run claude_proxy charge reporting tokens Anthropic has
 	// ALREADY served. It must be recorded even though it breaches the cap.

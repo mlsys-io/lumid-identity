@@ -2137,6 +2137,8 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		SevenTokens   int
 		ClaudeFive    int
 		ClaudeSeven   int
+		OpusFive      int
+		OpusSeven     int
 		RawInput      int
 		RawOutput     int
 		RawCacheRead  int
@@ -2175,6 +2177,10 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s ELSE 0 END), 0) AS seven_tokens,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_five,
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN %[1]s * %[2]s ELSE 0 END), 0) AS claude_seven,
+		       -- Opus-only, same windows/weighting as the per-admin Opus cap
+		       -- (common.ClaudePoolUsage / ClaudeOpusLimitsForRole).
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.five_eff  AND ue.model LIKE 'claude-opus%%' THEN %[1]s ELSE 0 END), 0) AS opus_five,
+		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff AND ue.model LIKE 'claude-opus%%' THEN %[1]s ELSE 0 END), 0) AS opus_seven,
 		       -- RAW totals alongside the weighted ones, so the quota number can be
 		       -- reconciled against Anthropic's own record instead of taken on trust.
 		       COALESCE(SUM(CASE WHEN ue.ts >= w.seven_eff THEN ue.input_tokens ELSE 0 END), 0)         AS raw_input,
@@ -2336,10 +2342,17 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		// deepseek/on-prem from the cap), so the dashboard must not show
 		// OpenRouter/on-prem drawing against the Claude budget. Full-window
 		// numbers stay in five_hour_tokens/seven_day_tokens.
-		ClaudeFive     int                   `json:"claude_five_hour_tokens"`
-		ClaudeSeven    int                   `json:"claude_seven_day_tokens"`
-		ClaudeFivePct  float64               `json:"claude_five_hour_pct"`
-		ClaudeSevenPct float64               `json:"claude_seven_day_pct"`
+		ClaudeFive     int     `json:"claude_five_hour_tokens"`
+		ClaudeSeven    int     `json:"claude_seven_day_tokens"`
+		ClaudeFivePct  float64 `json:"claude_five_hour_pct"`
+		ClaudeSevenPct float64 `json:"claude_seven_day_pct"`
+		// Per-admin Opus cap (role=admin only; 0 limits = not capped): Opus-only
+		// draw in the same windows as the gate, the caps, and whether it is used up.
+		OpusFive       int                   `json:"opus_five_hour_tokens"`
+		OpusSeven      int                   `json:"opus_seven_day_tokens"`
+		OpusFiveLimit  int                   `json:"opus_five_hour_limit"`
+		OpusSevenLimit int                   `json:"opus_seven_day_limit"`
+		OpusExhausted  bool                  `json:"opus_exhausted"`
 		CostCents7d    int                   `json:"cost_cents_7d"`
 		Requests       int                   `json:"requests_7d"`
 		LastTs         time.Time             `json:"last_ts"`
@@ -2403,6 +2416,10 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		u.SevenDay = r.SevenTokens
 		u.ClaudeFive = r.ClaudeFive
 		u.ClaudeSeven = r.ClaudeSeven
+		u.OpusFive, u.OpusSeven = r.OpusFive, r.OpusSeven
+		u.OpusFiveLimit, u.OpusSevenLimit = common.ClaudeOpusLimitsForRole(r.Role)
+		u.OpusExhausted = (u.OpusSevenLimit > 0 && u.OpusSeven >= u.OpusSevenLimit) ||
+			(u.OpusFiveLimit > 0 && u.OpusFive >= u.OpusFiveLimit)
 		u.RawInput, u.RawOutput = r.RawInput, r.RawOutput
 		u.RawCacheRead, u.RawCacheWrite = r.RawCacheRead, r.RawCacheWrite
 		u.RawTotal = r.RawInput + r.RawOutput + r.RawCacheRead + r.RawCacheWrite
@@ -2569,6 +2586,7 @@ func AdminClaudeUserUsage(c *gin.Context) {
 		onPremSavingsCents += u.Providers[string(common.ProviderOnPrem)].CostCents
 		openRouterSpendCents += u.Providers[string(common.ProviderOpenRouter)].CostCents
 	}
+	opusAdmin5, opusAdmin7 := common.ClaudeOpusLimitsForRole("admin")
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
@@ -2589,6 +2607,9 @@ func AdminClaudeUserUsage(c *gin.Context) {
 			// time the window moves. The JSON keys above keep their historical
 			// five_hour_* names for wire compatibility.
 			"short_window_label": shortWindowLabel(),
+			// Per-admin Opus cap (role=admin), for the panel header.
+			"opus_admin_five_hour_tokens": opusAdmin5,
+			"opus_admin_seven_day_tokens": opusAdmin7,
 		},
 	})
 }

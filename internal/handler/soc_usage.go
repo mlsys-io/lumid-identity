@@ -135,6 +135,56 @@ func AdminSocKeysUsage(c *gin.Context) {
 		return
 	}
 
+	summary := summarizeUsage(series, now)
+
+	var today []socKeyToday
+	common.DB.Model(&models.SocKeyUsage{}).
+		Select("key_id, SUM(requests) requests, SUM(errors) errors, SUM(in_tokens) in_tokens, SUM(out_tokens) out_tokens").
+		Where("minute >= ?", sgtDayStart(now).UTC()).Group("key_id").Scan(&today)
+
+	ok(c, "ok", gin.H{"series": series, "summary": summary, "keys_today": today, "minutes": minutes, "live": fetchSocRelayLive()})
+}
+
+// socRelayLive is claude-proxy's SoC relay /status: what is running RIGHT NOW,
+// read from the per-key Redis locks (one in-flight request per key), so it is
+// cluster-wide whichever proxy replica answers.
+type socRelayLive struct {
+	Streams    map[string]int `json:"streams"`
+	BusyKeys   []uint         `json:"busy_keys"`
+	Waiting    int64          `json:"waiting"`
+	Source     string         `json:"source"`
+	ObservedAt time.Time      `json:"observed_at"`
+	// Anthropic-pool streams in flight per model (claude-proxy modelusage.go).
+	ClaudeStreams map[string]int `json:"claude_streams"`
+}
+
+var socRelayClient = &http.Client{Timeout: 2 * time.Second}
+
+// fetchSocRelayLive is best-effort: nil when the relay is unreachable, so the
+// usage view never fails because of it.
+func fetchSocRelayLive() *socRelayLive {
+	url := os.Getenv("SOC_RELAY_STATUS_URL")
+	if url == "" {
+		url = "http://claude-proxy-soc.lumid.svc.cluster.local:8081/status"
+	}
+	resp, err := socRelayClient.Get(url)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var out socRelayLive
+	if json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return nil
+	}
+	return &out
+}
+
+// summarizeUsage: per-model tiles over the last 5 complete minutes (the current
+// minute is still being filled by the proxies' 60 s flush, so it is excluded).
+func summarizeUsage(series []socUsagePoint, now time.Time) []socUsageSummary {
 	// Summary over the last 5 complete-ish minutes (the current minute is
 	// still being filled by the proxies' 60s flush, so it is excluded).
 	const win = 5
@@ -171,45 +221,5 @@ func AdminSocKeysUsage(c *gin.Context) {
 		summary = append(summary, *s)
 	}
 
-	var today []socKeyToday
-	common.DB.Model(&models.SocKeyUsage{}).
-		Select("key_id, SUM(requests) requests, SUM(errors) errors, SUM(in_tokens) in_tokens, SUM(out_tokens) out_tokens").
-		Where("minute >= ?", sgtDayStart(now).UTC()).Group("key_id").Scan(&today)
-
-	ok(c, "ok", gin.H{"series": series, "summary": summary, "keys_today": today, "minutes": minutes, "live": fetchSocRelayLive()})
-}
-
-// socRelayLive is claude-proxy's SoC relay /status: what is running RIGHT NOW,
-// read from the per-key Redis locks (one in-flight request per key), so it is
-// cluster-wide whichever proxy replica answers.
-type socRelayLive struct {
-	Streams    map[string]int `json:"streams"`
-	BusyKeys   []uint         `json:"busy_keys"`
-	Waiting    int64          `json:"waiting"`
-	Source     string         `json:"source"`
-	ObservedAt time.Time      `json:"observed_at"`
-}
-
-var socRelayClient = &http.Client{Timeout: 2 * time.Second}
-
-// fetchSocRelayLive is best-effort: nil when the relay is unreachable, so the
-// usage view never fails because of it.
-func fetchSocRelayLive() *socRelayLive {
-	url := os.Getenv("SOC_RELAY_STATUS_URL")
-	if url == "" {
-		url = "http://claude-proxy-soc.lumid.svc.cluster.local:8081/status"
-	}
-	resp, err := socRelayClient.Get(url)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	var out socRelayLive
-	if json.NewDecoder(resp.Body).Decode(&out) != nil {
-		return nil
-	}
-	return &out
+	return summary
 }

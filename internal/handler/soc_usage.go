@@ -152,6 +152,7 @@ type socRelayLive struct {
 	Streams    map[string]int `json:"streams"`
 	BusyKeys   []uint         `json:"busy_keys"`
 	Waiting    int64          `json:"waiting"`
+	PerKeyMax  int            `json:"per_key_max"` // SOC_KEY_MAX_INFLIGHT (lum.id/code shows "max N/key")
 	Source     string         `json:"source"`
 	ObservedAt time.Time      `json:"observed_at"`
 	// Anthropic-pool streams in flight per model (claude-proxy modelusage.go).

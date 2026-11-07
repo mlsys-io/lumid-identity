@@ -81,65 +81,52 @@ type llmBackendStatsResp struct {
 }
 
 func AdminOnpremGpuStats(c *gin.Context) {
+	// 200 even when degraded: a lumid-llm outage must blank this ONE panel, not
+	// the rest of /code — same reasoning as the OpenRouter balance handler.
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": fetchOnpremStats()})
+}
+
+// fetchOnpremStats returns lumid-llm's per-backend stats, cached onpremStatsTTL.
+// Shared by the admin endpoint and the per-minute throughput sampler.
+func fetchOnpremStats() onpremStatsPayload {
 	onpremStatsMu.Lock()
 	if onpremStatsCache != nil && time.Since(onpremStatsCache.at) < onpremStatsTTL {
 		payload := onpremStatsCache.data
 		onpremStatsMu.Unlock()
-		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": payload})
-		return
+		return payload
 	}
 	onpremStatsMu.Unlock()
-
-	degrade := func(errMsg string) {
-		payload := onpremStatsPayload{Available: false, Error: errMsg}
+	store := func(payload onpremStatsPayload) onpremStatsPayload {
 		onpremStatsMu.Lock()
 		onpremStatsCache = &onpremStatsCached{at: time.Now(), data: payload}
 		onpremStatsMu.Unlock()
-		// 200, not 5xx: a lumid-llm outage must blank this ONE panel, not the
-		// rest of /code — same reasoning as the OpenRouter balance handler.
-		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": payload})
+		return payload
 	}
-
+	degrade := func(errMsg string) onpremStatsPayload {
+		return store(onpremStatsPayload{Available: false, Error: errMsg})
+	}
 	pat, err := kvrunPAT()
 	if err != nil {
-		degrade("lumid-llm credential not configured")
-		return
+		return degrade("lumid-llm credential not configured")
 	}
-
 	req, err := http.NewRequest(http.MethodGet, lumidLLMBase()+"/admin/llm-backend-stats", nil)
 	if err != nil {
-		degrade("build request: " + err.Error())
-		return
+		return degrade("build request: " + err.Error())
 	}
 	req.Header.Set("Authorization", "Bearer "+pat)
-
 	cl := &http.Client{Timeout: onpremStatsTimeout}
 	resp, err := cl.Do(req)
 	if err != nil {
-		degrade("lumid-llm unreachable")
-		return
+		return degrade("lumid-llm unreachable")
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 65536))
-
 	if resp.StatusCode != http.StatusOK {
-		degrade("lumid-llm HTTP " + http.StatusText(resp.StatusCode))
-		return
+		return degrade("lumid-llm HTTP " + http.StatusText(resp.StatusCode))
 	}
-
 	var upstream llmBackendStatsResp
 	if err := json.Unmarshal(raw, &upstream); err != nil {
-		degrade("malformed lumid-llm response")
-		return
+		return degrade("malformed lumid-llm response")
 	}
-
-	payload := onpremStatsPayload{
-		Available:     true,
-		WindowSeconds: upstream.WindowSeconds,
-		Backends:      upstream.Backends,
-	}
-	onpremStatsMu.Lock()
-	onpremStatsCache = &onpremStatsCached{at: time.Now(), data: payload}
-	onpremStatsMu.Unlock()
-	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": payload})
+	return store(onpremStatsPayload{Available: true, WindowSeconds: upstream.WindowSeconds, Backends: upstream.Backends})
 }

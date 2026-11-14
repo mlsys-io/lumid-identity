@@ -122,13 +122,19 @@ func MeAgentChatStream(c *gin.Context) {
 	}
 
 	role := currentUserRole(c)
-	provider, providerNote := resolveProviderWhy(body.Model, role)
+	pa := poolAccessFor(c)
+	c.Request = c.Request.WithContext(withPoolAccess(c.Request.Context(), pa))
+	provider, providerNote, anyOpen := resolveProviderForCaller(body.Model, role, pa)
+	if !anyOpen {
+		fail(c, http.StatusForbidden, 1005, "no model is available to your Claude pool — ask an operator to enable on-prem for it")
+		return
+	}
 	// Never let a downgrade be silent. A 200 carrying a model the caller
 	// did not ask for is indistinguishable from success.
 	if providerNote != "" {
 		log.Printf("me_agent: provider downgrade: %s", providerNote)
 	}
-	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context, body.Mode)
+	provider, autoRouted := autoRouteForCaller(body.Messages, provider, role, pa, body.Context, body.Mode)
 	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503, "chat unavailable: "+err.Error())
@@ -549,6 +555,7 @@ func streamOneAnthropicTurn(
 		req.Header.Set("anthropic-version", anthropicVersion)
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	applyOpenRouterPolicy(req)
 
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {

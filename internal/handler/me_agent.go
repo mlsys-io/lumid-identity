@@ -1077,7 +1077,7 @@ var llmProviders = []llmProvider{
 		authPrefix:        "",
 		keyFn:             claudeCodeKeyFn,
 		supportsVision:    false,
-		minRole:           "super_admin", // pool: fable = super_admin only
+		minRole:           "super_admin", // by ROLE; a pool allow_fable grant opens it to anyone (providerPoolAllowed, mirrors claude-proxy modelAllowed)
 		dailyBudgetTokens: -1,
 	},
 	// REMOVED 2026-08-28: claude-code-kimi (kimi-k3) and claude-code-glm
@@ -1275,11 +1275,13 @@ func MeAgentModels(c *gin.Context) {
 		AppTools bool `json:"app_tools"`
 	}
 	role := currentUserRole(c)
+	pa := poolAccessFor(c)
 	out := make([]item, 0, len(llmProviders))
-	def := defaultProviderFor(role).id
+	defP, _ := defaultProviderForCaller(role, pa)
+	def := defP.id
 	for _, p := range llmProviders {
-		if !providerAllowed(role, p) {
-			continue // policy: hide providers above the caller's role
+		if !providerPoolAllowed(role, pa, p) {
+			continue // policy: hide providers the caller's role or Claude pool closes
 		}
 		out = append(out, item{ID: p.id, DisplayName: p.displayName, Default: p.id == def, AppTools: !isClaudeCodeProvider(p)})
 	}
@@ -2216,13 +2218,19 @@ func MeAgentChat(c *gin.Context) {
 	}
 
 	role := currentUserRole(c)
-	provider, providerNote := resolveProviderWhy(body.Model, role)
+	pa := poolAccessFor(c)
+	c.Request = c.Request.WithContext(withPoolAccess(c.Request.Context(), pa))
+	provider, providerNote, anyOpen := resolveProviderForCaller(body.Model, role, pa)
+	if !anyOpen {
+		fail(c, http.StatusForbidden, 1005, "no model is available to your Claude pool — ask an operator to enable on-prem for it")
+		return
+	}
 	// Never let a downgrade be silent. A 200 carrying a model the caller
 	// did not ask for is indistinguishable from success.
 	if providerNote != "" {
 		log.Printf("me_agent: provider downgrade: %s", providerNote)
 	}
-	provider, autoRouted := autoRouteForTurn(body.Messages, provider, role, body.Context, body.Mode)
+	provider, autoRouted := autoRouteForCaller(body.Messages, provider, role, pa, body.Context, body.Mode)
 	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
 	apiKey, err := provider.keyFn()
 	if err != nil {
@@ -2683,6 +2691,7 @@ func callLLM(ctx context.Context, p llmProvider, apiKey string, body map[string]
 	if p.addAnthropicVersion {
 		req.Header.Set("anthropic-version", anthropicVersion)
 	}
+	applyOpenRouterPolicy(req)
 
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {

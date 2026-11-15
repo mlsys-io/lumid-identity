@@ -41,6 +41,10 @@ type Config struct {
 	JWT struct {
 		AccessTTLSec  int `yaml:"access_ttl_sec"`  // 15 min default
 		RefreshTTLSec int `yaml:"refresh_ttl_sec"` // 30 days default
+		// SessionTTLSec is the lifetime of the browser login (the lm_session
+		// cookie and its JWT) only. OAuth access tokens and ID tokens handed to
+		// other clients keep AccessTTLSec. 0 = fall back to AccessTTLSec.
+		SessionTTLSec int `yaml:"session_ttl_sec"`
 	} `yaml:"jwt"`
 
 	OAuth struct {

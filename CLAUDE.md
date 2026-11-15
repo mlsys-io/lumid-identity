@@ -86,12 +86,15 @@ docs/unified-auth.md       the shared `lumid_auth` hook-library spec for consume
   on billing/accounting. Bootstrap:
   `UPDATE users SET role='super_admin' WHERE email='admin@lum.id';` then re-login — the role is a
   cached JWT claim, so an existing session keeps the old one.
-- **`lm_session`** — RS256 JWT, 24 h, `Domain=lum.id; HttpOnly; Secure; SameSite=Lax`. Set by
+- **`lm_session`** — RS256 JWT, **30 days** (`jwt.session_ttl_sec`, issued by `common.IssueSessionJWT`;
+  was 24 h until 2026-11-15), `Domain=lum.id; HttpOnly; Secure; SameSite=Lax`. Set by
   `setSessionCookie` in `internal/handler/auth.go`. Apex domain is what makes subdomain SSO work.
-  Logout flips `sessions.revoked_at` by `jti`.
+  Logout flips `sessions.revoked_at` by `jti`. Because the role is a claim baked in at login, an
+  admin role change revokes that user's browser sessions (`AdminUsersPatch`); suspension already
+  revoked sessions + PATs. OAuth access/ID tokens keep `jwt.access_ttl_sec` (24 h).
 - **`GET /api/v1/session-bearer` must stay short-lived and scoped** — 10 min, `aud=runmesh`,
   `scope=runmesh:admin`, minted by `common.IssueBridgeJWT`. It exists precisely so an XSS on
-  lum.id cannot replay a general 24 h session against `runmesh.ai`. Widening its TTL or audience
+  lum.id cannot replay a general 30-day session against `runmesh.ai`. Widening its TTL or audience
   defeats the whole design.
 - **OAuth `client_secret` and refresh-tokens never leave this service.** Refresh-tokens are
   AES-256-GCM encrypted with `IDENTITY_GRANT_KEY` into `google_grants` / `microsoft_grants`. The

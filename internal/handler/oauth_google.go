@@ -140,7 +140,7 @@ func GoogleLoginHandler(c *gin.Context) {
 	if u.Role == "admin" || u.Role == "super_admin" {
 		scopes = []string{"*"}
 	}
-	sessionTok, jti, exp, err := common.IssueJWT(u.ID, u.Email, u.Role, scopes)
+	sessionTok, jti, exp, err := common.IssueSessionJWT(u.ID, u.Email, u.Role, scopes)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "sign jwt: "+err.Error())
 		return

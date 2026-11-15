@@ -24,7 +24,12 @@ signing:
   key_dir: "${SIGNING_KEY_DIR}"
 
 jwt:
-  access_ttl_sec: 86400      # 24h — dashboards expect a working-day session
+  access_ttl_sec: 86400      # 24h — OAuth access/ID tokens handed to other clients
+  # Browser login (lm_session cookie + its JWT): 30 days, so lum.id stays signed
+  # in for a month (2026-11-15; was the 24h above, users found re-login daily too
+  # often). Still revocable: logout / password change / suspension denylist the
+  # jti, and a role change revokes the user's sessions (admin_users.go).
+  session_ttl_sec: 2592000   # 30 days
   refresh_ttl_sec: 2592000   # 30 days
 
 oauth:

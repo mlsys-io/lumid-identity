@@ -73,7 +73,7 @@ func LoginHandler(c *gin.Context) {
 		scopes = []string{"*"}
 	}
 
-	tok, jti, exp, err := common.IssueJWT(u.ID, u.Email, u.Role, scopes)
+	tok, jti, exp, err := common.IssueSessionJWT(u.ID, u.Email, u.Role, scopes)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "sign jwt: "+err.Error())
 		return

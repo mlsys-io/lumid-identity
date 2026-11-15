@@ -21,8 +21,36 @@ type JWTClaims struct {
 }
 
 // IssueJWT signs an access token for `userID`. Returns (token, jti, exp).
-// jti goes into the sessions table for logout-everywhere.
+// jti goes into the sessions table for logout-everywhere. Lifetime is
+// jwt.access_ttl_sec; browser logins use IssueSessionJWT instead.
 func IssueJWT(userID, email, role string, scopes []string) (string, string, time.Time, error) {
+	return issueJWT(userID, email, role, scopes, accessTTL())
+}
+
+// IssueSessionJWT signs the browser-login JWT that backs the lm_session
+// cookie. Same claims as IssueJWT; lifetime is jwt.session_ttl_sec (30 days),
+// falling back to the access TTL when unset.
+func IssueSessionJWT(userID, email, role string, scopes []string) (string, string, time.Time, error) {
+	return issueJWT(userID, email, role, scopes, SessionTTL())
+}
+
+func accessTTL() time.Duration {
+	if ttl := time.Duration(config.G.JWT.AccessTTLSec) * time.Second; ttl > 0 {
+		return ttl
+	}
+	return 15 * time.Minute
+}
+
+// SessionTTL is the browser-login lifetime (jwt.session_ttl_sec, else the
+// access TTL).
+func SessionTTL() time.Duration {
+	if ttl := time.Duration(config.G.JWT.SessionTTLSec) * time.Second; ttl > 0 {
+		return ttl
+	}
+	return accessTTL()
+}
+
+func issueJWT(userID, email, role string, scopes []string, ttl time.Duration) (string, string, time.Time, error) {
 	k := Keys.Active()
 	if k == nil {
 		return "", "", time.Time{}, fmt.Errorf("no active signing key")
@@ -30,10 +58,6 @@ func IssueJWT(userID, email, role string, scopes []string) (string, string, time
 	jti, err := randID(16)
 	if err != nil {
 		return "", "", time.Time{}, err
-	}
-	ttl := time.Duration(config.G.JWT.AccessTTLSec) * time.Second
-	if ttl == 0 {
-		ttl = 15 * time.Minute
 	}
 	now := time.Now()
 	exp := now.Add(ttl)
@@ -74,7 +98,7 @@ func IssueJWT(userID, email, role string, scopes []string) (string, string, time
 // downstream service (runmesh.ai, etc.) where the HttpOnly `.lum.id`
 // session cookie can't reach. Distinct from IssueJWT in three ways:
 //
-//  1. Caller controls TTL (sessions are 24h; bridge tokens are 10m).
+//  1. Caller controls TTL (sessions are 30d; bridge tokens are 10m).
 //  2. Caller picks a service-specific audience (session JWTs carry
 //     `lumid-ecosystem`; bridge JWTs carry e.g. `runmesh`).
 //  3. Caller supplies a narrow scope set so XSS that steals the

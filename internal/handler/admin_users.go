@@ -241,9 +241,16 @@ func AdminUsersPatch(c *gin.Context) {
 
 	// Suspending a user cascades to token + session revocation so the
 	// change takes effect on the next request — not whenever their
-	// 24h JWT expires.
+	// 30-day session JWT expires.
 	if req.Status != nil && strings.EqualFold(*req.Status, "suspended") {
 		revokeUserSessionsAndTokens(id, "admin:user:suspend")
+	} else if before.Role != after.Role {
+		// The role is a claim baked into the session JWT at login, and the
+		// JWT path (introspect, currentUserID) trusts it. With 30-day
+		// sessions a demoted admin would otherwise keep admin for a month.
+		// Kill the browser sessions so the next request re-logs in with the
+		// new role. PATs are left alone: their role is read from the DB.
+		revokeUserSessions(id)
 	}
 
 	toks := countActiveTokensByUser([]string{id})
@@ -1105,6 +1112,19 @@ func revokeUserSessionsAndTokens(userID, reason string) int {
 
 	_ = reason
 	return int(n)
+}
+
+// revokeUserSessions flips revoked_at on every open browser session of the
+// user and denylists their jtis, leaving PATs untouched. Returns the number
+// of sessions revoked.
+func revokeUserSessions(userID string) int {
+	now := time.Now()
+	doomed := liveSessionsForUser(userID, "")
+	r := common.DB.Model(&models.Session{}).
+		Where("user_id = ? AND revoked_at IS NULL", userID).
+		Update("revoked_at", &now)
+	denylistSessions(context.Background(), doomed)
+	return int(r.RowsAffected)
 }
 
 func countActiveTokensByUser(userIDs []string) map[string]int {

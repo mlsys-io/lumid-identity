@@ -134,7 +134,7 @@ func MeAgentChatStream(c *gin.Context) {
 	if providerNote != "" {
 		log.Printf("me_agent: provider downgrade: %s", providerNote)
 	}
-	provider, autoRouted := autoRouteForCaller(body.Messages, provider, role, pa, body.Context, body.Mode)
+	provider, autoRouted := autoRouteForCaller(userID, body.Messages, provider, role, pa, body.Context, body.Mode)
 	apiKey, err := provider.keyFn()
 	if err != nil {
 		fail(c, http.StatusServiceUnavailable, 1503, "chat unavailable: "+err.Error())

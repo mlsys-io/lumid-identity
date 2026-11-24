@@ -157,14 +157,27 @@ func mergeCycleRows(disk, db []cycleListItem) []cycleListItem {
 // failed → Diagnose" row the only place in the product where a failure was
 // visible at all.
 func runRowsFromDB(userSub string, since, until time.Time) []RunRow {
+	rows, _, _ := runRowsFromDBScan(userSub, since, until)
+	return rows
+}
+
+// runStoreScanCap bounds one read of the run store. It used to be the hard
+// ceiling of /me/runs as a whole — rows past the newest 500 in the window were
+// unreachable by any cursor. Now /me/runs pages past it with a keyset cursor
+// (me_runs_page.go), which needs to know whether the cap was hit and where.
+const runStoreScanCap = 500
+
+// runRowsFromDBScan is runRowsFromDB plus whether the scan hit runStoreScanCap
+// and the oldest run_ts it read (meaningful only when capped).
+func runRowsFromDBScan(userSub string, since, until time.Time) ([]RunRow, bool, float64) {
 	if userSub == "" || common.DB == nil {
-		return nil
+		return nil, false, 0
 	}
 	var rows []models.MeAppRun
 	q := common.DB.Where("user_sub = ? AND run_ts >= ? AND run_ts <= ?",
 		userSub, since.Unix(), until.Unix())
-	if q.Order("run_ts DESC").Limit(500).Find(&rows).Error != nil {
-		return nil
+	if q.Order("run_ts DESC").Limit(runStoreScanCap).Find(&rows).Error != nil {
+		return nil, false, 0
 	}
 	out := make([]RunRow, 0, len(rows))
 	for _, r := range rows {
@@ -172,7 +185,12 @@ func runRowsFromDB(userSub string, since, until time.Time) []RunRow {
 			out = append(out, row)
 		}
 	}
-	return out
+	capped := len(rows) >= runStoreScanCap
+	var oldest float64
+	if len(rows) > 0 {
+		oldest = float64(rows[len(rows)-1].RunTs)
+	}
+	return out, capped, oldest
 }
 
 // primaryMetricFromBlob lifts the `primary_metric` object the runner writes into

@@ -8,23 +8,22 @@
 //
 // Filters: state (running|succeeded|failed|paused), workflow slug,
 // time range (last 24h default; ?since=ISO + ?until=ISO override).
-// Cursor pagination via opaque base64 (ts:source:row_id).
+// Keyset cursor pagination over (started_at, run_id) — see me_runs_page.go.
 
 package handler
 
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -50,7 +49,13 @@ type RunRow struct {
 	CycleDir string `json:"cycle_dir,omitempty"`
 }
 
-// MeRuns — GET /me/runs[?state=&workflow=&since=&until=&limit=&cursor=]
+// MeRuns — GET /me/runs[?state=&workflow=&since=&until=&limit=&cursor=&before=]
+//
+// Pagination (see me_runs_page.go): rows are ordered newest first by
+// (started_at DESC, run_id DESC). `next_cursor` is an opaque KEYSET token for
+// the row after the last one returned; pass it back as `cursor=` or `before=`.
+// `before=` also takes a bare started_at (unix seconds or RFC3339) meaning
+// "strictly older than this". Legacy integer-offset cursors are still honoured.
 func MeRuns(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -63,52 +68,39 @@ func MeRuns(c *gin.Context) {
 	until := parseISOorDefault(c.Query("until"), time.Now().UTC().Add(time.Minute))
 	limit := atoiClamp(c.Query("limit"), 50, 1, 500)
 
-	rows := collectRuns(c, userID, since, until)
-
-	// Apply filters.
-	filtered := make([]RunRow, 0, len(rows))
-	for _, r := range rows {
-		if stateFilter != "" && !stateMatches(r.State, stateFilter) {
-			continue
-		}
-		if workflowFilter != "" && r.WorkflowSlug != workflowFilter {
-			continue
-		}
-		filtered = append(filtered, r)
+	page, err := parseRunsPageParams(c.Query("cursor"), c.Query("before"))
+	if err != nil {
+		fail(c, http.StatusBadRequest, 1400, err.Error())
+		return
 	}
+	until = keysetScanUntil(page.keyset, until)
 
-	// Sort newest first.
-	sort.SliceStable(filtered, func(i, j int) bool {
-		return filtered[i].StartedAt > filtered[j].StartedAt
-	})
+	col := collectRunsFrom(c, userID, since, until)
+	c.Header("Server-Timing", col.serverTiming())
 
-	// Simple cursor: byte offset into the filtered slice, base64'd.
-	cursor := c.Query("cursor")
-	startIdx := 0
-	if cursor != "" {
-		if b, err := base64.URLEncoding.DecodeString(cursor); err == nil {
-			if v, err := strconv.Atoi(string(b)); err == nil && v >= 0 {
-				startIdx = v
-			}
-		}
-	}
-	endIdx := startIdx + limit
-	if endIdx > len(filtered) {
-		endIdx = len(filtered)
-	}
-	page := filtered[startIdx:endIdx]
-	nextCursor := ""
-	if endIdx < len(filtered) {
-		nextCursor = base64.URLEncoding.EncodeToString([]byte(strconv.Itoa(endIdx)))
+	filtered := filterRuns(col.rows, stateFilter, workflowFilter)
+	sortRunsNewestFirst(filtered)
+
+	var (
+		out        []RunRow
+		total      int
+		nextCursor string
+	)
+	if page.offset >= 0 {
+		out, total, nextCursor = pageByOffset(filtered, page.offset, limit, col.storeCapped, col.storeOldest)
+	} else {
+		out, total, nextCursor = pageByKeyset(filtered, page.keyset, limit, col.storeCapped, col.storeOldest)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"ret_code": 0, "message": "ok",
 		"data": gin.H{
-			"runs":        page,
-			"count":       len(page),
-			"total":       len(filtered),
+			"runs":        out,
+			"count":       len(out),
+			"total":       total,
 			"next_cursor": nextCursor,
+			"has_more":    nextCursor != "",
+			"sources":     col.status,
 			"as_of":       time.Now().UTC().Format(time.RFC3339),
 		},
 	})
@@ -359,9 +351,111 @@ func MeRunDetail(c *gin.Context) {
 }
 
 func collectRuns(c *gin.Context, userID string, since, until time.Time) []RunRow {
-	out := []RunRow{}
+	return collectRunsFrom(c, userID, since, until).rows
+}
+
+// meRunsN8nTimeout bounds the n8n sub-source. It was a fixed 6 s, run AFTER the
+// other sources, and n8n is not deployed on UKS — so every /me/runs paid the
+// full 6 s (measured 6.14–6.33 s in production for 0, 76 and 0 rows; a cheap
+// endpoint on the same path answers in 0.39 s). The breaker in common/n8n_client
+// makes the wait once per cool-down; this bound makes that once short.
+// Override with ME_RUNS_N8N_TIMEOUT_MS.
+func meRunsN8nTimeout() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("ME_RUNS_N8N_TIMEOUT_MS")); err == nil && v > 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return 1500 * time.Millisecond
+}
+
+// runsCollection is what collectRunsFrom gathered, plus how.
+type runsCollection struct {
+	rows []RunRow
+	// storeCapped: the run store returned runStoreScanCap rows, so older rows
+	// may exist below storeOldest that this scan did not read.
+	storeCapped bool
+	storeOldest float64
+	// per-source outcome ("ok" | "timeout" | "unreachable" | "error" |
+	// "unauthenticated") and wall time.
+	status  map[string]string
+	timings map[string]time.Duration
+}
+
+func (rc runsCollection) serverTiming() string {
+	parts := make([]string, 0, len(rc.timings))
+	for _, k := range []string{"journal", "store", "n8n"} {
+		if d, ok := rc.timings[k]; ok {
+			parts = append(parts, fmt.Sprintf("%s;dur=%.1f;desc=%q", k, float64(d.Microseconds())/1000, rc.status[k]))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// collectRunsFrom gathers the three sources CONCURRENTLY. They used to run
+// one after another with the remote one last, so the response time was the sum
+// — and n8n's fixed 6 s deadline dominated it. Now it is the slowest source,
+// and the remote one is bounded (meRunsN8nTimeout) and short-circuited while
+// known unreachable. A source that fails or times out contributes no rows and
+// reports its outcome in `status`; it never fails the request.
+func collectRunsFrom(c *gin.Context, userID string, since, until time.Time) runsCollection {
+	rc := runsCollection{status: map[string]string{}, timings: map[string]time.Duration{}}
+	var mu sync.Mutex
+	record := func(name, status string, d time.Duration) {
+		mu.Lock()
+		rc.status[name], rc.timings[name] = status, d
+		mu.Unlock()
+	}
+	// Read everything off the gin.Context BEFORE fanning out: it is not safe
+	// for concurrent use.
+	reqCtx := c.Request.Context()
+	cookie, _ := c.Cookie("n8n-auth")
+
+	var journal, store, visual []RunRow
+	var wg sync.WaitGroup
+	wg.Add(3)
 
 	// 1. Scheduled — walk every app's journal.jsonl.
+	go func() {
+		defer wg.Done()
+		t0 := time.Now()
+		journal = journalRuns(userID, since, until)
+		record("journal", "ok", time.Since(t0))
+	}()
+
+	// 1b. The RUN STORE. On a cloud pod neither path above exists — identity
+	// mounts no tenant volume — so the only source this function had was the
+	// n8n API below, and the endpoint could return VISUAL runs and nothing
+	// else. Merged, not substituted: an operator install on the scheduler's own
+	// volume is readable here and its journal carries a cycle_dir the store
+	// does not.
+	go func() {
+		defer wg.Done()
+		t0 := time.Now()
+		var capped bool
+		var oldest float64
+		store, capped, oldest = runRowsFromDBScan(userID, since, until)
+		mu.Lock()
+		rc.storeCapped, rc.storeOldest = capped, oldest
+		mu.Unlock()
+		record("store", "ok", time.Since(t0))
+	}()
+
+	// 2. Visual — n8n executions. Soft-fail on auth, timeout and unreachable.
+	go func() {
+		defer wg.Done()
+		t0 := time.Now()
+		var st string
+		visual, st = n8nRuns(reqCtx, cookie, since, until, meRunsN8nTimeout())
+		record("n8n", st, time.Since(t0))
+	}()
+
+	wg.Wait()
+	rc.rows = append(mergeRunRows(journal, store), visual...)
+	return rc
+}
+
+// journalRuns reads the tenant tree and the operator-shared apps.
+func journalRuns(userID string, since, until time.Time) []RunRow {
+	out := []RunRow{}
 	scan := func(appsRoot string) {
 		entries, _ := os.ReadDir(appsRoot)
 		for _, e := range entries {
@@ -380,40 +474,43 @@ func collectRuns(c *gin.Context, userID string, since, until time.Time) []RunRow
 	}
 	scan(tenantAppsDir(userID))
 	scan(filepath.Join(operatorHome(), ".xp", "apps"))
-
-	// 1b. The RUN STORE. On a cloud pod neither path above exists — identity
-	// mounts no tenant volume — so the only source this function had was the
-	// n8n API below, and the endpoint could return VISUAL runs and nothing
-	// else. Merged, not substituted: an operator install on the scheduler's own
-	// volume is readable here and its journal carries a cycle_dir the store
-	// does not.
-	out = mergeRunRows(out, runRowsFromDB(userID, since, until))
-
-	// 2. Visual — n8n executions. Soft-fail on auth.
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 6*time.Second)
-	defer cancel()
-	cli := common.NewN8nClient()
-	cookie, _ := c.Cookie("n8n-auth")
-	execs, err := cli.ListExecutions(ctx, "", "", cookie)
-	if err == nil {
-		for _, ex := range execs {
-			started := parseTimeToUnix(ex.StartedAt)
-			if started < float64(since.Unix()) || started > float64(until.Unix()) {
-				continue
-			}
-			out = append(out, RunRow{
-				RunID:        "visual:n8n:" + ex.ID,
-				WorkflowSlug: "n8n:" + ex.WorkflowID,
-				Kind:         "visual",
-				Name:         "",
-				State:        n8nStateToOurs(ex.Status, ex.Finished),
-				StartedAt:    started,
-				StartedISO:   ex.StartedAt,
-				DurationSec:  computeDuration(ex.StartedAt, ex.StoppedAt),
-			})
-		}
-	}
 	return out
+}
+
+// n8nRuns lists n8n executions in [since, until] with a hard deadline.
+func n8nRuns(parent context.Context, cookie string, since, until time.Time, timeout time.Duration) ([]RunRow, string) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	execs, err := common.NewN8nClient().ListExecutions(ctx, "", "", cookie)
+	switch {
+	case err == nil:
+	case errors.Is(err, common.ErrN8nUnreachable):
+		return nil, "unreachable"
+	case errors.Is(err, common.ErrUnauthenticated):
+		return nil, "unauthenticated"
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return nil, "timeout"
+	default:
+		return nil, "error"
+	}
+	out := []RunRow{}
+	for _, ex := range execs {
+		started := parseTimeToUnix(ex.StartedAt)
+		if started < float64(since.Unix()) || started > float64(until.Unix()) {
+			continue
+		}
+		out = append(out, RunRow{
+			RunID:        "visual:n8n:" + ex.ID,
+			WorkflowSlug: "n8n:" + ex.WorkflowID,
+			Kind:         "visual",
+			Name:         "",
+			State:        n8nStateToOurs(ex.Status, ex.Finished),
+			StartedAt:    started,
+			StartedISO:   ex.StartedAt,
+			DurationSec:  computeDuration(ex.StartedAt, ex.StoppedAt),
+		})
+	}
+	return out, "ok"
 }
 
 // journalRowToRun converts a single cycle row from journal.jsonl into

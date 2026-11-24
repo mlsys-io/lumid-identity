@@ -18,10 +18,62 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
+
+// ErrN8nUnreachable is returned WITHOUT a network round-trip while the n8n
+// endpoint is in its cool-down after a failed connect (see n8nBreaker).
+var ErrN8nUnreachable = errors.New("n8n unreachable (recent connect failure; in cool-down)")
+
+// n8nUnreachableCooldown — how long a failed CONNECT short-circuits every
+// later call to the same base URL.
+//
+// Why this exists: n8n was not migrated to UKS (k8s-lift/CUTOVER.md), so the
+// default base URL below (172.17.0.1:5678, the old docker-host bridge) is a
+// blackhole from a pod — the connect never completes and never fails, it just
+// hangs until the caller's deadline. Every /me/runs request paid that full
+// deadline (6 s) for a source that cannot answer; so did every 2 s tick of
+// /me/runs/stream. A refused or timed-out CONNECT is now remembered for this
+// long, so one request per cool-down pays the wait and the rest do not.
+//
+// Only a failure BEFORE a connection was established trips it. A reachable
+// n8n that is merely slow to answer is not "unreachable", and one caller's
+// short deadline must not cut it off for callers that allow longer.
+const n8nUnreachableCooldown = 60 * time.Second
+
+var n8nBreaker = struct {
+	sync.Mutex
+	until map[string]time.Time // base URL -> cool-down end
+}{until: map[string]time.Time{}}
+
+func n8nInCooldown(base string, now time.Time) bool {
+	n8nBreaker.Lock()
+	defer n8nBreaker.Unlock()
+	return now.Before(n8nBreaker.until[base])
+}
+
+func n8nMarkUnreachable(base string, now time.Time) {
+	n8nBreaker.Lock()
+	n8nBreaker.until[base] = now.Add(n8nUnreachableCooldown)
+	n8nBreaker.Unlock()
+}
+
+func n8nMarkReachable(base string) {
+	n8nBreaker.Lock()
+	delete(n8nBreaker.until, base)
+	n8nBreaker.Unlock()
+}
+
+// ResetN8nBreaker clears every cool-down. For tests.
+func ResetN8nBreaker() {
+	n8nBreaker.Lock()
+	n8nBreaker.until = map[string]time.Time{}
+	n8nBreaker.Unlock()
+}
 
 // N8nClient wraps the upstream n8n REST API.
 type N8nClient struct {
@@ -160,8 +212,18 @@ func (c *N8nClient) GetExecution(ctx context.Context, id, sessionCookie string) 
 // do — shared request driver. Adds Cookie header when supplied;
 // surfaces 401 as ErrUnauthenticated so aggregators can soft-fail.
 func (c *N8nClient) do(ctx context.Context, method, path, sessionCookie string, out any) error {
+	if n8nInCooldown(c.BaseURL, time.Now()) {
+		return fmt.Errorf("n8n %s %s: %w", method, path, ErrN8nUnreachable)
+	}
 	url := c.BaseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	var connected bool
+	var connMu sync.Mutex
+	trace := &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) {
+		connMu.Lock()
+		connected = true
+		connMu.Unlock()
+	}}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), method, url, nil)
 	if err != nil {
 		return err
 	}
@@ -172,8 +234,16 @@ func (c *N8nClient) do(ctx context.Context, method, path, sessionCookie string, 
 	req.Header.Set("User-Agent", "lumid-identity/1.0 n8n-client")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
+		connMu.Lock()
+		gotConn := connected
+		connMu.Unlock()
+		// The CALLER going away (client disconnect) says nothing about n8n.
+		if !gotConn && !errors.Is(ctx.Err(), context.Canceled) {
+			n8nMarkUnreachable(c.BaseURL, time.Now())
+		}
 		return fmt.Errorf("n8n %s %s: %w", method, path, err)
 	}
+	n8nMarkReachable(c.BaseURL)
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:

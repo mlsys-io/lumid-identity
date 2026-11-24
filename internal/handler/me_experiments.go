@@ -921,12 +921,24 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 	// self-report into. Only when the ledger is EMPTY: a ledger whose rows lack
 	// the metric is authoritative about that, and the run store must not paper
 	// over it. See me_experiment_run_series.go.
-	seriesSource := "results_ledger"
+	// Where the curve comes from, best first:
+	//   1. the ledger on disk — but only if it produced points. A ledger whose
+	//      rows carry no value for the declared metric (doc-readability) used
+	//      to end the search with an empty curve;
+	//   2. the scheduler's own per-arm history (state.history) — RUNNING MEANS
+	//      from the same fenced rows as the means beside it;
+	//   3. a rebuild from the run store, which knows an arm only when the run
+	//      named one.
+	seriesSource, seriesKind := "results_ledger", "raw"
 	seriesTotal, seriesTruncated := 0, false
-	if len(rows) == 0 {
-		feeding := feederLoops(decl, expLoops(m)[decl.ID])
-		if s, n, tr := expRunStoreSeries(userSub, app, decl.ID, metricName, feeding); len(s) > 0 {
-			series, seriesTotal, seriesTruncated, seriesSource = s, n, tr, "run_store"
+	if len(series) == 0 {
+		if hs := expSeriesFromStateHistory(st); len(hs) > 0 {
+			series, seriesSource, seriesKind = hs, "state_history", "running_mean"
+		} else {
+			feeding := feederLoops(decl, expLoops(m)[decl.ID])
+			if s, n, tr := expRunStoreSeries(userSub, app, decl.ID, metricName, feeding); len(s) > 0 {
+				series, seriesTotal, seriesTruncated, seriesSource = s, n, tr, "run_store"
+			}
 		}
 	}
 
@@ -1019,6 +1031,9 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		// and the curve was rebuilt from me_app_runs (newest expRunSeriesCap
 		// points); `results`/`cases` stay empty then — they ARE the ledger.
 		"series_source": seriesSource,
+		// "raw" = one point per result; "running_mean" = each point is the
+		// arm's mean so far (state.history) and carries its count `n`.
+		"series_kind": seriesKind,
 	}
 	if seriesSource == "run_store" {
 		detail["series_total"] = seriesTotal
@@ -1396,6 +1411,10 @@ type appExperimentBody struct {
 //
 // Idempotent on (user_sub, app, experiment_id): each cycle overwrites with the
 // freshly evaluated state, which is what evaluate() already does to state.json.
+// expStateMaxBytes keeps a stored state under the TEXT column's 65,535 bytes
+// with room to spare.
+const expStateMaxBytes = 60_000
+
 func InternalAppExperimentRecord(c *gin.Context) {
 	var b appExperimentBody
 	if err := c.ShouldBindJSON(&b); err != nil {
@@ -1411,6 +1430,24 @@ func InternalAppExperimentRecord(c *gin.Context) {
 	if b.State != nil {
 		if raw, err := json.Marshal(b.State); err == nil {
 			sj = string(raw)
+		}
+		// `state` is a TEXT column (64 KiB). The per-arm history is the only
+		// part that grows with arm count; if it would push the row past the
+		// column, drop IT and keep the state — an over-long write fails whole
+		// and the experiment would lose its numbers, not just its curve.
+		if len(sj) > expStateMaxBytes {
+			if _, has := b.State["history"]; has {
+				trimmed := make(map[string]any, len(b.State))
+				for k, v := range b.State {
+					if k != "history" {
+						trimmed[k] = v
+					}
+				}
+				trimmed["history_dropped"] = "state too large for storage"
+				if raw, err := json.Marshal(trimmed); err == nil {
+					sj = string(raw)
+				}
+			}
 		}
 		if v, ok := b.State["n_results"].(float64); ok {
 			n = int(v)

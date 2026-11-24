@@ -9,6 +9,7 @@ package handler
 // (TEST_MYSQL_DSN) drive the real GET /me/apps/:app/experiments/:id handler.
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -95,9 +96,11 @@ func TestExpRunPointsReadsEveryArmShape(t *testing.T) {
 				{"arm":"elsewhere","experiment":"other","realized_pnl_ticks":3},
 				{"note":"no arm","realized_pnl_ticks":4}]}}`,
 			[]expRunPoint{{runTs: 1, arm: "tape_covered", v: 1}, {runTs: 1, arm: "current", v: 2}}},
-		{"no arm anywhere: plain cycle, inferred current",
+		// No guessed arm: the run-level number is not what the ledger records
+		// (kol_alpha's guessed "current" read ~13M against evaluate()'s 122k).
+		{"no arm anywhere: not charted",
 			`{"primary_metric":{"name":"realized_pnl_ticks","value":7},"realized_pnl_ticks":7}`,
-			[]expRunPoint{{runTs: 1, arm: "current", v: 7, inferred: true}}},
+			nil},
 		{"metric absent", `{"arm":"musk_v1","other":1}`, nil},
 		{"garbage blob", `not json`, nil},
 	}
@@ -116,13 +119,12 @@ func TestExpSeriesFromRunsShapeAndCap(t *testing.T) {
 		seriesRun(1700000200, `{"realized_pnl_ticks":2}`),
 		seriesRun(1700000100, `{"arm":"musk_v1","realized_pnl_ticks":1}`),
 	}
-	series, total := expSeriesFromRuns(runs, "kol_alpha", "realized_pnl_ticks", 2)
-	if total != 3 {
-		t.Fatalf("total = %d, want 3", total)
+	series, total := expSeriesFromRuns(runs, "kol_alpha", "realized_pnl_ticks", 1)
+	if total != 2 {
+		t.Fatalf("total = %d, want 2 (the arm-less run is not charted)", total)
 	}
 	b, _ := json.Marshal(series)
-	want := `[{"arm_inferred":true,"points":[{"arm_inferred":true,"ts":"2023-11-14T22:16:40Z","v":2}],"variant_id":"current"},` +
-		`{"points":[{"ts":"2023-11-14T22:18:20Z","v":3}],"variant_id":"musk_v1"}]`
+	want := `[{"points":[{"ts":"2023-11-14T22:18:20Z","v":3}],"variant_id":"musk_v1"}]`
 	if string(b) != want {
 		t.Fatalf("series =\n%s\nwant\n%s", b, want)
 	}
@@ -297,12 +299,11 @@ func TestDetailSeriesFromRunStoreWhenLedgerAbsent(t *testing.T) {
 		t.Fatalf("series_source = %v (series %v)", d["series_source"], d["series"])
 	}
 	b, _ := json.Marshal(d["series"])
-	want := `[{"arm_inferred":true,"points":[{"arm_inferred":true,"ts":"2025-11-13T02:15:00Z","v":1.25}],"variant_id":"current"},` +
-		`{"points":[{"ts":"2025-11-13T02:13:20Z","v":4.5}],"variant_id":"musk_v1"}]`
+	want := `[{"points":[{"ts":"2025-11-13T02:13:20Z","v":4.5}],"variant_id":"musk_v1"}]`
 	if string(b) != want {
 		t.Fatalf("series =\n%s\nwant\n%s", b, want)
 	}
-	if d["series_total"] != float64(2) || d["series_truncated"] != false {
+	if d["series_total"] != float64(1) || d["series_truncated"] != false {
 		t.Fatalf("series_total/truncated = %v/%v", d["series_total"], d["series_truncated"])
 	}
 	if d["forked_from"] != "kol_alpha_v0" {
@@ -330,5 +331,89 @@ func TestDetailSeriesPrefersLedgerOverRunStore(t *testing.T) {
 	}
 	if rs, _ := d["results"].([]any); len(rs) != 1 {
 		t.Fatalf("results = %v", d["results"])
+	}
+}
+
+func writeExpState(t *testing.T, dir, expID, state string) {
+	t.Helper()
+	p := filepath.Join(dir, "data", "experiments", expID)
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(p, "state.json"), []byte(state), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The scheduler's own per-arm history wins over a rebuild, is marked as
+// running means, and a ledger whose rows carry no value for the metric no
+// longer ends the search with an empty curve (doc-readability, 2026-11-24).
+func TestDetailSeriesFromStateHistory(t *testing.T) {
+	dir := t.TempDir()
+	writeSeriesBundle(t, dir)
+	writeExpLedger(t, dir, "kol_alpha",
+		`{"ts":"2026-11-01T00:00:00Z","variant_id":"current","metrics":{"some_other_metric":1}}`)
+	writeExpState(t, dir, "kol_alpha", `{"n_results":3,"history":{
+		"musk_v1":[{"ts":"2026-11-01T00:00:00Z","mean":1,"n":1},{"ts":"2026-11-02T00:00:00Z","mean":2,"n":2}],
+		"current":[{"ts":null,"mean":9,"n":1},{"ts":"2026-11-03T00:00:00Z","mean":3,"n":2}]}}`)
+	d, found := loadExperimentDetailFor("", "", dir, "kol_alpha")
+	if !found {
+		t.Fatal("not found")
+	}
+	if d["series_source"] != "state_history" || d["series_kind"] != "running_mean" {
+		t.Fatalf("source/kind = %v/%v", d["series_source"], d["series_kind"])
+	}
+	b, _ := json.Marshal(d["series"])
+	want := `[{"points":[{"n":2,"ts":"2026-11-03T00:00:00Z","v":3}],"variant_id":"current"},` +
+		`{"points":[{"n":1,"ts":"2026-11-01T00:00:00Z","v":1},{"n":2,"ts":"2026-11-02T00:00:00Z","v":2}],"variant_id":"musk_v1"}]`
+	if string(b) != want {
+		t.Fatalf("series =\n%s\nwant\n%s", b, want)
+	}
+}
+
+// A ledger that DOES produce points still wins over the history, and says raw.
+func TestDetailLedgerPointsBeatStateHistory(t *testing.T) {
+	dir := t.TempDir()
+	writeSeriesBundle(t, dir)
+	writeExpLedger(t, dir, "kol_alpha",
+		`{"ts":"2026-11-01T00:00:00Z","variant_id":"current","metrics":{"realized_pnl_ticks":1.5}}`)
+	writeExpState(t, dir, "kol_alpha", `{"history":{"current":[{"ts":"2026-11-01T00:00:00Z","mean":1.5,"n":1}]}}`)
+	d, _ := loadExperimentDetailFor("", "", dir, "kol_alpha")
+	if d["series_source"] != "results_ledger" || d["series_kind"] != "raw" {
+		t.Fatalf("source/kind = %v/%v", d["series_source"], d["series_kind"])
+	}
+}
+
+// An oversized state loses its HISTORY, never its numbers: the column is TEXT
+// (64 KiB) and an over-long write would fail whole.
+func TestStateBridgeDropsHistoryNotStateWhenTooLarge(t *testing.T) {
+	db := setupSeriesDB(t)
+	sub := fmt.Sprintf("hist-%d", time.Now().UnixNano())
+	t.Cleanup(func() { db.Where("user_sub = ?", sub).Delete(&models.MeAppExperiment{}) })
+	pts := make([]map[string]any, 0, 2000)
+	for i := 0; i < 2000; i++ {
+		pts = append(pts, map[string]any{"ts": "2026-11-01T00:00:00Z", "mean": float64(i), "n": i + 1})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"user_sub": sub, "app": "a", "experiment_id": "e",
+		"state": map[string]any{"n_results": 2000, "best_variant": "x", "history": map[string]any{"x": pts}},
+	})
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/internal/app-experiments", InternalAppExperimentRecord)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/internal/app-experiments", bytes.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST: %d %s", w.Code, w.Body.String())
+	}
+	st := storedExpState(sub, "a", "e")
+	if st == nil || st["best_variant"] != "x" || st["n_results"] != float64(2000) {
+		t.Fatalf("state lost: %v", st)
+	}
+	if _, has := st["history"]; has {
+		t.Fatal("oversized history was stored")
+	}
+	if st["history_dropped"] == nil {
+		t.Fatal("dropping the history was not recorded")
 	}
 }

@@ -34,18 +34,10 @@ import (
 // N runs, then the newest N points (a run with per-result arms yields several).
 const expRunSeriesCap = 2000
 
-// expUnlabelledArm is the label for a run that carries no arm at all — a plain
-// cron cycle running the app's current configuration. "current" is the apps'
-// own convention for that (the arm a run is filed under when its variant names
-// none, sdk/scheduling/me_intent_picker.py). Points filed here this way carry
-// `arm_inferred: true` so a reader can tell the label was not on the row.
-const expUnlabelledArm = "current"
-
 type expRunPoint struct {
-	runTs    int64
-	arm      string
-	v        float64
-	inferred bool
+	runTs int64
+	arm   string
+	v     float64
 }
 
 // expRunPoints extracts this experiment's (arm, value) observations from one run.
@@ -111,12 +103,13 @@ func expRunPoints(r models.MeAppRun, expID, metricName string) []expRunPoint {
 		return pts
 	}
 
-	if topExp != "" && topExp != expID {
-		return nil
-	}
-	if v, _ := metricFromDocPath(m, metricName); v != nil {
-		return []expRunPoint{{runTs: r.RunTs, arm: expUnlabelledArm, v: *v, inferred: true}}
-	}
+	// A run that names no arm is NOT filed under a guessed one. It used to go
+	// under "current" with the run-level number, and that number is not what
+	// the ledger records: on quant-research kol_alpha (2026-11-24) the guessed
+	// "current" averaged ~13M ticks against evaluate()'s own 122k for that arm,
+	// because the run blob holds per-result TOTALS. A missing point is honest;
+	// a wrong one is drawn as fact. The scheduler's own per-arm history
+	// (state.history) is the source that knows the arm.
 	return nil
 }
 
@@ -134,22 +127,13 @@ func expSeriesFromRuns(runs []models.MeAppRun, expID, metricName string, capN in
 		all = all[len(all)-capN:]
 	}
 	by := map[string][]gin.H{}
-	inferred := map[string]bool{}
 	for _, p := range all {
 		pt := gin.H{"ts": time.Unix(p.runTs, 0).UTC().Format(time.RFC3339), "v": p.v}
-		if p.inferred {
-			pt["arm_inferred"] = true
-			inferred[p.arm] = true
-		}
 		by[p.arm] = append(by[p.arm], pt)
 	}
 	series := make([]gin.H, 0, len(by))
 	for arm, pts := range by {
-		s := gin.H{"variant_id": arm, "points": pts}
-		if inferred[arm] {
-			s["arm_inferred"] = true
-		}
-		series = append(series, s)
+		series = append(series, gin.H{"variant_id": arm, "points": pts})
 	}
 	sort.Slice(series, func(i, j int) bool {
 		return series[i]["variant_id"].(string) < series[j]["variant_id"].(string)
@@ -176,4 +160,43 @@ func expRunStoreSeries(userSub, app, expID, metricName string, loops []string) (
 	}
 	series, total := expSeriesFromRuns(runs, expID, metricName, expRunSeriesCap)
 	return series, total, len(runs) >= expRunSeriesCap || total > expRunSeriesCap
+}
+
+// expSeriesFromStateHistory turns the scheduler's own per-arm history
+// (state.history, written by evaluate() from the fenced ledger rows:
+// {arm: [{ts, mean, n}]}) into the detail's series shape. The points are
+// RUNNING MEANS, not raw results — the caller marks series_kind so a client
+// does not average them again. Points without a timestamp are skipped.
+func expSeriesFromStateHistory(st map[string]any) []gin.H {
+	h, _ := st["history"].(map[string]any)
+	if len(h) == 0 {
+		return nil
+	}
+	arms := make([]string, 0, len(h))
+	for a := range h {
+		arms = append(arms, a)
+	}
+	sort.Strings(arms)
+	out := make([]gin.H, 0, len(arms))
+	for _, arm := range arms {
+		raw, _ := h[arm].([]any)
+		pts := make([]gin.H, 0, len(raw))
+		for _, it := range raw {
+			p, _ := it.(map[string]any)
+			ts, _ := p["ts"].(string)
+			mean, ok := p["mean"].(float64)
+			if ts == "" || !ok {
+				continue
+			}
+			pt := gin.H{"ts": ts, "v": mean}
+			if n, ok := p["n"].(float64); ok {
+				pt["n"] = int(n)
+			}
+			pts = append(pts, pt)
+		}
+		if len(pts) > 0 {
+			out = append(out, gin.H{"variant_id": arm, "points": pts})
+		}
+	}
+	return out
 }

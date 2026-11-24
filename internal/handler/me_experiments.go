@@ -61,6 +61,18 @@ type expDecl struct {
 	//         with this question instead of firing a run that measures
 	//         nothing. The surface shows; the chat acts.
 	Dispatch map[string]any `yaml:"dispatch" json:"dispatch,omitempty"`
+	// ForkedFrom — the id of the experiment this one was derived from, when the
+	// spec says so. Optional and passed through verbatim: identity never infers
+	// lineage, so an experiment whose spec omits it simply has no parent.
+	ForkedFrom string `yaml:"forked_from" json:"forked_from,omitempty"`
+}
+
+// setForkedFrom adds `forked_from` to a list/detail row only when the spec
+// declares it (omitempty semantics for a gin.H row).
+func setForkedFrom(row gin.H, d *expDecl) {
+	if f := strings.TrimSpace(d.ForkedFrom); f != "" {
+		row["forked_from"] = f
+	}
 }
 
 type expManifest struct {
@@ -363,6 +375,7 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 		if len(d.Dispatch) > 0 {
 			row["dispatch"] = d.Dispatch
 		}
+		setForkedFrom(row, &d)
 		for _, k := range []string{
 			"n_results", "variants", "best_variant", "baseline_value",
 			"delta", "delta_pp", "criteria_met", "criteria_reason",
@@ -903,6 +916,19 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 	sort.Slice(series, func(i, j int) bool {
 		return series[i]["variant_id"].(string) < series[j]["variant_id"].(string)
 	})
+	// No ledger rows at all → the ledger is on a volume identity cannot read
+	// (every cloud install). Rebuild the curve from the run store the cycles
+	// self-report into. Only when the ledger is EMPTY: a ledger whose rows lack
+	// the metric is authoritative about that, and the run store must not paper
+	// over it. See me_experiment_run_series.go.
+	seriesSource := "results_ledger"
+	seriesTotal, seriesTruncated := 0, false
+	if len(rows) == 0 {
+		feeding := feederLoops(decl, expLoops(m)[decl.ID])
+		if s, n, tr := expRunStoreSeries(userSub, app, decl.ID, metricName, feeding); len(s) > 0 {
+			series, seriesTotal, seriesTruncated, seriesSource = s, n, tr, "run_store"
+		}
+	}
 
 	// cases: rows with dims.case_id and NO q_id (case-level), grouped —
 	// the casebook view payload.
@@ -989,7 +1015,17 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		"results_total":     rowsTotal,
 		"results_truncated": rowsTotal > len(rows),
 		"results_cap":       expResultsTailCap,
+		// Where `series` came from. `run_store` means the ledger was unreadable
+		// and the curve was rebuilt from me_app_runs (newest expRunSeriesCap
+		// points); `results`/`cases` stay empty then — they ARE the ledger.
+		"series_source": seriesSource,
 	}
+	if seriesSource == "run_store" {
+		detail["series_total"] = seriesTotal
+		detail["series_truncated"] = seriesTruncated
+		detail["series_cap"] = expRunSeriesCap
+	}
+	setForkedFrom(detail, decl)
 	return detail, true
 }
 
@@ -1081,6 +1117,7 @@ func MeAppExperiments(c *gin.Context) {
 					"status": strOr(d.Status, "active"), "loops": loops[d.ID],
 					"n_results": 0, "criteria_met": false,
 				}
+				setForkedFrom(row, &d)
 				mname := ""
 				if d.Metric != nil {
 					if s, ok := d.Metric["name"].(string); ok {

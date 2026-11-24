@@ -301,6 +301,17 @@ func metricFromBlobPath(metricsJSON, name string) (*float64, string) {
 	if json.Unmarshal([]byte(metricsJSON), &doc) != nil {
 		return nil, ""
 	}
+	return metricFromDocPath(doc, name)
+}
+
+// metricFromDocPath is metricFromBlobPath over an already-decoded document, so a
+// caller holding one SUBTREE of a run's blob (one entry of
+// command_engine.results[]) can resolve the metric inside it without
+// re-marshalling. Same breadth-first, sorted-key search.
+func metricFromDocPath(doc any, name string) (*float64, string) {
+	if name == "" || doc == nil {
+		return nil, ""
+	}
 	type node struct {
 		v    any
 		path string

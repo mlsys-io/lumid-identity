@@ -32,7 +32,8 @@ type appRunBody struct {
 	Metrics   map[string]any `json:"metrics"` // the cycle's own summary — any shape
 	Source    string         `json:"source"`
 	Outputs   any            `json:"outputs"`
-	// Offers + step_errors — what the run SAID. See models.MeAppRun.Events.
+	// Offers + step_errors + steps (the per-step timeline) — what the run
+	// SAID. See models.MeAppRun.Events and me_app_run_events.go.
 	Events any `json:"events"`
 	// WHICH fleet compute jobs this run ran: [{job_id, site}, ...].
 	// An authorization record, not a metric — see models.MeAppRun.ComputeJobs.
@@ -90,19 +91,12 @@ func InternalAppRunRecord(c *gin.Context) {
 			mj = string(raw)
 		}
 	}
-	// Run EVENTS — the offer the cycle emitted, and the step errors behind a
-	// failure. Marshalled like outputs and bounded the same way: a run that
-	// says something must not be able to say 64 KiB of it.
-	var ej *string
-	if b.Events != nil {
-		if raw, err := json.Marshal(b.Events); err == nil && len(raw) > 2 {
-			e := string(raw)
-			if len(e) > 16*1024 {
-				e = `{"_truncated":true,"_bytes":` + strconv.Itoa(len(raw)) + `}`
-			}
-			ej = &e
-		}
-	}
+	// Run EVENTS — the offer the cycle emitted, the step errors behind a
+	// failure, and (events.steps) the per-step timeline. Bounded: a run that
+	// says something must not be able to say 64 KiB of it, and an oversized
+	// timeline is trimmed rather than taking the failure reason down with it.
+	// See me_app_run_events.go.
+	ej := normalizeRunEvents(b.Events)
 	// Compute job addresses. Entries missing either half are dropped rather
 	// than stored: a half-address authorizes nothing and resolves nowhere,
 	// while reading as evidence the run was captured.

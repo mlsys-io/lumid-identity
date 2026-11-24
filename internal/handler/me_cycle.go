@@ -208,24 +208,19 @@ func MeCycleDetail(c *gin.Context) {
 	// so; "cycle not found" alone would read as a missing run rather than an
 	// unreadable volume.
 	data, found, why := cycleDetailResolved(ginReqCtx(c), userID, app, loop, ts)
-	if !found {
-		if why != "" {
-			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
-				"app": app, "loop": loop, "ts": ts, "steps": []any{},
-				"unavailable": why,
-				// The run store answers this even when the cycle dir cannot
-				// be read — it never lived in the dir.
-				"compute_jobs": cycleComputeJobs(userID, app, loop, ts),
-			}})
-			return
-		}
+	// Two run-store reads that answer on EVERY path — disk, scheduler and the
+	// `unavailable` degrade — because neither ever lived in the cycle dir:
+	//   - compute_jobs: fleet jobs this run fanned out to (Lumilake job ids +
+	//     site + arm) — see me_cycle_compute_jobs.go. `[]` when none.
+	//   - events: the per-step timeline the runner self-reported — see
+	//     me_app_run_events.go. Absent when the run reported none.
+	out := composeCycleDetail(app, loop, ts, data, found, why,
+		cycleComputeJobs(userID, app, loop, ts), cycleRunStepEvents(userID, app, loop, ts))
+	if out == nil {
 		fail(c, http.StatusNotFound, 1404, "cycle not found")
 		return
 	}
-	// Fleet jobs this run fanned out to (Lumilake job ids + site + arm), from
-	// the run store — see me_cycle_compute_jobs.go. `[]` when none.
-	data["compute_jobs"] = cycleComputeJobs(userID, app, loop, ts)
-	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": out})
 }
 
 // cycleDetailForUser is MeCycleDetail's core, shared with the chat tool

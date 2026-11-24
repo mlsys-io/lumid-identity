@@ -1318,6 +1318,14 @@ func containsImageAttachment(msgs []chatMessage) bool {
 // override in the usage event so the UI can show "answered by
 // Claude (auto)" instead of pretending the user's selection ran.
 func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx map[string]any, mode string) (llmProvider, bool) {
+	return autoRouteForTurnLoops(req, picked, role, ctx, mode, nil)
+}
+
+// autoRouteForTurnLoops is autoRouteForTurn with a resolver for the grounded
+// app's loop ids (see groundedRunIntent). loopsOf may be nil; it is consulted
+// only for a claude-code turn on an app-grounded chat that the other arms did
+// not already route, so the lookup costs nothing on every other turn.
+func autoRouteForTurnLoops(req []chatMessage, picked llmProvider, role string, ctx map[string]any, mode string, loopsOf func(app string) []string) (llmProvider, bool) {
 	if containsImageAttachment(req) && !providerSupportsVision(picked) {
 		// Route to the first vision-capable provider the caller's role
 		// allows. gemma4 is first + allowed to everyone + multimodal, so
@@ -1367,7 +1375,11 @@ func autoRouteForTurn(req []chatMessage, picked llmProvider, role string, ctx ma
 	// which toolset you want; flipping the search switch is a stronger one
 	// about what the turn is for.
 	wantsWeb := mode == "search" || mode == "deep_research"
-	inferred := groundedDrillIn(ctx) || controlIntent(req)
+	//   • a run request on an APP-GROUNDED chat ("run the baseline design",
+	//     "kick off simulate") — see groundedRunIntent. Evaluated last and only
+	//     for the claude-code lane, because it may resolve the app's loop ids.
+	inferred := groundedDrillIn(ctx) || controlIntent(req) ||
+		(isClaudeCodeProvider(picked) && groundedRunIntent(req, ctx, loopsOf))
 	if isClaudeCodeProvider(picked) &&
 		(wantsWeb || (inferred && !namesSandboxOnlyTool(req))) {
 		if p, ok := firstToolCapableProvider(role); ok {
@@ -2230,7 +2242,7 @@ func MeAgentChat(c *gin.Context) {
 	if providerNote != "" {
 		log.Printf("me_agent: provider downgrade: %s", providerNote)
 	}
-	provider, autoRouted := autoRouteForCaller(body.Messages, provider, role, pa, body.Context, body.Mode)
+	provider, autoRouted := autoRouteForCaller(userID, body.Messages, provider, role, pa, body.Context, body.Mode)
 	_ = autoRouted // surfaced via usage event in the stream handler; non-streaming response also signals via the model field below.
 	apiKey, err := provider.keyFn()
 	if err != nil {

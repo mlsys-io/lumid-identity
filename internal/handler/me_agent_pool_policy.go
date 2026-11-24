@@ -116,8 +116,10 @@ func resolveProviderForCaller(modelID, role string, pa poolAccess) (llmProvider,
 // autoRouteForCaller wraps autoRouteForTurn so a capability reroute (vision,
 // app tools) can never land on a provider the pool closes. A blocked reroute
 // keeps the provider the caller was already allowed.
-func autoRouteForCaller(msgs []chatMessage, picked llmProvider, role string, pa poolAccess, ctx map[string]any, mode string) (llmProvider, bool) {
-	p, routed := autoRouteForTurn(msgs, picked, role, ctx, mode)
+// userID scopes the grounded app's loop-id lookup (groundedRunIntent).
+func autoRouteForCaller(userID string, msgs []chatMessage, picked llmProvider, role string, pa poolAccess, ctx map[string]any, mode string) (llmProvider, bool) {
+	loopsOf := func(app string) []string { return cachedAppLoopNames(userID, app) }
+	p, routed := autoRouteForTurnLoops(msgs, picked, role, ctx, mode, loopsOf)
 	if routed && !providerPoolAllowed(role, pa, p) {
 		return picked, false
 	}

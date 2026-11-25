@@ -14,10 +14,12 @@ package handler
 // scoped session-bearer and the opsagent/cluster bridges — not a parallel auth.
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"lumid_identity/internal/common"
 	"lumid_identity/models"
@@ -44,6 +46,13 @@ func InternalMintUserToken(c *gin.Context) {
 	}
 	var u models.User
 	if err := common.DB.Where("id = ?", b.Sub).First(&u).Error; err != nil {
+		// 404 "user not found" is a VERDICT callers act on (the scheduler parks
+		// the tenant's loops on it), so it must mean exactly that. A lookup
+		// that failed for any other reason is an outage, not a missing user.
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			fail(c, http.StatusServiceUnavailable, 1503, "user lookup failed: "+err.Error())
+			return
+		}
 		fail(c, http.StatusNotFound, 1404, "user not found")
 		return
 	}

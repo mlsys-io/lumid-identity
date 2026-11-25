@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -147,6 +148,12 @@ func AdminUsersGet(c *gin.Context) {
 	id := c.Param("id")
 	var u models.User
 	if err := common.DB.Where("id = ?", id).First(&u).Error; err != nil {
+		// Only a positive miss is "not found"; operators read this route to
+		// decide which tenants are orphaned, so an outage must not look like one.
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			fail(c, http.StatusServiceUnavailable, 1503, "user lookup failed: "+err.Error())
+			return
+		}
 		fail(c, http.StatusNotFound, 1002, "user not found")
 		return
 	}

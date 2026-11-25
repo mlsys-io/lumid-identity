@@ -679,6 +679,10 @@ func Register(r *gin.Engine) {
 			// to forward LumidOS tool calls to a backend as the resolved user,
 			// without the client ever holding a broad backend PAT.
 			internal.POST("/mint-user-token", InternalMintUserToken)
+			// Batch user-existence check — the scheduler stops scheduling (and
+			// the archive tool moves aside) tenant trees whose user is gone.
+			// Unlike mint's 404, exists:false here is never a DB error.
+			internal.POST("/users/exists", InternalUsersExists)
 			// Claude session recording — claude-proxy posts each turn's full
 			// request+response; stored delta-compacted (respects opt-out).
 			internal.POST("/claude-transcript", InternalClaudeTranscript)

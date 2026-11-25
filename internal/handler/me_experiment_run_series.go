@@ -116,10 +116,27 @@ func expRunPoints(r models.MeAppRun, expID, metricName string) []expRunPoint {
 // expSeriesFromRuns groups run-store observations into the detail's series
 // shape. `runs` may arrive in any order; points come out oldest-first per arm,
 // arms sorted by id (as the disk path sorts them). Keeps the newest capN points.
-func expSeriesFromRuns(runs []models.MeAppRun, expID, metricName string, capN int) ([]gin.H, int) {
+//
+// `declared` is the experiment's own arm ids. When it is non-empty, a point
+// under any OTHER arm is dropped: one loop feeds several experiments and many
+// runs name their arm but not their experiment (mlsys-research `simulate`
+// feeds five; on 2026-11-25 "SLA concurrency" charted sla_model_size's
+// llm_1_7b as its best while none of its own arms had run). The `foreign`
+// check in expRunPoints can only catch runs that name another experiment.
+func expSeriesFromRuns(runs []models.MeAppRun, expID, metricName string, capN int, declared []string) ([]gin.H, int) {
+	own := map[string]bool{}
+	for _, a := range declared {
+		if a = strings.TrimSpace(a); a != "" {
+			own[a] = true
+		}
+	}
 	var all []expRunPoint
 	for _, r := range runs {
-		all = append(all, expRunPoints(r, expID, metricName)...)
+		for _, p := range expRunPoints(r, expID, metricName) {
+			if len(own) == 0 || own[p.arm] {
+				all = append(all, p)
+			}
+		}
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].runTs < all[j].runTs })
 	total := len(all)
@@ -146,7 +163,7 @@ func expSeriesFromRuns(runs []models.MeAppRun, expID, metricName string, capN in
 // builds the series. `total` is the points found in the runs read; `truncated`
 // is true when either cap (runs read, points kept) cut something off. (nil, 0,
 // false) when there is nothing to read or no DB.
-func expRunStoreSeries(userSub, app, expID, metricName string, loops []string) ([]gin.H, int, bool) {
+func expRunStoreSeries(userSub, app, expID, metricName string, loops, declared []string) ([]gin.H, int, bool) {
 	if userSub == "" || app == "" || metricName == "" || len(loops) == 0 || common.DB == nil {
 		return nil, 0, false
 	}
@@ -158,7 +175,7 @@ func expRunStoreSeries(userSub, app, expID, metricName string, loops []string) (
 		Order("run_ts DESC").Limit(expRunSeriesCap).Find(&runs).Error; err != nil {
 		return nil, 0, false
 	}
-	series, total := expSeriesFromRuns(runs, expID, metricName, expRunSeriesCap)
+	series, total := expSeriesFromRuns(runs, expID, metricName, expRunSeriesCap, declared)
 	return series, total, len(runs) >= expRunSeriesCap || total > expRunSeriesCap
 }
 

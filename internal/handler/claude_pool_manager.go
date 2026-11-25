@@ -80,7 +80,13 @@ func MeClaudePoolManage(c *gin.Context) {
 		Label         string     `json:"label,omitempty"`
 		DrainingSince *time.Time `json:"draining_since,omitempty"`
 		DrainReason   string     `json:"drain_reason,omitempty"`
-		Revoked       bool       `json:"revoked,omitempty"`
+		// When lease-time starts refusing the account even to sessions already
+		// on it (draining_since + drainPinGrace).
+		PauseEnforcedAt *time.Time `json:"pause_enforced_at,omitempty"`
+		// The last time the availability backstop served this paused account
+		// anyway (see models.ClaudeQuotaToken.DrainOverriddenAt).
+		DrainOverriddenAt *time.Time `json:"drain_overridden_at,omitempty"`
+		Revoked           bool       `json:"revoked,omitempty"`
 	}
 	var tokens []models.ClaudeQuotaToken
 	common.DB.Where("pool_id IN ?", pools).Find(&tokens)
@@ -89,6 +95,7 @@ func MeClaudePoolManage(c *gin.Context) {
 		accounts = append(accounts, acct{
 			Email: t.Email, PoolID: t.PoolID, Label: t.Label,
 			DrainingSince: t.DrainingSince, DrainReason: t.DrainReason,
+			PauseEnforcedAt: pauseEnforcedAt(t), DrainOverriddenAt: drainOverrideShown(t),
 			Revoked: t.RevokedAt != nil,
 		})
 	}
@@ -147,33 +154,48 @@ func MeClaudePoolAccountDrain(c *gin.Context) {
 		return
 	}
 
-	updates := map[string]interface{}{"draining_since": nil, "drain_reason": ""}
+	updates := map[string]interface{}{"draining_since": nil, "drain_reason": "", "drain_overridden_at": nil}
+	warn := ""
 	if *body.Draining {
-		// Refuse to pause the pool's last un-paused, usable account. The
-		// estate-wide admin endpoint makes the same refusal; a delegate must
-		// not be able to take their own pool offline by accident.
-		var usable int64
-		common.DB.Model(&models.ClaudeQuotaToken{}).
-			// No deleted_at clause: ClaudeQuotaToken carries gorm.DeletedAt, so
-			// GORM scopes this to live rows already. Spelling it out here would
-			// imply soft-delete is manual on this model, which it is not.
-			// poolIDOrDefault, matching the authorization check above: a legacy
-			// row holding "" IS the default pool, and reading it raw here made
-			// the two disagree — in a pool mixing '' and 'default' the guard
-			// counted zero siblings and refused every pause.
-			Where("pool_id = ? AND email <> ? AND draining_since IS NULL AND revoked_at IS NULL",
-				poolIDOrDefault(row.PoolID), row.Email).Count(&usable)
-		if usable == 0 {
-			fail(c, http.StatusConflict, 1409,
-				"refusing to pause the last usable account in this pool — it would take the pool offline")
+		if row.DrainingSince != nil {
+			// Idempotent, matching AdminClaudeAccountDrain: keep the original
+			// timestamp, and do not 409 a pause that already exists just
+			// because the siblings have since filled up.
+			ok(c, "ok", gin.H{"email": row.Email, "pool_id": poolIDOrDefault(row.PoolID), "draining": true,
+				"since": row.DrainingSince, "unchanged": true, "enforced_at": pauseEnforcedAt(row)})
 			return
 		}
+		// Refuse a pause that cannot take effect: no other account in this
+		// pool is usable (not paused, not benched, not quota-exhausted). The
+		// old count included exhausted accounts, so a pool whose only sibling
+		// was spent accepted the pause and the backstop served the account
+		// anyway. Same rule as the admin endpoint (pauseGuard).
+		refuse, w, gerr := pauseGuard(row)
+		if gerr != nil {
+			fail(c, http.StatusInternalServerError, 1500, "count servable: "+gerr.Error())
+			return
+		}
+		if refuse != "" {
+			fail(c, http.StatusConflict, 1409, refuse)
+			return
+		}
+		warn = w
 		now := time.Now().UTC()
 		updates["draining_since"] = &now
 		updates["drain_reason"] = strings.TrimSpace(body.Reason)
+		row.DrainingSince = &now
 	}
 	if err := common.DB.Model(&row).Updates(updates).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "update account: "+err.Error())
+		return
+	}
+	if *body.Draining {
+		// Same as the admin endpoint: move the already-idle users now instead
+		// of on the next assignmentTTL tick. This endpoint skipped it, so a
+		// delegate's pause did nothing visible for up to ten minutes.
+		EnsureAssignments(true)
+		ok(c, "ok", gin.H{"email": row.Email, "pool_id": poolIDOrDefault(row.PoolID), "draining": true,
+			"since": row.DrainingSince, "enforced_at": pauseEnforcedAt(row), "warning": warn})
 		return
 	}
 	ok(c, "ok", gin.H{"email": row.Email, "pool_id": poolIDOrDefault(row.PoolID), "draining": *body.Draining})

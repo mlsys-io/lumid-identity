@@ -157,7 +157,7 @@ func chatCycleMetrics(toolCalls []toolCallResult) map[string]any {
 // local file is usually absent — and parses it with readYamlLoopsBytes rather
 // than growing a second loops[] parser that could disagree with the first.
 func triggerLoopFor(userSub, app string) string {
-	spec, ok := fetchRepoSpecYAML(userSub, app)
+	spec, ok := fetchRepoSpecForParse(userSub, app)
 	if !ok {
 		return ""
 	}

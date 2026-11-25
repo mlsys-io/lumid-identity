@@ -520,7 +520,7 @@ type skillInfo struct {
 // capability exists.
 func resolveAppSkills(appDir, userSub string) []skillInfo {
 	specPath, _ := ResolveSpecPath(appDir)
-	yb, err := os.ReadFile(specPath)
+	yb, err := readSpecAware(specPath)
 	if err != nil {
 		return nil
 	}

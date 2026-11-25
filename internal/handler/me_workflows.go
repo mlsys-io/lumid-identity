@@ -220,7 +220,7 @@ func readAppVersion(appDir string) string {
 		}
 	}
 	specPath, _ := ResolveSpecPath(appDir)
-	if b, err := os.ReadFile(specPath); err == nil {
+	if b, err := readSpecAware(specPath); err == nil {
 		var m struct {
 			Version string `yaml:"version"`
 		}
@@ -279,7 +279,7 @@ type DatasetRef struct {
 // row.Datasets; this is the richer repo+version detail.
 func readAppDatasets(appDir string) []DatasetRef {
 	specPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(specPath)
+	b, err := readSpecAware(specPath)
 	if err != nil {
 		return nil
 	}
@@ -290,6 +290,7 @@ func readAppDatasets(appDir string) []DatasetRef {
 // lets the cross-node fallback populate the Data tab's mounted-dataset detail
 // for a tenant app identity can't read from disk.
 func readAppDatasetsBytes(b []byte) []DatasetRef {
+	b = normalizeSpecBytes(b, "") // the simple scheme reads as legacy (spec_v2.go)
 	var doc struct {
 		Datasets []struct {
 			ID      string `yaml:"id"`
@@ -356,9 +357,19 @@ type WorkflowRow struct {
 	LastRunOK     *bool    `json:"last_run_ok,omitempty"`
 	NextRunTS     float64  `json:"next_run_ts,omitempty"`
 	Description   string   `json:"description,omitempty"`
-	Engine        string   `json:"engine,omitempty"` // "runner_steps" | "command:<verb>" (scheduled)
-	StepCount     int      `json:"step_count,omitempty"`
-	N8nID         string   `json:"n8n_id,omitempty"` // for kind=visual
+	// The workflow graph (2026-11-25, spec_v2.go). Title is the human name;
+	// Parent the workflow this is a variant of; Node the child node it sits in;
+	// Role "helper" folds it into its parent on the graph; Feedback the ordered
+	// feedback steps + metrics. All read from the spec: graph edits are spec
+	// edits (PUT /config), the one write identity can see on UKS.
+	Title     string `json:"title,omitempty"`
+	Parent    string `json:"parent,omitempty"`
+	Node      string `json:"node,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Feedback  []any  `json:"feedback,omitempty"`
+	Engine    string `json:"engine,omitempty"` // "runner_steps" | "command:<verb>" (scheduled)
+	StepCount int    `json:"step_count,omitempty"`
+	N8nID     string `json:"n8n_id,omitempty"` // for kind=visual
 	// Sparkline of recent run states (W5+ visual polish). One char per
 	// run, oldest→newest, last 14 runs max. Encoding: "."=skipped,
 	// "✓"=succeeded, "✗"=failed, "·"=running. The UI renders these as
@@ -574,6 +585,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				if L.Name == "" {
 					continue
 				}
+
 				if s, ok := scheduleMap[L.Name]; ok {
 					L.Schedule = s
 				}
@@ -614,6 +626,11 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 					Version:      appVersion,
 					LastRunTS:    s.LastRunTS,
 					Description:  L.Description,
+					Title:        L.DisplayName,
+					Parent:       L.Parent,
+					Node:         L.Node,
+					Role:         L.Role,
+					Feedback:     L.Feedback,
 					Engine:       engine,
 					StepCount:    len(L.Steps),
 					CostCentsMTD: costMap[e.Name()+"."+L.Name],
@@ -720,7 +737,7 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 		// in global Runs — yet the Workflows page and the New-study picker
 		// showed only the 13 shipped loops, and the run's deep link fell back
 		// to another workflow (LQ-20261006-04).
-		spec := readAppSpecBytes(userID, app, "")
+		spec := readAppSpecForParse(userID, app, "")
 		if len(spec) == 0 {
 			continue
 		}
@@ -755,6 +772,11 @@ func scheduledWorkflows(userID string) []WorkflowRow {
 				Tenant:         true,
 				Version:        ver.Version,
 				Description:    L.Description,
+				Title:          L.DisplayName,
+				Parent:         L.Parent,
+				Node:           L.Node,
+				Role:           L.Role,
+				Feedback:       L.Feedback,
 				Engine:         engine,
 				StepCount:      len(L.Steps),
 				Datasets:       []string(L.Datasets),
@@ -1231,7 +1253,7 @@ func MeWorkflowDetail(c *gin.Context) {
 		}
 	}
 	if len(loops) == 0 {
-		if spec, okf := fetchRepoSpecYAML(userID, app); okf {
+		if spec, okf := fetchRepoSpecForParse(userID, app); okf {
 			if pl, err := readYamlLoopsBytes(spec); err == nil {
 				loops, src = pl, "xpcloud"
 			}

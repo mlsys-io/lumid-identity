@@ -48,7 +48,7 @@ func findAgentRole(agentID string) *agentRole {
 			continue
 		}
 		manifestPath, _ := ResolveSpecPath(filepath.Join(appsRoot, e.Name()))
-		b, err := os.ReadFile(manifestPath)
+		b, err := readSpecAware(manifestPath)
 		if err != nil {
 			continue
 		}

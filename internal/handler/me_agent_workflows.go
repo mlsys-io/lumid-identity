@@ -647,7 +647,7 @@ func toolAddSkillToWorkflow(userID, slug, skillName string) map[string]any {
 	if !ok {
 		return map[string]any{"error": fmt.Sprintf("tenant copy of '%s' not found; install the workflow first via compose_workflow or app_install", app)}
 	}
-	b, err := os.ReadFile(xpcloudPath)
+	b, err := readSpecAware(xpcloudPath)
 	if err != nil {
 		return map[string]any{"error": "read xpcloud.yaml: " + err.Error()}
 	}

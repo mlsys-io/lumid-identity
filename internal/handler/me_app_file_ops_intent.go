@@ -46,6 +46,11 @@ var appFileIntentOps = []struct {
 	{regexp.MustCompile(`^\.ui/[A-Za-z0-9._-]+\.(md|ya?ml)$`), []string{"write", "delete"}},
 	{regexp.MustCompile(`^ui/[A-Za-z0-9._-]+\.ya?ml$`), []string{"write", "delete"}},
 	{regexp.MustCompile(`^\.xpcloud\.yaml$`), []string{"write"}},
+	// A workflow's definition (spec_v2.go `steps`): its DAG, its agent notes,
+	// and — admins only, see appFileIsCode — its Python step.
+	{regexp.MustCompile(`^workflows/[A-Za-z0-9._-]+\.ya?ml$`), []string{"write", "delete"}},
+	{regexp.MustCompile(`^notes/[A-Za-z0-9._-]+\.md$`), []string{"write", "delete"}},
+	{regexp.MustCompile(`^commands/[A-Za-z0-9_]+\.py$`), []string{"write"}},
 	{regexp.MustCompile(`^\.lumid/control/signals\.jsonl$`), []string{"append"}},
 	{regexp.MustCompile(`^\.lumid/journal\.jsonl$`), []string{"append"}},
 	{regexp.MustCompile(`^data/improvements\.jsonl$`), []string{"append"}},
@@ -175,8 +180,26 @@ func queueAppFileBatch(userSub, app string, files []map[string]any) (string, err
 			}
 		}
 	}
-	return insertIntent(appFileWriteAction, userSub, map[string]any{"app": app, "files": files})
+	payload := map[string]any{"app": app, "files": files}
+	for _, f := range files {
+		if rel, _ := f["path"].(string); appFileIsCode(rel) {
+			// Code the scheduler will run. Only an admin's write may carry it;
+			// the picker refuses commands/*.py without this flag.
+			if !userIsAdmin(userSub) {
+				return "", errAppFileCode
+			}
+			payload["allow_code"] = true
+		}
+	}
+	return insertIntent(appFileWriteAction, userSub, payload)
 }
+
+var appFileCodeRe = regexp.MustCompile(`^commands/[A-Za-z0-9_]+\.py$`)
+
+// appFileIsCode: a path whose content the scheduler executes as the app's code.
+func appFileIsCode(rel string) bool { return appFileCodeRe.MatchString(rel) }
+
+var errAppFileCode = errors.New("only an admin can add Python code to an app")
 
 // queueAppFileOps is the one-call form: build errors and enqueue errors come
 // back the same way, so a handler maps them to a status once.
@@ -193,6 +216,8 @@ func appFileOpsStatus(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, errAppFileTooBig):
 		fail(c, http.StatusRequestEntityTooLarge, 1413, "record exceeds 16 KB")
+	case errors.Is(err, errAppFileCode):
+		fail(c, http.StatusForbidden, 1403, err.Error())
 	case errors.Is(err, errAppFileOp), errors.Is(err, errAppFileSet), errors.Is(err, errAppFileBatch):
 		fail(c, http.StatusBadRequest, 1400, err.Error())
 	default:

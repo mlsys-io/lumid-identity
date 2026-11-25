@@ -53,7 +53,7 @@ type promptInfo struct {
 // Best-effort: any read/parse error → nil. Mirrors resolveAppSkills' shape.
 func appPromptSkillImports(appDir string) []string {
 	specPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(specPath)
+	b, err := readSpecAware(specPath)
 	if err != nil {
 		return nil
 	}

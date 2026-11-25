@@ -372,7 +372,7 @@ func readSchedulerState(home string) schedulerState {
 		LastDurationSeconds float64 `json:"last_duration_s"`
 	}{}}
 	p := filepath.Join(home, ".lumilake", "scheduler", "xpio_state.json")
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return out
 	}
@@ -486,6 +486,14 @@ type rawLoop struct {
 	Steps          []rawStep   `json:"steps"           yaml:"steps"`
 	Engine         rawEngine   `json:"engine"          yaml:"engine"`
 	Goal           rawGoal     `json:"goal"            yaml:"goal"`
+	// The workflow graph (spec_v2.go): display title, the workflow this one is
+	// a variant of, the child node it sits in, "helper" for housekeeping, and
+	// the ordered feedback steps with the metrics each produces.
+	DisplayName string `json:"display_name" yaml:"display_name"`
+	Parent      string `json:"parent"       yaml:"parent"`
+	Node        string `json:"node"         yaml:"node"`
+	Role        string `json:"role"         yaml:"role"`
+	Feedback    []any  `json:"feedback"     yaml:"feedback"`
 }
 
 // flexStrings accepts a list whose entries are bare strings OR objects
@@ -716,7 +724,7 @@ func loadLoopDetail(home, app, loop string) (rawLoop, string, string) {
 // readAutoresearchYamlFull is a richer read than the existing
 // readAutoresearchYaml — pulls description + skills + stages.
 func readAutoresearchYamlFull(p string) (rawLoop, error) {
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return rawLoop{}, err
 	}
@@ -1043,7 +1051,7 @@ func loadAppStrategies(home, app string) []strategyState {
 }
 
 func readManifestLoops(p string) ([]rawLoop, error) {
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return nil, err
 	}
@@ -1061,7 +1069,7 @@ func readManifestLoops(p string) ([]rawLoop, error) {
 }
 
 func readYamlLoops(p string) ([]rawLoop, error) {
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return nil, err
 	}
@@ -1073,6 +1081,7 @@ func readYamlLoops(p string) ([]rawLoop, error) {
 // identity can't read from disk (svc node ≠ scheduler PVC; kind=agent apps live
 // in .xp/agents).
 func readYamlLoopsBytes(b []byte) ([]rawLoop, error) {
+	b = normalizeSpecBytes(b, "") // the simple scheme reads as legacy (spec_v2.go)
 	var doc struct {
 		Loops []rawLoop `yaml:"loops"`
 	}
@@ -1088,7 +1097,7 @@ func readYamlLoopsBytes(b []byte) ([]rawLoop, error) {
 // skills_invoked (then me_workflows falls back to manifest.json, which has no
 // goal) — this tolerant reader recovers the goal regardless.
 func readYamlLoopGoals(p string) map[string]rawGoal {
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return nil
 	}
@@ -1127,7 +1136,7 @@ type loopMeasurement struct {
 // loop, a list on the next. Resolving it here is what lets the workflows table
 // render "backtest · real_tape_rate · tape_covered_v1" instead of a dash.
 func readYamlLoopMeasurement(p string) map[string]loopMeasurement {
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return nil
 	}
@@ -1141,6 +1150,7 @@ func readYamlLoopMeasurement(p string) map[string]loopMeasurement {
 // must fill metric/dataset or the columns are blank for exactly the users who
 // installed the app the normal way.
 func readYamlLoopMeasurementBytes(b []byte) map[string]loopMeasurement {
+	b = normalizeSpecBytes(b, "") // the simple scheme reads as legacy (spec_v2.go)
 	var doc struct {
 		Loops []struct {
 			Name    string `yaml:"name"`
@@ -1212,7 +1222,7 @@ func readYamlLoopMeasurementBytes(b []byte) map[string]loopMeasurement {
 // readYamlMemoryAgents returns the app's knowledge agents — the top-level
 // memory_agents list unioned with roles[].memory_agent — from xpcloud.yaml.
 func readYamlMemoryAgents(p string) []string {
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return nil
 	}
@@ -1243,7 +1253,7 @@ func readYamlMemoryAgents(p string) []string {
 }
 
 func readAutoresearchYaml(p string) (string, string, error) {
-	b, err := os.ReadFile(p)
+	b, err := readSpecAware(p)
 	if err != nil {
 		return "", "", err
 	}
@@ -1281,7 +1291,7 @@ func loadAppGitStatus(home, app string) appGitStatus {
 	}
 	if out.Kind == "" {
 		specPath, _ := ResolveSpecPath(appDir)
-		if b, err := os.ReadFile(specPath); err == nil {
+		if b, err := readSpecAware(specPath); err == nil {
 			var m struct {
 				Kind    string `yaml:"kind"`
 				Version string `yaml:"version"`

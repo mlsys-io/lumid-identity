@@ -51,7 +51,7 @@ func loopExperiments(appDir, loop string) []string {
 		return nil
 	}
 	specPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(specPath)
+	b, err := readSpecAware(specPath)
 	if err != nil {
 		return nil
 	}
@@ -697,7 +697,7 @@ func declaredDatasets(appDir string) []string {
 	// xpcloud.yaml fallback — a light line scan (no YAML dep in this package):
 	// collect `- id: <x>` entries under a `datasets:` block.
 	specPath, _ := ResolveSpecPath(appDir)
-	if b, err := os.ReadFile(specPath); err == nil {
+	if b, err := readSpecAware(specPath); err == nil {
 		out := []string{}
 		inDS := false
 		for _, raw := range strings.Split(string(b), "\n") {

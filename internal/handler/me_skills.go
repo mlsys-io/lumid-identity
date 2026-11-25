@@ -126,7 +126,7 @@ func MeSkills(c *gin.Context) {
 			seenApps[e.Name()] = true
 			app := e.Name()
 			specPath, _ := ResolveSpecPath(filepath.Join(root, app))
-			b, err := os.ReadFile(specPath)
+			b, err := readSpecAware(specPath)
 			if err != nil {
 				continue
 			}

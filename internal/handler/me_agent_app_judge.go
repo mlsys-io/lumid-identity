@@ -359,7 +359,7 @@ func judgePanelFor(appDir string) (seats []string, minAgree int) {
 	if !ok {
 		return []string{judgeModelID}, minAgree
 	}
-	raw, err := os.ReadFile(specPath)
+	raw, err := readSpecAware(specPath)
 	if err != nil {
 		return []string{judgeModelID}, minAgree
 	}

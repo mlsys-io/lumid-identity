@@ -1,0 +1,60 @@
+# The simple app scheme (sdk/apps/spec_v2.py). Shared with lumid-identity's
+# spec_v2_test.go — keep the two copies identical.
+name: mlsys-research
+title: MLSys Research
+summary: Design LLM serving and test it.
+version: 0.4.0
+icon: cpu
+
+data:
+  - {id: protocol_v1, source: "repo:mlsys-io/hello-mlsys-agent", version: v1}
+compute: {site: office}
+
+workflows:
+  - id: simulate
+    title: Simulate
+    about: Simulate one serving design.
+    notes: notes/simulate.md
+    run: manual
+    steps: {python: simulate}
+    inputs: {task: "9.2", base: baseline, overrides: "", site: ""}
+    data: [protocol_v1]
+    feedback:
+      - step: simulator
+        metrics: [{name: objective, better: higher}]
+  - id: sandbox
+    parent: simulate
+    node: real_gpu
+    steps: {python: sandbox}
+    compute: {site: home, gpu: 24Gi}
+    feedback:
+      - {step: simulator, metrics: [{name: objective, better: higher}]}
+      - {step: sandbox, metrics: [{name: ttft_p99_ms, better: lower}]}
+  - id: score
+    steps: {dag: workflows/score.yaml}
+    run: "0 */6 * * *"
+    compute: {gpu: 16Gi}
+    inputs: {System: [hello]}
+  - id: coach
+    helper: true
+    steps: {python: coach}
+
+nodes:
+  - {id: real_gpu, title: On a real GPU, parent: simulate}
+
+experiments:
+  - id: sla_concurrency
+    workflow: simulate
+    question: How far can concurrency go before TTFT p99 breaks 2 s?
+    metric: {name: goodput_tok_s, better: higher}
+    data: protocol_v1
+    baseline: c32
+    done_when: best_n >= 1 and delta > 0
+    min_samples: 1
+    versions:
+      - {id: c32, inputs: {task: "9.2"}}
+      - {id: c16, about: "max_concurrency 16", inputs: {task: "9.2", overrides: "serving.max_concurrency=16"}}
+
+pages:
+  - {id: designs, title: Designs, file: ui/designs.yaml}
+  - {id: design, file: ui/design.yaml, hidden: true}

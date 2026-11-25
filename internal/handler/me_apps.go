@@ -267,7 +267,7 @@ func MeAppsList(c *gin.Context) {
 		if !out[i].Tenant || out[i].Status != "ready" || out[i].UI != nil {
 			continue
 		}
-		if spec, ok := fetchRepoSpecYAML(userID, out[i].Name); ok {
+		if spec, ok := fetchRepoSpecForParse(userID, out[i].Name); ok {
 			if ui := parseAppUI(spec); ui != nil {
 				out[i].UI = ui
 			}

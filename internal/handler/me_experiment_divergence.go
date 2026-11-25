@@ -84,7 +84,7 @@ func compareExperimentIDs(local, upstream []string) experimentDivergence {
 // experimentDivergenceFor compares the caller's install against the published
 // app. Returns nil when there is nothing to say.
 func experimentDivergenceFor(userID, app string, localIDs []string) *experimentDivergence {
-	blob, ok := fetchRepoSpecYAML(userID, app)
+	blob, ok := fetchRepoSpecForParse(userID, app)
 	if !ok {
 		return &experimentDivergence{Unavailable: true}
 	}

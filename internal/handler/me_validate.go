@@ -157,11 +157,14 @@ func validateManifestLintBytes(b []byte, err error) validateCheck {
 // or an engine (Pattern B). This is the "do I have a real pipeline?" gate.
 func validatePipelineShape(dir string) validateCheck {
 	specPath, _ := ResolveSpecPath(dir)
-	b, err := os.ReadFile(specPath)
+	b, err := readSpecAware(specPath)
 	return validatePipelineShapeBytes(b, err)
 }
 
 func validatePipelineShapeBytes(b []byte, err error) validateCheck {
+	if err == nil {
+		b = normalizeSpecBytes(b, "")
+	}
 	ck := validateCheck{Check: "pipeline_shape", Status: "pass"}
 	if err != nil || b == nil {
 		ck.Status = "fail"

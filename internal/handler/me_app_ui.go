@@ -120,7 +120,7 @@ type appUI struct {
 // Best-effort: any read/parse error (or no ui block) → nil, never fatal.
 func readAppUI(appDir string) *appUI {
 	specPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(specPath)
+	b, err := readSpecAware(specPath)
 	if err != nil {
 		return nil
 	}
@@ -146,7 +146,7 @@ func parseAppUI(b []byte) *appUI {
 // from config instead of hard-coded directive values. Best-effort → nil.
 func readAppConfig(appDir string) map[string]any {
 	specPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(specPath)
+	b, err := readSpecAware(specPath)
 	if err != nil {
 		return nil
 	}
@@ -168,7 +168,7 @@ func parseAppConfigBytes(b []byte) map[string]any {
 // readForkOf returns the fork_of field from an app's xpcloud.yaml, or "".
 func readForkOf(appDir string) string {
 	specPath, _ := ResolveSpecPath(appDir)
-	b, err := os.ReadFile(specPath)
+	b, err := readSpecAware(specPath)
 	if err != nil {
 		return ""
 	}
@@ -272,7 +272,7 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		ui = parseAppUI(ov.Content)
 		appCfg = parseAppConfigBytes(ov.Content)
 	} else if remote {
-		spec, ok := fetchRepoSpecYAML(userID, app)
+		spec, ok := fetchRepoSpecForParse(userID, app)
 		if !ok {
 			fail(c, http.StatusNotFound, 1404, "app not found")
 			return
@@ -566,7 +566,7 @@ func updateAppSurface(c *gin.Context, surfaceName string) {
 	// that can see it (me_app_file_intent.go) — same validation first.
 	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
 	if viaIntent {
-		ui := parseAppUI(readAppSpecBytes(userID, app, resolveAppDir(userID, app)))
+		ui := parseAppUI(readAppSpecForParse(userID, app, resolveAppDir(userID, app)))
 		rel, content, status, msg := surfaceIntentWrite(ui, name, body.Markdown, body.Spec)
 		if status != 0 {
 			fail(c, status, 1000+status, msg) // 1404 / 1400 / 1422, as the direct path

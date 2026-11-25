@@ -496,7 +496,7 @@ func toolAppUIGet(userID, app, surface string) (map[string]any, bool) {
 	}
 	// readAppSpecBytes applies a queued-and-applied spec save (see
 	// me_app_file_intent.go); the surface file gets the same overlay below.
-	ui := parseAppUI(readAppSpecBytes(userID, app, appDir))
+	ui := parseAppUI(readAppSpecForParse(userID, app, appDir))
 	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
 		return map[string]any{"error": "app declares no ui surface"}, false
 	}
@@ -570,7 +570,7 @@ func toolAppUISet(userID string, args map[string]any) (map[string]any, bool) {
 	// volume) the edit is queued as an app_file_write, validated identically.
 	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
 	if viaIntent {
-		ui := parseAppUI(readAppSpecBytes(userID, app, resolveAppDir(userID, app)))
+		ui := parseAppUI(readAppSpecForParse(userID, app, resolveAppDir(userID, app)))
 		rel, content, status, msg := surfaceIntentWrite(ui, name, markdown, spec)
 		if status != 0 {
 			return map[string]any{"error": msg}, false

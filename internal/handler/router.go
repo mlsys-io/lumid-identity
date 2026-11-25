@@ -275,6 +275,7 @@ func Register(r *gin.Engine) {
 			me.POST("/apps/:app/ui/generate", MeGenerateAppUI) // AI-generate surface from config
 			me.GET("/apps/:app/config", MeAppConfig)           // read xpcloud.yaml
 			me.PUT("/apps/:app/config", MeUpdateAppConfig)     // write xpcloud.yaml (YAML-validated)
+			me.GET("/apps/:app/files", MeAppFile)              // one workflow definition file (DAG / notes / code)
 			// Prompt editor — analyst & judge prompt cards. List unions local
 			// overrides with inherited shared-skill prompts; PUT/DELETE write a
 			// LOCAL override in the caller's own app only (never the shared file).

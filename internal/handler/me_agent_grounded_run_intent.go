@@ -260,7 +260,7 @@ func cachedAppLoopNames(userID, app string) []string {
 func loadAppLoopNames(userID, app string) []string {
 	loops, _ := readLoopsFromAnywhere(userID, app)
 	if len(loops) == 0 {
-		if spec := readAppSpecBytes(userID, app, ""); len(spec) > 0 {
+		if spec := readAppSpecForParse(userID, app, ""); len(spec) > 0 {
 			loops, _ = readYamlLoopsBytes(spec)
 		}
 	}

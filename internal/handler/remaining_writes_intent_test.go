@@ -132,7 +132,14 @@ func TestAppFileIntentOpTable(t *testing.T) {
 		{"data/step_instructions_pending.json", "json_set", true},
 		{"data/approved_actions.json", "write", false},
 		{".lumid/outbox/20260101T000000Z/drafts/x.json", "json_set", true},
-		{"commands/run.py", "write", false},
+		// A workflow's Python step is writable since 2026-11-25 (Make a
+		// variant) — but only by an admin: queueAppFileBatch refuses it for
+		// anyone else (TestAppFileCodeNeedsAdmin) and the picker needs allow_code.
+		{"commands/run.py", "write", true},
+		{"commands/run.py", "delete", false},
+		{"commands/../run.py", "write", false},
+		{"workflows/score.yaml", "write", true},
+		{"notes/simulate.md", "write", true},
 	} {
 		if got := appFileIntentOpOK(c.rel, c.op); got != c.want {
 			t.Errorf("appFileIntentOpOK(%q,%q)=%v want %v", c.rel, c.op, got, c.want)

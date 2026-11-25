@@ -572,7 +572,7 @@ func toolAppFeedback(userID, app, note string, rating int, fc feedbackContext) (
 	// not carry at all — reading only it meant the correction was silently
 	// attributed to a hardcoded agent instead of the app's own.
 	specPath, _ := ResolveSpecPath(resolveAppDir(userID, app))
-	if xp, err := os.ReadFile(specPath); err == nil {
+	if xp, err := readSpecAware(specPath); err == nil {
 		if a := firstMemoryAgent(xp); a != "" {
 			agent = a
 		}

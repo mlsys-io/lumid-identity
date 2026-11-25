@@ -167,7 +167,7 @@ func InternalAppRunRecord(c *gin.Context) {
 // published spec (the experiment attached to the loop → metric.name). Generic;
 // returns "" when the loop declares no experiment/metric.
 func loopMetricName(userSub, app, loop string) string {
-	spec, ok := fetchRepoSpecYAML(userSub, app)
+	spec, ok := fetchRepoSpecForParse(userSub, app)
 	if !ok {
 		return ""
 	}

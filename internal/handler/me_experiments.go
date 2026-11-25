@@ -101,7 +101,7 @@ type expManifest struct {
 
 func readExpManifest(appDir string) expManifest {
 	if specPath, ok := ResolveSpecPath(appDir); ok {
-		if b, err := os.ReadFile(specPath); err == nil {
+		if b, err := readSpecAware(specPath); err == nil {
 			return parseExpManifestBytes(b)
 		}
 	}
@@ -199,7 +199,7 @@ func readExpState(appDir, id string) map[string]any {
 func readExpStateFor(userSub, app, appDir, id string) map[string]any {
 	st := map[string]any{}
 	p, _ := ResolveRuntimeReadPath(appDir, filepath.Join("data", "experiments", id, "state.json"))
-	if b, err := os.ReadFile(p); err == nil {
+	if b, err := readSpecAware(p); err == nil {
 		_ = json.Unmarshal(b, &st)
 		// The DISK path carried no staleness marker at all, so exactly the
 		// installs identity CAN read served a number with no way to tell how old
@@ -1118,7 +1118,7 @@ func MeAppExperiments(c *gin.Context) {
 		// node; kind=agent apps in .xp/agents). Fall back to the published spec
 		// for the experiment DECLARATIONS (runtime ledger state stays absent —
 		// that's PVC-only). Kills the hard 404 + surfaces declared experiments.
-		if spec, okf := fetchRepoSpecYAML(userID, app); okf {
+		if spec, okf := fetchRepoSpecForParse(userID, app); okf {
 			m := parseExpManifestBytes(spec)
 			loops := expLoops(m)
 			// Overlay run-store metrics (me_app_runs) onto the declaration —

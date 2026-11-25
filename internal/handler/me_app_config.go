@@ -23,6 +23,8 @@ import (
 	"encoding/hex"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -178,6 +180,14 @@ func MeUpdateAppConfig(c *gin.Context) {
 	var body struct {
 		YAML    string `json:"yaml" binding:"required"`
 		BaseSHA string `json:"base_sha"`
+		// Definition files that land WITH the spec, all or nothing — a new
+		// workflow and its DAG/notes/code (Studio's "Make a variant"). Paths:
+		// workflows/<n>.yaml, notes/<n>.md, commands/<n>.py (admins only).
+		Files []struct {
+			Path    string `json:"path"`
+			Content string `json:"content"`
+			BaseSHA string `json:"base_sha"`
+		} `json:"files"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		fail(c, http.StatusBadRequest, 1400, "invalid request body")
@@ -200,9 +210,45 @@ func MeUpdateAppConfig(c *gin.Context) {
 	// On UKS that install is on the scheduler's disk, which identity does not
 	// mount, so the save is queued for the scheduler; it checks base_sha against
 	// the bytes it can actually see.
+	for _, f := range body.Files {
+		rel := normAppFileRel(f.Path)
+		if rel != f.Path || !workflowDefFileRe.MatchString(rel) {
+			fail(c, http.StatusBadRequest, 1400, "files: "+f.Path+" is not a workflow definition file")
+			return
+		}
+		if appFileIsCode(rel) && !userIsAdmin(userID) {
+			fail(c, http.StatusForbidden, 1403, errAppFileCode.Error())
+			return
+		}
+		if len(f.Content) > appFileIntentMaxBytes {
+			fail(c, http.StatusRequestEntityTooLarge, 1413, f.Path+" exceeds 256 KB")
+			return
+		}
+	}
+	if len(body.Files) > appFileBatchMax-1 {
+		fail(c, http.StatusBadRequest, 1400, "too many files")
+		return
+	}
+
 	appDir, direct, viaIntent, shared := ownerWriteTarget(userID, app)
 	if viaIntent {
-		enqueueAppFileWrite(c, userID, app, appFileSpecRel, "write", body.YAML, body.BaseSHA)
+		if len(body.Files) == 0 {
+			enqueueAppFileWrite(c, userID, app, appFileSpecRel, "write", body.YAML, body.BaseSHA)
+			return
+		}
+		// Definition files first, spec last: the picker validates the whole
+		// batch before writing any of it, so order is only for readability.
+		var ops []map[string]any
+		for _, f := range body.Files {
+			ops = append(ops, writeOp(f.Path, f.Content, f.BaseSHA))
+		}
+		ops = append(ops, writeOp(appFileSpecRel, body.YAML, body.BaseSHA))
+		id, err := queueAppFileBatch(userID, app, ops)
+		if err != nil {
+			appFileOpsStatus(c, err)
+			return
+		}
+		respondQueued(c, id, gin.H{"app": app, "files": len(ops)})
 		return
 	}
 	if !direct {
@@ -229,6 +275,19 @@ func MeUpdateAppConfig(c *gin.Context) {
 		}
 	}
 
+	// Definition files before the spec that names them (direct mode).
+	for _, f := range body.Files {
+		dst := filepath.Join(appDir, f.Path)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "cannot write "+f.Path)
+			return
+		}
+		if err := os.WriteFile(dst, []byte(f.Content), 0o644); err != nil {
+			fail(c, http.StatusInternalServerError, 1500, "cannot write "+f.Path)
+			return
+		}
+	}
+
 	// Atomic write.
 	tmp := yamlPath + ".tmp"
 	if err := os.WriteFile(tmp, []byte(body.YAML), 0644); err != nil {
@@ -250,4 +309,56 @@ func MeUpdateAppConfig(c *gin.Context) {
 		// Echo the new sha so the editor can chain further saves without a reload.
 		"data": gin.H{"ok": true, "bytes": len(body.YAML), "sha": contentSHA([]byte(body.YAML))},
 	})
+}
+
+// workflowDefFileRe: the definition files PUT /config may carry with the spec.
+var workflowDefFileRe = regexp.MustCompile(`^(workflows/[A-Za-z0-9._-]+\.ya?ml|notes/[A-Za-z0-9._-]+\.md|commands/[A-Za-z0-9_]+\.py)$`)
+
+// MeAppFile — GET /me/apps/:app/files?path=<rel>
+//
+// Reads one workflow definition file (workflows/*.yaml, notes/*.md,
+// commands/*.py) so Studio can show a workflow's steps and start a variant from
+// them. Same sources, same order, as the spec: the caller's applied
+// app_file_write overlay, then the install on disk, then the app's repo.
+func MeAppFile(c *gin.Context) {
+	userID, ok := currentUserID(c)
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
+		return
+	}
+	app := c.Param("app")
+	rel := normAppFileRel(c.Query("path"))
+	if !slugRe.MatchString(app) || rel != c.Query("path") || !workflowDefFileRe.MatchString(rel) {
+		fail(c, http.StatusBadRequest, 1400, "path must be workflows/<n>.yaml, notes/<n>.md or commands/<n>.py")
+		return
+	}
+	var b []byte
+	source := ""
+	if ob, deleted, found := appFileOverlay(userID, app, rel); found {
+		if deleted {
+			fail(c, http.StatusNotFound, 1404, "deleted")
+			return
+		}
+		b, source = ob, "overlay"
+	}
+	if b == nil {
+		if dir := resolveAppDir(userID, app); dir != "" {
+			if db, err := os.ReadFile(filepath.Join(dir, rel)); err == nil {
+				b, source = db, "disk"
+			}
+		}
+	}
+	if b == nil {
+		if rb, ok := fetchRepoBlob(userID, app, rel); ok {
+			b, source = rb, "repo"
+		}
+	}
+	if b == nil {
+		fail(c, http.StatusNotFound, 1404, "no such file")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{
+		"path": rel, "content": string(b), "sha": contentSHA(b), "source": source,
+		"editable": ownerCanEdit(userID, app),
+	}})
 }

@@ -56,6 +56,9 @@ var appFileIntentPathRes = []*regexp.Regexp{
 	regexp.MustCompile(`^\.ui/[A-Za-z0-9._-]+\.(md|ya?ml)$`),
 	regexp.MustCompile(`^ui/[A-Za-z0-9._-]+\.ya?ml$`),
 	regexp.MustCompile(`^\.xpcloud\.yaml$`),
+	regexp.MustCompile(`^workflows/[A-Za-z0-9._-]+\.ya?ml$`),
+	regexp.MustCompile(`^notes/[A-Za-z0-9._-]+\.md$`),
+	regexp.MustCompile(`^commands/[A-Za-z0-9_]+\.py$`),
 }
 
 const (

@@ -859,6 +859,15 @@ type quotaResult struct {
 	// simply "down" would be wrong too.
 	DrainingSince *time.Time `json:"draining_since,omitempty"`
 	DrainReason   string     `json:"drain_reason,omitempty"`
+	// PauseEnforcedAt is when the pin grace ends and lease-time refuses the
+	// account even to sessions already on it, which claude-proxy then moves to
+	// a sibling straight away. Lets /code say "live sessions move at HH:MM"
+	// instead of implying the account keeps serving them indefinitely.
+	PauseEnforcedAt *time.Time `json:"pause_enforced_at,omitempty"`
+	// DrainOverriddenAt is the last time the availability backstop served this
+	// paused account anyway, because nothing else in the pool was free. A
+	// recent value means the pause is not holding.
+	DrainOverriddenAt *time.Time `json:"drain_overridden_at,omitempty"`
 }
 
 // applyAccountState copies the OPERATOR-VISIBLE state of a pooled account onto
@@ -875,6 +884,8 @@ func applyAccountState(res *quotaResult, row models.ClaudeQuotaToken, now time.T
 	// Unconditional: a drain has no expiry. It clears only on resume.
 	res.DrainingSince = row.DrainingSince
 	res.DrainReason = row.DrainReason
+	res.PauseEnforcedAt = pauseEnforcedAt(row)
+	res.DrainOverriddenAt = drainOverrideShown(row)
 	// Report a standing bench alongside whatever the quota headers say — the two
 	// are independent, and a benched account otherwise looks green.
 	if row.BenchUntil != nil && now.Before(*row.BenchUntil) {
@@ -1364,8 +1375,11 @@ func hrwScore(userSub, email string) float64 {
 //     so conversations finish where they started;
 //   - never expires — only a human resumes it.
 //
-// Users leave as they go idle, on the normal placement cadence. That drift is
-// the "safe transfer": no deadline, no forced move, no split sessions.
+// Users leave as they go idle, on the normal placement cadence. Sessions still
+// live when drainPinGrace runs out are moved to a sibling, one split each:
+// claude-proxy learns of the pause from the quota-report response and from
+// prefer_paused on the lease, and moves them straight away (see
+// claude_pause.go). A pause is guaranteed to take effect, at a bounded cost.
 //
 // ADMIN, not super_admin — the same level as deleting an account, which an admin
 // can already do. Gating a reversible pause more tightly than an irreversible
@@ -1403,7 +1417,7 @@ func AdminClaudeAccountDrain(c *gin.Context) {
 	was := row.DrainingSince
 	if !*body.Draining {
 		if err := common.DB.Model(&row).Updates(map[string]interface{}{
-			"draining_since": nil, "drain_reason": "",
+			"draining_since": nil, "drain_reason": "", "drain_overridden_at": nil,
 		}).Error; err != nil {
 			fail(c, http.StatusInternalServerError, 1500, "persist resume: "+err.Error())
 			return
@@ -1414,36 +1428,40 @@ func AdminClaudeAccountDrain(c *gin.Context) {
 		return
 	}
 
-	// Refuse to pause the last one standing. Pausing every account does not
-	// drain the pool, it takes lum.id/claude down: placement would have no
-	// target, and excludeDraining's backstop would ignore the drain anyway, so
-	// the operator would get an outage AND a control that silently did nothing.
-	var alive int64
-	if err := common.DB.Model(&models.ClaudeQuotaToken{}).
-		Where("revoked_at IS NULL AND draining_since IS NULL AND email <> ?", email).
-		Count(&alive).Error; err != nil {
-		fail(c, http.StatusInternalServerError, 1500, "count servable: "+err.Error())
-		return
-	}
-	if alive == 0 {
-		fail(c, http.StatusConflict, 1409,
-			"refusing to pause the last un-paused account — that is an outage, not a drain. Add or resume another account first.")
+	if row.DrainingSince != nil {
+		// Idempotent: keep the original timestamp so "paused 40m ago" stays
+		// true and a double-click cannot restart the clock. Checked BEFORE the
+		// guard: re-confirming a pause that already exists must not 409 just
+		// because the siblings have since filled up.
+		ok(c, "ok", gin.H{"email": email, "draining": true, "since": row.DrainingSince, "unchanged": true,
+			"enforced_at": pauseEnforcedAt(row)})
 		return
 	}
 
-	if row.DrainingSince != nil {
-		// Idempotent: keep the original timestamp so "paused 40m ago" stays
-		// true and a double-click cannot restart the clock.
-		ok(c, "ok", gin.H{"email": email, "draining": true, "since": row.DrainingSince, "unchanged": true})
+	// Refuse a pause that cannot take effect. Pausing the last usable account
+	// does not drain the pool: placement has no target and the lease backstop
+	// serves the paused account anyway, so the operator gets a control that
+	// silently does nothing. "Usable" is pool-scoped and quota-aware (see
+	// pauseGuard). The old check counted any non-revoked account in ANY pool,
+	// which let ac5 be paused on 2026-11-25 with ac4 at 98% on 7d as its only
+	// sibling besides ylu.
+	refuse, warn, gerr := pauseGuard(row)
+	if gerr != nil {
+		fail(c, http.StatusInternalServerError, 1500, "count servable: "+gerr.Error())
 		return
 	}
+	if refuse != "" {
+		fail(c, http.StatusConflict, 1409, refuse)
+		return
+	}
+
 	reason := strings.TrimSpace(body.Reason)
 	if len(reason) > 512 {
 		reason = reason[:512]
 	}
 	now := time.Now()
 	if err := common.DB.Model(&row).Updates(map[string]interface{}{
-		"draining_since": now, "drain_reason": reason,
+		"draining_since": now, "drain_reason": reason, "drain_overridden_at": nil,
 	}).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "persist drain: "+err.Error())
 		return
@@ -1456,7 +1474,12 @@ func AdminClaudeAccountDrain(c *gin.Context) {
 	// appears to do nothing for ten minutes reads as broken. GET_LOCK-serialised,
 	// so forcing it is safe.
 	EnsureAssignments(true)
-	ok(c, "ok", gin.H{"email": email, "draining": true, "since": now, "reason": reason})
+	row.DrainingSince = &now
+	if warn != "" {
+		log.Printf("claude-pool: %s pause WARNING: %s", email, warn)
+	}
+	ok(c, "ok", gin.H{"email": email, "draining": true, "since": now, "reason": reason,
+		"enforced_at": pauseEnforcedAt(row), "warning": warn})
 }
 
 func InternalClaudeAccountBench(c *gin.Context) {
@@ -1707,6 +1730,14 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	var nExcluded, nQuarantined, nBenched, nExhausted, nDraining int
 	// Paused accounts skipped this pass, kept for the availability fallback below.
 	var drainFallback []models.ClaudeQuotaToken
+	// preferPaused: the caller's prefer_email (its live session's home) was
+	// passed over because an operator paused it and the pin grace is over.
+	// Sent back as prefer_paused so claude-proxy moves the session straight
+	// away. Otherwise the proxy reads "identity gave me someone else" as "home
+	// is busy" and refuses the user for sessionPinMaxWait (2 min) first, which
+	// is what everyone still on ac5 hit on 2026-11-25. usedBackstop: the
+	// lease came from drainFallback below.
+	preferPaused, usedBackstop := false, false
 
 	var cands []cand
 	for _, row := range rows {
@@ -1760,6 +1791,9 @@ func InternalClaudeTokenLease(c *gin.Context) {
 			if !pinned {
 				nDraining++
 				drainFallback = append(drainFallback, row)
+				if row.Email == prefer {
+					preferPaused = true
+				}
 				continue
 			}
 		}
@@ -1800,6 +1834,7 @@ func InternalClaudeTokenLease(c *gin.Context) {
 	if len(cands) == 0 && len(drainFallback) > 0 {
 		log.Printf("claude-lease: every usable account is PAUSED (%d) — serving a paused account rather than refusing; resume one or add capacity",
 			len(drainFallback))
+		usedBackstop = true
 		for _, row := range drainFallback {
 			var snap models.ClaudeQuotaSnapshot
 			var sp *models.ClaudeQuotaSnapshot
@@ -2032,6 +2067,9 @@ func InternalClaudeTokenLease(c *gin.Context) {
 		// dormant. Throttled: dormancy is judged in hours, so a write per lease
 		// would be pure churn on the row claude-proxy's bench reporter already
 		// writes to most often.
+		if usedBackstop && row.DrainingSince != nil {
+			noteDrainOverride(row.Email, time.Now())
+		}
 		if row.LastLeasedAt == nil || time.Since(*row.LastLeasedAt) > leaseStampThrottle {
 			at := time.Now()
 			common.DB.Model(&row).Update("last_leased_at", at)
@@ -2052,6 +2090,18 @@ func InternalClaudeTokenLease(c *gin.Context) {
 				// tell that the caller has since moved pools — the candidate
 				// scoping below happened once, when the lease was issued.
 				"pool_id": poolID,
+				// Operator-pause signals, read by claude-proxy cp-<sha> and
+				// later (an older proxy ignores unknown fields):
+				//   paused: this account is paused, and the lease is either a
+				//     session inside its pin grace or the backstop.
+				//   prefer_paused: the session's home was refused because it
+				//     is paused. Move the session now; do not wait for it.
+				//   lease_ttl_sec: cache this lease for at most this long, so
+				//     a lease on a paused account cannot outlive the grace or
+				//     a backstop moment. 0 means no cap.
+				"paused":        row.DrainingSince != nil,
+				"prefer_paused": preferPaused && row.Email != prefer,
+				"lease_ttl_sec": pauseLeaseTTL(row, time.Now(), usedBackstop),
 			},
 		})
 		return
@@ -2787,7 +2837,23 @@ func InternalClaudeQuotaReport(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "insert snapshot: "+err.Error())
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok"})
+	// Pause state rides back on the report. claude-proxy sends it about once
+	// a minute for every account that is actually serving, which is exactly
+	// the set whose cached leases matter. pause_enforced=true means the pin
+	// grace is over: the proxy drops every cached lease on this account, so
+	// its sessions re-lease and move. Without this, a cached lease kept a
+	// paused account serving for up to leaseTTL (30m) after the grace, which
+	// is about 20 of the ~50 minutes ac5 kept serving on 2026-11-25.
+	//
+	// A lookup failure answers false. That is the old behaviour (the lease
+	// expires on its own), never a spurious eviction.
+	data := gin.H{"paused": false, "pause_enforced": false}
+	var row models.ClaudeQuotaToken
+	if common.DB.Select("email", "draining_since").Where("email = ?", body.Email).First(&row).Error == nil {
+		data["paused"] = row.DrainingSince != nil
+		data["pause_enforced"] = pauseEnforced(row, time.Now())
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
 }
 
 // ── proactive token refresh loop ───────────────────────────────────────────

@@ -87,8 +87,9 @@ type ClaudeQuotaToken struct {
 	//     them. Refusing them instead would make claude-proxy hit
 	//     sessionPinMaxWait and fire PIN RELEASED, splitting the session across
 	//     subscriptions — the exact suspension signal a pause exists to avoid.
-	//   - Users drift off as they go idle, on the normal placement cadence. That
-	//     drift IS the safe transfer; there is no deadline and no forced move.
+	//   - Users drift off as they go idle, on the normal placement cadence.
+	//     Sessions still live when drainPinGrace (env
+	//     LUMID_CLAUDE_DRAIN_PIN_GRACE) runs out are moved, one split each.
 	//
 	// A timestamp rather than a bool so the dashboard can say how long a drain
 	// has been running, and so an abandoned one is visible rather than silent.
@@ -96,6 +97,17 @@ type ClaudeQuotaToken struct {
 	// resumed itself would be worse than no pause at all.
 	DrainingSince *time.Time `gorm:"column:draining_since"        json:"draining_since,omitempty"`
 	DrainReason   string     `gorm:"column:drain_reason;size:512" json:"drain_reason,omitempty"`
+	// DrainOverriddenAt is the last time the lease path served this PAUSED
+	// account anyway, because no other candidate was left in its pool (the
+	// availability backstop in InternalClaudeTokenLease). It is written at most
+	// once a minute per replica, and cleared when the account is paused again
+	// or resumed.
+	//
+	// Without it a pause and a backstop look the same on /code. On 2026-11-25
+	// ac5 was paused while ac4 sat at 98% on 7d. Every time ylu filled its
+	// in-flight slots, the backstop served ac5 (51 times in 5 minutes), and
+	// the operator could only see "paused".
+	DrainOverriddenAt *time.Time `gorm:"column:drain_overridden_at" json:"drain_overridden_at,omitempty"`
 	// ── Refresh-exchange forensics ────────────────────────────────────────────
 	//
 	// Added 2026-08-14. When all four pooled accounts were quarantined on

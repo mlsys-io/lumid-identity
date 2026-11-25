@@ -423,7 +423,7 @@ func TestStateBridgeDropsHistoryNotStateWhenTooLarge(t *testing.T) {
 // declared arms are charted.
 func TestExpSeriesFromRunsKeepsOnlyDeclaredArms(t *testing.T) {
 	runs := []models.MeAppRun{
-		seriesRun(1700000300, `{"arm":"llm_1_7b","goodput_tok_s":22.4}`),  // sla_model_size's arm
+		seriesRun(1700000300, `{"arm":"llm_1_7b","goodput_tok_s":22.4}`),    // sla_model_size's arm
 		seriesRun(1700000200, `{"arm":"concurrency_4","goodput_tok_s":30}`), // this experiment's
 	}
 	series, total := expSeriesFromRuns(runs, "sla_concurrency", "goodput_tok_s", 100, []string{"concurrency_1", "concurrency_4"})

@@ -187,10 +187,14 @@ func TestAppFileCodeNeedsAdmin(t *testing.T) {
 		t.Fatalf("payload lacks allow_code: %s", q.Payload)
 	}
 	// A DAG or notes file needs no flag.
-	id, _ = queueAppFileBatch("spec-v2-user", "mlsys-research", []map[string]any{writeOp("workflows/score.yaml", "a: 1\n", "")})
-	db.First(&q, "id = ?", id)
-	if strings.Contains(q.Payload, "allow_code") {
-		t.Fatalf("non-code batch carries allow_code: %s", q.Payload)
+	id, err = queueAppFileBatch("spec-v2-user", "mlsys-research", []map[string]any{writeOp("workflows/score.yaml", "a: 1\n", "")})
+	if err != nil {
+		t.Fatalf("non-code batch: %v", err)
+	}
+	var q2 models.MeAppIntent // fresh: gorm adds a reused struct's id to the WHERE
+	db.First(&q2, "id = ?", id)
+	if q2.Payload == "" || strings.Contains(q2.Payload, "allow_code") {
+		t.Fatalf("non-code batch: payload %q", q2.Payload)
 	}
 	db.Where("1 = 1").Delete(&models.MeAppIntent{})
 }

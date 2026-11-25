@@ -175,3 +175,46 @@ func TestIntrospectAudienceEndToEnd(t *testing.T) {
 		})
 	}
 }
+
+// The /fm edge gate admits a FlowMesh token for /fm paths only (Research Fleet
+// submits through it), and never without knowing the path.
+func TestAuthCheckEdgeAudience(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	testKeys(t)
+	mk := func(aud string) string {
+		tok, _, _, err := common.IssueBridgeJWT("u-1", "u@x", "user", aud, nil, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok
+	}
+	cases := []struct {
+		name, aud, uri string
+		want           int
+	}{
+		{"flowmesh at /fm/home", "flowmesh", "/fm/home/api/v1/workflows", http.StatusOK},
+		{"flowmesh at /fm/office", "flowmesh", "/fm/office/api/v1/workflows/wfl-1", http.StatusOK},
+		{"flowmesh, no uri", "flowmesh", "", http.StatusUnauthorized},
+		{"flowmesh at /sbx", "flowmesh", "/sbx/api/whoami", http.StatusUnauthorized},
+		{"flowmesh at /fmx", "flowmesh", "/fmx/", http.StatusUnauthorized},
+		{"lumilake at /fm", "lumilake", "/fm/home/api/v1/workflows", http.StatusUnauthorized},
+		{"runmesh at /fm", "runmesh", "/fm/home/api/v1/workflows", http.StatusUnauthorized},
+		{"ecosystem anywhere", common.AudienceEcosystem, "/sbx/", http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			r := httptest.NewRequest("GET", "/api/v1/auth-check", nil)
+			r.Header.Set("Authorization", "Bearer "+mk(tc.aud))
+			if tc.uri != "" {
+				r.Header.Set("X-Original-URI", tc.uri)
+			}
+			c.Request = r
+			AuthCheckHandler(c)
+			if w.Code != tc.want {
+				t.Fatalf("got %d, want %d (%s)", w.Code, tc.want, w.Body.String())
+			}
+		})
+	}
+}

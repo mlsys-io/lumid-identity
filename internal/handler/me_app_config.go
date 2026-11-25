@@ -69,9 +69,9 @@ func fetchRepoBlob(userID, app string, paths ...string) ([]byte, bool) {
 	// cloud-installed app 404 for everyone but its author — surfaces blank,
 	// spec missing, so no sidebar entry and no nav tabs. repoOwnerFor reads the
 	// owner off the install record and falls back to the caller.
-	owner := repoOwnerFor(userID, app)
+	owner, repo := repoSlugFor(userID, app)
 	for _, p := range safe {
-		url := xpcloudBaseURL() + "/api/v1/repos/" + owner + "/" + app + "/blob/main/" + p
+		url := xpcloudBaseURL() + "/api/v1/repos/" + owner + "/" + repo + "/blob/main/" + p
 		code, resp, err := xpcloudJSON(http.MethodGet, url, bearer, nil)
 		if err != nil || code >= 300 || resp == nil {
 			continue

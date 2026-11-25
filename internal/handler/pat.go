@@ -547,7 +547,10 @@ func currentUserID(c *gin.Context) (string, bool) {
 	// identity runs 2 replicas and an in-process cache would let the other one
 	// keep honouring a session this one just killed; it fails OPEN, so a Redis
 	// blip degrades to the old behaviour rather than locking every user out.
-	if claims, err := common.VerifyJWT(tok); err == nil {
+	// Identity audiences only (common.IdentityAudiences): a JWT minted for
+	// another service, or an OIDC id_token for a client, is not a lum.id
+	// credential.
+	if claims, err := common.VerifyIdentityJWT(tok); err == nil {
 		if common.IsSessionRevoked(c.Request.Context(), claims.ID) {
 			return "", false
 		}

@@ -5,12 +5,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -135,6 +137,13 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-o1/logs":
 		_, _ = w.Write([]byte(`{"ts":"2026-10-10T01:00:05Z","stream":"stdout","message":"PROBE-STDOUT hello"}` + "\n" +
 			`{"ts":"2026-10-10T01:00:06Z","stream":"stderr","message":"ValueError: boom"}` + "\n"))
+	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-1/files/images/a.png":
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("PNGBYTES"))
+	case r.Method == "GET" && p == "/ll/office/api/v1/jobs/req-zzzzzz999999/artifact" &&
+		r.URL.Query().Get("path") == "lumid-data://lumilake-archive/office/artifacts/req-zzzzzz999999/x.png":
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("LLPNG"))
 	case r.Method == "POST" && p == "/fm/home/api/v1/workflows/wfl-abc123/cancel":
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	case r.Method == "POST" && p == "/ll/office/api/v1/jobs":
@@ -339,8 +348,9 @@ func TestFleetLumilakeRunStatusResultTrace(t *testing.T) {
 	}
 	// Per user: Lumilake gives an S3 prefix to the first principal to write it.
 	loc, _ := item["output_location"].(map[string]any)
-	if p, _ := loc["prefix"].(string); !regexp.MustCompile(`^fleet-jobs/[^/]+/$`).MatchString(p) {
-		t.Errorf("output_location = %v, want the caller's own fleet-jobs/<sub>/", loc)
+	// One folder per run, under the caller's own prefix, so runs never overwrite each other.
+	if p, _ := loc["prefix"].(string); !regexp.MustCompile(`^fleet-jobs/[^/]+/\d{8}-\d{6}-[0-9a-f]{6}/$`).MatchString(p) {
+		t.Errorf("output_location = %v, want fleet-jobs/<sub>/<run>/", loc)
 	}
 	// Written as the caller (their compute PAT), not the service read token.
 	if a := fake.auth[0]; a == "Bearer svc-read-token" || !strings.HasPrefix(a, "Bearer lm_pat_") {
@@ -456,6 +466,87 @@ func TestFleetOutputPrefixIsPerUser(t *testing.T) {
 	a, b := fleetOutputPrefix("u-a"), fleetOutputPrefix("u-b")
 	if a == b || a != "fleet-jobs/u-a/" {
 		t.Errorf("prefixes %q %q: want distinct, per-user, slash-terminated", a, b)
+	}
+}
+
+func TestFleetRunOutputPrefixIsPerRun(t *testing.T) {
+	at := time.Date(2026, 11, 25, 9, 30, 0, 0, time.UTC)
+	a := fleetRunOutputPrefix("u-a", at, "abc123")
+	if a != "fleet-jobs/u-a/20261125-093000-abc123/" {
+		t.Errorf("got %q", a)
+	}
+	if b := fleetRunOutputPrefix("u-a", at, "def456"); b == a || !strings.HasPrefix(b, fleetOutputPrefix("u-a")) {
+		t.Errorf("runs must get distinct folders under the user's prefix: %q %q", a, b)
+	}
+	if n := fleetNonce(); len(n) != 6 {
+		t.Errorf("nonce %q", n)
+	}
+}
+
+func TestFleetFMFilePath(t *testing.T) {
+	good := map[string][2]string{
+		"tsk-58e5/images/image_0.png": {"tsk-58e5", "images/image_0.png"},
+		"tsk-1/results.json":          {"tsk-1", "results.json"},
+	}
+	for in, want := range good {
+		task, rel, ok := fleetFMFilePath(in)
+		if !ok || task != want[0] || rel != want[1] {
+			t.Errorf("%q: got (%q,%q,%v)", in, task, rel, ok)
+		}
+	}
+	for _, bad := range []string{"", "tsk-1", "tsk-1/", "x-1/a.png", "tsk-1/../etc/passwd", "tsk-1//a", "tsk-1/a/./b", "tsk-1/a\\b", "../tsk-1/a"} {
+		if _, _, ok := fleetFMFilePath(bad); ok {
+			t.Errorf("%q should be refused", bad)
+		}
+	}
+}
+
+func TestFleetLLArtifactOK(t *testing.T) {
+	if !fleetLLArtifactOK("lumid-data://lumilake-archive/home/artifacts/req-1/abc.png") {
+		t.Error("artifact URI refused")
+	}
+	for _, bad := range []string{"", "images/a.png", "x/artifacts/a\r\nb"} {
+		if fleetLLArtifactOK(bad) {
+			t.Errorf("%q should be refused", bad)
+		}
+	}
+}
+
+func TestFleetFileView(t *testing.T) {
+	_, owner, other := fleetTestSetup(t)
+	h := fleetRouter()
+	code, job := fleetCallAPI(t, "POST", "/api/v1/me/fleet/jobs", `{"workflow":"`+fmGraph+`","site":"home"}`, owner)
+	if code != http.StatusAccepted {
+		t.Fatalf("run = %d %v", code, job)
+	}
+	id := job["id"].(string)
+	w := fleetServe(t, h, "GET", "/api/v1/me/fleet/jobs/"+id+"?view=file&path=tsk-1/images/a.png", "", owner)
+	if w.Code != 200 || w.Body.String() != "PNGBYTES" || w.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("owner file = %d %q %q", w.Code, w.Body.String(), w.Header().Get("Content-Type"))
+	}
+	// Another user cannot read it, and a task outside this run is refused.
+	if w := fleetServe(t, h, "GET", "/api/v1/me/fleet/jobs/"+id+"?view=file&path=tsk-1/images/a.png", "", other); w.Code == 200 {
+		t.Errorf("other user got the file: %d", w.Code)
+	}
+	if w := fleetServe(t, h, "GET", "/api/v1/me/fleet/jobs/"+id+"?view=file&path=tsk-9/images/a.png", "", owner); w.Code != 404 {
+		t.Errorf("foreign task = %d, want 404", w.Code)
+	}
+	if w := fleetServe(t, h, "GET", "/api/v1/me/fleet/jobs/"+id+"?view=file&path=tsk-1/../x", "", owner); w.Code != 400 {
+		t.Errorf("traversal = %d, want 400", w.Code)
+	}
+
+	code, ll := fleetCallAPI(t, "POST", "/api/v1/me/fleet/jobs",
+		`{"workflow":"name: w\ninputs: {}\nops: []\n","site":"office","inputs":{"x":["1"]}}`, owner)
+	if code != http.StatusAccepted {
+		t.Fatalf("ll run = %d %v", code, ll)
+	}
+	w = fleetServe(t, h, "GET", "/api/v1/me/fleet/jobs/"+ll["id"].(string)+"?view=file&path="+
+		url.QueryEscape("lumid-data://lumilake-archive/office/artifacts/req-zzzzzz999999/x.png"), "", owner)
+	if w.Code != 200 || w.Body.String() != "LLPNG" {
+		t.Errorf("ll artifact = %d %q", w.Code, w.Body.String())
+	}
+	if w := fleetServe(t, h, "GET", "/api/v1/me/fleet/jobs/"+ll["id"].(string)+"?view=file&path=images/a.png", "", owner); w.Code != 400 {
+		t.Errorf("non-artifact ll path = %d, want 400", w.Code)
 	}
 }
 

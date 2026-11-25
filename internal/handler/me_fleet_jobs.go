@@ -3,6 +3,8 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -380,7 +382,7 @@ func MeFleetJobRun(c *gin.Context) {
 		if !b.DryRun {
 			loc := b.OutputLocation
 			if loc == nil {
-				loc = map[string]any{"type": "s3", "prefix": fleetOutputPrefix(sub)}
+				loc = map[string]any{"type": "s3", "prefix": fleetRunOutputPrefix(sub, time.Now(), fleetNonce())}
 			}
 			item["output_location"] = loc
 		}
@@ -450,6 +452,22 @@ func MeFleetJobRun(c *gin.Context) {
 // belong to whoever ran the first job, and every other user would get
 // "403 write on object-prefix/... denied".
 func fleetOutputPrefix(sub string) string { return "fleet-jobs/" + sub + "/" }
+
+// fleetRunOutputPrefix is one run's folder under the user's prefix. All of a
+// user's runs used to share fleet-jobs/<sub>/, and Lumilake writes item-000001.txt
+// at the same key every time, so each run overwrote the last (2026-11-25). The
+// folder is still the user's (claimed by them on first write), just per run.
+func fleetRunOutputPrefix(sub string, at time.Time, nonce string) string {
+	return fleetOutputPrefix(sub) + at.UTC().Format("20060102-150405") + "-" + nonce + "/"
+}
+
+func fleetNonce() string {
+	b := make([]byte, 3)
+	if _, err := rand.Read(b); err != nil {
+		return "000000"
+	}
+	return hex.EncodeToString(b)
+}
 
 func fleetClip(s string, n int) string {
 	if len(s) <= n {
@@ -565,13 +583,141 @@ func MeFleetJobGet(c *gin.Context) {
 		fleetLogsView(c, id, bearer)
 	case view == "trace" && id.Kind == fleetKindLL:
 		fleetTraceView(c, id, bearer)
+	case view == "file":
+		fleetFileView(c, id, bearer)
 	case view == "logs" || view == "trace":
 		fail(c, http.StatusBadRequest, 1400, fmt.Sprintf(
 			"view=%s is not available for %s jobs (FlowMesh: logs; Lumilake: trace, "+
 				"which lists the FlowMesh workflows to read logs from)", view, id.Kind))
 	default:
-		fail(c, http.StatusBadRequest, 1400, "view must be status, result, logs or trace")
+		fail(c, http.StatusBadRequest, 1400, "view must be status, result, logs, trace or file")
 	}
+}
+
+// ── files ───────────────────────────────────────────────────────────────────
+//
+// GET /me/fleet/jobs/:id?view=file&path=<p> streams one file a run produced,
+// to its owner only (fleetOwnedJob), fetched upstream AS the owner:
+//
+//	Lumilake: p is an artifact URI from the run's result (contains /artifacts/,
+//	          e.g. a generated image). Lumilake re-checks it is one of THIS
+//	          job's artifacts (GET /jobs/{id}/artifact?path=).
+//	FlowMesh: p is "<task_id>/<relative path>" (e.g. tsk-…/images/image_0.png).
+//	          The task must belong to this run; FlowMesh serves it from
+//	          /results/{task}/files/{path}.
+//
+// No store credential is involved: outputs are read through the runtimes, which
+// already scope them to the submitting user.
+
+const fleetFileMaxBytes = 256 << 20
+
+var fleetTaskIDRe = regexp.MustCompile(`^tsk-[A-Za-z0-9-]{1,64}$`)
+
+// fleetFMFilePath splits and validates "<task_id>/<relative path>".
+func fleetFMFilePath(p string) (task, rel string, ok bool) {
+	task, rel, found := strings.Cut(p, "/")
+	if !found || !fleetTaskIDRe.MatchString(task) || rel == "" || len(rel) > 512 ||
+		strings.HasPrefix(rel, "/") || strings.Contains(rel, "\\") || strings.Contains(rel, "\x00") {
+		return "", "", false
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", "", false
+		}
+	}
+	return task, rel, true
+}
+
+// fleetLLArtifactOK accepts a Lumilake artifact URI as found in a result.
+func fleetLLArtifactOK(p string) bool {
+	return p != "" && len(p) <= 2048 && strings.Contains(p, "/artifacts/") && !strings.ContainsAny(p, "\r\n\x00")
+}
+
+func fleetFileView(c *gin.Context, id fleetJobID, bearer string) {
+	p := strings.TrimSpace(c.Query("path"))
+	base := fleetSiteBase(id.Kind, id.Site)
+	var upstream string
+	if id.Kind == fleetKindLL {
+		if !fleetLLArtifactOK(p) {
+			fail(c, http.StatusBadRequest, 1400, "path must be an artifact from this run's result")
+			return
+		}
+		upstream = base + "/api/v1/jobs/" + id.Native + "/artifact?path=" + url.QueryEscape(p)
+	} else {
+		task, rel, ok := fleetFMFilePath(p)
+		if !ok {
+			fail(c, http.StatusBadRequest, 1400, "path must be <task_id>/<file path>")
+			return
+		}
+		rec, raw, code := fleetGet(c, base+"/api/v1/workflows/"+id.Native, bearer)
+		if code < 200 || code >= 300 {
+			failUpstream(c, code, raw)
+			return
+		}
+		mine := false
+		for _, t := range fleetWorkflowTaskIDs(rec) {
+			if t == task {
+				mine = true
+				break
+			}
+		}
+		if !mine {
+			fail(c, http.StatusNotFound, 1404, "no such file in this run")
+			return
+		}
+		segs := strings.Split(rel, "/")
+		for i := range segs {
+			segs[i] = url.PathEscape(segs[i])
+		}
+		upstream = base + "/api/v1/results/" + task + "/files/" + strings.Join(segs, "/")
+	}
+	fleetStream(c, upstream, bearer, p)
+}
+
+// fleetStream proxies one file: status and errors as JSON, bytes as-is.
+func fleetStream(c *gin.Context, upstream, bearer, name string) {
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, upstream, nil)
+	if err != nil {
+		fail(c, http.StatusBadRequest, 1400, "bad file path")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
+	if err != nil {
+		failUpstream(c, 0, nil)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		failUpstream(c, resp.StatusCode, b)
+		return
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	c.Header("Cache-Control", "private, max-age=300")
+	c.Header("X-Content-Type-Options", "nosniff")
+	file := name
+	if i := strings.LastIndexAny(file, "/="); i >= 0 {
+		file = file[i+1:]
+	}
+	file = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == '"' || r == '\\' || r > 0x7e {
+			return '_'
+		}
+		return r
+	}, file)
+	if file != "" {
+		c.Header("Content-Disposition", `inline; filename="`+file+`"`)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		c.Header("Content-Length", cl)
+	}
+	c.Status(http.StatusOK)
+	c.Header("Content-Type", ct)
+	_, _ = io.Copy(c.Writer, io.LimitReader(resp.Body, fleetFileMaxBytes))
 }
 
 func fleetGet(c *gin.Context, url, bearer string) (map[string]any, []byte, int) {

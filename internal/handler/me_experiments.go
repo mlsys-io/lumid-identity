@@ -936,7 +936,13 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 			series, seriesSource, seriesKind = hs, "state_history", "running_mean"
 		} else {
 			feeding := feederLoops(decl, expLoops(m)[decl.ID])
-			if s, n, tr := expRunStoreSeries(userSub, app, decl.ID, metricName, feeding); len(s) > 0 {
+			declared := make([]string, 0, len(decl.Arms))
+			for _, a := range decl.Arms {
+				if id, _ := a["id"].(string); id != "" {
+					declared = append(declared, id)
+				}
+			}
+			if s, n, tr := expRunStoreSeries(userSub, app, decl.ID, metricName, feeding, declared); len(s) > 0 {
 				series, seriesTotal, seriesTruncated, seriesSource = s, n, tr, "run_store"
 			}
 		}

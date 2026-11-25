@@ -119,7 +119,7 @@ func TestExpSeriesFromRunsShapeAndCap(t *testing.T) {
 		seriesRun(1700000200, `{"realized_pnl_ticks":2}`),
 		seriesRun(1700000100, `{"arm":"musk_v1","realized_pnl_ticks":1}`),
 	}
-	series, total := expSeriesFromRuns(runs, "kol_alpha", "realized_pnl_ticks", 1)
+	series, total := expSeriesFromRuns(runs, "kol_alpha", "realized_pnl_ticks", 1, nil)
 	if total != 2 {
 		t.Fatalf("total = %d, want 2 (the arm-less run is not charted)", total)
 	}
@@ -415,5 +415,23 @@ func TestStateBridgeDropsHistoryNotStateWhenTooLarge(t *testing.T) {
 	}
 	if st["history_dropped"] == nil {
 		t.Fatal("dropping the history was not recorded")
+	}
+}
+
+// One loop feeds several experiments, and its runs name the arm but not the
+// experiment (mlsys-research simulate, 2026-11-25): only the experiment's own
+// declared arms are charted.
+func TestExpSeriesFromRunsKeepsOnlyDeclaredArms(t *testing.T) {
+	runs := []models.MeAppRun{
+		seriesRun(1700000300, `{"arm":"llm_1_7b","goodput_tok_s":22.4}`),    // sla_model_size's arm
+		seriesRun(1700000200, `{"arm":"concurrency_4","goodput_tok_s":30}`), // this experiment's
+	}
+	series, total := expSeriesFromRuns(runs, "sla_concurrency", "goodput_tok_s", 100, []string{"concurrency_1", "concurrency_4"})
+	if total != 1 || len(series) != 1 || series[0]["variant_id"] != "concurrency_4" {
+		t.Fatalf("got total=%d series=%v, want only concurrency_4", total, series)
+	}
+	// No declared arms: nothing to filter against, keep every arm (old behaviour).
+	if _, n := expSeriesFromRuns(runs, "sla_concurrency", "goodput_tok_s", 100, nil); n != 2 {
+		t.Fatalf("undeclared: total=%d, want 2", n)
 	}
 }

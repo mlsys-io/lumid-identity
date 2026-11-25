@@ -198,3 +198,20 @@ func TestAppFileCodeNeedsAdmin(t *testing.T) {
 	}
 	db.Where("1 = 1").Delete(&models.MeAppIntent{})
 }
+
+// A simple-scheme app declares pages but no home surface: its home is Studio's
+// graph, and /ui must still return its nav (serveAppSurface's "home" branch).
+func TestSpecV2PagesWithoutHomeSurface(t *testing.T) {
+	_, spec := loadV2Fixture(t)
+	b, err := readSpecAware(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := parseAppUI(b)
+	if ui == nil || ui.Surface != nil || len(ui.Surfaces) == 0 {
+		t.Fatalf("ui = %+v", ui)
+	}
+	if len(ui.Nav) != 1 || ui.Nav[0].Surface != "designs" {
+		t.Fatalf("nav = %+v", ui.Nav)
+	}
+}

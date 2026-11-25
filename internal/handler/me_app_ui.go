@@ -294,6 +294,16 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		mdPath = p
 	} else if name == "home" && ui.Surface != nil {
 		mdPath, native, pagePath = ui.Surface.Markdown, ui.Surface.Native, ui.Surface.Page
+	} else if name == "home" {
+		// No home surface: the app's home IS Studio's research graph (the
+		// simple scheme declares only `pages`). Answer with the app's pages and
+		// config and no body — a 404 here left Studio without the app's tab
+		// row ("Graph" alone), even though the pages exist.
+		c.JSON(http.StatusOK, gin.H{
+			"ret_code": 0, "message": "ok",
+			"data": gin.H{"app": app, "surface": "home", "markdown": "", "nav": ui.Nav, "config": appCfg, "home": "graph"},
+		})
+		return
 	} else {
 		fail(c, http.StatusNotFound, 1404, "unknown surface")
 		return

@@ -215,3 +215,20 @@ func TestSpecV2PagesWithoutHomeSurface(t *testing.T) {
 		t.Fatalf("nav = %+v", ui.Nav)
 	}
 }
+
+// An install renamed with `as` reads its files from the SOURCE repo name:
+// mlsys-research installed as mlsys-research-e2e is repos/<owner>/mlsys-research.
+func TestSourceFromIntentPayloadFollowsRename(t *testing.T) {
+	pl := `{"slug":"a3f48236-ffe9-4fb9-9548-6e044d5cd9c7/mlsys-research","as":"mlsys-research-e2e"}`
+	owner, repo, ok := sourceFromIntentPayload(pl, "mlsys-research-e2e")
+	if !ok || owner != "a3f48236-ffe9-4fb9-9548-6e044d5cd9c7" || repo != "mlsys-research" {
+		t.Fatalf("got %q %q %v", owner, repo, ok)
+	}
+	if _, _, ok := sourceFromIntentPayload(pl, "mlsys-research"); ok {
+		t.Fatal("the source name is not the installed app's name here")
+	}
+	o2, r2, ok2 := sourceFromIntentPayload(`{"slug":"own/quant-research"}`, "quant-research")
+	if !ok2 || o2 != "own" || r2 != "quant-research" {
+		t.Fatalf("plain install: %q %q %v", o2, r2, ok2)
+	}
+}

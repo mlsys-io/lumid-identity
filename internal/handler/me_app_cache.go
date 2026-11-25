@@ -570,22 +570,51 @@ func repoIsRunnable(userSub, slug string) bool {
 // not a wrong query, and a test that needs MySQL is a test that skips in CI —
 // which is how the assumption survived a full green suite in the first place.
 func ownerFromIntentPayload(payload, app string) (string, bool) {
+	owner, _, ok := sourceFromIntentPayload(payload, app)
+	return owner, ok
+}
+
+// sourceFromIntentPayload is the install's source slug "<owner>/<repo>" when
+// the intent installed `app`. The repo name differs from `app` when the install
+// renamed it (`as`): mlsys-research installed as mlsys-research-e2e lives at
+// repos/<owner>/mlsys-research, not repos/<owner>/mlsys-research-e2e.
+func sourceFromIntentPayload(payload, app string) (string, string, bool) {
 	var pl map[string]any
 	if json.Unmarshal([]byte(payload), &pl) != nil {
-		return "", false
+		return "", "", false
 	}
 	slug, _ := pl["slug"].(string)
 	slug = strings.TrimSpace(slug)
 	owner, name, ok := strings.Cut(slug, "/")
 	if !ok || owner == "" || name == "" {
-		return "", false
+		return "", "", false
 	}
 	// installAppName applies `as` renames and strips -draft, so the local
 	// directory name is compared the same way everywhere else compares it.
 	if installAppName(pl) != app {
-		return "", false
+		return "", "", false
 	}
-	return owner, true
+	return owner, name, true
+}
+
+// repoSlugFor is the published repo behind an installed app: the install's
+// source owner AND repo name (they differ from the caller / the local name for
+// marketplace installs and `as` renames). Falls back to <caller>/<app>.
+func repoSlugFor(userSub, app string) (string, string) {
+	if common.DB == nil {
+		return userSub, app
+	}
+	var rows []models.MeAppIntent
+	if err := common.DB.Where("user_sub = ? AND action = ?", userSub, "install").
+		Order("created_at DESC").Limit(50).Find(&rows).Error; err != nil {
+		return userSub, app
+	}
+	for i := range rows {
+		if owner, repo, ok := sourceFromIntentPayload(rows[i].Payload, app); ok {
+			return owner, repo
+		}
+	}
+	return userSub, app
 }
 
 // repoOwnerFor returns the sub that OWNS the published bundle for `app`.

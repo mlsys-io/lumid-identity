@@ -5,6 +5,8 @@
 //   1. Scheduled cycles — journal.jsonl entries from the user's tenant
 //      tree + operator-shared apps.
 //   2. Visual executions — n8n /rest/executions (W1 best-effort).
+//   3. Entrance jobs — lum.id/data /jobs/v1/jobs, as the user (best-effort;
+//      me_runs_jobs.go). `sources.jobs` says whether they could be read.
 //
 // Filters: state (running|succeeded|failed|paused), workflow slug,
 // time range (last 24h default; ?since=ISO + ?until=ISO override).
@@ -35,10 +37,10 @@ import (
 type RunRow struct {
 	RunID        string  `json:"run_id"`
 	WorkflowSlug string  `json:"workflow_slug"`
-	Kind         string  `json:"kind"` // "scheduled" | "visual"
+	Kind         string  `json:"kind"` // "scheduled" | "visual" | "job"
 	Name         string  `json:"name"` // workflow display name
 	App          string  `json:"app,omitempty"`
-	State        string  `json:"state"` // "succeeded" | "failed" | "running" | "skipped" | "canceled"
+	State        string  `json:"state"` // "succeeded" | "failed" | "running" | "skipped" | "canceled" | "queued" (jobs)
 	StartedAt    float64 `json:"started_at"`
 	StartedISO   string  `json:"started_iso,omitempty"`
 	DurationSec  float64 `json:"duration_s,omitempty"`
@@ -47,6 +49,9 @@ type RunRow struct {
 	// The artifact dir + step log path for the drill-down view. Empty
 	// for visual (n8n keeps its own state).
 	CycleDir string `json:"cycle_dir,omitempty"`
+	// Link — where the row opens in Studio, when that is not derivable from
+	// run_id. Set for entrance jobs (Studio → Data → Jobs).
+	Link string `json:"link,omitempty"`
 }
 
 // MeRuns — GET /me/runs[?state=&workflow=&since=&until=&limit=&cursor=&before=]
@@ -382,7 +387,7 @@ type runsCollection struct {
 
 func (rc runsCollection) serverTiming() string {
 	parts := make([]string, 0, len(rc.timings))
-	for _, k := range []string{"journal", "store", "n8n"} {
+	for _, k := range []string{"journal", "store", "n8n", "jobs"} {
 		if d, ok := rc.timings[k]; ok {
 			parts = append(parts, fmt.Sprintf("%s;dur=%.1f;desc=%q", k, float64(d.Microseconds())/1000, rc.status[k]))
 		}
@@ -390,8 +395,9 @@ func (rc runsCollection) serverTiming() string {
 	return strings.Join(parts, ", ")
 }
 
-// collectRunsFrom gathers the three sources CONCURRENTLY. They used to run
-// one after another with the remote one last, so the response time was the sum
+// collectRunsFrom gathers the sources (journal, run store, n8n, entrance
+// jobs) CONCURRENTLY. They used to run one after another with the remote one
+// last, so the response time was the sum
 // — and n8n's fixed 6 s deadline dominated it. Now it is the slowest source,
 // and the remote one is bounded (meRunsN8nTimeout) and short-circuited while
 // known unreachable. A source that fails or times out contributes no rows and
@@ -409,9 +415,9 @@ func collectRunsFrom(c *gin.Context, userID string, since, until time.Time) runs
 	reqCtx := c.Request.Context()
 	cookie, _ := c.Cookie("n8n-auth")
 
-	var journal, store, visual []RunRow
+	var journal, store, visual, jobs []RunRow
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	// 1. Scheduled — walk every app's journal.jsonl.
 	go func() {
@@ -448,8 +454,17 @@ func collectRunsFrom(c *gin.Context, userID string, since, until time.Time) runs
 		record("n8n", st, time.Since(t0))
 	}()
 
+	// 3. Entrance jobs — lum.id/data, as the user. Bounded, best-effort.
+	go func() {
+		defer wg.Done()
+		t0 := time.Now()
+		var st string
+		jobs, st = entranceJobRuns(reqCtx, userID, since, until, meRunsJobsTimeout())
+		record("jobs", st, time.Since(t0))
+	}()
+
 	wg.Wait()
-	rc.rows = append(mergeRunRows(journal, store), visual...)
+	rc.rows = append(append(mergeRunRows(journal, store), visual...), jobs...)
 	return rc
 }
 

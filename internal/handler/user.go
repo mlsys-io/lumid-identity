@@ -158,8 +158,18 @@ func SessionBearerHandler(c *gin.Context) {
 		// capability tag a user mints on a PAT deliberately, and a 10-minute
 		// bearer minted from a session cookie is the wrong instrument for it.
 		audience = "lqt"
+	case "lumid-data":
+		// lum.id/data (`/data/*`: catalog, retrieve, blobs, the jobs entrance).
+		// Studio used to borrow the runmesh bearer for these calls, which only
+		// worked while introspection ignored audiences; lum.id/data names
+		// itself `lumid-data` when it introspects, so it needs its own.
+		// lum.id/data authorizes on role and ownership, not on these scopes —
+		// `lumid:read` states intent and grants nothing extra. No lumid:write:
+		// a role=user PAT cannot self-grant it either.
+		audience = "lumid-data"
+		scopes = []string{"lumid:read"}
 	default:
-		fail(c, http.StatusBadRequest, 1001, "audience must be 'runmesh', 'flowmesh' or 'lqt'")
+		fail(c, http.StatusBadRequest, 1001, "audience must be 'runmesh', 'flowmesh', 'lqt' or 'lumid-data'")
 		return
 	}
 

@@ -1221,7 +1221,7 @@ func providerAllowed(userRole string, p llmProvider) bool {
 // Defaults to "user" so gating fails closed to the least privilege.
 func currentUserRole(c *gin.Context) string {
 	if tok := bearerToken(c); tok != "" {
-		if claims, err := common.VerifyJWT(tok); err == nil && claims.Role != "" {
+		if claims, err := common.VerifyIdentityJWT(tok); err == nil && claims.Role != "" {
 			return claims.Role
 		}
 	}

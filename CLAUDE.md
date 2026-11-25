@@ -101,6 +101,15 @@ docs/unified-auth.md       the shared `lumid_auth` hook-library spec for consume
   CLI calls `POST /api/v1/identity/google-access-token` per use and caches the short-lived access
   token client-side. `GET …/google-grants` returns status only — never a token — so it is safe for
   the browser.
+- **A JWT is valid only for its audience** (2026-11-25). lum.id's own API (PATs, admin,
+  session-bearer, Google grants, OAuth authorize) accepts only `common.IdentityAudiences`
+  (`lumid-ecosystem`, `lumid-identity`, `lumid`) — use `common.VerifyIdentityJWT`, never bare
+  `VerifyJWT`, for any new auth check. `/oauth/introspect` takes the caller's `audience`
+  (form/JSON/`?audience=`/`X-Introspect-Audience`): with it, only that audience or
+  `lumid-ecosystem` is active; without it, only `lumid-ecosystem` plus the migration allowance
+  `INTROSPECT_UNBOUND_AUDIENCES` (default = the bridge audiences live consumers receive; logged
+  as `[introspect] UNBOUND aud=…`). OIDC id_tokens (aud = client_id) are never active at
+  introspect for another service. Goal: every consumer sends `audience`, then set the env to "".
 - **Internal bridge routes are gated by `X-Bridge-Secret`**, not by a user bearer
   (`internal_mint.go`, `/internal/me-intents`). The scheduler drains its intent queue this way
   because there is no shared filesystem between pods on UKS.

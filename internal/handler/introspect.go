@@ -93,6 +93,13 @@ type IntrospectResponse struct {
 	Iat       int64    `json:"iat,omitempty"`
 	Source    string   `json:"source,omitempty"` // native | legacy-lqa | legacy-runmesh
 	Reason    string   `json:"reason,omitempty"` // why active=false
+	// Aud — the JWT's audiences (RFC 7662 `aud`). Empty for PATs. Consumers
+	// that verify locally can check it; consumers that introspect should
+	// instead send `audience=<their service>` and let identity refuse.
+	Aud []string `json:"aud,omitempty"`
+	// unboundAud is set when a service-specific JWT was accepted only through
+	// the migration allowance (caller sent no `audience`). Never serialised.
+	unboundAud string
 	// AllowOnprem — may this identity reach the SELF-HOSTED models (the GB10
 	// fleet behind lumid-llm)? Resolved from the caller's effective Claude
 	// pool; see ClaudeOnpremAllowedFor.
@@ -145,7 +152,7 @@ type IntrospectResponse struct {
 // stays happy. The OIDC-standard `/oauth/introspect` stays flat
 // per RFC 7662.
 func Introspect(c *gin.Context) {
-	token := extractIntrospectToken(c)
+	token, audience := extractIntrospectRequest(c)
 
 	if token == "" {
 		writeIntrospect(c, IntrospectResponse{Active: false, Reason: "no token"})
@@ -163,7 +170,10 @@ func Introspect(c *gin.Context) {
 	var key string
 	if ttl > 0 {
 		introCacheSweep()
-		key = introCacheKey(token)
+		// The verdict depends on the caller's audience, so it is part of the
+		// key: a JWT cached as active for its own service must not be served
+		// from cache to a different one.
+		key = introCacheKey(token + "\x00" + audience)
 		if v, ok := introCache.Load(key); ok {
 			if e, ok := v.(introCacheEntry); ok && time.Now().Before(e.exp) {
 				writeIntrospect(c, e.resp)
@@ -172,7 +182,10 @@ func Introspect(c *gin.Context) {
 		}
 	}
 
-	resp := enrichClaudePolicy(resolveIntrospect(token))
+	resp := enrichClaudePolicy(resolveIntrospect(token, audience))
+	if resp.unboundAud != "" {
+		logUnboundAudience(resp.unboundAud, c.GetHeader("User-Agent"), c.ClientIP())
+	}
 
 	// Cache determinate verdicts (active, or a real inactive reason like
 	// revoked/expired). Skip "unknown token" so a not-yet-provisioned token
@@ -185,7 +198,7 @@ func Introspect(c *gin.Context) {
 
 // resolveIntrospect runs the actual (expensive) validation: prefix-routed to the
 // legacy/native/JWT paths. Split out of Introspect so the cache wraps it.
-func resolveIntrospect(token string) IntrospectResponse {
+func resolveIntrospect(token, audience string) IntrospectResponse {
 	// Fast path for legacy prefixes during shadow.
 	if config.G.Legacy.Enabled && strings.HasPrefix(token, "rm_pat_") {
 		if resp := introspectLegacyLQA(token); resp != nil {
@@ -200,7 +213,7 @@ func resolveIntrospect(token string) IntrospectResponse {
 	}
 	// JWT (lm_session cookies, Bearer Authorization headers)
 	if strings.Count(token, ".") == 2 {
-		if resp := introspectJWT(token); resp != nil {
+		if resp := introspectJWT(token, audience); resp != nil {
 			return *resp
 		}
 	}
@@ -228,23 +241,39 @@ func enrichClaudePolicy(resp IntrospectResponse) IntrospectResponse {
 	return resp
 }
 
-// extractIntrospectToken pulls the token out of form body, JSON body,
-// or Authorization header — whichever the caller used. Runmesh sends
-// JSON `{"token": "..."}` via WebClient; curl tends to use form;
-// OAuth2 clients may use either per the RFC 7662 spec.
-func extractIntrospectToken(c *gin.Context) string {
+// extractIntrospectRequest pulls the token, and the caller's optional
+// `audience`, out of form body, JSON body, or Authorization header — whichever
+// the caller used. Runmesh sends JSON `{"token": "..."}` via WebClient; curl
+// tends to use form; OAuth2 clients may use either per the RFC 7662 spec.
+//
+// `audience` (form field, JSON field, `?audience=` or X-Introspect-Audience)
+// is the name of the service doing the introspection. When present, a JWT is
+// active only if it was minted for that service or for the general
+// `lumid-ecosystem` audience. See common.IntrospectAudienceVerdict.
+func extractIntrospectRequest(c *gin.Context) (token, audience string) {
+	audience = strings.TrimSpace(c.GetHeader("X-Introspect-Audience"))
+	if a := strings.TrimSpace(c.Query("audience")); a != "" {
+		audience = a
+	}
 	if t := strings.TrimSpace(c.PostForm("token")); t != "" {
-		return t
+		if a := strings.TrimSpace(c.PostForm("audience")); a != "" {
+			audience = a
+		}
+		return t, audience
 	}
 	// Try JSON body.
 	ct := c.ContentType()
 	if strings.Contains(ct, "application/json") {
 		var body struct {
-			Token string `json:"token"`
+			Token    string `json:"token"`
+			Audience string `json:"audience"`
 		}
 		if err := c.ShouldBindJSON(&body); err == nil {
+			if a := strings.TrimSpace(body.Audience); a != "" {
+				audience = a
+			}
 			if t := strings.TrimSpace(body.Token); t != "" {
-				return t
+				return t, audience
 			}
 		}
 	}
@@ -254,17 +283,39 @@ func extractIntrospectToken(c *gin.Context) string {
 		b, _ := c.GetRawData()
 		raw := strings.TrimSpace(string(b))
 		if strings.HasPrefix(raw, "token=") {
-			return strings.TrimPrefix(raw, "token=")
+			v := strings.TrimPrefix(raw, "token=")
+			if i := strings.Index(v, "&audience="); i >= 0 {
+				if a := strings.TrimSpace(v[i+len("&audience="):]); a != "" {
+					audience = a
+				}
+				v = v[:i]
+			}
+			return v, audience
 		}
 		// Accept a bare JWT in the body too.
-		return raw
+		return raw, audience
 	}
 	// Authorization header: Bearer <token>.
 	if h := c.GetHeader("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer ")), audience
 	}
-	return ""
+	return "", audience
 }
+
+// logUnboundAudience names, at most once per 10 minutes per (aud, UA), a
+// consumer that still relies on the unbound-audience allowance — the list of
+// consumers to migrate before INTROSPECT_UNBOUND_AUDIENCES is emptied.
+func logUnboundAudience(aud, ua, ip string) {
+	k := aud + "|" + ua
+	now := time.Now()
+	if v, ok := unboundLogged.Load(k); ok && now.Sub(v.(time.Time)) < 10*time.Minute {
+		return
+	}
+	unboundLogged.Store(k, now)
+	log.Printf("[introspect] UNBOUND aud=%s accepted for a caller that sent no audience (ua=%q ip=%s) — have it send audience=%s", aud, ua, ip, aud)
+}
+
+var unboundLogged sync.Map
 
 // writeIntrospect picks the envelope shape per route. /oauth/introspect
 // stays flat (RFC 7662 + OIDC-compatible); the LQA-compatible alias
@@ -440,10 +491,22 @@ func introspectNative(token string) *IntrospectResponse {
 // introspectJWT — verify the signature against our JWKS + check
 // the session isn't revoked. Used when downstream services bounce
 // the bearer cookie through introspect instead of verifying locally.
-func introspectJWT(token string) *IntrospectResponse {
+func introspectJWT(token, audience string) *IntrospectResponse {
 	claims, err := common.VerifyJWT(token)
 	if err != nil {
 		return &IntrospectResponse{Active: false, Reason: "jwt verify: " + err.Error()}
+	}
+	// Audience: a JWT minted for one service (a bridge token, an OIDC
+	// id_token for a client) is not a credential for another. Until
+	// 2026-11-25 this path checked only the signature, so e.g. a 10-minute
+	// FlowMesh session-bearer authenticated at lum.id/data with the user's
+	// full role.
+	okAud, unbound := common.IntrospectAudienceVerdict(claims, audience)
+	if !okAud {
+		if audience != "" {
+			return &IntrospectResponse{Active: false, Reason: "audience mismatch: token not minted for " + audience}
+		}
+		return &IntrospectResponse{Active: false, Reason: "audience not accepted: send audience=<your service>"}
 	}
 	// Session revocation: one row per jti. Logout flips revoked_at.
 	// We treat "no such session" as expired (the JWT verified fine
@@ -469,6 +532,13 @@ func introspectJWT(token string) *IntrospectResponse {
 		Exp:       claims.ExpiresAt.Unix(),
 		Iat:       claims.IssuedAt.Unix(),
 		Source:    "native",
+		Aud:       []string(claims.Audience),
+		unboundAud: func() string {
+			if unbound && len(claims.Audience) > 0 {
+				return claims.Audience[0]
+			}
+			return ""
+		}(),
 	}
 }
 

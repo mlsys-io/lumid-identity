@@ -52,7 +52,7 @@ func GoogleConnectInit(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
-	claims, err := common.VerifyJWT(tok)
+	claims, err := common.VerifyIdentityJWT(tok)
 	if err != nil {
 		fail(c, http.StatusUnauthorized, 1003, "invalid session")
 		return

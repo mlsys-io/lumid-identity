@@ -25,7 +25,7 @@ import (
 // Handles both JWTs (fast, no DB) and lm_pat_* / rm_pat_* tokens
 // (DB lookup for the owning user's role).
 func resolveRole(tok string) (userID, role string, ok bool) {
-	if claims, err := common.VerifyJWT(tok); err == nil {
+	if claims, err := common.VerifyIdentityJWT(tok); err == nil {
 		return claims.Subject, claims.Role, true
 	}
 	if strings.HasPrefix(tok, "lm_pat_") || strings.HasPrefix(tok, "rm_pat_") {

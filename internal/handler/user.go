@@ -41,7 +41,10 @@ func SessionBearerHandler(c *gin.Context) {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
-	claims, err := common.VerifyJWT(tok)
+	// Identity audiences only: a bridge token must not be able to mint more
+	// bridge tokens (a 10-min FlowMesh bearer would otherwise refresh itself
+	// into runmesh:admin indefinitely).
+	claims, err := common.VerifyIdentityJWT(tok)
 	if err != nil {
 		fail(c, http.StatusUnauthorized, 1003, "invalid session")
 		return

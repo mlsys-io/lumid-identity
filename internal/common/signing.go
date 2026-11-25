@@ -150,3 +150,9 @@ func randHex(n int) string {
 	}
 	return string(out)
 }
+
+// NewTestKeyring returns a keyring holding one active key — for tests in
+// other packages, which cannot reach Keyring's unexported fields.
+func NewTestKeyring(k *rsa.PrivateKey) *Keyring {
+	return &Keyring{keys: map[string]*SigningKey{"test": {Kid: "test", Private: k, Public: &k.PublicKey, Active: true}}, active: "test"}
+}

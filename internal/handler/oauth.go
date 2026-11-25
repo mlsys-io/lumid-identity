@@ -68,7 +68,9 @@ func OAuthAuthorizeHandler(c *gin.Context) {
 		bounceToLogin(c)
 		return
 	}
-	claims, err := common.VerifyJWT(tok)
+	// A login session (or another identity-audience token) — never a bridge
+	// token or another client's id_token.
+	claims, err := common.VerifyIdentityJWT(tok)
 	if err != nil {
 		bounceToLogin(c)
 		return

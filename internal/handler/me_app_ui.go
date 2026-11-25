@@ -269,8 +269,12 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 	var ui *appUI
 	var appCfg map[string]any
 	if ov, ok := overlays[appFileSpecRel]; ok && !ov.Deleted && len(ov.Content) > 0 {
-		ui = parseAppUI(ov.Content)
-		appCfg = parseAppConfigBytes(ov.Content)
+		// The overlay is the raw saved spec: read it in the legacy shape like
+		// every other source (a simple-scheme app saved from Studio lost its
+		// pages here — "app declares no ui surface").
+		spec := normalizeSpecBytes(ov.Content, "")
+		ui = parseAppUI(spec)
+		appCfg = parseAppConfigBytes(spec)
 	} else if remote {
 		spec, ok := fetchRepoSpecForParse(userID, app)
 		if !ok {

@@ -246,6 +246,10 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/ui", MeAppUI) // app-declared Studio surface (markdown)
 			me.GET("/apps/:app/ui/:surface", MeAppUISurface)
 			me.GET("/apps/:app/data", MeAppData) // read-only app content for declarative surfaces
+			// Fleet capacity, counts only, for every signed-in user
+			// (me_compute_summary.go). Read server-side as an operator
+			// principal because the merged fleet read is admin-gated.
+			me.GET("/compute", MeCompute)
 			// Job status for the workflow canvas. The browser cannot reach
 			// Lumilake directly — /ll/<site>/ wants a PAT, the SPA carries a
 			// session, and session-bearer rejects PATs — so the hop is here.
@@ -289,6 +293,9 @@ func Register(r *gin.Engine) {
 			// (hypothesis × variants × dataset/casebook × metric).
 			me.GET("/experiments", MeExperiments) // cross-app aggregate (Workstream F)
 			me.GET("/apps/:app/experiments", MeAppExperiments)
+			// The caller's queued / running / recent runs for one install,
+			// read on the scheduler via a queue_read intent (me_app_queue.go).
+			me.GET("/apps/:app/queue", MeAppQueue)
 			me.GET("/apps/:app/experiments/:id", MeAppExperiment)
 			me.GET("/apps/:app/experiments/:id/case/:caseId", MeAppExperimentCase)
 			// WRITE path (W1). Until this existed nothing could create an

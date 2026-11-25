@@ -36,7 +36,7 @@ import (
 // readIntentActions are the picker actions that only read. Listed so every
 // surface that enumerates intents can leave them out, and the claim can serve
 // them first (a caller is blocked on each one).
-var readIntentActions = []string{"trajectory_query", "app_file_read", cycleReadAction}
+var readIntentActions = []string{"trajectory_query", "app_file_read", cycleReadAction, queueReadAction}
 
 func isReadIntentAction(a string) bool {
 	for _, r := range readIntentActions {

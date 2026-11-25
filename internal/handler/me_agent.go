@@ -943,8 +943,14 @@ var llmProviders = []llmProvider{
 		// OpenRouter and can return an empty completion instead of erroring.
 		// 2026-10-27: DeepSeek-V4-Flash RETIRED -> DeepSeek-V4.1-Flash (vLLM TP4
 		// on NUS s0's 4x H200, 1M ctx). The old id resolves via modelIDAliases.
+		// SERVING, 2026-11-25: NUS SoC serves deepseek-v4.1-flash, qwen3.8-27b and
+		// qwen3.8-flash-next at tier 0 (claude-proxy-soc relay). The only on-prem
+		// route left is deepseek's tier-1 fallback on the office GX10 TP4 ring, so
+		// the chip names no longer say "Lumid GPU" (the operator: "we don't serve
+		// deepseek and qwen on prem now, deepseek fallback only"). Older notes below
+		// that describe s0 / luyao1 / gmk backends are history, not today's routing.
 		id:                  "deepseek-v4.1-flash",
-		displayName:         "DeepSeek-V4.1-Flash (Chat · Lumid GPU)",
+		displayName:         "DeepSeek-V4.1-Flash (Chat)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
 		upstreamModel:       "deepseek-v4.1-flash",
 		authHeader:          "Authorization",
@@ -962,7 +968,7 @@ var llmProviders = []llmProvider{
 		// of them, while the one model that can actually read an image sat
 		// flagged false below.
 		supportsVision:    false,
-		minRole:           "user", // in-house on our own GPUs; the default for everyone
+		minRole:           "user", // the default for everyone (served by NUS SoC; see SERVING above)
 		maxOutputTokens:   16384,  // 512K ctx, free local GPU — let answers/structured output run
 		dailyBudgetTokens: -1,     // free local GPU; the 6000/min gateway rate-limit is the abuse guard
 	},
@@ -1002,7 +1008,7 @@ var llmProviders = []llmProvider{
 		//
 		// KEEP upstreamModel IN SYNC WITH THE GATEWAY — see the deepseek note above.
 		id:                  "lumid-qwen38-27b",
-		displayName:         "Qwen3.8-27B (Chat · Lumid GPU)",
+		displayName:         "Qwen3.8-27B (Chat)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
 		upstreamModel:       "qwen3.8-27b",
 		authHeader:          "Authorization",
@@ -1014,7 +1020,7 @@ var llmProviders = []llmProvider{
 		// answer 400 "is not a multimodal model" was described correctly here.
 		// It ships with an mmproj; deepseek-v4-flash does not.
 		supportsVision:    true,
-		minRole:           "user", // in-house GPU now, like deepseek — everyone
+		minRole:           "user", // everyone, like deepseek
 		maxOutputTokens:   8192,   // matches skills/llm.py's gateway floor
 		dailyBudgetTokens: 1_500_000,
 	},
@@ -1025,7 +1031,7 @@ var llmProviders = []llmProvider{
 		// tokens of every turn's prefix. Reads images (BF16 mmproj; verified red/blue test image).
 		// No OpenRouter fallback, so a saturated box queues rather than bills: dailyBudgetTokens -1.
 		id:                  "lumid-flash-next",
-		displayName:         "Qwen3.8 Flash-Next (Chat · Lumid GPU)",
+		displayName:         "Qwen3.8 Flash-Next (Chat)",
 		endpoint:            lumidLLMBase() + "/v1/messages",
 		upstreamModel:       "qwen3.8-flash-next",
 		authHeader:          "Authorization",
@@ -1118,7 +1124,7 @@ var llmProviders = []llmProvider{
 		// could never answer. deepseek-v4-flash is the in-house model this lane
 		// was reaching for, and it is the one claude-proxy allows.
 		id:                "claude-code-qwen35",
-		displayName:       "DeepSeek-V4.1-Flash (Code · Lumid GPU)",
+		displayName:       "DeepSeek-V4.1-Flash (Code)",
 		endpoint:          "",
 		upstreamModel:     "lumid-llm/deepseek-v4.1-flash",
 		authHeader:        "",
@@ -1162,7 +1168,7 @@ var llmProviders = []llmProvider{
 		// claude-proxy for the full result). Unlike GLM, this lane does not
 		// need a prose-extraction workaround.
 		id:                "claude-code-qwen38",
-		displayName:       "Qwen3.8-27B (Code · Lumid GPU)",
+		displayName:       "Qwen3.8-27B (Code)",
 		endpoint:          "",
 		upstreamModel:     "lumid-llm/qwen3.8-27b",
 		authHeader:        "",
@@ -1178,7 +1184,7 @@ var llmProviders = []llmProvider{
 		// id because SELF_HOSTED_MODELS names it (deploy_infra #421; flashNextProfile, 4096-token
 		// budget ceiling). Caveat: 32k context per session, so long agent sessions hit the window.
 		id:                "claude-code-flash-next",
-		displayName:       "Qwen3.8 Flash-Next (Code · Lumid GPU)",
+		displayName:       "Qwen3.8 Flash-Next (Code)",
 		endpoint:          "",
 		upstreamModel:     "lumid-llm/qwen3.8-flash-next",
 		authHeader:        "",

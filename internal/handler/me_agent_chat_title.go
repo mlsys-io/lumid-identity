@@ -19,8 +19,8 @@ package handler
 //     regenerating on later saves and stops inferTitle clobbering it back to
 //     the truncated first message.
 //
-// Model is the default provider (Gemma-4 on the Lumid GPU via lumid-llm):
-// free local compute, dailyBudgetTokens -1, so titling costs nothing and
+// Model is the default provider (deepseek-v4.1-flash via lumid-llm):
+// unmetered (NUS SoC, office GX10 fallback), dailyBudgetTokens -1, so titling costs nothing and
 // never competes with a user's Claude quota.
 
 import (

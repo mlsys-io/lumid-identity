@@ -18,12 +18,50 @@ package handler
 // resolveRole is the same resolver RequireAdmin uses, so "authenticated" now
 // means one thing here regardless of credential type. No role check: callers who
 // need admin use /admin/check.
+//
+// EDGE AUDIENCES. This is the gate in FRONT of other services, not lum.id's own
+// API, so a token minted for the service behind the gated path belongs here.
+// Research Fleet (me_fleet_jobs.go) submits to https://lum.id/fm/<site>/… with
+// an aud=flowmesh bridge JWT; when v0.5.480 bound JWTs to their audience,
+// resolveRole (VerifyIdentityJWT) started refusing it and every fleet FlowMesh
+// job got "compute service returned 401" (2026-11-25). The service still
+// re-checks the token itself (FlowMesh introspects it), so admitting it at the
+// edge widens nothing; it stays refused on every path that is not that
+// service's, and on lum.id's own API.
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"lumid_identity/internal/common"
 )
+
+// edgeAudiencePaths: a JWT whose aud is a key passes this gate only for a
+// request under one of its prefixes.
+var edgeAudiencePaths = map[string][]string{
+	"flowmesh": {"/fm/"},
+}
+
+// edgeAudienceOK reports whether tok is a valid JWT minted for the service
+// that serves originalURI — the gated request's URI, which nginx passes as
+// X-Original-URI. Without that header the gate cannot tell which service is
+// behind it, so a service token is refused.
+func edgeAudienceOK(tok, originalURI string) (string, string, bool) {
+	c, err := common.VerifyJWT(tok)
+	if err != nil {
+		return "", "", false
+	}
+	for _, aud := range c.Audience {
+		for _, prefix := range edgeAudiencePaths[aud] {
+			if originalURI != "" && strings.HasPrefix(originalURI, prefix) {
+				return c.Subject, c.Role, true
+			}
+		}
+	}
+	return "", "", false
+}
 
 func AuthCheckHandler(c *gin.Context) {
 	tok := bearerToken(c)
@@ -32,6 +70,9 @@ func AuthCheckHandler(c *gin.Context) {
 		return
 	}
 	userID, role, ok := resolveRole(tok)
+	if !ok {
+		userID, role, ok = edgeAudienceOK(tok, c.GetHeader("X-Original-URI"))
+	}
 	if !ok {
 		fail(c, http.StatusUnauthorized, 1003, "invalid credential")
 		return

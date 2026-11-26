@@ -69,10 +69,14 @@ func measureLimit(env string, def int) int {
 type measurePlan struct {
 	version  string         // goes into the key
 	label    string         // human version ("v0.1.3"), for measured_on
-	material map[string]any // what the key covers, besides instrument + version
-	workflow string         // FlowMesh graph to submit
-	site     string
-	name     string
+	material map[string]any // what is stored and replayed
+	// keyMaterial, when set, is what the key covers instead of material: the
+	// simulator drops each candidate's `id` (a label) so the same design under
+	// another name is the same measurement.
+	keyMaterial map[string]any
+	workflow    string // FlowMesh graph to submit
+	site        string
+	name        string
 }
 
 type measureInstrument struct {
@@ -203,9 +207,9 @@ func mlsysSimulatorPlan(in map[string]any) (measurePlan, error) {
 	}
 	site, _ := in["site"].(string)
 	if site == "" {
-		site = "office"
+		site = "auto" // picked at submit: the site with the most idle workers (measurePickSite)
 	}
-	if !computeSiteRe.MatchString(site) {
+	if site != "auto" && !computeSiteRe.MatchString(site) {
 		return measurePlan{}, errors.New("invalid site")
 	}
 	timeout := measureDefaultTimeoutS
@@ -216,12 +220,13 @@ func mlsysSimulatorPlan(in map[string]any) (measurePlan, error) {
 	}
 	digest := image[strings.Index(image, "@")+1:]
 	material := map[string]any{"job": job, "payload": payload}
-	key := measureKey("mlsys-simulator", digest, material)
+	keyMaterial := map[string]any{"job": job, "payload": withoutCandidateIDs(payload)}
+	key := measureKey("mlsys-simulator", digest, keyMaterial)
 	wf, err := mlsysWorkflow(image, tag, job, payload, "measure-"+key[:12], timeout)
 	if err != nil {
 		return measurePlan{}, err
 	}
-	return measurePlan{version: digest, label: tag, material: material, workflow: wf, site: site,
+	return measurePlan{version: digest, label: tag, material: material, keyMaterial: keyMaterial, workflow: wf, site: site,
 		name: "measure mlsys-simulator " + key[:12]}, nil
 }
 
@@ -270,6 +275,109 @@ func canonicalJSON(v any) (string, error) {
 		return "", err
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// keyed is what the key covers: keyMaterial when the instrument set one.
+func (p measurePlan) keyed() map[string]any {
+	if p.keyMaterial != nil {
+		return p.keyMaterial
+	}
+	return p.material
+}
+
+// withoutCandidateIDs copies a simulator payload with each candidate's `id`
+// removed — the design is its infra + strategy (the app's own config_hash);
+// the id is the name someone gave it.
+func withoutCandidateIDs(payload map[string]any) map[string]any {
+	out := make(map[string]any, len(payload))
+	for k, v := range payload {
+		out[k] = v
+	}
+	if cands, ok := payload["candidates"].([]any); ok {
+		stripped := make([]any, len(cands))
+		for i, c := range cands {
+			if m, isMap := c.(map[string]any); isMap {
+				cp := make(map[string]any, len(m))
+				for k, v := range m {
+					if k != "id" {
+						cp[k] = v
+					}
+				}
+				stripped[i] = cp
+			} else {
+				stripped[i] = c
+			}
+		}
+		out["candidates"] = stripped
+	}
+	return out
+}
+
+// candidateIDs lists a stored or requested material's candidate ids in order.
+func candidateIDs(material map[string]any) []string {
+	payload, _ := material["payload"].(map[string]any)
+	cands, _ := payload["candidates"].([]any)
+	ids := make([]string, len(cands))
+	for i, c := range cands {
+		if m, ok := c.(map[string]any); ok {
+			ids[i], _ = m["id"].(string)
+		}
+	}
+	return ids
+}
+
+// renameCandidates rewrites every `candidate_id` in a stored result from the
+// first requester's names to this requester's, matched by position (equal keys
+// mean the same candidates in the same order). Anything it cannot map is left.
+func renameCandidates(result, storedInputs string, requested map[string]any) string {
+	var stored map[string]any
+	if json.Unmarshal([]byte(storedInputs), &stored) != nil {
+		return result
+	}
+	from, to := candidateIDs(stored), candidateIDs(requested)
+	if len(from) == 0 || len(from) != len(to) {
+		return result
+	}
+	rename := map[string]string{}
+	for i := range from {
+		if from[i] != "" && to[i] != "" && from[i] != to[i] {
+			rename[from[i]] = to[i]
+		}
+	}
+	if len(rename) == 0 {
+		return result
+	}
+	var v any
+	dec := json.NewDecoder(strings.NewReader(result))
+	dec.UseNumber()
+	if dec.Decode(&v) != nil {
+		return result
+	}
+	var walk func(any) any
+	walk = func(x any) any {
+		switch t := x.(type) {
+		case map[string]any:
+			for k, val := range t {
+				if s, isStr := val.(string); isStr && k == "candidate_id" {
+					if n, ok := rename[s]; ok {
+						t[k] = n
+					}
+					continue
+				}
+				t[k] = walk(val)
+			}
+		case []any:
+			for i := range t {
+				t[i] = walk(t[i])
+			}
+		}
+		return x
+	}
+	out, err := canonicalJSON(walk(v))
+	if err != nil {
+		return result
+	}
+	return out
 }
 
 func measureKey(instrument, version string, material map[string]any) string {
@@ -343,7 +451,7 @@ func MeMeasure(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, err.Error())
 		return
 	}
-	key := measureKey(inst.Name, plan.version, plan.material)
+	key := measureKey(inst.Name, plan.version, plan.keyed())
 	labels := models.MeasureRequest{UserSub: sub, Key: key, App: fleetClip(b.App, 128),
 		Workflow: fleetClip(b.Workflow, 128), RunID: fleetClip(b.RunID, 200)}
 
@@ -355,7 +463,7 @@ func MeMeasure(c *gin.Context) {
 		// Another tenant's private measurement of the same content — or one
 		// still running whose reuse is not decided yet: measure it again under
 		// this tenant (never reveal or reuse theirs).
-		key = measureKey(inst.Name, plan.version, map[string]any{"tenant": sub, "inputs": plan.material})
+		key = measureKey(inst.Name, plan.version, map[string]any{"tenant": sub, "inputs": plan.keyed()})
 		labels.Key = key
 		row = models.MeasureResult{}
 		found = common.DB.First(&row, "mkey = ?", key).Error == nil
@@ -366,6 +474,9 @@ func MeMeasure(c *gin.Context) {
 		case row.Status == "succeeded" && !b.Fresh && !row.NoReuse:
 			common.DB.Model(&row).UpdateColumn("hits", gorm.Expr("hits + 1"))
 			row.Hits++
+			// Same design, the requester's names: a hit answers with THEIR
+			// candidate ids, not the first requester's.
+			row.Result = renameCandidates(row.Result, row.Inputs, plan.material)
 			measureRecord(labels, "cached")
 			measureRespond(c, http.StatusOK, &row, sub, true)
 			return
@@ -387,6 +498,14 @@ func MeMeasure(c *gin.Context) {
 				"instrument": inst.Name, "status": "not_measured", "reason": why}})
 			return
 		}
+	}
+	// Where it runs. NUS is admin+ by policy (2026-11-26); an unnamed site is
+	// the one with the most idle workers among those this caller may use.
+	if plan.site == "auto" {
+		plan.site = measurePickSite(c, sub)
+	} else if plan.site != "" && measureAdminSites()[plan.site] && !measureIsAdmin(sub) {
+		fail(c, http.StatusForbidden, 1403, "the "+plan.site+" fleet runs jobs for admins only; leave site empty to use office or home")
+		return
 	}
 	if msg, retry := measureQuota(sub, b.Fresh && found && row.Status == "succeeded" && !row.NoReuse); msg != "" {
 		c.Header("Retry-After", strconv.Itoa(retry))
@@ -700,4 +819,115 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 		out["version_label"] = label
 	}
 	c.JSON(code, gin.H{"ret_code": 0, "message": "", "data": out})
+}
+
+// ── Where a measurement runs ────────────────────────────────────────────
+
+// measureSites: the fleet sites any user's measurements may use, in order of
+// preference for ties. MEASURE_SITES overrides (comma separated).
+func measureSites() []string {
+	return splitSites(os.Getenv("MEASURE_SITES"), "office,home")
+}
+
+// measureAdminSites: sites only admins may use (NUS: not our hardware, no user
+// GPU quota). MEASURE_ADMIN_SITES overrides.
+func measureAdminSites() map[string]bool {
+	out := map[string]bool{}
+	for _, s := range splitSites(os.Getenv("MEASURE_ADMIN_SITES"), "nus") {
+		out[s] = true
+	}
+	return out
+}
+
+func splitSites(raw, def string) []string {
+	if strings.TrimSpace(raw) == "" {
+		raw = def
+	}
+	var out []string
+	for _, s := range strings.Split(raw, ",") {
+		if s = strings.TrimSpace(s); s != "" && computeSiteRe.MatchString(s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func measureIsAdmin(sub string) bool {
+	_, role := userEmailRole(sub)
+	return role == "admin" || role == "super_admin"
+}
+
+// measurePickSite reads each usable site's FlowMesh workers as the caller and
+// picks the one with the most idle python workers. Unreadable sites are
+// skipped; if none answers, the first site is used.
+func measurePickSite(c *gin.Context, sub string) string {
+	order := measureSites()
+	if measureIsAdmin(sub) {
+		for s := range measureAdminSites() {
+			order = append(order, s)
+		}
+	}
+	idle := map[string]int{}
+	for _, site := range order {
+		if n, ok := measureIdleWorkers(c, sub, site); ok {
+			idle[site] = n
+		}
+	}
+	return pickSite(order, idle)
+}
+
+// pickSite: the most idle workers wins; ties go to the earlier site; with no
+// readings at all, the first site.
+func pickSite(order []string, idle map[string]int) string {
+	best, bestN := "", -1
+	for _, s := range order {
+		if n, ok := idle[s]; ok && n > bestN {
+			best, bestN = s, n
+		}
+	}
+	if best == "" && len(order) > 0 {
+		return order[0]
+	}
+	return best
+}
+
+func measureIdleWorkers(c *gin.Context, sub, site string) (int, bool) {
+	bearer, err := fleetReadBearer(sub, fleetKindFM)
+	if err != nil {
+		return 0, false
+	}
+	b, code := fleetDo(c.Request.Context(), fleetCall{method: http.MethodGet, bearer: bearer,
+		url: fleetSiteBase(fleetKindFM, site) + "/api/v1/workers"})
+	if code != http.StatusOK {
+		return 0, false
+	}
+	var list []map[string]any
+	if json.Unmarshal(b, &list) != nil {
+		var wrapped map[string]any
+		if json.Unmarshal(b, &wrapped) != nil {
+			return 0, false
+		}
+		if raw, ok := wrapped["workers"].([]any); ok {
+			for _, w := range raw {
+				if m, ok := w.(map[string]any); ok {
+					list = append(list, m)
+				}
+			}
+		}
+	}
+	n := 0
+	for _, w := range list {
+		if w["cordoned"] == true || w["stale"] == true || !strings.EqualFold(fmt.Sprint(w["status"]), "IDLE") {
+			continue
+		}
+		caps, _ := w["capabilities"].(map[string]any)
+		types, _ := caps["supported_task_types"].([]any)
+		for _, t := range types {
+			if t == "python" {
+				n++
+				break
+			}
+		}
+	}
+	return n, true
 }

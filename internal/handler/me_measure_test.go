@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lumid_identity/internal/common"
+	"lumid_identity/internal/config"
 	"lumid_identity/models"
 )
 
@@ -61,8 +62,8 @@ func TestMeasureKeyIsTheContentNotTheSpelling(t *testing.T) {
 	if measureKey("mlsys-simulator", pd.version, pd.material) == ka {
 		t.Fatal("a different image produced the same key")
 	}
-	if pa.site != "office" || pb.site != "home" {
-		t.Errorf("sites = %q, %q; want the office default and the explicit home", pa.site, pb.site)
+	if pa.site != "auto" || pb.site != "home" {
+		t.Errorf("sites = %q, %q; want auto (picked at submit) and the explicit home", pa.site, pb.site)
 	}
 }
 
@@ -287,5 +288,107 @@ func TestMeasureUnknownKeyAndInstrument(t *testing.T) {
 	code, list := measureCall(t, "GET", "/api/v1/me/measure/instruments", "", owner)
 	if ins, _ := list["instruments"].([]any); code != 200 || len(ins) == 0 {
 		t.Errorf("instruments = %d %v", code, list)
+	}
+}
+
+func TestMlsysKeyIsTheDesignNotItsName(t *testing.T) {
+	t.Setenv("MEASURE_MLSYS_IMAGES", "vt="+testSimImage)
+	mk := func(id, conc string) string {
+		in := decodeInputs(t, `{"image":"`+testSimImage+`","job":"evaluate","payload":{"task":"9.2","seeds":[42],`+
+			`"candidates":[{"id":"`+id+`","infra":{"gpu":"x"},"strategy":{"serving":{"max_concurrency":`+conc+`}}}]}}`)
+		p, err := mlsysSimulatorPlan(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := candidateIDs(p.material); len(got) != 1 || got[0] != id {
+			t.Fatalf("stored material lost the requester's id: %v", got)
+		}
+		return measureKey("mlsys-simulator", p.version, p.keyed())
+	}
+	if mk("c32", "32") != mk("my-renamed-copy", "32") {
+		t.Fatal("the same design under another name is a different measurement")
+	}
+	if mk("c32", "32") == mk("c32", "16") {
+		t.Fatal("a different design shares a key")
+	}
+}
+
+func TestRenameCandidatesGivesTheRequesterTheirNames(t *testing.T) {
+	stored := `{"job":"evaluate","payload":{"candidates":[{"id":"c32"},{"id":"c16"}]}}`
+	requested := map[string]any{"payload": map[string]any{"candidates": []any{
+		map[string]any{"id": "mine-a"}, map[string]any{"id": "mine-b"}}}}
+	result := `{"value":{"results":[{"candidate_id":"c32","objective":{"value":22.4}},{"candidate_id":"c16"}]}}`
+	got := renameCandidates(result, stored, requested)
+	if !strings.Contains(got, `"candidate_id":"mine-a"`) || !strings.Contains(got, `"candidate_id":"mine-b"`) ||
+		strings.Contains(got, `"c32"`) || !strings.Contains(got, `22.4`) {
+		t.Fatalf("renamed = %s", got)
+	}
+	// Mismatched candidate counts: nothing is guessed.
+	one := map[string]any{"payload": map[string]any{"candidates": []any{map[string]any{"id": "x"}}}}
+	if renameCandidates(result, stored, one) != result {
+		t.Error("renamed despite a different number of candidates")
+	}
+	// Same names: unchanged.
+	same := map[string]any{"payload": map[string]any{"candidates": []any{map[string]any{"id": "c32"}, map[string]any{"id": "c16"}}}}
+	if renameCandidates(result, stored, same) != result {
+		t.Error("rewrote a result whose names already match")
+	}
+}
+
+func TestPickSiteTakesTheMostIdleAndBreaksTiesInOrder(t *testing.T) {
+	order := []string{"office", "home", "nus"}
+	for _, tc := range []struct {
+		idle map[string]int
+		want string
+	}{
+		{map[string]int{"office": 2, "home": 7, "nus": 12}, "nus"},
+		{map[string]int{"office": 5, "home": 5}, "office"},
+		{map[string]int{"home": 0}, "home"},
+		{map[string]int{}, "office"},
+	} {
+		if got := pickSite(order, tc.idle); got != tc.want {
+			t.Errorf("%v -> %s, want %s", tc.idle, got, tc.want)
+		}
+	}
+	if got := splitSites(" office, ../x ,home ", ""); len(got) != 2 || got[0] != "office" || got[1] != "home" {
+		t.Errorf("splitSites kept a bad name or lost order: %v", got)
+	}
+}
+
+func TestMeasureNusIsAdminsOnly(t *testing.T) {
+	_, owner, _ := fleetTestSetup(t)
+	t.Setenv("MEASURE_MLSYS_IMAGES", "vt="+testSimImage)
+	measureCleanup(t, subOf(t, owner))
+	body := strings.Replace(measureBodyFor(`{"task":"9.2","seeds":[5]}`), `"site":"home"`, `"site":"nus"`, 1)
+	code, got := measureCall(t, "POST", "/api/v1/me/measure", body, owner)
+	if code != http.StatusForbidden {
+		t.Fatalf("a user's NUS measurement = %d %v, want 403", code, got)
+	}
+}
+
+func TestAuthCheckAdminRefusesUsersAndAcceptsAdmins(t *testing.T) {
+	sub := runNowTestUser(t, "user")
+	admin := runNowTestUser(t, "admin")
+	if config.G == nil {
+		config.G = &config.Config{}
+		t.Cleanup(func() { config.G = nil })
+	}
+	call := func(tok string) int {
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		r.GET("/api/v1/auth-check/admin", AuthCheckAdminHandler)
+		w := fleetServe(t, r, "GET", "/api/v1/auth-check/admin", "", tok)
+		return w.Code
+	}
+	userTok, _, _ := mintPATForUser(sub, "cli", []string{"*"}, nil, "native")
+	adminTok, _, _ := mintPATForUser(admin, "cli", []string{"*"}, nil, "native")
+	if code := call(userTok); code != http.StatusForbidden {
+		t.Errorf("user = %d, want 403", code)
+	}
+	if code := call(adminTok); code != http.StatusOK {
+		t.Errorf("admin = %d, want 200", code)
+	}
+	if code := call(""); code != http.StatusUnauthorized {
+		t.Errorf("no credential = %d, want 401", code)
 	}
 }

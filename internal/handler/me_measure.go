@@ -87,6 +87,9 @@ type measureInstrument struct {
 	// shareOnSettle: whether a result may be reused is known only once it
 	// settles (lqt-backtest), so another tenant never joins a running one.
 	shareOnSettle bool
+	// precheck runs before anything is claimed or submitted; a non-empty
+	// answer is returned as status not_measured with that reason.
+	precheck func(c *gin.Context, sub string, plan measurePlan) string
 	// versions lists the accepted versions, for the listing.
 	versions func() []string
 }
@@ -125,6 +128,31 @@ var measureRegistry = map[string]measureInstrument{
 		executor:      "lqt",
 		shareOnSettle: true,
 	},
+	"mlsys-sandbox": {
+		Name: "mlsys-sandbox",
+		About: "An MLSys design measured for real on ONE GPU (vLLM in the pinned sandbox image) and scored in " +
+			"the pinned tool image. Never reused: every run is a fresh observation. Checks for a free matching " +
+			"GPU first and answers not_measured, with the reason, when it cannot run.",
+		Share: "tenant",
+		Inputs: map[string]string{
+			"graph":           "the FlowMesh graph (JSON): one GPU stage on an accepted sandbox image, the rest on accepted mlsys tool images",
+			"site":            "compute site (default office)",
+			"gpu":             "the GPU stage's requirement ({type, memory}) for the free-GPU check",
+			"queue_timeout_s": "how long the job may wait for a GPU before it is cancelled (default 900)",
+		},
+		plan:     mlsysSandboxPlan,
+		versions: func() []string { return sandboxAcceptedTags() },
+		executor: "fleet",
+		precheck: sandboxPrecheck,
+	},
+}
+
+// measureScope is the share scope a fresh row starts with.
+func measureScope(inst measureInstrument, sub string) string {
+	if inst.Share == "tenant" {
+		return "tenant:" + sub
+	}
+	return inst.Share
 }
 
 // mlsysDefaultImages: tag=ref pairs. MEASURE_MLSYS_IMAGES replaces the list
@@ -352,6 +380,14 @@ func MeMeasure(c *gin.Context) {
 		// it again below.
 	}
 
+	if inst.precheck != nil {
+		if why := inst.precheck(c, sub, plan); why != "" {
+			measureRecord(labels, "not_measured")
+			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "", "data": gin.H{"key": key,
+				"instrument": inst.Name, "status": "not_measured", "reason": why}})
+			return
+		}
+	}
 	if msg, retry := measureQuota(sub, b.Fresh && found && row.Status == "succeeded" && !row.NoReuse); msg != "" {
 		c.Header("Retry-After", strconv.Itoa(retry))
 		c.JSON(http.StatusTooManyRequests, gin.H{"ret_code": 1429, "message": msg,
@@ -362,7 +398,8 @@ func MeMeasure(c *gin.Context) {
 	now := time.Now()
 	if !found {
 		row = models.MeasureResult{Key: key, Instrument: inst.Name, Version: plan.version,
-			ShareScope: inst.Share, Status: "queued", Executor: inst.executor, ExecutorSub: sub, ClaimedAt: now}
+			ShareScope: measureScope(inst, sub), Status: "queued", Executor: inst.executor, ExecutorSub: sub,
+			ClaimedAt: now, NoReuse: inst.Name == "mlsys-sandbox"}
 		row.Inputs, _ = canonicalJSON(plan.material)
 		if err := common.DB.Create(&row).Error; err != nil {
 			// Lost the race: someone claimed this key a moment ago. Join it.
@@ -381,7 +418,7 @@ func MeMeasure(c *gin.Context) {
 			Where("mkey = ? AND status = ? AND updated_at = ?", key, row.Status, row.UpdatedAt).
 			Updates(map[string]any{"status": "queued", "executor_sub": sub, "executor_ref": "",
 				"claimed_at": now, "result": "", "error": "", "settled_at": nil, "not_before": nil,
-				"no_reuse": false, "share_scope": inst.Share})
+				"no_reuse": inst.Name == "mlsys-sandbox", "share_scope": measureScope(inst, sub)})
 		if res.Error != nil || res.RowsAffected == 0 {
 			_ = common.DB.First(&row, "mkey = ?", key).Error
 			measureRecord(labels, "joined")
@@ -534,6 +571,9 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 		return
 	}
 	status, terminal := fleetStatus(fmt.Sprint(rec["status"]))
+	if !terminal && status == "queued" && row.Instrument == "mlsys-sandbox" && sandboxQueueTimedOut(c, row, id, bearer) {
+		return
+	}
 	if !terminal {
 		if row.Status != "running" {
 			row.Status = "running"
@@ -556,6 +596,15 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 		measureSettle(row, "failed", "", msg)
 		return
 	}
+	// Every stage's value by its stage name; `value` is the first one (a
+	// one-stage graph's only one), which is what the simulator reads.
+	var first map[string]any
+	var metrics any
+	values := map[string]any{}
+	var names map[string]fleetTask
+	if len(ids) > 1 {
+		names = fleetTaskListing(c, base, id.Native, bearer)
+	}
 	for _, taskID := range ids {
 		if !fleetNativeFM.MatchString(taskID) {
 			continue
@@ -565,12 +614,20 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 			continue
 		}
 		if value, isMap := res["value"].(map[string]any); isMap {
-			out, _ := canonicalJSON(map[string]any{"value": value, "metrics": res["metrics"]})
-			measureSettle(row, "succeeded", out, "")
-			return
+			if first == nil {
+				first, metrics = value, res["metrics"]
+			}
+			if n := names[taskID].Name; n != "" {
+				values[n] = value
+			}
 		}
 	}
-	measureSettle(row, "failed", "", "the job succeeded but returned no value")
+	if first == nil {
+		measureSettle(row, "failed", "", "the job succeeded but returned no value")
+		return
+	}
+	out, _ := canonicalJSON(map[string]any{"value": first, "values": values, "metrics": metrics})
+	measureSettle(row, "succeeded", out, "")
 }
 
 func measureSettle(row *models.MeasureResult, status, result, msg string) {
@@ -586,6 +643,12 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 	label := ""
 	if row.Instrument == "lqt-backtest" {
 		label = strings.Replace(row.Version, "harness-", "harness ", 1)
+	} else if row.Instrument == "mlsys-sandbox" {
+		for ref, tag := range sandboxImages() {
+			if strings.HasSuffix(ref, row.Version) {
+				label = tag
+			}
+		}
 	} else if row.Instrument == "mlsys-simulator" {
 		for ref, tag := range mlsysImages() {
 			if strings.HasSuffix(ref, row.Version) {
@@ -606,6 +669,8 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 		}
 	case "failed":
 		out["error"] = row.Error
+	case "not_measured":
+		out["reason"] = row.Error
 	case "succeeded":
 		var res map[string]any
 		dec := json.NewDecoder(strings.NewReader(row.Result))
@@ -615,7 +680,7 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 		if label != "" {
 			measuredOn += " " + label
 		}
-		result := gin.H{"value": res["value"], "metrics": res["metrics"], "instrument": row.Instrument,
+		result := gin.H{"value": res["value"], "values": res["values"], "metrics": res["metrics"], "instrument": row.Instrument,
 			"version": row.Version, "measured_on": measuredOn, "reused": reused, "share": "everyone"}
 		if row.ShareScope != "global" {
 			result["share"] = "you"

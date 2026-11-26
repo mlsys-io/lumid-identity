@@ -18,7 +18,9 @@ package handler
 //     receipt does not say which. So:
 //       reusable  = replay "pg_tape" + window pinned by the claim (until in
 //                   the past) + the harness version the key assumed
-//       global    = reusable and no recorded signals were read
+//       global    = reusable and no recorded signals were read, or every
+//                   recorded name came from its shared publisher (the
+//                   receipt's signal_sources, LQT v0.1.33+)
 //       otherwise reusable by the submitting tenant only; a synthetic replay
 //       or an unpinned window is never reused.
 
@@ -250,8 +252,25 @@ func lqtShareScope(claim map[string]any, pinned bool, harness, executorSub strin
 	if !reusable {
 		return tenant, false
 	}
-	if str("signals") == "recorded" {
+	if str("signals") == "recorded" && !lqtAllShared(rep["signal_sources"]) {
 		return tenant, true
 	}
 	return "global", true
+}
+
+// lqtAllShared: the worker's per-name signal_sources (LQT v0.1.33+) say every
+// recorded name came from its registered shared publisher — the series any
+// tenant without rows of its own reads — so the replay is the same for
+// everyone. Absent (an older worker), "own" or "unknown" keeps it tenant-only.
+func lqtAllShared(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) == 0 {
+		return false
+	}
+	for _, src := range m {
+		if src != "shared" {
+			return false
+		}
+	}
+	return true
 }

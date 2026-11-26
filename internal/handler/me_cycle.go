@@ -54,6 +54,12 @@ type cycleListItem struct {
 	// not exist. The Runs table reads it as the fallback for the metric column,
 	// which otherwise depended on the trajectory endpoint answering.
 	KeyMetric *cycleKeyMetric `json:"key_metric,omitempty"`
+	// Reused / MeasuredOn — where the run's number came from, as the run
+	// itself said (metrics.measured_on / metrics.reused): a measurement an
+	// identical earlier one answered via /me/measure. Lets the Runs list mark
+	// a reused result without a detail fetch per row. Omitted when unsaid.
+	Reused     bool   `json:"reused,omitempty"`
+	MeasuredOn string `json:"measured_on,omitempty"`
 }
 
 // cycleKeyMetric is a named measurement: which metric, and what it measured.
@@ -136,6 +142,7 @@ func MeCyclesList(c *gin.Context) {
 						// recorded its declared metric answers the table's Metric
 						// column without a second request.
 						item.KeyMetric = primaryMetricFromBlob(raw)
+						item.Reused, item.MeasuredOn = measuredFromBlob(raw)
 					}
 				} else if st, serr := os.Stat(filepath.Join(cyclesRoot, lp.Name(), td.Name())); serr == nil &&
 					time.Since(st.ModTime()) < 2*time.Hour {

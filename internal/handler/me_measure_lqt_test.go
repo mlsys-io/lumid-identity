@@ -85,6 +85,12 @@ func TestLqtShareScopeFollowsTheReceipt(t *testing.T) {
 		{"another harness", rec("pg_tape", "static", "claim", json.Number("2")), true, "tenant:u1", false},
 		{"unpinned request", rec("pg_tape", "static", "claim", json.Number("3")), false, "tenant:u1", false},
 		{"no receipt", map[string]any{"status": "done"}, true, "tenant:u1", false},
+		{"recorded signals all from the shared publisher", withSources(rec("pg_tape", "recorded", "claim", json.Number("3")),
+			map[string]any{"ofi_z": "shared", "vpin": "shared"}), true, "global", true},
+		{"one name is the tenant's own", withSources(rec("pg_tape", "recorded", "claim", json.Number("3")),
+			map[string]any{"ofi_z": "shared", "vpin": "own"}), true, "tenant:u1", true},
+		{"sources unknown", withSources(rec("pg_tape", "recorded", "claim", json.Number("3")),
+			map[string]any{"ofi_z": "unknown"}), true, "tenant:u1", true},
 	}
 	for _, tc := range cases {
 		scope, reusable := lqtShareScope(tc.claim, tc.pinned, "3", "u1")
@@ -228,5 +234,24 @@ func TestLqtUnpinnedWindowIsNeverReused(t *testing.T) {
 	_, b := measureCall(t, "POST", "/api/v1/me/measure", lqtBody("live-window", false), owner)
 	if b["key"] == a["key"] || len(g.posts) != 2 {
 		t.Fatalf("an unpinned window was reused: %v (submits %d)", b, len(g.posts))
+	}
+}
+
+func withSources(claim map[string]any, sources map[string]any) map[string]any {
+	claim["replay"].(map[string]any)["signal_sources"] = sources
+	return claim
+}
+
+func TestMeasuredFromBlobReadsOnlyWhatTheRunSaid(t *testing.T) {
+	reused, on := measuredFromBlob(map[string]any{"metrics": map[string]any{
+		"reused": true, "measured_on": " Simulated RTX 5080 (mlsys-simulator v0.1.3) · reused from an identical run "}})
+	if !reused || on != "Simulated RTX 5080 (mlsys-simulator v0.1.3) · reused from an identical run" {
+		t.Errorf("got %v %q", reused, on)
+	}
+	if r, o := measuredFromBlob(map[string]any{"metrics": map[string]any{"reused": "yes", "measured_on": 3}}); r || o != "" {
+		t.Errorf("non-bool / non-string inferred: %v %q", r, o)
+	}
+	if r, o := measuredFromBlob(map[string]any{}); r || o != "" {
+		t.Errorf("no metrics: %v %q", r, o)
 	}
 }

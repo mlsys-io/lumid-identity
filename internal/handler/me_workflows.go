@@ -1238,27 +1238,7 @@ func MeWorkflowDetail(c *gin.Context) {
 	app, loop := parts[0], parts[1]
 	// Read the app's xpcloud.yaml from tenant tree (or operator-shared
 	// as fallback) and surface the matching loop entry verbatim.
-	loops, src := readLoopsFromAnywhere(userID, app)
-	// Cross-node fallback: identity can't read a tenant kind=agent app's PVC,
-	// so readLoopsFromAnywhere is empty → detail 404'd even though the loop
-	// exists. Pull loops from the caller's PUBLISHED xp.io spec.
-	// A draft composed on a cloud pod exists only as a stage_app intent plus
-	// the me_app_specs row compose wrote for it (stageDraftApp) — it has no
-	// published spec, so read that row before asking xp.io.
-	if len(loops) == 0 {
-		if row := storedAppSpec(userID, app); row != nil {
-			if pl, err := readYamlLoopsBytes([]byte(row.SpecYAML)); err == nil && len(pl) > 0 {
-				loops, src = pl, "installed"
-			}
-		}
-	}
-	if len(loops) == 0 {
-		if spec, okf := fetchRepoSpecForParse(userID, app); okf {
-			if pl, err := readYamlLoopsBytes(spec); err == nil {
-				loops, src = pl, "xpcloud"
-			}
-		}
-	}
+	loops, src := readLoopsForDetail(userID, app)
 	for _, L := range loops {
 		if L.Name == loop {
 			c.JSON(http.StatusOK, gin.H{
@@ -1437,6 +1417,32 @@ func appendUnique(arr []string, s string) []string {
 // readLoopsFromAnywhere tries the user's tenant copy first, then the
 // operator-shared copy. Returns the loops list + a label describing
 // where it came from ("tenant" | "operator-shared").
+// readLoopsForDetail is readLoopsFromAnywhere plus the cross-node fallbacks a
+// tenant app needs: identity can't read a tenant kind=agent app's PVC, so the
+// local read is empty even though the loop exists. Then read the caller's
+// stored spec (Studio edits and drafts land in me_app_specs), then the
+// PUBLISHED xp.io spec. Shared by the workflow detail page and the chat's
+// workflow_detail tool, which used to answer "workflow not found" for every
+// tenant workflow (the chat then said it had no way to read a run history).
+func readLoopsForDetail(userID, app string) ([]rawLoop, string) {
+	loops, src := readLoopsFromAnywhere(userID, app)
+	if len(loops) == 0 {
+		if row := storedAppSpec(userID, app); row != nil {
+			if pl, err := readYamlLoopsBytes([]byte(row.SpecYAML)); err == nil && len(pl) > 0 {
+				loops, src = pl, "installed"
+			}
+		}
+	}
+	if len(loops) == 0 {
+		if spec, okf := fetchRepoSpecForParse(userID, app); okf {
+			if pl, err := readYamlLoopsBytes(spec); err == nil {
+				loops, src = pl, "xpcloud"
+			}
+		}
+	}
+	return loops, src
+}
+
 func readLoopsFromAnywhere(userID, app string) ([]rawLoop, string) {
 	tenantSpec, _ := ResolveSpecPath(filepath.Join(tenantAppsDir(userID), app))
 	operatorSpec, _ := ResolveSpecPath(filepath.Join(operatorHome(), ".xp", "apps", app))

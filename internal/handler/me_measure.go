@@ -82,6 +82,11 @@ type measureInstrument struct {
 	// Inputs, in words, for the instruments listing (the chat reads it).
 	Inputs map[string]string `json:"inputs"`
 	plan   func(inputs map[string]any) (measurePlan, error)
+	// executor: "fleet" (a FlowMesh graph) or "lqt" (the backtest job API).
+	executor string
+	// shareOnSettle: whether a result may be reused is known only once it
+	// settles (lqt-backtest), so another tenant never joins a running one.
+	shareOnSettle bool
 	// versions lists the accepted versions, for the listing.
 	versions func() []string
 }
@@ -101,6 +106,24 @@ var measureRegistry = map[string]measureInstrument{
 		},
 		plan:     mlsysSimulatorPlan,
 		versions: func() []string { return mlsysAcceptedTags() },
+		executor: "fleet",
+	},
+	"lqt-backtest": {
+		Name: "lqt-backtest",
+		About: "A backtest on recorded market history (the LQT backtest job API), submitted as you. Reused " +
+			"by everyone only when it replayed recorded prints over a window pinned in the past and read no " +
+			"recorded signals; with recorded signals, by you only (they may be your own). An unpinned window " +
+			"or a synthetic replay is never reused.",
+		Share: "global",
+		Inputs: map[string]string{
+			"strategy": "the strategy body the backtest job API takes (program, params, window_secs, until, fill_model)",
+			"symbol":   "the instrument to replay (or strategy.symbol)",
+			"name":     "a label; not part of the key",
+		},
+		plan:          lqtBacktestPlan,
+		versions:      func() []string { return []string{"harness " + lqtHarness()} },
+		executor:      "lqt",
+		shareOnSettle: true,
 	},
 }
 
@@ -298,9 +321,12 @@ func MeMeasure(c *gin.Context) {
 
 	var row models.MeasureResult
 	found := common.DB.First(&row, "mkey = ?", key).Error == nil
-	if found && !measureVisible(&row, sub) {
-		// Another tenant's private measurement of the same content: measure
-		// it again under this tenant (never reveal or reuse theirs).
+	undecided := found && inst.shareOnSettle && row.ExecutorSub != sub &&
+		(row.Status == "queued" || row.Status == "running")
+	if found && (!measureVisible(&row, sub) || undecided) {
+		// Another tenant's private measurement of the same content — or one
+		// still running whose reuse is not decided yet: measure it again under
+		// this tenant (never reveal or reuse theirs).
 		key = measureKey(inst.Name, plan.version, map[string]any{"tenant": sub, "inputs": plan.material})
 		labels.Key = key
 		row = models.MeasureResult{}
@@ -309,7 +335,7 @@ func MeMeasure(c *gin.Context) {
 	if found {
 		measureAdvance(c, &row)
 		switch {
-		case row.Status == "succeeded" && !b.Fresh:
+		case row.Status == "succeeded" && !b.Fresh && !row.NoReuse:
 			common.DB.Model(&row).UpdateColumn("hits", gorm.Expr("hits + 1"))
 			row.Hits++
 			measureRecord(labels, "cached")
@@ -322,10 +348,11 @@ func MeMeasure(c *gin.Context) {
 			measureRespond(c, http.StatusAccepted, &row, sub, row.ExecutorSub != sub)
 			return
 		}
-		// failed, or succeeded + fresh: run it again below.
+		// failed, succeeded + fresh, or a result that must not be reused: run
+		// it again below.
 	}
 
-	if msg, retry := measureQuota(sub, b.Fresh && found && row.Status == "succeeded"); msg != "" {
+	if msg, retry := measureQuota(sub, b.Fresh && found && row.Status == "succeeded" && !row.NoReuse); msg != "" {
 		c.Header("Retry-After", strconv.Itoa(retry))
 		c.JSON(http.StatusTooManyRequests, gin.H{"ret_code": 1429, "message": msg,
 			"data": gin.H{"key": key, "status": "not_measured", "retry_after": retry, "reason": msg}})
@@ -335,7 +362,7 @@ func MeMeasure(c *gin.Context) {
 	now := time.Now()
 	if !found {
 		row = models.MeasureResult{Key: key, Instrument: inst.Name, Version: plan.version,
-			ShareScope: inst.Share, Status: "queued", Executor: "fleet", ExecutorSub: sub, ClaimedAt: now}
+			ShareScope: inst.Share, Status: "queued", Executor: inst.executor, ExecutorSub: sub, ClaimedAt: now}
 		row.Inputs, _ = canonicalJSON(plan.material)
 		if err := common.DB.Create(&row).Error; err != nil {
 			// Lost the race: someone claimed this key a moment ago. Join it.
@@ -353,7 +380,8 @@ func MeMeasure(c *gin.Context) {
 		res := common.DB.Model(&models.MeasureResult{}).
 			Where("mkey = ? AND status = ? AND updated_at = ?", key, row.Status, row.UpdatedAt).
 			Updates(map[string]any{"status": "queued", "executor_sub": sub, "executor_ref": "",
-				"claimed_at": now, "result": "", "error": "", "settled_at": nil})
+				"claimed_at": now, "result": "", "error": "", "settled_at": nil, "not_before": nil,
+				"no_reuse": false, "share_scope": inst.Share})
 		if res.Error != nil || res.RowsAffected == 0 {
 			_ = common.DB.First(&row, "mkey = ?", key).Error
 			measureRecord(labels, "joined")
@@ -367,7 +395,12 @@ func MeMeasure(c *gin.Context) {
 	if b.Fresh && found {
 		outcome = "fresh"
 	}
-	if err := measureSubmit(c, &row, plan, sub, b.App); err != nil {
+	if inst.executor == "lqt" {
+		_, _, err = lqtMeasureSubmit(&row, sub)
+	} else {
+		err = measureSubmit(c, &row, plan, sub, b.App)
+	}
+	if err != nil {
 		common.DB.Model(&row).Updates(map[string]any{"status": "failed", "error": fleetClip(err.Error(), 1000),
 			"settled_at": time.Now()})
 		row.Status, row.Error = "failed", err.Error()
@@ -476,6 +509,10 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 	if row.Status != "queued" && row.Status != "running" {
 		return
 	}
+	if row.Executor == "lqt" {
+		lqtMeasureAdvance(c, row)
+		return
+	}
 	if row.ExecutorRef == "" {
 		if time.Since(row.ClaimedAt) > measureClaimStale {
 			measureSettle(row, "failed", "", "the submission did not complete; asking again retries it")
@@ -547,7 +584,9 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 	out := gin.H{"key": row.Key, "instrument": row.Instrument, "version": row.Version,
 		"status": row.Status, "hits": row.Hits}
 	label := ""
-	if row.Instrument == "mlsys-simulator" {
+	if row.Instrument == "lqt-backtest" {
+		label = strings.Replace(row.Version, "harness-", "harness ", 1)
+	} else if row.Instrument == "mlsys-simulator" {
 		for ref, tag := range mlsysImages() {
 			if strings.HasSuffix(ref, row.Version) {
 				label = tag
@@ -557,6 +596,14 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 	switch row.Status {
 	case "queued", "running":
 		out["retry_after"] = measureRetryAfter
+		if row.NotBefore != nil && row.ExecutorRef == "" {
+			wait := int(time.Until(*row.NotBefore).Seconds()) + 1
+			if wait < 1 {
+				wait = 1
+			}
+			out["retry_after"] = wait
+			out["reason"] = "the backtest job API is pacing this account; it is submitted after the wait"
+		}
 	case "failed":
 		out["error"] = row.Error
 	case "succeeded":
@@ -569,7 +616,13 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 			measuredOn += " " + label
 		}
 		result := gin.H{"value": res["value"], "metrics": res["metrics"], "instrument": row.Instrument,
-			"version": row.Version, "measured_on": measuredOn, "reused": reused}
+			"version": row.Version, "measured_on": measuredOn, "reused": reused, "share": "everyone"}
+		if row.ShareScope != "global" {
+			result["share"] = "you"
+		}
+		if row.NoReuse {
+			result["share"] = "this run only"
+		}
 		if row.SettledAt != nil {
 			result["measured_at"] = row.SettledAt.UTC().Format(time.RFC3339)
 		}

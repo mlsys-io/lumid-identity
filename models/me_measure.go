@@ -25,6 +25,13 @@ type MeasureResult struct {
 	ExecutorRef string `gorm:"column:executor_ref;size:200" json:"executor_ref,omitempty"`
 	ExecutorSub string `gorm:"column:executor_sub;size:36;index" json:"-"`
 
+	// NotBefore: an upstream that paces callers (the LQT gateway's 409) left
+	// this row queued; the first read after this time submits it.
+	NotBefore *time.Time `gorm:"column:not_before" json:"not_before,omitempty"`
+	// NoReuse: the settled result answers the run it came from but must not
+	// answer an identical request (a synthetic replay, an unpinned window).
+	NoReuse bool `gorm:"column:no_reuse;not null;default:false" json:"no_reuse"`
+
 	Hits      int        `gorm:"column:hits;not null;default:0" json:"hits"`
 	ClaimedAt time.Time  `gorm:"column:claimed_at" json:"claimed_at"`
 	SettledAt *time.Time `gorm:"column:settled_at" json:"settled_at,omitempty"`

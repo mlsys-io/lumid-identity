@@ -91,6 +91,9 @@ func writeIntentDirect(userSub, action string, payload map[string]any) string {
 // {{ args.* }} template expands them; nil = full. `variant` / `experiment`
 // thread an experiment ARM through to the cycle.
 func agentEnqueueOneshot(userID, app, loop string, args map[string]any) (string, error) {
+	if why, _ := runNowLimit(userID); why != "" {
+		return "", fmt.Errorf("%s", why)
+	}
 	payload := map[string]any{"app": app, "loop": loop, "via": "agent"}
 	// Pull the run-shaping keys up to the top level, where _process_run_loop
 	// reads them; anything else stays in `args` for the loop's template.

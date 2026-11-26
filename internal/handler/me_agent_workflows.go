@@ -71,7 +71,7 @@ func toolWorkflowDetail(c *gin.Context, userID, slug string) map[string]any {
 			"active":     wf.Active,
 		}
 	}
-	loops, src := readLoopsFromAnywhere(userID, parts[0])
+	loops, src := readLoopsForDetail(userID, parts[0])
 	for _, L := range loops {
 		if L.Name == parts[1] {
 			engine := "runner_steps"

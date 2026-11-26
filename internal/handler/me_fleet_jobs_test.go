@@ -117,6 +117,8 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && p == "/fm/home/api/v1/tasks" && r.URL.Query().Get("workflow_id") == "wfl-abc123":
 		_, _ = w.Write([]byte(`[{"task_id":"tsk-0","task":{"metadata":{"name":"two-stage:prep"}}},` +
 			`{"task_id":"tsk-1","task":{"metadata":{"name":"two-stage:score"}}}]`))
+	case r.Method == "GET" && p == "/fm/home/api/v1/workflows/wfl-done02":
+		_, _ = w.Write([]byte(`{"workflow_id":"wfl-done02","status":"DONE"}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/workflows/wfl-fail01":
 		_, _ = w.Write([]byte(`{"workflow_id":"wfl-fail01","task_ids":["tsk-f0","tsk-f1"],"status":"FAILED"}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/tasks" && r.URL.Query().Get("workflow_id") == "wfl-fail01":
@@ -617,5 +619,83 @@ func assertFleetLogsFallBackToTaskArchives(t *testing.T, owner string) {
 	last, _ := entries[1].(map[string]any)["event"].(map[string]any)
 	if first["message"] != "PROBE-STDOUT hello" || last["message"] != "ValueError: boom" || last["task_id"] != "tsk-o1" {
 		t.Errorf("entries out of order or missing task ids: %v", entries)
+	}
+}
+
+// The list re-reads stale unfinished rows itself: before 2026-11-26 only a read
+// of the job refreshed it, and finished jobs sat "queued" in every list.
+func TestFleetListRefreshesStaleUnfinishedRows(t *testing.T) {
+	fake, owner, _ := fleetTestSetup(t)
+	code, job := fleetCallAPI(t, "POST", "/api/v1/me/fleet/jobs", `{"workflow":"`+fmGraph+`","labels":{"study":"lr"}}`, owner)
+	if code != http.StatusAccepted || job["status"] != "queued" {
+		t.Fatalf("run = %d %v", code, job)
+	}
+	// A second job whose site answers 404 (gone upstream): left as it was.
+	sub := ""
+	if err := common.DB.Model(&models.MeFleetJob{}).Where("native_id = ?", "wfl-abc123").Pluck("user_sub", &sub).Error; err != nil || sub == "" {
+		t.Fatalf("owner sub: %v", err)
+	}
+	gone := models.MeFleetJob{Site: "home", Kind: fleetKindFM, NativeID: "wfl-gone01", UserSub: sub, Format: "flowmesh", Study: "lr", Status: "running"}
+	if err := common.DB.Create(&gone).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	reads := func() int {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		n := 0
+		for _, c := range fake.calls {
+			if c == "GET /fm/home/api/v1/workflows/wfl-abc123" {
+				n++
+			}
+		}
+		return n
+	}
+	statusOf := func(list map[string]any, id string) any {
+		for _, j := range list["jobs"].([]any) {
+			if m := j.(map[string]any); m["id"] == id {
+				return m["status"]
+			}
+		}
+		return nil
+	}
+
+	// Just observed: not asked again yet.
+	_, list := fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs?study=lr", "", owner)
+	if statusOf(list, "home:fm:wfl-abc123") != "queued" || reads() != 0 {
+		t.Fatalf("fresh row was re-read (reads=%d) or changed: %v", reads(), list)
+	}
+
+	// Stale: the list asks, picks up DONE, and stores it.
+	old := time.Now().Add(-time.Minute)
+	common.DB.Model(&models.MeFleetJob{}).Where("user_sub = ? AND study = ?", sub, "lr").Update("updated_at", old)
+	_, list = fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs?study=lr", "", owner)
+	if statusOf(list, "home:fm:wfl-abc123") != "succeeded" || reads() != 1 {
+		t.Fatalf("stale row not refreshed (reads=%d): %v", reads(), list)
+	}
+	if statusOf(list, "home:fm:wfl-gone01") != "running" {
+		t.Errorf("a row whose site errored changed: %v", list)
+	}
+	var stored models.MeFleetJob
+	common.DB.Where("native_id = ?", "wfl-abc123").First(&stored)
+	if stored.Status != "succeeded" || !stored.Terminal {
+		t.Errorf("refreshed status not stored: %+v", stored)
+	}
+
+	// Terminal now: never asked again; and a filter on the old status no
+	// longer returns it.
+	_, list = fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs?study=lr", "", owner)
+	if reads() != 1 {
+		t.Errorf("terminal row re-read (reads=%d)", reads())
+	}
+	// A stale "queued" row that finished upstream is dropped from a
+	// status=queued list in the same request that learns it finished.
+	done := models.MeFleetJob{Site: "home", Kind: fleetKindFM, NativeID: "wfl-done02", UserSub: sub, Format: "flowmesh", Study: "lr", Status: "queued"}
+	if err := common.DB.Create(&done).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	common.DB.Model(&models.MeFleetJob{}).Where("native_id = ?", "wfl-done02").Update("updated_at", old)
+	_, list = fleetCallAPI(t, "GET", "/api/v1/me/fleet/jobs?study=lr&status=queued", "", owner)
+	if n := len(list["jobs"].([]any)); n != 0 {
+		t.Errorf("status=queued returned %d jobs after they moved on: %v", n, list)
 	}
 }

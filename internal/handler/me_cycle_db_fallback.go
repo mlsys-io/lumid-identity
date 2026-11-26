@@ -29,6 +29,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"lumid_identity/models"
@@ -121,6 +122,7 @@ func cycleRowFromStore(r models.MeAppRun) (cycleListItem, bool) {
 		// one caller to re-derive them, which is what made the display depend
 		// on a second request at all.
 		item.KeyMetric = primaryMetricFromBlob(m)
+		item.Reused, item.MeasuredOn = measuredFromBlob(m)
 	}
 	// StepCount and Running stay zero/false on purpose. The store has no
 	// per-step rows, and a run still in flight has not reported yet — claiming
@@ -201,6 +203,16 @@ func runRowsFromDBScan(userSub string, since, until time.Time) ([]RunRow, bool, 
 // is what that name measured. Nothing here has to guess an app's metric name, so
 // it stays app-agnostic. Returns nil when the run recorded none (a loop with no
 // declared metric, or a run that never reached the analysis step).
+// measuredFromBlob reads where a run's number came from, as the run said it
+// in its metrics: `reused` only when literally true, `measured_on` only when a
+// non-empty string — never inferred.
+func measuredFromBlob(m map[string]any) (bool, string) {
+	mm, _ := m["metrics"].(map[string]any)
+	reused, _ := mm["reused"].(bool)
+	on, _ := mm["measured_on"].(string)
+	return reused, fleetClip(strings.TrimSpace(on), 200)
+}
+
 func primaryMetricFromBlob(m map[string]any) *cycleKeyMetric {
 	pm, ok := m["primary_metric"].(map[string]any)
 	if !ok {

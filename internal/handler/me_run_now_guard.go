@@ -14,7 +14,7 @@ package handler
 //   - A per-user rate limit, enforced: RUN_NOW_PER_HOUR (60) and
 //     RUN_NOW_PER_DAY (600) run_loop intents. Over 7 days the busiest hour of
 //     every other user was ≤ 9. Admins are exempt (operators, e2e).
-//   - A token-scope check for personal tokens, OBSERVED by default: a PAT
+//   - A token-scope check for users' personal tokens (admins exempt), OBSERVED by default: a PAT
 //     must name a scope that can start work (*, lumid:write, lumid:admin,
 //     lumid:run, flowmesh:workflows:write, flowmesh:write). With
 //     RUN_NOW_REQUIRE_SCOPE=enforce a narrower token (lqt:strategy,
@@ -114,6 +114,13 @@ func runNowScopeRefusal(c *gin.Context, userID, app, loop string) string {
 	}
 	row, found := lookupPAT(tok)
 	if !found || runNowScopesAllow(row.Scopes) {
+		return ""
+	}
+	// Admins are exempt, as from the rate limit: operator automation runs on
+	// admin PATs minted before run scopes existed (the operator's own token is
+	// claude:proxy-scoped), and enforcing on them broke it (2026-11-26). The
+	// check exists for users' narrow tokens.
+	if _, role := userEmailRole(userID); role == "admin" || role == "super_admin" {
 		return ""
 	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("RUN_NOW_REQUIRE_SCOPE")), "enforce") {

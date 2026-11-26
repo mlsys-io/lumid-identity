@@ -142,3 +142,23 @@ func TestRunNowScopeObservesThenEnforces(t *testing.T) {
 		t.Errorf("a non-PAT bearer refused: %q", why)
 	}
 }
+
+func TestRunNowScopeExemptsAdmins(t *testing.T) {
+	admin := runNowTestUser(t, "admin")
+	if config.G == nil {
+		config.G = &config.Config{}
+		t.Cleanup(func() { config.G = nil })
+	}
+	narrow, _, err := mintPATForUser(admin, "token", []string{"claude:proxy"}, nil, "native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RUN_NOW_REQUIRE_SCOPE", "enforce")
+	r := httptest.NewRequest(http.MethodPost, "/", nil)
+	r.Header.Set("Authorization", "Bearer "+narrow)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = r
+	if why := runNowScopeRefusal(c, admin, "mlsys-research-e2e", "simulate"); why != "" {
+		t.Fatalf("an admin's claude:proxy PAT was refused: %q", why)
+	}
+}

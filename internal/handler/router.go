@@ -269,6 +269,10 @@ func Register(r *gin.Engine) {
 			me.GET("/fleet/jobs", MeFleetJobList)
 			me.GET("/fleet/jobs/:id", MeFleetJobGet)
 			me.POST("/fleet/jobs/:id/cancel", MeFleetJobCancel)
+			// Central measurement: measure once, read many times (me_measure.go).
+			me.POST("/measure", MeMeasure)
+			me.GET("/measure/instruments", MeMeasureInstruments)
+			me.GET("/measure/:key", MeMeasureGet)
 			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
 			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)

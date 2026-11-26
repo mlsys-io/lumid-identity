@@ -205,6 +205,17 @@ func MeLoopRunNow(c *gin.Context) {
 		return
 	}
 
+	// Run-now guard (me_run_now_guard.go): a credential that can't start runs,
+	// then the per-user rate limit — both before anything is queued.
+	if why := runNowScopeRefusal(c, userID, app, loop); why != "" {
+		fail(c, http.StatusForbidden, 1403, why)
+		return
+	}
+	if why, retry := runNowLimit(userID); why != "" {
+		runNowRefuse(c, why, retry)
+		return
+	}
+
 	var body meLoopRunBody
 	_ = c.ShouldBindJSON(&body) // optional body
 

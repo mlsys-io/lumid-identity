@@ -45,6 +45,10 @@ type expDecl struct {
 	Criteria   string           `yaml:"success_criteria" json:"success_criteria,omitempty"`
 	MinSamples int              `yaml:"min_samples" json:"min_samples,omitempty"`
 	Status     string           `yaml:"status" json:"status,omitempty"`
+	// Shared — measured once, centrally, for every install (an operator-scope
+	// workflow such as the stock backtests). Its state is the one reported under
+	// the operator sentinel, and tenant-run health warnings don't apply.
+	Shared bool `yaml:"shared" json:"shared,omitempty"`
 	// Cases/Description are WRITTEN into the spec by patch_experiment and were
 	// never parsed back, so every read-then-rewrite verb (add_experiment_arm)
 	// silently dropped them. For an experiment scoped by `cases` with no
@@ -351,7 +355,7 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 		if d.ID == "" {
 			continue
 		}
-		st := readExpStateFor(userSub, app, appDir, d.ID)
+		st := sharedExpState(&d, app, readExpStateFor(userSub, app, appDir, d.ID))
 		row := gin.H{
 			"id": d.ID, "hypothesis": d.Hypothesis, "kind": d.Kind,
 			"dataset_id": d.DatasetID, "metric": d.Metric,
@@ -437,6 +441,12 @@ func markZeroReasons(row gin.H, userSub, app string, d *expDecl, st map[string]a
 		st = map[string]any{}
 	}
 	markStaleState(row, d, st)
+	if d != nil && d.Shared {
+		// Measured centrally: "starved/unfed/undispatched" judge a tenant's own
+		// runs and would tell every install its shared experiment is broken.
+		row["shared"] = true
+		return
+	}
 	markUnfed(row, d, feeding)
 	markStarved(row, userSub, app, specMetricName(d), feederLoops(d, feeding))
 	markUndispatched(row, d, feeding)
@@ -887,7 +897,7 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 	if decl == nil {
 		return nil, false
 	}
-	st := readExpStateFor(userSub, app, appDir, id)
+	st := sharedExpState(decl, app, readExpStateFor(userSub, app, appDir, id))
 	rows, rowsTotal := readExpRowsCounted(appDir, id, expResultsTailCap)
 	metricName, _ := st["metric"].(string)
 	stateMetric := metricName
@@ -1479,6 +1489,24 @@ func InternalAppExperimentRecord(c *gin.Context) {
 // HOME, so identity can read that ledger directly and it is the freshest copy.
 // The DB is the fallback for everything identity cannot see — which is every
 // tenant install.
+// operatorStateSub is the user_sub operator-scope cycles report experiment
+// state under (LumidOS LUMID_STATE_SUB). Not a user.
+const operatorStateSub = "operator"
+
+// sharedExpState swaps in the centrally measured state for a `shared`
+// experiment, when there is one; otherwise the tenant's own state stands.
+func sharedExpState(d *expDecl, app string, st map[string]any) map[string]any {
+	if d == nil || !d.Shared || app == "" || common.DB == nil {
+		return st
+	}
+	op := storedExpState(operatorStateSub, app, d.ID)
+	if op == nil {
+		return st
+	}
+	op["shared"] = true
+	return op
+}
+
 func storedExpState(userSub, app, experimentID string) map[string]any {
 	var row models.MeAppExperiment
 	q := common.DB.Where("user_sub = ? AND app = ? AND experiment_id = ?",

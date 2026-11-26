@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -496,8 +497,11 @@ func fleetJobView(r models.MeFleetJob) gin.H {
 // MeFleetJobList — GET /me/fleet/jobs?study=&experiment=&status=&limit=.
 //
 // Reads this service's own records, never a fan-out across sites: one site's
-// task list alone has measured 13.8 MB. Statuses are the last ones observed;
-// reading a job (view=status) refreshes its row.
+// task list alone has measured 13.8 MB. Statuses are the last ones observed,
+// and the stale unfinished ones among the page are re-read first (one small
+// status GET each, bounded — fleetRefreshRows). Before that only a read of the
+// job itself refreshed its row, so a list showed finished jobs as queued for
+// hours (2026-11-26: ten measure jobs "Waiting at Nus" 2–6 h after they ran).
 func MeFleetJobList(c *gin.Context) {
 	sub, authed := currentUserID(c)
 	if !authed {
@@ -523,11 +527,91 @@ func MeFleetJobList(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "read: "+err.Error())
 		return
 	}
+	fleetRefreshRows(c.Request.Context(), sub, rows)
+	statusFilter := c.Query("status")
 	jobs := make([]gin.H, 0, len(rows))
 	for _, r := range rows {
+		// A row asked for by its old status that has since moved on is no
+		// longer an answer to the filter.
+		if statusFilter != "" && r.Status != statusFilter {
+			continue
+		}
 		jobs = append(jobs, fleetJobView(r))
 	}
 	ok(c, "", gin.H{"jobs": jobs})
+}
+
+const (
+	// fleetListRefreshMax unfinished rows are re-read per list, newest first.
+	fleetListRefreshMax = 8
+	// A row observed this recently is not asked about again.
+	fleetListRefreshAfter = 20 * time.Second
+	// The whole refresh waits at most this long; a slow or unreachable site
+	// leaves its rows as they were rather than holding up the list.
+	fleetListRefreshWait = 4 * time.Second
+)
+
+// fleetRefreshRows re-reads the upstream status of the stale, unfinished rows
+// among rows (in place) and writes it back. updated_at is touched even when
+// nothing changed, so a list polled every few seconds asks each site at most
+// once per fleetListRefreshAfter per job.
+func fleetRefreshRows(ctx context.Context, sub string, rows []models.MeFleetJob) {
+	now := time.Now()
+	var idx []int
+	for i := range rows {
+		if !rows[i].Terminal && now.Sub(rows[i].UpdatedAt) >= fleetListRefreshAfter {
+			idx = append(idx, i)
+			if len(idx) == fleetListRefreshMax {
+				break
+			}
+		}
+	}
+	if len(idx) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, fleetListRefreshWait)
+	defer cancel()
+	bearers := map[string]string{}
+	for _, i := range idx {
+		k := rows[i].Kind
+		if _, seen := bearers[k]; !seen {
+			tok, err := fleetReadBearer(sub, k)
+			if err != nil {
+				tok = ""
+			}
+			bearers[k] = tok
+		}
+	}
+	var wg sync.WaitGroup
+	for _, i := range idx {
+		r := &rows[i]
+		tok := bearers[r.Kind]
+		if tok == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			path := "/api/v1/jobs/" + r.NativeID
+			if r.Kind == fleetKindFM {
+				path = "/api/v1/workflows/" + r.NativeID
+			}
+			b, code := fleetDo(ctx, fleetCall{method: http.MethodGet, url: fleetSiteBase(r.Kind, r.Site) + path, bearer: tok})
+			if code < 200 || code >= 300 {
+				return
+			}
+			native, _ := fleetJSON(b)["status"].(string)
+			if native == "" {
+				return
+			}
+			status, terminal := fleetStatus(native)
+			at := time.Now()
+			common.DB.Model(&models.MeFleetJob{}).Where("id = ?", r.ID).
+				Updates(map[string]any{"status": status, "terminal": terminal, "updated_at": at})
+			r.Status, r.Terminal, r.UpdatedAt = status, terminal, at
+		}()
+	}
+	wg.Wait()
 }
 
 // ── get (one) ───────────────────────────────────────────────────────────────

@@ -91,6 +91,7 @@ func Register(r *gin.Engine) {
 		// Cheap "any signed-in caller" check for nginx auth_request. Accepts
 		// session JWTs AND PATs; see auth_check.go for why session-bearer could not.
 		v1.GET("/auth-check", AuthCheckHandler)
+		v1.GET("/auth-check/admin", AuthCheckAdminHandler) // admin+ fleet sites (NUS), incl. the FlowMesh-audience credential
 		v1.PUT("/user", UpdateUserHandler)
 		v1.POST("/user/password", ChangePasswordHandler)
 		// First-time Google-OAuth users land at /auth/callback without an

@@ -81,3 +81,34 @@ func AuthCheckHandler(c *gin.Context) {
 		"sub": userID, "role": role,
 	}})
 }
+
+// GET /api/v1/auth-check/admin — auth-check's credential rules (PATs, identity
+// JWTs, and a service-audience JWT for the path it serves) plus a role check:
+// admin or super_admin, else 403.
+//
+// /admin/check cannot gate a FlowMesh site for a job identity submits on an
+// admin's behalf: it resolves the role through identity-audience tokens only
+// (v0.5.480 audience binding), and the credential identity mints for FlowMesh
+// is addressed to "flowmesh". So an admin's measurement on NUS — admin+ by
+// policy (2026-11-26) — was refused by nginx's own 401. This gate keeps NUS
+// admin-only without that hole.
+func AuthCheckAdminHandler(c *gin.Context) {
+	tok := bearerToken(c)
+	if tok == "" {
+		fail(c, http.StatusUnauthorized, 1003, "auth required")
+		return
+	}
+	userID, role, ok := resolveRole(tok)
+	if !ok {
+		userID, role, ok = edgeAudienceOK(tok, c.GetHeader("X-Original-URI"))
+	}
+	if !ok {
+		fail(c, http.StatusUnauthorized, 1003, "invalid credential")
+		return
+	}
+	if role != "admin" && role != "super_admin" {
+		fail(c, http.StatusForbidden, 1403, "admins only")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": gin.H{"sub": userID, "role": role}})
+}

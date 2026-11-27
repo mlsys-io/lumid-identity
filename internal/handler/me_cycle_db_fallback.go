@@ -206,10 +206,20 @@ func runRowsFromDBScan(userSub string, since, until time.Time) ([]RunRow, bool, 
 // measuredFromBlob reads where a run's number came from, as the run said it
 // in its metrics: `reused` only when literally true, `measured_on` only when a
 // non-empty string — never inferred.
+//
+// Two shapes carry it. cycle.json nests the app's metrics under "metrics"; the
+// run store's blob is the scheduler's self-report, which FLATTENS them to the
+// top level (app_runner: metrics.update(summary["metrics"])). Reading only the
+// nested shape left every scheduler-run cycle without its reuse mark on a cloud
+// pod, where the store is the only source (2026-11-27: a repeat answered in
+// 0.04 s from the stored measurement listed as a plain run).
 func measuredFromBlob(m map[string]any) (bool, string) {
-	mm, _ := m["metrics"].(map[string]any)
-	reused, _ := mm["reused"].(bool)
-	on, _ := mm["measured_on"].(string)
+	src, nested := m["metrics"].(map[string]any)
+	if !nested {
+		src = m
+	}
+	reused, _ := src["reused"].(bool)
+	on, _ := src["measured_on"].(string)
 	return reused, fleetClip(strings.TrimSpace(on), 200)
 }
 

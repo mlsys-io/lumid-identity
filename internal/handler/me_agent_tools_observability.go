@@ -366,6 +366,9 @@ func toolAppConfigSet(userID string, args map[string]any) (map[string]any, bool)
 	if err := yaml.Unmarshal([]byte(yamlText), &check); err != nil {
 		return map[string]any{"error": "invalid YAML: " + err.Error()}, false
 	}
+	if err := specV2ChainError(asMap(check)); err != nil {
+		return map[string]any{"error": err.Error()}, false
+	}
 	// Ownership, as MeUpdateAppConfig. This used resolveAppDir — the READ
 	// resolver — so it would write into the operator-shared bundle every tenant
 	// reads, or into the materialised published-bundle cache, a pod-local copy

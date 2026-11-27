@@ -8,7 +8,7 @@ package handler
 //	name / title / summary / version / icon
 //	data:        [{id, source: "repo:<owner/name>" | "path:<dir>", version}]
 //	compute:     {site, gpu}                    # app default
-//	workflows:   [{id, title, about, notes, run, steps: {python|dag|skills},
+//	workflows:   [{id, title, about, notes, run, steps: {python|dag|skills|workflows},
 //	               inputs, data, compute, feedback, parent, node, helper}]
 //	nodes:       [{id, title, parent}]
 //	experiments: [{id, workflow, question, hypothesis, metric: {name, better},
@@ -221,6 +221,15 @@ func engineForWorkflow(w, appCompute map[string]any, exps []string) map[string]a
 		if g := specStr(compute["gpu"]); g != "" {
 			eng["hardware"] = map[string]any{"gpu_memory": g}
 		}
+	} else if stages, ok := chainStages(w); ok {
+		// A composite workflow: other workflows of this app, run in order by
+		// the LumidOS runner (_run_chain_engine). Each stage keeps its own
+		// compute, so no site/hardware here.
+		l := make([]any, len(stages))
+		for i, st := range stages {
+			l[i] = st
+		}
+		eng = map[string]any{"type": "chain", "stages": l}
 	} else {
 		return nil
 	}
@@ -278,6 +287,11 @@ func loopFromWorkflow(w, appCompute map[string]any, appDir string, expsByWf map[
 	}
 	if len(parts) > 0 && specStr(out["description"]) == "" {
 		out["description"] = strings.Join(parts, "\n\n")
+	}
+	if specStr(out["description"]) == "" {
+		if stages, ok := chainStages(w); ok && len(stages) > 0 {
+			out["description"] = chainSummary(stages)
+		}
 	}
 	run, has := w["run"]
 	if !has {
@@ -615,4 +629,166 @@ func fetchRepoSpecForParse(userSub, app string) ([]byte, bool) {
 		return b, ok
 	}
 	return normalizeSpecBytes(b, ""), true
+}
+
+// chainStages reads a composite workflow's `steps.workflows`, in order. Each
+// entry is a bare workflow id or {use: <id>, inputs: {...}}; both become
+// {"loop": <id>} plus "inputs" when given. ok is false when the workflow has
+// no `steps.workflows` key at all.
+func chainStages(w map[string]any) ([]map[string]any, bool) {
+	raw, ok := asMap(w["steps"])["workflows"]
+	if !ok {
+		return nil, false
+	}
+	var out []map[string]any
+	for _, s := range asList(raw) {
+		st := map[string]any{}
+		if m := asMap(s); m != nil {
+			st["loop"] = strings.TrimSpace(specStr(m["use"]))
+			if in := asMap(m["inputs"]); len(in) > 0 {
+				st["inputs"] = in
+			}
+		} else {
+			st["loop"] = strings.TrimSpace(specStr(s))
+		}
+		out = append(out, st)
+	}
+	return out, true
+}
+
+// chainSummary is the one-line description of a composite workflow, shown
+// where a workflow has no about/notes: "Chain: backtest → forward_test".
+func chainSummary(stages []map[string]any) string {
+	ids := make([]string, len(stages))
+	for i, st := range stages {
+		ids[i] = specStr(st["loop"])
+	}
+	return "Chain: " + strings.Join(ids, " → ")
+}
+
+// specV2ChainError checks every composite workflow (`steps.workflows`) in a
+// parsed spec against the app's own workflow ids. It returns the first problem
+// in words, or nil. Specs without a chain always pass, so this is safe to call
+// on any spec before saving it. The runner re-checks at run time (a spec can
+// arrive by app_push without passing through here).
+func specV2ChainError(doc map[string]any) error {
+	ids := map[string]bool{}
+	var order []string
+	chains := map[string][]string{}
+	var problems []error
+	for _, key := range []string{"workflows", "loops"} {
+		for _, w := range asList(doc[key]) {
+			wm := asMap(w)
+			id := specStr(wm["id"])
+			if id == "" {
+				id = specStr(wm["name"])
+			}
+			if id == "" {
+				continue
+			}
+			ids[id] = true
+			stages, ok := chainStages(wm)
+			if !ok {
+				// Already translated (loops[].engine), e.g. read via readSpecAware.
+				if eng := asMap(wm["engine"]); specStr(eng["type"]) == "chain" {
+					for _, st := range asList(eng["stages"]) {
+						stages = append(stages, map[string]any{"loop": strings.TrimSpace(specStr(asMap(st)["loop"]))})
+					}
+					ok = true
+				}
+			}
+			if !ok {
+				continue
+			}
+			if _, dup := chains[id]; dup {
+				continue
+			}
+			steps := asMap(wm["steps"])
+			for _, other := range []string{"python", "dag", "skills"} {
+				if _, has := steps[other]; has {
+					problems = append(problems, fmt.Errorf("workflow %q: steps.workflows cannot be combined with steps.%s — a chain only runs other workflows", id, other))
+				}
+			}
+			if len(stages) == 0 {
+				problems = append(problems, fmt.Errorf("workflow %q: steps.workflows lists no workflows to run", id))
+			}
+			order = append(order, id)
+			l := make([]string, len(stages))
+			for i, st := range stages {
+				l[i] = specStr(st["loop"])
+			}
+			chains[id] = l
+		}
+	}
+	if len(problems) > 0 {
+		return problems[0]
+	}
+	for _, id := range order {
+		for i, st := range chains[id] {
+			switch {
+			case st == "":
+				return fmt.Errorf("workflow %q: stage %d names no workflow (write an id, or {use: <id>})", id, i+1)
+			case st == id:
+				return fmt.Errorf("workflow %q: stage %d runs the workflow itself", id, i+1)
+			case !ids[st]:
+				return fmt.Errorf("workflow %q: stage %d (%s) is not a workflow in this app", id, i+1, st)
+			}
+		}
+	}
+	// A cycle through other composites (a → b → a): depth-first over chains
+	// only, since a plain workflow ends every path.
+	const (
+		unseen = iota
+		active
+		done
+	)
+	state := map[string]int{}
+	var path []string
+	var visit func(id string) error
+	visit = func(id string) error {
+		state[id] = active
+		path = append(path, id)
+		for _, st := range chains[id] {
+			if _, isChain := chains[st]; !isChain {
+				continue
+			}
+			switch state[st] {
+			case active:
+				start := 0
+				for i, p := range path {
+					if p == st {
+						start = i
+						break
+					}
+				}
+				loop := append(append([]string{}, path[start:]...), st)
+				return fmt.Errorf("workflow %q: its stages loop back to it (%s)", st, strings.Join(loop, " → "))
+			case unseen:
+				if err := visit(st); err != nil {
+					return err
+				}
+			}
+		}
+		path = path[:len(path)-1]
+		state[id] = done
+		return nil
+	}
+	for _, id := range order {
+		if state[id] == unseen {
+			if err := visit(id); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// specV2ChainErrorBytes is specV2ChainError on raw YAML. Unparseable YAML is
+// not its concern (callers check that first) and passes.
+func specV2ChainErrorBytes(b []byte) error {
+	var doc map[string]any
+	if yaml.Unmarshal(b, &doc) != nil || doc == nil {
+		return nil
+	}
+	return specV2ChainError(doc)
 }

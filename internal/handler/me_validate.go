@@ -162,7 +162,9 @@ func validatePipelineShape(dir string) validateCheck {
 }
 
 func validatePipelineShapeBytes(b []byte, err error) validateCheck {
+	var chainErr error
 	if err == nil {
+		chainErr = specV2ChainErrorBytes(b)
 		b = normalizeSpecBytes(b, "")
 	}
 	ck := validateCheck{Check: "pipeline_shape", Status: "pass"}
@@ -197,6 +199,9 @@ func validatePipelineShapeBytes(b []byte, err error) validateCheck {
 		if len(lp.Steps) == 0 && lp.Engine == nil {
 			issues = append(issues, "loop "+nm+" has no steps and no engine — add at least one skill")
 		}
+	}
+	if chainErr != nil {
+		issues = append(issues, chainErr.Error())
 	}
 	if len(issues) > 0 {
 		ck.Status = "fail"

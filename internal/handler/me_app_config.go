@@ -204,6 +204,12 @@ func MeUpdateAppConfig(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid YAML: "+err.Error())
 		return
 	}
+	// A composite workflow (steps.workflows) must chain this app's own
+	// workflows, without itself or a loop through other chains.
+	if err := specV2ChainError(asMap(check)); err != nil {
+		fail(c, http.StatusBadRequest, 1400, err.Error())
+		return
+	}
 
 	// WRITE path: only the caller's own tenant install may be mutated — never
 	// the operator-shared bundle (which the scheduler + every other tenant read).

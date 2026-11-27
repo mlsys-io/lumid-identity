@@ -193,8 +193,14 @@ func materialiseTenantApp(userSub, app string) string {
 	// and every surface and tool reports "app not found" — for an app /me/apps
 	// says is ready. The whole cross-node fallback worked only for an app's own
 	// author until now, which is why owner-only testing never saw it.
-	owner := repoOwnerFor(userSub, app)
-	paths := repoTree(owner, userSub, app, "")
+	//
+	// And WHICH repo? Not necessarily the one named like the install: an app
+	// installed under another name (`as`: quant-research as quant-research-e2e)
+	// comes from the SOURCE repo. Fetching repos/<owner>/<installed name> found
+	// nothing, the spec-only rescue below kept the echoed spec alone, and every
+	// page and surface file of a renamed install 404'd (2026-11-27).
+	owner, repo := repoSlugFor(userSub, app)
+	paths := repoTree(owner, userSub, repo, "")
 	if len(paths) == 0 {
 		// RESCUE for a bare-slug install. repoOwnerFor recovers the author from
 		// the install intent's "<owner>/<name>" slug; an install recorded as the
@@ -213,9 +219,9 @@ func materialiseTenantApp(userSub, app string) string {
 		// Placed here rather than inside repoOwnerFor on purpose: it runs only
 		// where the existing code has already failed outright, so no currently
 		// working resolution changes behaviour.
-		if alt := resolvePublishedOwner(userSub, app); alt != "" && alt != owner {
+		if alt := resolvePublishedOwner(userSub, repo); alt != "" && alt != owner {
 			owner = alt
-			paths = repoTree(owner, userSub, app, "")
+			paths = repoTree(owner, userSub, repo, "")
 		}
 	}
 	if len(paths) == 0 {
@@ -250,7 +256,7 @@ func materialiseTenantApp(userSub, app string) string {
 	total := 0
 	wrote := 0
 	for _, p := range paths {
-		body, ok := fetchRepoBlobAt(userSub, owner+"/"+app, p)
+		body, ok := fetchRepoBlobAt(userSub, owner+"/"+repo, p)
 		if !ok {
 			continue
 		}

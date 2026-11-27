@@ -152,3 +152,26 @@ func TestCommonTopDir(t *testing.T) {
 		}
 	}
 }
+
+// A renamed install (`as`) materialises from its SOURCE repo. It fetched
+// repos/<owner>/<installed name>, found nothing, kept the echoed spec alone,
+// and every page of quant-research-e2e / mlsys-research-e2e 404'd.
+func TestMaterialiseFetchesTheSourceRepoOfARenamedInstall(t *testing.T) {
+	src := uncommentedGo(mustRead(t, "me_app_cache.go"))
+	i := strings.Index(src, "func materialiseTenantApp(")
+	if i < 0 {
+		t.Fatal("materialiseTenantApp missing")
+	}
+	body := src[i:]
+	if j := strings.Index(body, "\n}\n"); j > 0 {
+		body = body[:j]
+	}
+	if !strings.Contains(body, "repoSlugFor(userSub, app)") {
+		t.Error("materialiseTenantApp must resolve owner AND repo from the install record (repoSlugFor)")
+	}
+	for _, bad := range []string{`repoTree(owner, userSub, app,`, `owner+"/"+app`} {
+		if strings.Contains(body, bad) {
+			t.Errorf("materialiseTenantApp still addresses the repo by the installed name: %s", bad)
+		}
+	}
+}

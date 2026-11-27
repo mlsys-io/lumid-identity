@@ -260,14 +260,18 @@ func MeAppsList(c *gin.Context) {
 	// scheduler's app PVC (compute node, RWO), and kind=agent apps install to
 	// .xp/agents (not the .xp/apps dir walk() scans) — so tenant cards arrive
 	// as bare DB stubs with no ui: block, and the Studio sidebar has nothing to
-	// render. Backfill the ui: (+ mark xpcloud-backed) from the caller's
-	// PUBLISHED xp.io spec, the same fallback MeAppConfig uses. Best-effort;
-	// only for ready tenant cards missing a ui block.
+	// render. Backfill the ui: (+ mark xpcloud-backed) from the INSTALLED spec
+	// the scheduler echoed (me_app_specs), else the PUBLISHED xp.io spec — the
+	// same order MeAppConfig reads. Best-effort; only for ready tenant cards
+	// missing a ui block.
 	for i := range out {
 		if !out[i].Tenant || out[i].Status != "ready" || out[i].UI != nil {
 			continue
 		}
-		if spec, ok := fetchRepoSpecForParse(userID, out[i].Name); ok {
+		name := out[i].Name
+		if spec, ok := cardSpecForParse(storedAppSpec(userID, name), func() ([]byte, bool) {
+			return fetchRepoSpecForParse(userID, name)
+		}); ok {
 			if ui := parseAppUI(spec); ui != nil {
 				out[i].UI = ui
 			}
@@ -280,6 +284,19 @@ func MeAppsList(c *gin.Context) {
 		"data": gin.H{"apps": out},
 	})
 	return // (kept to mirror the early-return on error below; non-fatal)
+}
+
+// cardSpecForParse picks the spec an app card's ui: block is read from. The
+// installed spec wins: the published one belongs to whoever PUBLISHED the app,
+// so a user who renamed their install (title, ui.sidebar.label) or installed
+// it under another name kept seeing the publisher's label in the sidebar —
+// two rows both reading "MLSys Research" (2026-11-27). The published spec is
+// the fallback for an install the scheduler has not echoed yet.
+func cardSpecForParse(stored *models.MeAppSpec, published func() ([]byte, bool)) ([]byte, bool) {
+	if stored != nil && stored.SpecYAML != "" {
+		return normalizeSpecBytes([]byte(stored.SpecYAML), ""), true
+	}
+	return published()
 }
 
 // pendingCard is a synthetic app card derived from an unresolved or failed

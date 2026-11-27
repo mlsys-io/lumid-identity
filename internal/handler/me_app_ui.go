@@ -165,6 +165,36 @@ func parseAppConfigBytes(b []byte) map[string]any {
 	return doc.Config
 }
 
+// specNameOf returns the spec's own `name:` ("" when absent or unparseable).
+func specNameOf(b []byte) string {
+	var doc struct {
+		Name string `yaml:"name"`
+	}
+	_ = yaml.Unmarshal(b, &doc)
+	return strings.TrimSpace(doc.Name)
+}
+
+// rebindPageApp points a page spec written for the app's published name at
+// the name it is installed under. Pages address their app by name — a button's
+// run_loop.app, a source's ?app=, a row link's /studio/apps/<name> — so an
+// install under another name (quant-research installed as quant-research-e2e)
+// read and DROVE the original: its Deploy and Run backtest buttons queued runs
+// in the user's other copy (2026-11-27). Only exact references to the published
+// name move; the editable source served beside the compiled page is untouched.
+func rebindPageApp(pb []byte, specName, installed string) []byte {
+	if specName == "" || installed == "" || specName == installed || !slugRe.MatchString(specName) {
+		return pb
+	}
+	q := regexp.QuoteMeta(specName)
+	out := regexp.MustCompile(`(?m)^(\s*(?:-\s+)?app:[ \t]*)(['"]?)`+q+`(['"]?[ \t]*(?:#.*)?)$`).
+		ReplaceAll(pb, []byte("${1}${2}"+installed+"${3}"))
+	out = regexp.MustCompile(`([{,][ \t]*app:[ \t]*)(['"]?)`+q+`(['"]?[ \t]*[,}])`).
+		ReplaceAll(out, []byte("${1}${2}"+installed+"${3}"))
+	out = regexp.MustCompile(`([?&]app=)`+q+`([^A-Za-z0-9_-]|$)`).ReplaceAll(out, []byte("${1}"+installed+"${2}"))
+	out = regexp.MustCompile(`(/studio/apps/)`+q+`([^A-Za-z0-9_-]|$)`).ReplaceAll(out, []byte("${1}"+installed+"${2}"))
+	return out
+}
+
 // readForkOf returns the fork_of field from an app's xpcloud.yaml, or "".
 func readForkOf(appDir string) string {
 	specPath, _ := ResolveSpecPath(appDir)
@@ -268,6 +298,10 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 
 	var ui *appUI
 	var appCfg map[string]any
+	// The name the spec calls itself — the PUBLISHED name. Its pages address
+	// that name (run_loop.app, ?app=, /studio/apps/<name>); an install under
+	// another name rebinds them to itself below (rebindPageApp).
+	var specName string
 	if ov, ok := overlays[appFileSpecRel]; ok && !ov.Deleted && len(ov.Content) > 0 {
 		// The overlay is the raw saved spec: read it in the legacy shape like
 		// every other source (a simple-scheme app saved from Studio lost its
@@ -275,6 +309,7 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		spec := normalizeSpecBytes(ov.Content, "")
 		ui = parseAppUI(spec)
 		appCfg = parseAppConfigBytes(spec)
+		specName = specNameOf(spec)
 	} else if remote {
 		spec, ok := fetchRepoSpecForParse(userID, app)
 		if !ok {
@@ -283,9 +318,15 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 		}
 		ui = parseAppUI(spec)
 		appCfg = parseAppConfigBytes(spec)
+		specName = specNameOf(spec)
 	} else {
 		ui = readAppUI(appDir)
 		appCfg = readAppConfig(appDir)
+		if specPath, _ := ResolveSpecPath(appDir); specPath != "" {
+			if b, err := readSpecAware(specPath); err == nil {
+				specName = specNameOf(b)
+			}
+		}
 	}
 	if ui == nil || (ui.Surface == nil && len(ui.Surfaces) == 0) {
 		fail(c, http.StatusNotFound, 1404, "app declares no ui surface")
@@ -352,7 +393,7 @@ func serveAppSurface(c *gin.Context, surfaceName string) {
 				return
 			}
 		}
-		md, cerr := compilePageSpec(pb)
+		md, cerr := compilePageSpec(rebindPageApp(pb, specName, app))
 		if cerr != nil {
 			fail(c, http.StatusUnprocessableEntity, 1422, "page spec: "+cerr.Error())
 			return

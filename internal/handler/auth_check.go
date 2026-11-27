@@ -40,8 +40,16 @@ import (
 
 // edgeAudiencePaths: a JWT whose aud is a key passes this gate only for a
 // request under one of its prefixes.
+//
+// /sbx/nus/: lum.id's sandbox page calls sandbox-control with the SAME
+// flowmesh session-bearer it mints for /fm (lumid_ui src/api/sandboxes.ts).
+// Home's /sbx/ has no edge gate and office's was dropped, so only NUS, gated
+// admin+ by nginx, refused it — every NUS sandbox list/create from the UI got
+// nginx's 401 after v0.5.480, admins included (2026-11-27). sandbox-control
+// re-checks the token itself, exactly as it does at home, so admitting it here
+// widens nothing. Scoped to the gated site, not all of /sbx/.
 var edgeAudiencePaths = map[string][]string{
-	"flowmesh": {"/fm/"},
+	"flowmesh": {"/fm/", "/sbx/nus/"},
 }
 
 // edgeAudienceOK reports whether tok is a valid JWT minted for the service

@@ -196,6 +196,10 @@ func TestAuthCheckEdgeAudience(t *testing.T) {
 		{"flowmesh at /fm/office", "flowmesh", "/fm/office/api/v1/workflows/wfl-1", http.StatusOK},
 		{"flowmesh, no uri", "flowmesh", "", http.StatusUnauthorized},
 		{"flowmesh at /sbx", "flowmesh", "/sbx/api/whoami", http.StatusUnauthorized},
+		{"flowmesh at /sbx/nus", "flowmesh", "/sbx/nus/api/sandboxes", http.StatusOK},
+		{"flowmesh at /sbx/office", "flowmesh", "/sbx/office/api/sandboxes", http.StatusUnauthorized},
+		{"flowmesh at /sbx/nusx", "flowmesh", "/sbx/nusx/api/sandboxes", http.StatusUnauthorized},
+		{"lumilake at /sbx/nus", "lumilake", "/sbx/nus/api/sandboxes", http.StatusUnauthorized},
 		{"flowmesh at /fmx", "flowmesh", "/fmx/", http.StatusUnauthorized},
 		{"lumilake at /fm", "lumilake", "/fm/home/api/v1/workflows", http.StatusUnauthorized},
 		{"runmesh at /fm", "runmesh", "/fm/home/api/v1/workflows", http.StatusUnauthorized},
@@ -216,5 +220,39 @@ func TestAuthCheckEdgeAudience(t *testing.T) {
 				t.Fatalf("got %d, want %d (%s)", w.Code, tc.want, w.Body.String())
 			}
 		})
+	}
+}
+
+// The NUS sandbox gate is /api/v1/auth-check/admin with X-Original-URI
+// /sbx/nus/...: the UI's flowmesh session-bearer must pass for an admin and
+// still be refused (403) for a user, and refused outright off that path.
+func TestAuthCheckAdminFlowmeshAtSbxNus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	testKeys(t)
+	call := func(role, uri string) int {
+		tok, _, _, err := common.IssueBridgeJWT("u-1", "u@x", role, "flowmesh", nil, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		r := httptest.NewRequest("GET", "/api/v1/auth-check/admin", nil)
+		r.Header.Set("Authorization", "Bearer "+tok)
+		r.Header.Set("X-Original-URI", uri)
+		c.Request = r
+		AuthCheckAdminHandler(c)
+		return w.Code
+	}
+	if got := call("admin", "/sbx/nus/api/sandboxes"); got != http.StatusOK {
+		t.Errorf("admin flowmesh at /sbx/nus = %d, want 200", got)
+	}
+	if got := call("super_admin", "/sbx/nus/api/sandboxes"); got != http.StatusOK {
+		t.Errorf("super_admin flowmesh at /sbx/nus = %d, want 200", got)
+	}
+	if got := call("user", "/sbx/nus/api/sandboxes"); got != http.StatusForbidden {
+		t.Errorf("user flowmesh at /sbx/nus = %d, want 403", got)
+	}
+	if got := call("admin", "/api/v1/admin/users"); got != http.StatusUnauthorized {
+		t.Errorf("admin flowmesh off the edge paths = %d, want 401", got)
 	}
 }

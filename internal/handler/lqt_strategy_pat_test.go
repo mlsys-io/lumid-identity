@@ -150,3 +150,29 @@ func TestIntentPATScopeColumnMatchesWhatMintStores(t *testing.T) {
 		t.Fatalf("multi-scope column = %q, want space-joined", got)
 	}
 }
+
+// quant-research installed as quant-research-e2e deploys strategies too: its
+// source repo decides, not its installed name (2026-11-27).
+func TestRenamedQuantInstallGetsTheDeployPAT(t *testing.T) {
+	if !installedFromLQTStrategyApp("quant-research-e2e", "quant-research") {
+		t.Error("a renamed quant-research install must get the deploy PAT")
+	}
+	for _, c := range [][2]string{
+		{"mlsys-research-e2e", "mlsys-research"}, // another app's copy: no
+		{"quant-research", "quant-research"},     // the name gate already covers it
+		{"quant-research-e2e", ""},               // no install record
+	} {
+		if installedFromLQTStrategyApp(c[0], c[1]) {
+			t.Errorf("installedFromLQTStrategyApp(%q, %q) should be false", c[0], c[1])
+		}
+	}
+	// The install record maps the copy back to its source.
+	_, repo, ok := sourceFromIntentPayload(`{"slug":"own/quant-research","as":"quant-research-e2e"}`, "quant-research-e2e")
+	if !ok || repo != "quant-research" {
+		t.Fatalf("install record should resolve to quant-research, got %q ok=%v", repo, ok)
+	}
+	// Without a database the lookup degrades to "no", never a panic.
+	if renamedLQTInstall("run_loop", "sub", map[string]any{"app": "quant-research-e2e"}) {
+		t.Error("no DB, no install record: no PAT")
+	}
+}

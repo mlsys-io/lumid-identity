@@ -102,6 +102,33 @@ func lqtIntentNeedsStrategyPAT(action string, payload map[string]any) bool {
 	return isLQTStrategyApp(app)
 }
 
+// renamedLQTInstall — the same gate for an app installed under ANOTHER name.
+//
+// The rename bug again, one level down: `quant-research` installed as
+// `quant-research-e2e` (POST /me/apps {as}) runs as that name, matched neither
+// slug above, got no deploy PAT, and its Deploy fell back to the run's login
+// JWT (aud lumid-ecosystem) — `auth_denied: jwt_invalid` on every submit
+// (2026-11-27, found by the Quant Research e2e scenario). Decide by the
+// install's SOURCE repo too. Only looked up for a run_loop whose name did not
+// already match, so the common path costs nothing extra.
+func renamedLQTInstall(action, userSub string, p map[string]any) bool {
+	if action != "run_loop" || userSub == "" {
+		return false
+	}
+	app, _ := p["app"].(string)
+	app = strings.TrimSpace(app)
+	if app == "" || isLQTStrategyApp(app) {
+		return false
+	}
+	_, repo := repoSlugFor(userSub, app)
+	return installedFromLQTStrategyApp(app, repo)
+}
+
+// installedFromLQTStrategyApp: installed as `app` from source repo `repo`.
+func installedFromLQTStrategyApp(app, repo string) bool {
+	return repo != "" && repo != app && isLQTStrategyApp(repo)
+}
+
 // mintLQTStrategyPAT returns a fresh `lqt:strategy` PAT for userSub, or "" if
 // minting fails. Best-effort BY DESIGN: a miss must not block the intent. The
 // app then fails at its own credential check with a message naming the cause,
@@ -222,7 +249,7 @@ func lqtStrategyPATCached(userSub string) string {
 // The key is NOT persisted to `me_app_intents.payload` — it is merged at CLAIM
 // time, exactly like `bearer`, so no deploy credential is ever stored at rest.
 func attachLQTStrategyPAT(action, userSub string, p map[string]any) {
-	if p == nil || !lqtIntentNeedsStrategyPAT(action, p) {
+	if p == nil || !(lqtIntentNeedsStrategyPAT(action, p) || renamedLQTInstall(action, userSub, p)) {
 		return
 	}
 	if tok := lqtStrategyPATCached(userSub); tok != "" {

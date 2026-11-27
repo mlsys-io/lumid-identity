@@ -539,6 +539,17 @@ func repoIsRunnable(userSub, slug string) bool {
 			return false
 		}
 	}
+	return specIsRunnable(spec)
+}
+
+// specIsRunnable is repoIsRunnable's decision on the spec bytes. It reads the
+// spec in the legacy shape first: a simple-scheme (v2) app declares
+// `workflows:` and `pages:`, not `loops:` and `ui.surfaces`, so without the
+// translation every v2 app published as kind=agent — Quant Research, MBB
+// Consultant — read as a knowledge bank and was refused install with "subscribe
+// instead" (2026-11-27).
+func specIsRunnable(spec []byte) bool {
+	spec = normalizeSpecBytes(spec, "")
 	var doc struct {
 		Loops []map[string]any `yaml:"loops"`
 		Tools []map[string]any `yaml:"tools"`

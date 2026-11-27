@@ -10,6 +10,7 @@ package handler
 //	compute:     {site, gpu}                    # app default
 //	workflows:   [{id, title, about, notes, run, steps: {python|dag|skills|workflows},
 //	               inputs, data, compute, feedback, parent, node, helper}]
+//	             feedback: [{step, metrics: [{name, target, better}], gate}]   # gate → engine.gates
 //	nodes:       [{id, title, parent}]
 //	experiments: [{id, workflow, question, hypothesis, metric: {name, better},
 //	               data, baseline, done_when, min_samples, versions: [{id, about, inputs}]}]
@@ -232,6 +233,11 @@ func engineForWorkflow(w, appCompute map[string]any, exps []string) map[string]a
 		eng = map[string]any{"type": "chain", "stages": l}
 	} else {
 		return nil
+	}
+	// Gates ride on the engine the runner reads: engine.gates, for a chain and
+	// a single workflow alike (one shape; LumidOS spec_v2.py writes the same).
+	if g := feedbackGates(w); len(g) > 0 {
+		eng["gates"] = g
 	}
 	if len(exps) == 1 {
 		eng["experiment"] = exps[0]
@@ -631,6 +637,57 @@ func fetchRepoSpecForParse(userSub, app string) ([]byte, bool) {
 	return normalizeSpecBytes(b, ""), true
 }
 
+// feedbackGates reads a workflow's `feedback[].gate` pass rules as
+// {<step>: "<expr>"}. `step` names the stage (a chain stage's workflow id) or,
+// for a single workflow, one of its steps; an entry without `step` gates the
+// workflow itself (keyed by its id). A gate is a safe_eval expression over that
+// step's metrics — the evaluator success_criteria uses (LumidOS
+// experiments.safe_eval_expr). Entries without a gate, or with an empty or
+// non-string one, add nothing (specV2ChainError refuses the latter on save).
+// Twin of LumidOS spec_v2.feedback_gates.
+func feedbackGates(w map[string]any) map[string]any {
+	out := map[string]any{}
+	self := strings.TrimSpace(specStr(w["id"]))
+	if self == "" {
+		self = strings.TrimSpace(specStr(w["name"]))
+	}
+	for _, f := range asList(w["feedback"]) {
+		fm := asMap(f)
+		g, ok := fm["gate"].(string)
+		if fm == nil || !ok || strings.TrimSpace(g) == "" {
+			continue
+		}
+		step := strings.TrimSpace(specStr(fm["step"]))
+		if step == "" {
+			step = self
+		}
+		if _, dup := out[step]; step != "" && !dup {
+			out[step] = strings.TrimSpace(g)
+		}
+	}
+	return out
+}
+
+// feedbackGateError names the first `feedback[].gate` that is present but not
+// a non-empty string, or nil.
+func feedbackGateError(id string, w map[string]any) error {
+	for i, f := range asList(w["feedback"]) {
+		fm := asMap(f)
+		v, has := fm["gate"]
+		if fm == nil || !has {
+			continue
+		}
+		if g, ok := v.(string); !ok || strings.TrimSpace(g) == "" {
+			step := specStr(fm["step"])
+			if step == "" {
+				step = fmt.Sprintf("#%d", i+1)
+			}
+			return fmt.Errorf("workflow %q: feedback step %s: gate must be an expression over its metrics, e.g. \"score >= 0.5\" (or leave gate out)", id, step)
+		}
+	}
+	return nil
+}
+
 // chainStages reads a composite workflow's `steps.workflows`, in order. Each
 // entry is a bare workflow id or {use: <id>, inputs: {...}}; both become
 // {"loop": <id>} plus "inputs" when given. ok is false when the workflow has
@@ -667,9 +724,10 @@ func chainSummary(stages []map[string]any) string {
 }
 
 // specV2ChainError checks every composite workflow (`steps.workflows`) in a
-// parsed spec against the app's own workflow ids. It returns the first problem
-// in words, or nil. Specs without a chain always pass, so this is safe to call
-// on any spec before saving it. The runner re-checks at run time (a spec can
+// parsed spec against the app's own workflow ids, and every `feedback[].gate`
+// is a non-empty string. It returns the first problem in words, or nil. Specs
+// without a chain or a gate always pass, so this is safe to call on any spec
+// before saving it. The runner re-checks at run time (a spec can
 // arrive by app_push without passing through here).
 func specV2ChainError(doc map[string]any) error {
 	ids := map[string]bool{}
@@ -687,6 +745,9 @@ func specV2ChainError(doc map[string]any) error {
 				continue
 			}
 			ids[id] = true
+			if err := feedbackGateError(id, wm); err != nil {
+				problems = append(problems, err)
+			}
 			stages, ok := chainStages(wm)
 			if !ok {
 				// Already translated (loops[].engine), e.g. read via readSpecAware.

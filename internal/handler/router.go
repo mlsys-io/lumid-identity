@@ -281,6 +281,7 @@ func Register(r *gin.Engine) {
 			me.GET("/apps/:app/config", MeAppConfig)           // read xpcloud.yaml
 			me.PUT("/apps/:app/config", MeUpdateAppConfig)     // write xpcloud.yaml (YAML-validated)
 			me.GET("/apps/:app/files", MeAppFile)              // one workflow definition file (DAG / notes / code)
+			me.GET("/apps/:app/bundle", MeAppBundleFile)       // read-only: any bundle file or directory (the chat's app_file tool)
 			// Prompt editor — analyst & judge prompt cards. List unions local
 			// overrides with inherited shared-skill prompts; PUT/DELETE write a
 			// LOCAL override in the caller's own app only (never the shared file).

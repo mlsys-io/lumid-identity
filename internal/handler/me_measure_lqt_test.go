@@ -254,4 +254,12 @@ func TestMeasuredFromBlobReadsOnlyWhatTheRunSaid(t *testing.T) {
 	if r, o := measuredFromBlob(map[string]any{}); r || o != "" {
 		t.Errorf("no metrics: %v %q", r, o)
 	}
+	// The run store's shape: the scheduler flattens the app's metrics to the top.
+	if r, o := measuredFromBlob(map[string]any{"primary_metric": map[string]any{"name": "objective", "value": 22.4},
+		"reused": true, "measured_on": "Simulated RTX 5080 (mlsys-simulator v0.1.3) · reused from an identical run"}); !r || o == "" {
+		t.Errorf("flattened store blob: %v %q", r, o)
+	}
+	if r, o := measuredFromBlob(map[string]any{"reused": "true"}); r || o != "" {
+		t.Errorf("flattened non-bool inferred: %v %q", r, o)
+	}
 }

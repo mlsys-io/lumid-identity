@@ -332,6 +332,8 @@ func Register(r *gin.Engine) {
 			// conclude/checkpoint/fork/revert each mean something the
 			// define-shaped body cannot express.
 			me.POST("/apps/:app/experiments/:id/control", MeAppExperimentControl)
+			// Discard / restore results: tombstones, never deletes (me_experiment_discard.go).
+			me.POST("/apps/:app/experiments/:id/discard", MeAppExperimentDiscard)
 			// FinData SQL — self-service warehouse credentials. The role is an
 			// entitlement provisioned by an operator; minting is what makes it
 			// usable, and the password is shown exactly once.

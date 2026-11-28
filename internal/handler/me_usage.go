@@ -761,7 +761,12 @@ func MeUsage(c *gin.Context) {
 	out := gin.H{"app": app, "since": nil, "used": used,
 		"saved": gin.H{"gpu_s": round3(s.SavedGPUS), "cpu_s": round3(s.SavedCPUS), "reused_runs": s.Reused,
 			"cost_usd": math.Round(s.SavedUSD*1e6) / 1e6},
-		"rates": currentRates()}
+		"rates": currentRates(),
+		// The per-user daily GPU-measurement budget, so a press can say "N of today's 24
+		// left" and block at zero, instead of only learning it from a refusal (the
+		// MLSys student's limit is 24, everyone else's 12; the UI could not know).
+		"limits": gin.H{"gpu_measurements_per_day": gpuDailyBudget(sub),
+			"gpu_measurements_today": gpuMeasurementsToday(sub)}}
 	if !since.IsZero() {
 		out["since"] = since.UTC().Format(time.RFC3339)
 	}

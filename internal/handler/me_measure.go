@@ -638,6 +638,8 @@ func MeMeasure(c *gin.Context) {
 	}
 	if inst.executor == "lqt" {
 		_, _, err = lqtMeasureSubmit(&row, sub)
+	} else if inst.executor == "llm" {
+		err = llmMeasureSubmit(&row, plan, sub, labels.App)
 	} else {
 		err = measureSubmit(c, &row, plan, sub, b.App)
 	}
@@ -758,6 +760,10 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 	}
 	if row.Executor == "lqt" {
 		lqtMeasureAdvance(c, row)
+		return
+	}
+	if row.Executor == "llm" {
+		llmAdvance(row)
 		return
 	}
 	if row.ExecutorRef == "" {

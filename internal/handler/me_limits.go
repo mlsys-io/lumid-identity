@@ -91,6 +91,10 @@ type internalChargeBody struct {
 	CostCents             int    `json:"cost_cents,omitempty"`
 	DryRun                bool   `json:"dry_run,omitempty"`
 	Meta                  string `json:"meta,omitempty"`
+	// Attribution (claude-proxy sends these from the bearer's run claims). A
+	// run-credential caller cannot choose them: they come from its credential.
+	App   string `json:"app,omitempty"`
+	RunID string `json:"run_id,omitempty"`
 }
 
 // POST /api/v1/internal/usage/charge   (X-Bridge-Secret required)
@@ -106,6 +110,9 @@ func InternalUsageCharge(c *gin.Context) {
 	if !allowRunWrite(c, body.UserSub) || !runChargeAllowed(c, body) {
 		return
 	}
+	if row := runCredentialOf(c); row != nil {
+		body.App, body.RunID = row.App, row.ID
+	}
 	res, err := common.CheckAndCharge(common.DB, common.ChargeReq{
 		UserSub:               body.UserSub,
 		Kind:                  body.Kind,
@@ -120,6 +127,8 @@ func InternalUsageCharge(c *gin.Context) {
 		CostCents:             body.CostCents,
 		DryRun:                body.DryRun,
 		Meta:                  body.Meta,
+		App:                   fleetClip(body.App, 128),
+		RunID:                 fleetClip(body.RunID, 64),
 	})
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "charge: "+err.Error())

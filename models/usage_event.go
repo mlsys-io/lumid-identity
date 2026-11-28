@@ -41,6 +41,14 @@ type UsageEvent struct {
 	CacheCreation1hTokens int    `gorm:"column:cache_creation_1h_tokens;not null;default:0" json:"cache_creation_1h_tokens"`
 	CostCents             int    `gorm:"column:cost_cents;not null;default:0"    json:"cost_cents"`
 	Meta                  string `gorm:"column:meta;type:text"               json:"meta"` // optional JSON blob
+	// Which installed app and run spent it (2026-11-28), when the caller knows:
+	// claude-proxy forwards them from the bearer's run claims, and a run
+	// credential's own charge takes them from the credential. NULL = not
+	// attributed (every row before this, and plain chat) — never guessed.
+	// Deliberately unindexed: reads filter by user first (idx_usage_user_ts), and
+	// a new index on this ~1M-row table would hold up identity's start-up.
+	App   *string `gorm:"column:app;size:128"   json:"app,omitempty"`
+	RunID *string `gorm:"column:run_id;size:64" json:"run_id,omitempty"`
 }
 
 func (UsageEvent) TableName() string { return "usage_events" }

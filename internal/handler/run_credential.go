@@ -223,7 +223,8 @@ func InternalRunCredentialMint(c *gin.Context) {
 		fail(c, http.StatusServiceUnavailable, 1503, "store: "+err.Error())
 		return
 	}
-	tok, _, exp, err := common.IssueBridgeJWT(u.ID, u.Email, u.Role, runBearerAudience, nil, runBearerTTL)
+	tok, _, exp, err := common.IssueBridgeJWTWithClaims(u.ID, u.Email, u.Role, runBearerAudience, nil, runBearerTTL,
+		runBearerClaims(&row))
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "mint: "+err.Error())
 		return
@@ -236,6 +237,13 @@ func InternalRunCredentialMint(c *gin.Context) {
 		"token":              tok,
 		"expires_at":         exp.UTC().Format(time.RFC3339),
 	})
+}
+
+// runBearerClaims: what a run's bearer says about the run, so the LLM gateways
+// it calls can attribute spend to the app (usage_events.app / run_id). The run
+// id is the credential's id: one credential per run, minted by the daemon.
+func runBearerClaims(row *models.RunCredential) common.RunClaims {
+	return common.RunClaims{App: row.App, Loop: row.Loop, RunID: row.ID}
 }
 
 // RunCredentialRefresh — POST /api/v1/run-credential/refresh.
@@ -252,7 +260,8 @@ func RunCredentialRefresh(c *gin.Context) {
 	if rem := time.Until(row.ExpiresAt); rem < ttl {
 		ttl = rem
 	}
-	tok, _, exp, err := common.IssueBridgeJWT(u.ID, u.Email, u.Role, runBearerAudience, nil, ttl)
+	tok, _, exp, err := common.IssueBridgeJWTWithClaims(u.ID, u.Email, u.Role, runBearerAudience, nil, ttl,
+		runBearerClaims(row))
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 1500, "mint: "+err.Error())
 		return

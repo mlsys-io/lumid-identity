@@ -17,7 +17,25 @@ type JWTClaims struct {
 	Scopes string `json:"scope,omitempty"` // space-separated, standard OAuth shape
 	Email  string `json:"email,omitempty"`
 	Role   string `json:"role,omitempty"` // "user" | "admin"
+	RunClaims
 	jwt.RegisteredClaims
+}
+
+// RunClaims bind a bearer to the work it was minted for. All optional and
+// additive: a token without them is exactly the token it always was.
+//
+//   - App / Loop / RunID: a tenant run's bearer (run_credential.go) says which
+//     installed app and run it belongs to, so the services it calls (the LLM
+//     gateways) can attribute spend to the app, not just the user.
+//   - MeasureModel: a central measurement's bearer (me_measure_llm.go) names the
+//     one pooled model it may call. claude-proxy serves that model genuinely,
+//     instead of aliasing a non-admin's Claude request to the in-house model.
+//     identity mints it inside the measure call and never hands it out.
+type RunClaims struct {
+	App          string `json:"app,omitempty"`
+	Loop         string `json:"loop,omitempty"`
+	RunID        string `json:"run_id,omitempty"`
+	MeasureModel string `json:"measure_model,omitempty"`
 }
 
 // IssueJWT signs an access token for `userID`. Returns (token, jti, exp).
@@ -107,6 +125,11 @@ func issueJWT(userID, email, role string, scopes []string, ttl time.Duration) (s
 // Still signed by the same keyring so downstream services verifying
 // against our JWKS accept it unchanged.
 func IssueBridgeJWT(userID, email, role, audience string, scopes []string, ttl time.Duration) (string, string, time.Time, error) {
+	return IssueBridgeJWTWithClaims(userID, email, role, audience, scopes, ttl, RunClaims{})
+}
+
+// IssueBridgeJWTWithClaims is IssueBridgeJWT plus RunClaims.
+func IssueBridgeJWTWithClaims(userID, email, role, audience string, scopes []string, ttl time.Duration, rc RunClaims) (string, string, time.Time, error) {
 	k := Keys.Active()
 	if k == nil {
 		return "", "", time.Time{}, fmt.Errorf("no active signing key")
@@ -130,9 +153,10 @@ func IssueBridgeJWT(userID, email, role, audience string, scopes []string, ttl t
 	}
 
 	claims := JWTClaims{
-		Scopes: scope,
-		Email:  email,
-		Role:   role,
+		Scopes:    scope,
+		Email:     email,
+		Role:      role,
+		RunClaims: rc,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    config.G.App.Issuer,
 			Subject:   userID,

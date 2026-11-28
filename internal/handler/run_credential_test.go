@@ -497,3 +497,46 @@ func TestRunCredSignalsBoundToOwnSubAndApp(t *testing.T) {
 		t.Fatalf("ack for other sub: code=%d, want 403", code)
 	}
 }
+
+// A run's own LLM charge is attributed to the app and run its credential was
+// minted for, whatever the body claims; a bridge caller (claude-proxy) names them.
+func TestRunCredChargeIsAttributedToItsAppAndRun(t *testing.T) {
+	db := runCredDB(t)
+	r := runCredRouter(t)
+	alice := runCredUser(t, db, "uat", "active")
+	refresh, _ := mintRunCred(t, r, alice, "app-a", "")
+	t.Cleanup(func() { db.Where("user_sub = ?", alice).Delete(&models.UsageEvent{}) })
+
+	body := fmt.Sprintf(`{"user_sub":%q,"kind":"cycle_llm","input_tokens":7,"app":"app-b","run_id":"forged"}`, alice)
+	if code, out := runCredDo(t, r, "/api/v1/internal/usage/charge", body, "", refresh); code != http.StatusOK {
+		t.Fatalf("charge: code=%d resp=%+v", code, out)
+	}
+	var cred models.RunCredential
+	db.Where("token_hash = ?", hashRunCredential(refresh)).First(&cred)
+	var ev models.UsageEvent
+	db.Where("user_sub = ? AND kind = ?", alice, "cycle_llm").Order("id DESC").First(&ev)
+	if ev.App == nil || *ev.App != "app-a" || ev.RunID == nil || *ev.RunID != cred.ID {
+		t.Fatalf("attribution = app %v run %v, want app-a / %s", ev.App, ev.RunID, cred.ID)
+	}
+
+	bridge := fmt.Sprintf(`{"user_sub":%q,"kind":"claude_proxy","input_tokens":3,"app":"app-c","run_id":"measure:k1"}`, alice)
+	if code, _ := runCredDo(t, r, "/api/v1/internal/usage/charge", bridge, runCredTestSecret, ""); code != http.StatusOK {
+		t.Fatalf("bridge charge: code=%d", code)
+	}
+	ev = models.UsageEvent{}
+	db.Where("user_sub = ? AND kind = ?", alice, "claude_proxy").Order("id DESC").First(&ev)
+	if ev.App == nil || *ev.App != "app-c" || ev.RunID == nil || *ev.RunID != "measure:k1" {
+		t.Fatalf("bridge attribution = %v %v", ev.App, ev.RunID)
+	}
+	// Plain chat stays unattributed (NULL, not "").
+	plain := fmt.Sprintf(`{"user_sub":%q,"kind":"chat","input_tokens":1}`, alice)
+	runCredDo(t, r, "/api/v1/internal/usage/charge", plain, runCredTestSecret, "")
+	ev = models.UsageEvent{}
+	db.Where("user_sub = ? AND kind = ?", alice, "chat").Order("id DESC").First(&ev)
+	if ev.ID == 0 {
+		t.Fatal("the chat charge wrote no row")
+	}
+	if ev.App != nil || ev.RunID != nil {
+		t.Fatalf("unattributed row stored %v %v", ev.App, ev.RunID)
+	}
+}

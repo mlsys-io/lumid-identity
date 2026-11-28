@@ -39,6 +39,11 @@ type MeasureResult struct {
 	GPUType string   `gorm:"column:gpu_type;size:64" json:"gpu_type,omitempty"`
 	// measured | estimated
 	Metered string `gorm:"column:metered;size:16" json:"metered,omitempty"`
+	// A pooled-model call's own cost (2026-11-28, pooled-llm): notional list USD
+	// from the reply's token counts. nil = not an LLM measurement.
+	CostUSD   *float64 `gorm:"column:cost_usd" json:"cost_usd,omitempty"`
+	TokensIn  *int     `gorm:"column:tokens_in" json:"tokens_in,omitempty"`
+	TokensOut *int     `gorm:"column:tokens_out" json:"tokens_out,omitempty"`
 	// ChargedRequestID: the MeasureRequest that actually ran it (and pays for
 	// it). Every other request it answered was reused and costs nothing.
 	ChargedRequestID uint `gorm:"column:charged_request_id;not null;default:0" json:"-"`

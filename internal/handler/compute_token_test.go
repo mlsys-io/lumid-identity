@@ -217,3 +217,25 @@ func TestPreFlowMeshCachedTokenIsNotServed(t *testing.T) {
 		}
 	}
 }
+
+func TestSpecDeclaresComputeEngine_placementMapping(t *testing.T) {
+	// quant-research's kol_score_fleet: the mapping once failed the whole unmarshal.
+	spec := []byte("workflows:\n  - id: kol_score_fleet\n    compute: {site: home, gpu: 16Gi}\n  - id: other\n    run: manual\n")
+	if !specDeclaresComputeEngine(spec) {
+		t.Fatal("a {site, gpu} placement must declare compute")
+	}
+}
+
+func TestSpecDeclaresComputeEngine_budgetOnlyIsNotCompute(t *testing.T) {
+	spec := []byte("compute: {budget: {gpu_minutes: 168}}\nworkflows:\n  - id: simulate\n    compute: {budget: {cpu_minutes: 10}, parallel: 2}\n")
+	if specDeclaresComputeEngine(spec) {
+		t.Fatal("budget/parallel alone is accounting, not a compute submission")
+	}
+}
+
+func TestSpecDeclaresComputeEngine_oddShapeDoesNotFailTheSpec(t *testing.T) {
+	spec := []byte("workflows:\n  - id: a\n    compute: [x, y]\n  - id: b\n    engine: {type: lumilake}\n")
+	if !specDeclaresComputeEngine(spec) {
+		t.Fatal("an odd compute shape on one loop must not hide another loop's engine")
+	}
+}

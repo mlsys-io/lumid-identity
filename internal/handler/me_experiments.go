@@ -35,7 +35,10 @@ import (
 const expResultsTailCap = 500
 
 type expDecl struct {
-	ID         string           `yaml:"id" json:"id"`
+	ID string `yaml:"id" json:"id"`
+	// Title is the spec's own name for the experiment (`title:`); the UI prefers
+	// it over the humanised id, which can't say whether serve_9_2 is 9.2.
+	Title      string           `yaml:"title" json:"title,omitempty"`
 	Hypothesis string           `yaml:"hypothesis" json:"hypothesis"`
 	Kind       string           `yaml:"kind" json:"kind"`
 	DatasetID  string           `yaml:"dataset_id" json:"dataset_id,omitempty"`
@@ -367,7 +370,7 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			// Carried for the same reason `arms` is: a verb that reads this row
 			// and rewrites the whole experiments[] entry must be able to put
 			// back everything it did not mean to change.
-			"dispatch": d.Dispatch, "cases": d.Cases, "description": d.Description,
+			"dispatch": d.Dispatch, "cases": d.Cases, "description": d.Description, "title": d.Title,
 			// The DECLARED arms. expDecl has parsed these since it was written
 			// and the row dropped them, so the only arms any client could see
 			// were the ones already OBSERVED in state.variants — i.e. a
@@ -1031,6 +1034,7 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		"success_criteria": decl.Criteria, "min_samples": decl.MinSamples,
 		"status":      strOr(decl.Status, "active"),
 		"description": decl.Description,
+		"title":       decl.Title,
 		// The DECLARED arms and the app's dispatch routing — the same two
 		// fields the LIST row carries, for the same reason its comment gives:
 		// an arm that has never run exists only in the declaration, so a

@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -157,10 +158,12 @@ func sandboxPrecheck(c *gin.Context, sub string, plan measurePlan, app, workflow
 	if running >= int64(limit) {
 		return fmt.Sprintf("waiting for a GPU slot (%d of %d in use)", running, limit), true
 	}
+	// A measurement that never got a GPU (not_measured: no worker picked it up,
+	// refused) used nothing, so it does not count against the day.
 	var today int64
-	common.DB.Model(&models.MeasureResult{}).Where("executor_sub = ? AND instrument = ? AND created_at > ?",
-		sub, "mlsys-sandbox", time.Now().Add(-24*time.Hour)).Count(&today)
-	if budget := measureLimit("MEASURE_GPU_DAILY_BUDGET", 12); today >= int64(budget) {
+	common.DB.Model(&models.MeasureResult{}).Where("executor_sub = ? AND instrument = ? AND created_at > ? AND status <> ?",
+		sub, "mlsys-sandbox", time.Now().Add(-24*time.Hour), "not_measured").Count(&today)
+	if budget := gpuDailyBudget(sub); today >= int64(budget) {
 		return fmt.Sprintf("your daily budget of %d GPU measurements is used; it resets over the next 24 hours", budget), false
 	}
 	req, _ := plan.material["gpu"].(map[string]any)
@@ -296,4 +299,24 @@ func sandboxQueueTimedOut(c *gin.Context, row *models.MeasureResult, id fleetJob
 		"no GPU worker at %s picked the job up within %d minutes, so it was cancelled; try again later",
 		id.Site, queue/60))
 	return true
+}
+
+// gpuDailyBudget: MEASURE_GPU_DAILY_BUDGET (default 12) GPU measurements per user
+// per rolling 24 h, overridable per user with MEASURE_GPU_DAILY_BUDGET_USERS
+// ("<sub>=<n>,<sub>=<n>"; a sub prefix of 8+ characters is enough). Operator
+// decision 2026-11-28: a research round that has budget left (GPU-minutes) should
+// not stall on the daily RATE for one named account.
+func gpuDailyBudget(sub string) int {
+	def := measureLimit("MEASURE_GPU_DAILY_BUDGET", 12)
+	for _, pair := range strings.Split(os.Getenv("MEASURE_GPU_DAILY_BUDGET_USERS"), ",") {
+		k, v, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		k = strings.TrimSpace(k)
+		if !ok || len(k) < 8 || !strings.HasPrefix(sub, k) {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }

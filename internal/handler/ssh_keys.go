@@ -32,7 +32,8 @@ type sshKeyItem struct {
 
 // SSHKeysListHandler returns the caller's uploaded keys.
 func SSHKeysListHandler(c *gin.Context) {
-	userID, found := currentUserID(c)
+	// Read-only and self-scoped, so the sandbox page's flowmesh bearer may call it (common.SSHKeyReadAudiences).
+	userID, found := currentUserIDFor(c, common.SSHKeyReadAudiences...)
 	if !found {
 		fail(c, http.StatusUnauthorized, 1003, "auth required")
 		return

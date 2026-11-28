@@ -127,3 +127,31 @@ func TestUnboundAllowanceEnv(t *testing.T) {
 		t.Fatalf("explicit list not honoured")
 	}
 }
+
+func TestSSHKeyReadAcceptsFlowmeshBridgeOnly(t *testing.T) {
+	withTestKeys(t)
+	fm := bridge(t, "flowmesh")
+	if _, err := VerifyJWTFor(fm, SSHKeyReadAudiences...); err != nil {
+		t.Fatalf("flowmesh bridge must be able to read own ssh keys: %v", err)
+	}
+	if _, err := VerifyIdentityJWT(fm); err == nil {
+		t.Fatal("flowmesh bridge must still be refused by the general identity API")
+	}
+	for _, aud := range []string{"runmesh", "lqt", "lumilake"} {
+		if _, err := VerifyJWTFor(bridge(t, aud), SSHKeyReadAudiences...); err == nil {
+			t.Fatalf("%s bridge must not read ssh keys", aud)
+		}
+	}
+	idTok, _, err := IssueIDToken("u1", "u1@example.com", "U", "admin", "harbor", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyJWTFor(idTok, SSHKeyReadAudiences...); err == nil {
+		t.Fatal("an OIDC id_token must not read ssh keys")
+	}
+	for _, a := range IdentityAudiences {
+		if a == "flowmesh" {
+			t.Fatal("IdentityAudiences must not have grown flowmesh")
+		}
+	}
+}

@@ -151,6 +151,9 @@ func Register(r *gin.Engine) {
 		// Unified username + uid (username.go): chosen on the Sandboxes page, applied on every cluster.
 		v1.GET("/user/username", UsernameGetHandler)
 		v1.PUT("/user/username", UsernameSetHandler)
+		// Claim an existing host login by proving control of it (username_claim.go).
+		v1.POST("/user/username/claim", UsernameClaimCreateHandler)
+		v1.GET("/user/username/claim", UsernameClaimGetHandler)
 		v1.GET("/user/ssh-keys", SSHKeysListHandler)
 		v1.POST("/user/ssh-keys", SSHKeysUploadHandler)
 		v1.DELETE("/user/ssh-keys/:id", SSHKeysDeleteHandler)
@@ -173,6 +176,9 @@ func Register(r *gin.Engine) {
 			// What sandbox-control and the per-machine host agents apply (username.go).
 			admin.GET("/usernames", AdminUsernamesListHandler)
 			admin.PUT("/users/:id/username", AdminUsernameSetHandler)
+			// The per-host claim verifier (deploy_infra k8s-lift/host-users) lists and verifies claims.
+			admin.GET("/username-claims", AdminUsernameClaimsListHandler)
+			admin.POST("/username-claims/:id/verify", AdminUsernameClaimVerifyHandler)
 
 			// Cohort research review — the reviewer's side of the progress
 			// protocol. Every /me/* path is scoped to the caller, which is right

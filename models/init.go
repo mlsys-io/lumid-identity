@@ -7,6 +7,7 @@ import "gorm.io/gorm"
 var AllTables = []interface{}{
 	&User{},
 	&UsernameChange{},
+	&UsernameClaim{},
 	&Identity{},
 	&Token{},
 	&AuditLog{},

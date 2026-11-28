@@ -11,7 +11,7 @@ import "time"
 // the account whose credential advances the upstream job, and is not returned.
 type MeasureResult struct {
 	Key        string `gorm:"column:mkey;primaryKey;size:64" json:"key"`
-	Instrument string `gorm:"column:instrument;size:64;not null;index" json:"instrument"`
+	Instrument string `gorm:"column:instrument;size:160;not null;index" json:"instrument"` // "<owner>/<app>.<module>" fits
 	Version    string `gorm:"column:version;size:128;not null" json:"version"`
 	Inputs     string `gorm:"column:inputs;type:mediumtext" json:"-"`
 	// global | tenant:<sub>. The simulator is seeded and pinned, so global.

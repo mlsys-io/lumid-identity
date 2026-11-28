@@ -97,6 +97,18 @@ type measureInstrument struct {
 	precheck func(c *gin.Context, sub string, plan measurePlan, app, workflow string) (why string, wait bool)
 	// versions lists the accepted versions, for the listing.
 	versions func() []string
+	// keyAs, when set, is the instrument name the content key covers instead
+	// of Name: an app module is keyed as "module" (image digest + run +
+	// inputs), so the same computation reached by two names is one row.
+	keyAs string
+}
+
+// keyName is the instrument name that goes into the content key.
+func (in measureInstrument) keyName() string {
+	if in.keyAs != "" {
+		return in.keyAs
+	}
+	return in.Name
 }
 
 var measureRegistry = map[string]measureInstrument{
@@ -398,9 +410,11 @@ type measureBody struct {
 	Fresh      bool            `json:"fresh"`
 }
 
-// MeMeasureInstruments lists what can be measured.
+// MeMeasureInstruments lists what can be measured; with ?app=<app>, also
+// the compute modules that app may call (its own install's modules).
 func MeMeasureInstruments(c *gin.Context) {
-	if _, authed := currentUserID(c); !authed {
+	sub, authed := currentUserID(c)
+	if !authed {
 		fail(c, http.StatusUnauthorized, 1003, "not authenticated")
 		return
 	}
@@ -412,7 +426,7 @@ func MeMeasureInstruments(c *gin.Context) {
 	out := []gin.H{}
 	for _, n := range names {
 		in := measureRegistry[n]
-		item := gin.H{"name": in.Name, "about": in.About, "share": in.Share,
+		item := gin.H{"name": in.Name, "kind": "instrument", "about": in.About, "share": in.Share,
 			"inputs": in.Inputs, "versions": in.versions()}
 		// What a fresh run of it usually uses (median of recent metered runs).
 		if g, cp, t, k := measureEstimate(in.Name); k > 0 {
@@ -424,6 +438,14 @@ func MeMeasureInstruments(c *gin.Context) {
 				est["cpu_s"] = round3(cp)
 			}
 			item["estimate"] = est
+		}
+		out = append(out, item)
+	}
+	for _, item := range moduleListing(sub, strings.TrimSpace(c.Query("app"))) {
+		if name, _ := item["name"].(string); name != "" && item["refused"] == nil {
+			if g, cp, t, k := measureEstimate(name); k > 0 {
+				item["estimate"] = gin.H{"from_runs": k, "cost_usd": currentRates().cost(g, cp, t), "cpu_s": round3(cp)}
+			}
 		}
 		out = append(out, item)
 	}
@@ -443,6 +465,17 @@ func MeMeasure(c *gin.Context) {
 		return
 	}
 	inst, known := measureRegistry[b.Instrument]
+	if !known {
+		// An app compute module: "<app>.<module>" (the caller's own install)
+		// or "<owner>/<app>.<module>" (a public one). Refusals in words.
+		if mod, _, isModule, refusal := resolveModule(sub, b.Instrument, b.App); isModule {
+			if refusal != nil {
+				fail(c, refusal.code, 1000+refusal.code, refusal.why)
+				return
+			}
+			inst, known = moduleInstrument(b.Instrument, mod), true
+		}
+	}
 	if !known {
 		fail(c, http.StatusBadRequest, 1400, "unknown instrument "+strconv.Quote(b.Instrument)+
 			"; GET /me/measure/instruments lists them")
@@ -464,7 +497,7 @@ func MeMeasure(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, err.Error())
 		return
 	}
-	key := measureKey(inst.Name, plan.version, plan.keyed())
+	key := measureKey(inst.keyName(), plan.version, plan.keyed())
 	labels := models.MeasureRequest{UserSub: sub, Key: key, App: fleetClip(b.App, 128),
 		Workflow: fleetClip(b.Workflow, 128), RunID: fleetClip(b.RunID, 200)}
 
@@ -476,7 +509,7 @@ func MeMeasure(c *gin.Context) {
 		// Another tenant's private measurement of the same content — or one
 		// still running whose reuse is not decided yet: measure it again under
 		// this tenant (never reveal or reuse theirs).
-		key = measureKey(inst.Name, plan.version, map[string]any{"tenant": sub, "inputs": plan.keyed()})
+		key = measureKey(inst.keyName(), plan.version, map[string]any{"tenant": sub, "inputs": plan.keyed()})
 		labels.Key = key
 		row = models.MeasureResult{}
 		found = common.DB.First(&row, "mkey = ?", key).Error == nil
@@ -749,6 +782,9 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 		if msg == "" {
 			msg = "the job ended " + status
 		}
+		if row.Executor == "module" {
+			msg = moduleFailureWords(msg)
+		}
 		measureSettle(row, "failed", "", msg)
 		return
 	}
@@ -781,6 +817,16 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 	if first == nil {
 		measureSettle(row, "failed", "", "the job succeeded but returned no value")
 		return
+	}
+	if row.Executor == "module" {
+		// One stage; its value is the module's own output object, re-checked
+		// against the output limit here (the wrapper already stops at 1 MiB).
+		out, why := moduleSettleValue(first)
+		if why != "" {
+			measureSettle(row, "failed", "", why)
+			return
+		}
+		first, values = out, map[string]any{"module": out}
 	}
 	out, _ := canonicalJSON(map[string]any{"value": first, "values": values, "metrics": metrics})
 	measureSettle(row, "succeeded", out, "")

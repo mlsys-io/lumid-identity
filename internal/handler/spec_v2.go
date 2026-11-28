@@ -8,7 +8,8 @@ package handler
 //	name / title / summary / version / icon
 //	data:        [{id, source: "repo:<owner/name>" | "path:<dir>", version}]
 //	compute:     {site, gpu}                    # app default
-//	workflows:   [{id, title, about, notes, run, steps: {python|dag|skills|workflows},
+//	modules:     [{id, title, about, image (pinned digest), run, inputs, limits, share, public}]
+//	workflows:   [{id, title, about, notes, run, steps: {python|dag|skills|workflows|module},
 //	               inputs, data, compute, feedback, parent, node, helper}]
 //	             feedback: [{step, metrics: [{name, target, better}], gate}]   # gate → engine.gates
 //	nodes:       [{id, title, parent}]
@@ -221,6 +222,21 @@ func engineForWorkflow(w, appCompute map[string]any, exps []string) map[string]a
 		}
 		if g := specStr(compute["gpu"]); g != "" {
 			eng["hardware"] = map[string]any{"gpu_memory": g}
+		}
+	} else if mod := strings.TrimSpace(specStr(steps["module"])); mod != "" {
+		// One app compute module (spec `modules:`), run centrally through
+		// /me/measure by the LumidOS runner (sdk/apps/module_engine.py). The
+		// workflow's inputs are defaults; steps.inputs win over them.
+		eng = map[string]any{"type": "module", "module": mod}
+		in := map[string]any{}
+		for k, v := range inputs {
+			in[k] = v
+		}
+		for k, v := range asMap(steps["inputs"]) {
+			in[k] = v
+		}
+		if len(in) > 0 {
+			eng["inputs"] = in
 		}
 	} else if stages, ok := chainStages(w); ok {
 		// A composite workflow: other workflows of this app, run in order by
@@ -800,6 +816,9 @@ func specV2ChainError(doc map[string]any) error {
 	var order []string
 	chains := map[string][]string{}
 	var problems []error
+	if err := specModulesError(doc); err != nil {
+		problems = append(problems, err)
+	}
 	for _, key := range []string{"workflows", "loops"} {
 		for _, w := range asList(doc[key]) {
 			wm := asMap(w)

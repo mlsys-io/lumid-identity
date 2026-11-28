@@ -113,6 +113,15 @@ docs/unified-auth.md       the shared `lumid_auth` hook-library spec for consume
 - **Internal bridge routes are gated by `X-Bridge-Secret`**, not by a user bearer
   (`internal_mint.go`, `/internal/me-intents`). The scheduler drains its intent queue this way
   because there is no shared filesystem between pods on UKS.
+  **Tenant cycles never hold that secret** (app code runs in the cycle, and the secret mints
+  tokens for ANY user). The daemon mints each tenant run an `lm_runref_*` refresh credential
+  (`run_credential.go`, `POST /internal/run-credential`, hashed, 6 h, bound to user + app +
+  intent); the cycle trades it at `POST /api/v1/run-credential/refresh` for its own 15-min
+  `lumid-ecosystem` bearer, and it authenticates ONLY the run-reporting `/internal` routes
+  (`runInternal` in router.go: usage/charge, me-intents/:id/result, app-signals/*, app-runs,
+  app-experiments), each of which must call `allowRunWrite`/`allowRunAppWrite` with the exact
+  sub/app it writes. It is not a PAT (prefix is not `lm_pat_`) and works nowhere else. A new
+  cycle-callable route goes in `runInternal` WITH that check, never by loosening `RequireBridge`.
 - **The per-user Claude pool 5h/7d quota is a HARD fixed window, not a rolling one** (v0.4.4).
   Two anchors per user in `claude_pool_windows`; token totals are still summed live from
   `usage_events` but bounded by the anchor, and an anchor only rolls forward once its window has

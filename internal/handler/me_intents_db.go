@@ -295,6 +295,13 @@ func InternalMeIntentResult(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid result body")
 		return
 	}
+	// A run credential may report only the Run-now intent it was minted for,
+	// and only for its own user (the user predicate is added to the UPDATE).
+	cred := runCredentialOf(c)
+	if cred != nil && (cred.IntentID == "" || cred.IntentID != id) {
+		fail(c, http.StatusForbidden, 1403, "run credential is bound to another intent")
+		return
+	}
 	rb, _ := json.Marshal(result)
 	status := "failed"
 	if ok, _ := installResultOK(rb); ok {
@@ -302,7 +309,11 @@ func InternalMeIntentResult(c *gin.Context) {
 	}
 	var rowsAffected int64
 	err := retryTxConflict("[me-intents] intent result "+id, func() error {
-		res := common.DB.Model(&models.MeAppIntent{}).Where("id = ?", id).
+		q := common.DB.Model(&models.MeAppIntent{}).Where("id = ?", id)
+		if cred != nil {
+			q = q.Where("user_sub = ?", cred.UserID)
+		}
+		res := q.
 			Updates(map[string]any{"status": status, "result": string(rb), "completed_at": time.Now()})
 		rowsAffected = res.RowsAffected
 		return res.Error

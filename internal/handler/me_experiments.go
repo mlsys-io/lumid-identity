@@ -1562,6 +1562,9 @@ func InternalAppExperimentRecord(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "user_sub, app, experiment_id required")
 		return
 	}
+	if !allowRunAppWrite(c, b.UserSub, b.App) {
+		return
+	}
 	sj := "{}"
 	n := 0
 	if b.State != nil {

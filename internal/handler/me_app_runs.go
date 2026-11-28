@@ -68,6 +68,13 @@ func InternalAppRunRecord(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "user_sub, app, loop, run_ts required")
 		return
 	}
+	if !allowRunAppWrite(c, b.UserSub, b.App) {
+		return
+	}
+	// A run credential is the cycle — i.e. app code — speaking. A compute job
+	// address on a run row AUTHORIZES the user to that job (callerOwnsComputeJob),
+	// so app code must not be able to adopt a job another user already owns.
+	runCaller := runCredentialOf(c) != nil
 	src := b.Source
 	if src == "" {
 		src = "self_report"
@@ -108,6 +115,9 @@ func InternalAppRunRecord(c *gin.Context) {
 				continue
 			}
 			if !computeSiteRe.MatchString(e.Site) || !computeJobRe.MatchString(e.JobID) {
+				continue
+			}
+			if runCaller && computeJobOwnedByOther(b.UserSub, e.Site, e.JobID) {
 				continue
 			}
 			// Re-bound the worker map here rather than trusting the producer's

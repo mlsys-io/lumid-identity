@@ -34,8 +34,13 @@ import (
 const sandboxDefaultQueueS = 900
 
 // sandboxDefaultImages: tag=ref pairs; MEASURE_MLSYS_SANDBOX_IMAGES replaces them.
+// sandbox-v0.2.1 (2026-11-28) measures several workloads per GPU session and
+// has the Qwen3 0.6B/1.7B weights baked in; v0.1.0 stays accepted for installs
+// that still pin it.
 const sandboxDefaultImages = "sandbox-v0.1.0=ghcr.io/mlsys-io/hello-mlsys-agent-sandbox@sha256:" +
-	"e9eaf0de8bf7d2c1f77618137c4f5a679906dbd681e47c8f7b822dee58236400"
+	"e9eaf0de8bf7d2c1f77618137c4f5a679906dbd681e47c8f7b822dee58236400," +
+	"sandbox-v0.2.1=ghcr.io/mlsys-io/hello-mlsys-agent-sandbox@sha256:" +
+	"96ee81521a5c776ef1911abac43aae13baf4e42577d0f108b2f49fab7e63a434"
 
 func sandboxImages() map[string]string {
 	raw := strings.TrimSpace(os.Getenv("MEASURE_MLSYS_SANDBOX_IMAGES"))

@@ -896,6 +896,7 @@ func tenantInstalledAppNames(userSub string) []string {
 	}
 	seen := map[string]bool{}
 	var names []string
+	installedAt := map[string]time.Time{} // newest completed install per app (rows are newest first)
 	for i := range rows {
 		var payload map[string]any
 		if rows[i].Payload != "" {
@@ -904,6 +905,7 @@ func tenantInstalledAppNames(userSub string) []string {
 		if n := installAppName(payload); n != "" && !seen[n] {
 			seen[n] = true
 			names = append(names, n)
+			installedAt[n] = rows[i].CreatedAt
 		}
 	}
 	// Intent history is not the whole truth: an install that predates the
@@ -926,7 +928,60 @@ func tenantInstalledAppNames(userSub string) []string {
 			}
 		}
 	}
-	return names
+	return dropUninstalled(userSub, names, installedAt)
+}
+
+// dropUninstalled removes apps the user has since uninstalled. Neither source
+// above ever forgot an app: a done `install` intent and a run record both
+// outlive an uninstall, so an uninstalled app's workflows stayed on the
+// Workflows page indefinitely (admin's two e2e copies, 2026-11-28, 19 rows a
+// quarter of an hour after the uninstall). An app is gone when its newest done
+// `uninstall` is newer than both its newest install and its newest run; a
+// reinstall, or a run after the uninstall, brings it back.
+func dropUninstalled(userSub string, names []string, installedAt map[string]time.Time) []string {
+	if len(names) == 0 || common.DB == nil {
+		return names
+	}
+	var un []models.MeAppIntent
+	if err := common.DB.
+		Where("user_sub = ? AND action = ? AND status = ?", userSub, "uninstall", "done").
+		Order("created_at desc").Limit(200).Find(&un).Error; err != nil || len(un) == 0 {
+		return names
+	}
+	uninstalledAt := map[string]time.Time{}
+	for i := range un {
+		var payload map[string]any
+		if un[i].Payload != "" {
+			_ = json.Unmarshal([]byte(un[i].Payload), &payload)
+		}
+		app, _ := payload["app"].(string)
+		app = strings.TrimSpace(app)
+		if app != "" {
+			if _, ok := uninstalledAt[app]; !ok {
+				uninstalledAt[app] = un[i].CreatedAt
+			}
+		}
+	}
+	kept := names[:0:0]
+	for _, n := range names {
+		at, gone := uninstalledAt[n]
+		if gone && at.After(installedAt[n]) && at.After(lastRunAt(userSub, n)) {
+			continue
+		}
+		kept = append(kept, n)
+	}
+	return kept
+}
+
+// lastRunAt is the newest recorded run of one app for one user (zero if none).
+func lastRunAt(userSub, app string) time.Time {
+	var ts int64
+	if err := common.DB.Model(&models.MeAppRun{}).
+		Where("user_sub = ? AND app = ?", userSub, app).
+		Select("COALESCE(MAX(run_ts), 0)").Scan(&ts).Error; err != nil || ts <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(ts, 0)
 }
 
 // visualWorkflows hits the n8n REST API and maps the result to

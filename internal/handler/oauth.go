@@ -334,6 +334,8 @@ func OAuthUserinfoHandler(c *gin.Context) {
 		"email_verified":     u.EmailVerified,
 		"name":               u.Name,
 		"preferred_username": u.Email,
+		"username":           u.Username, // unified login name (nil until chosen) — sandbox-control uses it
+		"uid":                u.PosixUID,
 		"picture":            u.AvatarURL,
 		"role":               u.Role,
 		"groups":             []string{u.Role},

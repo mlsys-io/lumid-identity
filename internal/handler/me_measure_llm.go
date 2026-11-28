@@ -291,7 +291,12 @@ func llmMeasureSubmit(row *models.MeasureResult, plan measurePlan, sub, app stri
 	// Its cost is ALREADY counted through this measure row (usageSpent), so the
 	// usage_events side of /me/usage MUST exclude run_id LIKE 'measure:%' —
 	// keep it that way; do not "fix" the apparent double count from either side.
-	tok, _, _, err := common.IssueBridgeJWTWithClaims(u.ID, u.Email, u.Role, "lumid-ecosystem", nil, llmBearerTTL,
+	// Scope claude:proxy is what claude-proxy's gate requires of any bearer. The
+	// proxy prepends the Claude Code system line the pooled accounts need
+	// (LUMID_CLAUDE_INJECT_CC_SYSTEM=1, all users), equally for every caller, and
+	// holds injected calls to CLAUDE_MAX_SCRIPT_RPM per user — which the running
+	// cap above keeps well under.
+	tok, _, _, err := common.IssueBridgeJWTWithClaims(u.ID, u.Email, u.Role, "lumid-ecosystem", []string{"claude:proxy"}, llmBearerTTL,
 		common.RunClaims{App: app, RunID: "measure:" + row.Key, MeasureModel: model})
 	if err != nil {
 		return fmt.Errorf("mint: %w", err)

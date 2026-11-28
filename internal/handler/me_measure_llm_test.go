@@ -225,7 +225,7 @@ func TestPooledLLMEndToEnd(t *testing.T) {
 	// The bearer the pool saw names the model and the app, for the requester.
 	cl, err := common.VerifyJWT(strings.TrimPrefix(pool.auth[0], "Bearer "))
 	if err != nil || cl.MeasureModel != "claude-sonnet-4-6" || cl.App != "mbb-consultant" ||
-		cl.Subject != subOf(t, owner) || !strings.HasPrefix(cl.RunID, "measure:") {
+		cl.Subject != subOf(t, owner) || !strings.HasPrefix(cl.RunID, "measure:") || cl.Scopes != "claude:proxy" {
 		t.Fatalf("pool bearer claims = %+v err=%v", cl, err)
 	}
 

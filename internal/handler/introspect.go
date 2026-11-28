@@ -77,9 +77,12 @@ func introCacheSweep() {
 // auth on lum.id.
 type IntrospectResponse struct {
 	Active   bool   `json:"active"`
-	Sub      string `json:"sub,omitempty"` // canonical user id
-	Username string `json:"username,omitempty"`
-	Email    string `json:"email,omitempty"`
+	Sub      string `json:"sub,omitempty"`      // canonical user id
+	Username string `json:"username,omitempty"` // DISPLAY name (historic key) — never a login name
+	// PosixUsername is the unified login name chosen on the Sandboxes page (nil until chosen). Consumers that need
+	// a login (sandbox-control, host agents) read THIS, never `username`.
+	PosixUsername *string `json:"posix_username,omitempty"`
+	Email         string  `json:"email,omitempty"`
 	// Role from the user record — "user" or "admin". Downstream
 	// services (Runmesh admin UI via lum.id, etc.) read this to
 	// decide whether a lum.id-issued token is allowed to hit admin
@@ -453,13 +456,14 @@ func introspectNative(token string) *IntrospectResponse {
 	// authenticate. This lookup already happened for email/name; it now also
 	// decides.
 	var u struct {
-		ID     string
-		Email  string
-		Name   string
-		Role   string
-		Status string
+		ID       string
+		Email    string
+		Name     string
+		Role     string
+		Status   string
+		Username *string
 	}
-	common.DB.Raw(`SELECT id, email, name, role, status FROM users WHERE id = ? LIMIT 1`,
+	common.DB.Raw(`SELECT id, email, name, role, status, username FROM users WHERE id = ? LIMIT 1`,
 		row.UserID).Scan(&u)
 	if reason, ok := ownerRejection(u.ID == "", u.Status); ok {
 		// Orphans should be rare -- AdminUsersDelete removes a user's tokens in
@@ -483,16 +487,17 @@ func introspectNative(token string) *IntrospectResponse {
 		exp = row.ExpiresAt.Unix()
 	}
 	return &IntrospectResponse{
-		Active:    true,
-		Sub:       row.UserID,
-		Email:     u.Email,
-		Username:  u.Name,
-		Role:      u.Role,
-		Scopes:    scopes,
-		Scope:     strings.Join(scopes, " "),
-		TokenType: "pat",
-		Exp:       exp,
-		Source:    "native",
+		Active:        true,
+		Sub:           row.UserID,
+		Email:         u.Email,
+		Username:      u.Name,
+		PosixUsername: u.Username,
+		Role:          u.Role,
+		Scopes:        scopes,
+		Scope:         strings.Join(scopes, " "),
+		TokenType:     "pat",
+		Exp:           exp,
+		Source:        "native",
 	}
 }
 
@@ -529,22 +534,25 @@ func introspectJWT(token, audience string) *IntrospectResponse {
 		return &IntrospectResponse{Active: false, Reason: "session revoked"}
 	}
 	scopes := common.ExpandFlowmeshScopes(strings.Fields(claims.Scopes))
+	var posix struct{ Username *string }
+	common.DB.Raw(`SELECT username FROM users WHERE id = ? LIMIT 1`, claims.Subject).Scan(&posix)
 	return &IntrospectResponse{
-		Active:       true,
-		Sub:          claims.Subject,
-		Email:        claims.Email,
-		Role:         claims.Role,
-		Scopes:       scopes,
-		Scope:        strings.Join(scopes, " "),
-		TokenType:    "jwt",
-		Exp:          claims.ExpiresAt.Unix(),
-		Iat:          claims.IssuedAt.Unix(),
-		Source:       "native",
-		Aud:          []string(claims.Audience),
-		App:          claims.App,
-		Loop:         claims.Loop,
-		RunID:        claims.RunID,
-		MeasureModel: claims.MeasureModel,
+		Active:        true,
+		PosixUsername: posix.Username,
+		Sub:           claims.Subject,
+		Email:         claims.Email,
+		Role:          claims.Role,
+		Scopes:        scopes,
+		Scope:         strings.Join(scopes, " "),
+		TokenType:     "jwt",
+		Exp:           claims.ExpiresAt.Unix(),
+		Iat:           claims.IssuedAt.Unix(),
+		Source:        "native",
+		Aud:           []string(claims.Audience),
+		App:           claims.App,
+		Loop:          claims.Loop,
+		RunID:         claims.RunID,
+		MeasureModel:  claims.MeasureModel,
 		unboundAud: func() string {
 			if unbound && len(claims.Audience) > 0 {
 				return claims.Audience[0]

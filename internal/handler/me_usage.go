@@ -23,12 +23,14 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -394,31 +396,54 @@ func (b computeBudget) since(now time.Time) time.Time {
 }
 
 type specBudgets struct {
-	App       computeBudget
-	Workflows map[string]computeBudget
+	App        computeBudget
+	Workflows  map[string]computeBudget
+	Unreadable []string // compute blocks that could not be read as a budget (logged)
 }
 
 // parseSpecBudgets reads `compute.budget` at app level and per workflow.
 func parseSpecBudgets(specYAML []byte) specBudgets {
+	// Each `compute` block is decoded ON ITS OWN. Decoding the whole spec into
+	// typed structs once failed outright on one workflow's legacy scalar
+	// (`compute: lumilake`, mbb-consultant 0.10.4): the app's $40 budget then
+	// read as empty and every budget check failed OPEN, silently (2026-11-28).
 	var doc struct {
-		Compute struct {
-			Budget computeBudget `yaml:"budget"`
-		} `yaml:"compute"`
+		Compute   yaml.Node `yaml:"compute"`
 		Workflows []struct {
-			ID      string `yaml:"id"`
-			Compute struct {
-				Budget computeBudget `yaml:"budget"`
-			} `yaml:"compute"`
+			ID      string    `yaml:"id"`
+			Compute yaml.Node `yaml:"compute"`
 		} `yaml:"workflows"`
 	}
 	out := specBudgets{Workflows: map[string]computeBudget{}}
-	if yaml.Unmarshal(specYAML, &doc) != nil {
+	if err := yaml.Unmarshal(specYAML, &doc); err != nil {
 		return out
 	}
-	out.App = doc.Compute.Budget
+	budgetOf := func(n yaml.Node) (computeBudget, bool) {
+		var c struct {
+			Budget computeBudget `yaml:"budget"`
+		}
+		if n.Kind != yaml.MappingNode {
+			return c.Budget, n.Kind == 0 // absent is fine; a scalar or list is not a budget
+		}
+		if err := n.Decode(&c); err != nil {
+			return computeBudget{}, false
+		}
+		return c.Budget, true
+	}
+	if b, ok := budgetOf(doc.Compute); ok {
+		out.App = b
+	} else {
+		out.Unreadable = append(out.Unreadable, "compute")
+	}
 	for _, w := range doc.Workflows {
-		if w.ID != "" && !w.Compute.Budget.empty() {
-			out.Workflows[w.ID] = w.Compute.Budget
+		b, ok := budgetOf(w.Compute)
+		if !ok {
+			// A workflow's legacy `compute: lumilake` carries no budget; it must
+			// not hide the app's.
+			continue
+		}
+		if w.ID != "" && !b.empty() {
+			out.Workflows[w.ID] = b
 		}
 	}
 	return out
@@ -430,14 +455,22 @@ func appBudgets(sub, app string) specBudgets {
 	if app == "" {
 		return specBudgets{}
 	}
+	var out specBudgets
 	if row := storedAppSpec(sub, app); row != nil {
-		return parseSpecBudgets([]byte(row.SpecYAML))
+		out = parseSpecBudgets([]byte(row.SpecYAML))
+	} else if b, ok := fetchRepoSpecYAML(sub, app); ok {
+		out = parseSpecBudgets(b)
 	}
-	if b, ok := fetchRepoSpecYAML(sub, app); ok {
-		return parseSpecBudgets(b)
+	if len(out.Unreadable) > 0 {
+		if _, seen := budgetUnreadableLogged.LoadOrStore(sub+"|"+app, true); !seen {
+			log.Printf("[usage] %s/%s: compute block(s) %v are not a mapping; no budget read from them", sub, app, out.Unreadable)
+		}
 	}
-	return specBudgets{}
+	return out
 }
+
+// budgetUnreadableLogged: one log line per (user, app) per process.
+var budgetUnreadableLogged sync.Map
 
 // spent sums what the caller's charged measurements for app (and workflow,
 // when given) used since t, plus, at app level (workflow ""), the app's

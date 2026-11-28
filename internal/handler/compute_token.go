@@ -178,7 +178,7 @@ func specDeclaresComputeEngine(spec []byte) bool {
 		return false
 	}
 	for _, l := range append(append([]rawComputeLoop{}, doc.Loops...), doc.Workflows...) {
-		if computeEngineTypes[strings.TrimSpace(l.Engine.Type)] || computeEngineTypes[strings.TrimSpace(l.Compute)] {
+		if computeEngineTypes[strings.TrimSpace(l.Engine.Type)] || l.Compute.declares() {
 			return true
 		}
 	}
@@ -196,8 +196,40 @@ type rawComputeLoop struct {
 	// engine.type — never minted it a credential and every scheduled GPU-lane
 	// cycle failed. Declared, not sniffed, for the same reason the gate asks
 	// the spec at all.
-	Compute string `yaml:"compute"`
+	Compute computeDecl `yaml:"compute"`
 }
+
+// computeDecl reads a loop's `compute:` in either spelling: the legacy scalar
+// (`compute: lumilake`) or the simple scheme's placement mapping
+// (`compute: {site: home, gpu: 16Gi}`). Until 2026-11-28 the field was a plain
+// string, so a mapping failed the WHOLE spec's unmarshal and quant-research
+// (kol_score_fleet) got no compute credential: its tenant cycles had been
+// submitting Lumilake jobs with the operator's PAT instead. A mapping counts
+// only when it places work (site or gpu); `{budget: ...}` / `{parallel: N}`
+// alone is accounting, not a compute submission.
+type computeDecl struct {
+	scalar    string
+	placement bool
+}
+
+func (c *computeDecl) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		c.scalar = strings.TrimSpace(n.Value)
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			switch strings.TrimSpace(n.Content[i].Value) {
+			case "site", "gpu":
+				if strings.TrimSpace(n.Content[i+1].Value) != "" || n.Content[i+1].Kind != yaml.ScalarNode {
+					c.placement = true
+				}
+			}
+		}
+	}
+	return nil // any other shape declares nothing; never fail the spec over it
+}
+
+func (c computeDecl) declares() bool { return computeEngineTypes[c.scalar] || c.placement }
 
 // mintComputePAT returns a fresh scoped PAT for userSub, or "" if minting
 // fails. Best-effort BY DESIGN: a miss must not block the run.

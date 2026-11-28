@@ -130,6 +130,8 @@ func measureRouter() *gin.Engine {
 	r.POST("/api/v1/me/measure", MeMeasure)
 	r.GET("/api/v1/me/measure/instruments", MeMeasureInstruments)
 	r.GET("/api/v1/me/measure/:key", MeMeasureGet)
+	r.GET("/api/v1/me/usage", MeUsage)
+	r.GET("/api/v1/me/usage/rates", MeUsageRates)
 	return r
 }
 

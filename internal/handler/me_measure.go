@@ -93,7 +93,8 @@ type measureInstrument struct {
 	shareOnSettle bool
 	// precheck runs before anything is claimed or submitted; a non-empty
 	// answer is returned as status not_measured with that reason.
-	precheck func(c *gin.Context, sub string, plan measurePlan) string
+	// wait=true means "not now, ask again" (a slot frees up), not a refusal.
+	precheck func(c *gin.Context, sub string, plan measurePlan, app, workflow string) (why string, wait bool)
 	// versions lists the accepted versions, for the listing.
 	versions func() []string
 }
@@ -411,8 +412,20 @@ func MeMeasureInstruments(c *gin.Context) {
 	out := []gin.H{}
 	for _, n := range names {
 		in := measureRegistry[n]
-		out = append(out, gin.H{"name": in.Name, "about": in.About, "share": in.Share,
-			"inputs": in.Inputs, "versions": in.versions()})
+		item := gin.H{"name": in.Name, "about": in.About, "share": in.Share,
+			"inputs": in.Inputs, "versions": in.versions()}
+		// What a fresh run of it usually uses (median of recent metered runs).
+		if g, cp, t, k := measureEstimate(in.Name); k > 0 {
+			est := gin.H{"from_runs": k, "cost_usd": currentRates().cost(g, cp, t)}
+			if g > 0 {
+				est["gpu_s"], est["gpu_type"] = round3(g), t
+			}
+			if cp > 0 {
+				est["cpu_s"] = round3(cp)
+			}
+			item["estimate"] = est
+		}
+		out = append(out, item)
 	}
 	ok(c, "", gin.H{"instruments": out})
 }
@@ -492,12 +505,28 @@ func MeMeasure(c *gin.Context) {
 	}
 
 	if inst.precheck != nil {
-		if why := inst.precheck(c, sub, plan); why != "" {
+		if why, wait := inst.precheck(c, sub, plan, labels.App, labels.Workflow); why != "" {
+			if wait {
+				// Not a refusal: a slot frees up soon. Nothing is claimed or
+				// recorded; asking again after retry_after proceeds.
+				c.Header("Retry-After", "30")
+				c.JSON(http.StatusAccepted, gin.H{"ret_code": 0, "message": "", "data": gin.H{"key": key,
+					"instrument": inst.Name, "status": "waiting", "reason": why, "retry_after": 30}})
+				return
+			}
 			measureRecord(labels, "not_measured")
 			c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "", "data": gin.H{"key": key,
 				"instrument": inst.Name, "status": "not_measured", "reason": why}})
 			return
 		}
+	}
+	// The app's compute budget (spec compute.budget): refuse a fresh run that
+	// would go over it. Reused and joined answers above cost nothing.
+	if why := budgetRefusal(sub, labels.App, labels.Workflow, inst.Name, labels.App); why != "" {
+		measureRecord(labels, "not_measured")
+		c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "", "data": gin.H{"key": key,
+			"instrument": inst.Name, "status": "not_measured", "reason": why, "budget": true}})
+		return
 	}
 	// Where it runs. NUS is admin+ by policy (2026-11-26); an unnamed site is
 	// the one with the most idle workers among those this caller may use.
@@ -564,7 +593,10 @@ func MeMeasure(c *gin.Context) {
 		measureRespond(c, http.StatusBadGateway, &row, sub, false)
 		return
 	}
-	measureRecord(labels, outcome)
+	if id := measureRecord(labels, outcome); id != 0 {
+		row.ChargedRequestID = id
+		common.DB.Model(&row).Update("charged_request_id", id)
+	}
 	measureRespond(c, http.StatusAccepted, &row, sub, false)
 }
 
@@ -624,9 +656,12 @@ func measureQuota(sub string, fresh bool) (string, int) {
 	return "", 0
 }
 
-func measureRecord(r models.MeasureRequest, outcome string) {
+func measureRecord(r models.MeasureRequest, outcome string) uint {
 	r.Outcome = outcome
-	common.DB.Create(&r)
+	if common.DB.Create(&r).Error != nil {
+		return 0
+	}
+	return r.ID
 }
 
 // measureSubmit runs the plan's graph on the fleet AS THE CALLER and records
@@ -701,6 +736,8 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 		return
 	}
 	ids := fleetWorkflowTaskIDs(rec)
+	// What it used, failed or not: a GPU that ran and failed was still spent.
+	measureRecordUsage(c, row, base, id.Native, bearer)
 	if status != "succeeded" {
 		msg := ""
 		if e := rec["error"]; e != nil {
@@ -788,6 +825,9 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 		}
 	case "failed":
 		out["error"] = row.Error
+		if u := usageBlock(row, reused); u != nil {
+			out["usage"] = u
+		}
 	case "not_measured":
 		out["reason"] = row.Error
 	case "succeeded":
@@ -809,6 +849,9 @@ func measureRespond(c *gin.Context, code int, row *models.MeasureResult, sub str
 		}
 		if row.SettledAt != nil {
 			result["measured_at"] = row.SettledAt.UTC().Format(time.RFC3339)
+		}
+		if u := usageBlock(row, reused); u != nil {
+			result["usage"] = u
 		}
 		out["result"] = result
 	}

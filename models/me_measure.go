@@ -32,6 +32,17 @@ type MeasureResult struct {
 	// answer an identical request (a synthetic replay, an unpinned window).
 	NoReuse bool `gorm:"column:no_reuse;not null;default:false" json:"no_reuse"`
 
+	// What it used (usage metering, 2026-11-28), from the fleet's per-task
+	// usage records at settle. nil = not metered (never 0 for "unknown").
+	GPUS    *float64 `gorm:"column:gpu_s" json:"gpu_s,omitempty"`
+	CPUS    *float64 `gorm:"column:cpu_s" json:"cpu_s,omitempty"`
+	GPUType string   `gorm:"column:gpu_type;size:64" json:"gpu_type,omitempty"`
+	// measured | estimated
+	Metered string `gorm:"column:metered;size:16" json:"metered,omitempty"`
+	// ChargedRequestID: the MeasureRequest that actually ran it (and pays for
+	// it). Every other request it answered was reused and costs nothing.
+	ChargedRequestID uint `gorm:"column:charged_request_id;not null;default:0" json:"-"`
+
 	Hits      int        `gorm:"column:hits;not null;default:0" json:"hits"`
 	ClaimedAt time.Time  `gorm:"column:claimed_at" json:"claimed_at"`
 	SettledAt *time.Time `gorm:"column:settled_at" json:"settled_at,omitempty"`

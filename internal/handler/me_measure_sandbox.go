@@ -130,33 +130,42 @@ func mlsysSandboxPlan(in map[string]any) (measurePlan, error) {
 }
 
 // sandboxPrecheck: quota, then a free matching GPU. "" = go ahead.
-func sandboxPrecheck(c *gin.Context, sub string, plan measurePlan) string {
+//
+// wait=true is "not now": the caller's GPU slots are full (the smaller of the
+// app's declared `compute.budget.parallel` and MEASURE_GPU_RUNNING_CAP), or
+// every matching GPU is busy. Asking again later proceeds. The daily count
+// and "no such GPU" are refusals.
+func sandboxPrecheck(c *gin.Context, sub string, plan measurePlan, app, workflow string) (string, bool) {
 	var running int64
 	common.DB.Model(&models.MeasureResult{}).Where("executor_sub = ? AND instrument = ? AND status IN ?",
 		sub, "mlsys-sandbox", []string{"queued", "running"}).Count(&running)
-	if cap := measureLimit("MEASURE_GPU_RUNNING_CAP", 1); running >= int64(cap) {
-		return fmt.Sprintf("you already have %d GPU measurement(s) running (limit %d); it has to finish first", running, cap)
+	limit := measureLimit("MEASURE_GPU_RUNNING_CAP", 2)
+	if p := appParallel(sub, app, workflow); p > 0 && p < limit {
+		limit = p
+	}
+	if running >= int64(limit) {
+		return fmt.Sprintf("waiting for a GPU slot (%d of %d in use)", running, limit), true
 	}
 	var today int64
 	common.DB.Model(&models.MeasureResult{}).Where("executor_sub = ? AND instrument = ? AND created_at > ?",
 		sub, "mlsys-sandbox", time.Now().Add(-24*time.Hour)).Count(&today)
 	if budget := measureLimit("MEASURE_GPU_DAILY_BUDGET", 12); today >= int64(budget) {
-		return fmt.Sprintf("your daily budget of %d GPU measurements is used; it resets over the next 24 hours", budget)
+		return fmt.Sprintf("your daily budget of %d GPU measurements is used; it resets over the next 24 hours", budget), false
 	}
 	req, _ := plan.material["gpu"].(map[string]any)
 	total, idle, names, readable := sandboxGPUs(c, sub, plan.site, req)
 	if !readable {
-		return "" // the queue timeout decides
+		return "", false // the queue timeout decides
 	}
 	words := sandboxGPUWords(req)
 	if total == 0 {
-		return fmt.Sprintf("no GPU worker at %s has %s", plan.site, words)
+		return fmt.Sprintf("no GPU worker at %s has %s", plan.site, words), false
 	}
 	if idle == 0 {
-		return fmt.Sprintf("all %d GPU worker(s) at %s with %s (%s) are busy; try again later",
-			total, plan.site, words, strings.Join(names, ", "))
+		return fmt.Sprintf("waiting for a free %s at %s (all %d busy: %s)",
+			words, plan.site, total, strings.Join(names, ", ")), true
 	}
-	return ""
+	return "", false
 }
 
 func sandboxGPUWords(req map[string]any) string {

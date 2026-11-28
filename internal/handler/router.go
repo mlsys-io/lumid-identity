@@ -274,6 +274,9 @@ func Register(r *gin.Engine) {
 			me.POST("/measure", MeMeasure)
 			me.GET("/measure/instruments", MeMeasureInstruments)
 			me.GET("/measure/:key", MeMeasureGet)
+			// Usage metering + compute budgets (me_usage.go).
+			me.GET("/usage", MeUsage)
+			me.GET("/usage/rates", MeUsageRates)
 			me.POST("/apps/:app/proposals", MeAppProposalsStage) // stage a candidate-experiment slate
 			me.PUT("/apps/:app/ui", MeUpdateAppUI)               // write/create surface markdown
 			me.PUT("/apps/:app/ui/:surface", MeUpdateAppUISurface)

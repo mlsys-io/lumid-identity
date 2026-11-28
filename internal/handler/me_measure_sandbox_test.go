@@ -125,8 +125,13 @@ func (f *fakeSandboxFM) handler(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && p == "/fm/home/api/v1/workflows/wfl-sbx001":
 		_, _ = w.Write([]byte(`{"workflow_id":"wfl-sbx001","status":"` + f.state + `","task_ids":["tsk-m","tsk-s"]}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/tasks":
-		_, _ = w.Write([]byte(`[{"task_id":"tsk-m","task":{"metadata":{"name":"g:measure"}}},` +
-			`{"task_id":"tsk-s","task":{"metadata":{"name":"g:score"}}}]`))
+		// Usage records as FlowMesh keeps them: a GPU stage (one device) that
+		// ran 412 s on a 5080, and a CPU scoring stage of 8 s.
+		_, _ = w.Write([]byte(`[{"task_id":"tsk-m","task":{"metadata":{"name":"g:measure"},` +
+			`"spec":{"resources":{"hardware":{"gpu":{"count":1,"type":"RTX 5080"}}}}},` +
+			`"usages":[{"runtime_sec":412,"hardware":{"gpu":{"devices":[{"name":"NVIDIA GeForce RTX 5080"}]}}}]},` +
+			`{"task_id":"tsk-s","task":{"metadata":{"name":"g:score"}},` +
+			`"usages":[{"runtime_sec":8,"hardware":{"gpu":{"devices":[]}}}]}]`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-m":
 		_, _ = w.Write([]byte(`{"task_type":"python","value":{"ok":true,"records":{"development":{}}}}`))
 	case r.Method == "GET" && p == "/fm/home/api/v1/results/tsk-s":
@@ -164,8 +169,10 @@ func sandboxBody(extra string) string {
 func TestSandboxSaysNotMeasuredBeforeTakingAGPU(t *testing.T) {
 	f, owner := sandboxTestSetup(t)
 	f.workers = strings.Replace(idle5080, `"IDLE"`, `"BUSY"`, 1)
+	// Every matching GPU busy is "wait", not a refusal: nothing is claimed.
 	code, got := measureCall(t, "POST", "/api/v1/me/measure", sandboxBody(""), owner)
-	if code != 200 || got["status"] != "not_measured" || !strings.Contains(got["reason"].(string), "busy") || f.posts != 0 {
+	if code != http.StatusAccepted || got["status"] != "waiting" || !strings.Contains(got["reason"].(string), "busy") ||
+		f.posts != 0 {
 		t.Fatalf("busy = %d %v (submits %d)", code, got, f.posts)
 	}
 	f.workers = strings.Replace(idle5080, "RTX 5080", "RTX PRO 4000", 1)
@@ -181,10 +188,15 @@ func TestSandboxRunsReturnsEveryStageAndIsNeverReused(t *testing.T) {
 	if code != http.StatusAccepted || first["status"] != "running" || f.posts != 1 {
 		t.Fatalf("submit = %d %v", code, first)
 	}
-	// One GPU measurement at a time per user.
-	if code, again := measureCall(t, "POST", "/api/v1/me/measure", sandboxBody(""), owner); code != 200 ||
-		again["status"] != "not_measured" || !strings.Contains(again["reason"].(string), "already have") {
+	// Two GPU measurements at a time per user (MEASURE_GPU_RUNNING_CAP=2);
+	// the third waits for a slot instead of failing.
+	if code, again := measureCall(t, "POST", "/api/v1/me/measure", sandboxBody(""), owner); code != http.StatusAccepted ||
+		again["status"] != "running" || f.posts != 2 {
 		t.Fatalf("second while running = %d %v", code, again)
+	}
+	if code, third := measureCall(t, "POST", "/api/v1/me/measure", sandboxBody(""), owner); code != http.StatusAccepted ||
+		third["status"] != "waiting" || !strings.Contains(third["reason"].(string), "2 of 2 in use") || f.posts != 2 {
+		t.Fatalf("third while two run = %d %v", code, third)
 	}
 	f.state = "DONE"
 	code, got := measureCall(t, "GET", "/api/v1/me/measure/"+first["key"].(string), "", owner)
@@ -195,6 +207,42 @@ func TestSandboxRunsReturnsEveryStageAndIsNeverReused(t *testing.T) {
 	}
 	if res["share"] != "this run only" || res["measured_on"] != "mlsys-sandbox st" {
 		t.Errorf("share/measured_on = %v / %v", res["share"], res["measured_on"])
+	}
+	// What it used, from the fleet's own usage records.
+	use, _ := res["usage"].(map[string]any)
+	if use["gpu_s"] != 412.0 || use["cpu_s"] != 8.0 || use["gpu_type"] != "RTX 5080" || use["metered"] != "measured" {
+		t.Fatalf("usage = %v", use)
+	}
+	if c, _ := use["cost_usd"].(float64); c <= 0 {
+		t.Fatalf("cost_usd = %v", use["cost_usd"])
+	}
+	// /me/usage charges it to this user's app, once.
+	code, u := measureCall(t, "GET", "/api/v1/me/usage?app=mlsys-research", "", owner)
+	used, _ := u["used"].(map[string]any)
+	if code != 200 || used["gpu_s"] != 412.0 || used["runs"] != 1.0 || used["running"] != 1.0 {
+		t.Fatalf("/me/usage = %d %v", code, u)
+	}
+}
+
+func TestSandboxBudgetRefusesARunThatWouldGoOver(t *testing.T) {
+	f, owner := sandboxTestSetup(t)
+	sub := subOf(t, owner)
+	spec := "name: mlsys-research\ncompute:\n  budget: {gpu_minutes: 10, per: total, parallel: 1}\n"
+	common.DB.Save(&models.MeAppSpec{UserSub: sub, App: "mlsys-research", SpecYAML: spec, UpdatedAt: time.Now()})
+	t.Cleanup(func() { common.DB.Where("user_sub = ?", sub).Delete(&models.MeAppSpec{}) })
+	// parallel: 1 from the spec wins over the platform cap of 2.
+	_, first := measureCall(t, "POST", "/api/v1/me/measure", sandboxBody(""), owner)
+	if code, again := measureCall(t, "POST", "/api/v1/me/measure", sandboxBody(""), owner); code != http.StatusAccepted ||
+		again["status"] != "waiting" || !strings.Contains(again["reason"].(string), "1 of 1") {
+		t.Fatalf("parallel 1 = %d %v", code, again)
+	}
+	f.state = "DONE"
+	measureCall(t, "GET", "/api/v1/me/measure/"+first["key"].(string), "", owner) // settles: 412 s used
+	// The next run is estimated at 412 s; 412 + 412 > 600 s, so it is refused, in words.
+	code, got := measureCall(t, "POST", "/api/v1/me/measure", sandboxBody(""), owner)
+	if code != 200 || got["status"] != "not_measured" || got["budget"] != true ||
+		!strings.Contains(got["reason"].(string), "GPU-min left") {
+		t.Fatalf("over budget = %d %v", code, got)
 	}
 }
 

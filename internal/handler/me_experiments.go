@@ -407,6 +407,13 @@ func loadAppExperimentsFor(userSub, app, appDir string) []gin.H {
 			// client needs them to offer real keys at define-time instead of
 			// asking for a name typed from memory.
 			"metric_keys_seen", "n_zero_reason",
+			// A gated chain's progress (LumidOS #190, scheduler v0.4.137):
+			// per version the furthest step reached and whether it passed, and
+			// whether the best number passed its own step. Without them the
+			// UI said "X leads — not confirmed yet" over a version every gate
+			// had stopped (2026-11-28, quant fundamentals_search). And the
+			// versions tied with the best, which the tie words read.
+			"gate_progress", "best_failed_gate", "best_stopped_at", "not_separable_from",
 			// When the state was computed — see storedExpState.
 			"state_updated_at",
 		} {

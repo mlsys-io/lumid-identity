@@ -398,11 +398,120 @@ func TestRemoveLoopFromAppDirect(t *testing.T) {
 	}
 }
 
-// The UKS path (identity mounts no tenant volume): a simple-scheme delete is
-// queued as an app_file_write of the rewritten spec, base_sha = the bytes it
-// was planned on; a plain legacy delete stays a remove_loop intent; a refusal
-// queues nothing.
+// wfDeleteSeedInstall seeds an install the scheduler echoed (install done)
+// whose current spec is an applied app_file_write, so readAppSpecBytes finds it.
+func wfDeleteSeedInstall(t *testing.T, user, app, spec string) {
+	t.Helper()
+	now := time.Now()
+	past := now.Add(-time.Hour)
+	content, _ := json.Marshal(spec)
+	rows := []models.MeAppIntent{
+		{ID: "wfdel-install-" + app, Action: "install", UserSub: user, Status: "done",
+			Payload: `{"slug":"owner/` + app + `"}`, CreatedAt: past, CompletedAt: &past},
+		{ID: "wfdel-spec-" + app, Action: appFileWriteAction, UserSub: user, Status: "done",
+			Payload:   `{"app":"` + app + `","path":".xpcloud.yaml","op":"write","content":` + string(content) + `,"base_sha":""}`,
+			CreatedAt: now, CompletedAt: &now},
+	}
+	if err := common.DB.Create(&rows).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+}
+
+// With a scheduler that runs the simple-scheme remove_loop
+// (LUMID_SCHEDULER_REMOVES_WORKFLOWS=1), every delete is a remove_loop
+// intent carrying force, so the scheduler archives the workflow's runs and
+// mirrors the manifest; identity's pre-checks still refuse at once, in words.
+func TestRemoveLoopFromAppViaRemoveLoop(t *testing.T) {
+	t.Setenv("LUMID_SCHEDULER_REMOVES_WORKFLOWS", "1")
+	db := setupIntentDB(t)
+	if err := db.AutoMigrate(&models.MeAppSpec{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LUMID_OPERATOR_HOME", t.TempDir())
+	user := "u-wfdel-rl"
+	t.Cleanup(func() { common.DB.Where("user_sub = ?", user).Delete(&models.MeAppSpec{}) })
+	pending := func(action string) []models.MeAppIntent {
+		var rows []models.MeAppIntent
+		db.Where("user_sub = ? AND action = ? AND status = ?", user, action, "pending").
+			Order("created_at").Find(&rows)
+		return rows
+	}
+	payloadOf := func(row models.MeAppIntent) map[string]any {
+		var pl map[string]any
+		if err := json.Unmarshal([]byte(row.Payload), &pl); err != nil {
+			t.Fatalf("payload: %v", err)
+		}
+		return pl
+	}
+	wfDeleteSeedInstall(t, user, "simple", wfDeleteSpec)
+	wfDeleteSeedInstall(t, user, "legacy", "name: legacy\nloops:\n  - name: a\n  - name: b\n")
+
+	// Refusals answer synchronously, in identity's words, and queue nothing.
+	for _, c := range []struct {
+		wf    string
+		force bool
+		code  int
+		msg   string
+	}{
+		{"sandbox", false, 409, "Experiment 'sla_concurrency' runs on this workflow; archive or move it first"},
+		{"sla_tuned", true, 409, "Chain 'pipeline' runs this workflow as a stage"},
+		{"nope", false, 404, "workflow 'nope' not found in simple"},
+	} {
+		if r := removeLoopFromApp(user, "simple", c.wf, c.force); r.Status != c.code ||
+			r.IntentID != "" || !strings.Contains(r.Msg, c.msg) {
+			t.Errorf("%s: %+v", c.wf, r)
+		}
+	}
+	if n := len(pending(appFileWriteAction)) + len(pending("remove_loop")); n != 0 {
+		t.Fatalf("a refusal queued %d intents", n)
+	}
+
+	// Simple scheme: a remove_loop, never a spec write.
+	r := removeLoopFromApp(user, "simple", "pipeline", false)
+	if r.Status != 200 || r.IntentID == "" || r.SpecWrite || r.Remaining != 3 {
+		t.Fatalf("simple delete: %+v", r)
+	}
+	rl := pending("remove_loop")
+	if len(rl) != 1 || rl[0].ID != r.IntentID {
+		t.Fatalf("want one remove_loop intent, got %+v", rl)
+	}
+	if pl := payloadOf(rl[0]); !reflect.DeepEqual(pl, map[string]any{"app": "simple", "loop": "pipeline"}) {
+		t.Errorf("payload = %v (force only when asked)", pl)
+	}
+
+	// force rides along; the plan's details are reported as expected.
+	r = removeLoopFromApp(user, "simple", "sandbox", true)
+	if r.Status != 200 || r.IntentID == "" || r.SpecWrite {
+		t.Fatalf("forced delete: %+v", r)
+	}
+	if !reflect.DeepEqual(r.Plan.DroppedExperiments, []string{"sla_concurrency"}) {
+		t.Errorf("plan = %+v", r.Plan)
+	}
+	rl = pending("remove_loop")
+	if len(rl) != 2 || rl[1].ID != r.IntentID {
+		t.Fatalf("want a second remove_loop intent, got %+v", rl)
+	}
+	if pl := payloadOf(rl[1]); pl["loop"] != "sandbox" || pl["force"] != true {
+		t.Errorf("forced payload = %v", pl)
+	}
+
+	// Legacy: unchanged, a remove_loop.
+	r = removeLoopFromApp(user, "legacy", "a", false)
+	if r.Status != 200 || r.IntentID == "" || r.SpecWrite || r.Remaining != 1 {
+		t.Fatalf("legacy delete: %+v", r)
+	}
+	if n := len(pending(appFileWriteAction)); n != 0 {
+		t.Errorf("%d spec writes queued; deletes must all be remove_loop", n)
+	}
+}
+
+// The UKS path (identity mounts no tenant volume) against a scheduler older
+// than the simple-scheme remove_loop (LUMID_SCHEDULER_REMOVES_WORKFLOWS
+// unset): a simple-scheme delete is queued as an app_file_write of the
+// rewritten spec, base_sha = the bytes it was planned on; a plain legacy delete
+// stays a remove_loop intent; a refusal queues nothing.
 func TestRemoveLoopFromAppViaIntent(t *testing.T) {
+	t.Setenv("LUMID_SCHEDULER_REMOVES_WORKFLOWS", "")
 	db := setupIntentDB(t)
 	if err := db.AutoMigrate(&models.MeAppSpec{}); err != nil {
 		t.Fatal(err)

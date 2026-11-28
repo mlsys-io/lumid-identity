@@ -86,7 +86,7 @@ func toolDeleteLoop(userID string, args map[string]any) (map[string]any, bool) {
 	}
 	if r.IntentID != "" {
 		out := map[string]any{"deleted": false, "app": app, "loop": loop, "remaining": nil}
-		if r.Plan != nil && !r.Plan.onlyRemovesLegacyLoop() {
+		if r.Plan != nil {
 			out["remaining"] = r.Remaining
 		}
 		r.addDetails(out)

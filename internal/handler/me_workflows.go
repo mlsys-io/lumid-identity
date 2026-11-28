@@ -66,13 +66,18 @@ func MeLoopDelete(c *gin.Context) {
 	if r.IntentID != "" {
 		data := gin.H{
 			"app": app, "removed_loop": loop, "remaining": nil,
-			"note": "removal queued for the scheduler; it unregisters this workflow once applied",
+			"note": "removal queued for the scheduler; it unregisters this workflow and archives " +
+				"its past runs once applied",
 		}
-		if r.Plan != nil && !r.Plan.onlyRemovesLegacyLoop() {
-			// A spec write checked against the bytes identity read (base_sha),
-			// so the count is exact if it applies at all.
+		if r.Plan != nil {
+			// What identity planned on the bytes it read. remove_loop re-checks
+			// against the spec on disk; its intent result is the final word.
 			data["remaining"] = r.Remaining
 			r.addDetails(data)
+		}
+		if r.SpecWrite {
+			// A spec write checked against the bytes identity read (base_sha),
+			// so the count is exact if it applies at all.
 			data["note"] = "removal queued for the scheduler (a spec write, refused if the spec " +
 				"changed since); it unregisters this workflow once applied. Its past runs stay where they are."
 		}
@@ -105,6 +110,7 @@ type loopRemoval struct {
 	Code      int
 	Msg       string
 	Plan      *workflowDeletePlan // nil when identity could not read the spec
+	SpecWrite bool                // queued as an app_file_write of Plan.Out, not remove_loop
 }
 
 func loopRemovalFail(status, code int, msg string) loopRemoval {
@@ -135,14 +141,20 @@ func (r loopRemoval) addDetails(data gin.H) {
 // delete_loop chatbox tool.
 //
 // identity mounts no tenant volume; the scheduler can see the disk. For an
-// install only it can see, the removal is queued: a plain legacy `loops:`
-// removal goes as a `remove_loop` intent (the scheduler archives the history);
-// anything else — a simple-scheme workflow, or an edit that re-parents or drops
-// other entries, which remove_loop knows nothing about — goes as an
-// app_file_write of the rewritten spec, checked by base_sha against the bytes
-// identity planned on, so it is refused rather than applied to a spec that has
-// changed since. The checks identity CAN make from the spec it reads (unknown
-// workflow, last one, chain, experiments) answer immediately.
+// install only it can see, the checks identity CAN make from the spec it reads
+// (unknown workflow, last one, chain, experiments) answer immediately, in
+// words, and the removal is queued as a `remove_loop` intent carrying `force`.
+// The scheduler re-runs the same plan on the spec on disk (LumidOS
+// me_intent_picker.py _plan_workflow_delete, a mirror of planWorkflowDelete),
+// edits it, mirrors the manifest and archives the cycle history.
+//
+// Version skew: a scheduler older than that LumidOS change only reads
+// `loops:`, and refuses a simple-scheme remove_loop ("declares no loop") or
+// ignores `force`. So unless LUMID_SCHEDULER_REMOVES_WORKFLOWS says the
+// scheduler is new (schedulerRemovesWorkflows), a delete that is not a plain
+// legacy `loops:` removal still goes as an app_file_write of the rewritten
+// spec, checked by base_sha against the bytes identity planned on — which
+// leaves the workflow's past runs where they are.
 func removeLoopFromApp(userID, app, loop string, force bool) loopRemoval {
 	if !slugRe.MatchString(app) || loop == "" {
 		return loopRemovalFail(http.StatusBadRequest, 1400, "invalid app or loop")
@@ -169,7 +181,7 @@ func removeLoopFromApp(userID, app, loop string, force bool) loopRemoval {
 			}
 			// Unparseable here: leave the verdict to the scheduler.
 		}
-		if plan != nil && !plan.onlyRemovesLegacyLoop() {
+		if plan != nil && !plan.onlyRemovesLegacyLoop() && !schedulerRemovesWorkflows() {
 			id, _, err := queueAppFileWrite(userID, app, appFileSpecRel, "write", string(plan.Out), contentSHA(b))
 			if err != nil {
 				if errors.Is(err, errAppFileTooBig) {
@@ -177,19 +189,37 @@ func removeLoopFromApp(userID, app, loop string, force bool) loopRemoval {
 				}
 				return loopRemovalFail(http.StatusInternalServerError, 1500, "queue intent: "+err.Error())
 			}
-			return loopRemoval{Remaining: plan.Remaining, IntentID: id, Status: http.StatusOK, Plan: plan}
+			return loopRemoval{Remaining: plan.Remaining, IntentID: id, Status: http.StatusOK, Plan: plan, SpecWrite: true}
 		}
-		id, err := insertIntent("remove_loop", userID, map[string]any{"app": app, "loop": loop})
+		payload := map[string]any{"app": app, "loop": loop}
+		if force {
+			payload["force"] = true
+		}
+		id, err := insertIntent("remove_loop", userID, payload)
 		if err != nil {
 			return loopRemovalFail(http.StatusInternalServerError, 1500, "queue intent: "+err.Error())
 		}
-		return loopRemoval{IntentID: id, Status: http.StatusOK, Plan: plan}
+		r := loopRemoval{IntentID: id, Status: http.StatusOK, Plan: plan}
+		if plan != nil {
+			r.Remaining = plan.Remaining
+		}
+		return r
 	}
 	if !direct {
 		return loopRemovalFail(http.StatusNotFound, 1404,
 			"app not found in your account (operator-shared apps can't be edited)")
 	}
 	return removeLoopInDir(userID, app, appDir, loop, force)
+}
+
+// schedulerRemovesWorkflows reports whether the scheduler draining intents
+// runs a remove_loop that deletes simple-scheme workflows, honours `force` and
+// keeps the graph consistent (LumidOS fix/remove-loop-simple-scheme). Set
+// LUMID_SCHEDULER_REMOVES_WORKFLOWS=1 once EVERY scheduler that drains
+// me_app_intents runs it; until then deletes other than a plain legacy
+// `loops:` removal stay spec writes, which work against any scheduler.
+func schedulerRemovesWorkflows() bool {
+	return truthyParam(os.Getenv("LUMID_SCHEDULER_REMOVES_WORKFLOWS"))
 }
 
 // removeLoopInDir is the direct (tenant tree mounted) half of

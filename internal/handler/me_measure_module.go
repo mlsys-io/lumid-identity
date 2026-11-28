@@ -398,6 +398,13 @@ func resolveModule(sub, name, callerApp string) (m appModule, app string, isModu
 	if owner == sub {
 		owner = ""
 	}
+	if owner != "" {
+		// A public module the index holds is answered without a fetch. A miss
+		// is not a refusal: the live read below decides, in the same words.
+		if m, hit := publicModules.lookup(owner, app, id); hit {
+			return m, app, true, nil
+		}
+	}
 	spec, found := moduleSpecSource(sub, owner, app)
 	if !found {
 		if owner == "" {
@@ -616,9 +623,26 @@ func moduleFailureWords(msg string) string {
 	return msg
 }
 
-// moduleListing: the modules visible to app, for GET /me/measure/instruments.
-// Only the caller's own install's modules are listed; a public module of
-// another app is called by its owner-qualified name.
+// moduleListItem is one module as the instruments listing shows it.
+func moduleListItem(name string, m appModule) gin.H {
+	share := "tenant"
+	if m.Share == "everyone" {
+		share = "global"
+	}
+	item := gin.H{"name": name, "kind": "module", "title": m.Title, "about": m.About,
+		"inputs": m.Inputs, "share": share, "public": m.Public, "image": m.Image, "digest": m.digest(),
+		"run": m.Run, "versions": []string{m.digest()},
+		"limits": gin.H{"cpu": m.Limits.CPU, "memory": m.Limits.memory(), "timeout_s": m.Limits.TimeoutS,
+			"gpu": false, "network": "none", "max_output": "1 MiB", "max_inputs": "256 KiB"}}
+	if len(m.Notes) > 0 {
+		item["notes"] = m.Notes
+	}
+	return item
+}
+
+// moduleListing: the modules of the caller's own install of app, for GET
+// /me/measure/instruments?app=. nil when the caller has no such app. Public
+// modules of other apps come from publicModuleListing (?public=1).
 func moduleListing(sub, app string) []gin.H {
 	if app == "" || !moduleAppRe.MatchString(app) {
 		return nil
@@ -630,19 +654,7 @@ func moduleListing(sub, app string) []gin.H {
 	mods, bad := specModules(spec)
 	out := []gin.H{}
 	for _, m := range mods {
-		share := "tenant"
-		if m.Share == "everyone" {
-			share = "global"
-		}
-		item := gin.H{"name": app + "." + m.ID, "kind": "module", "title": m.Title, "about": m.About,
-			"inputs": m.Inputs, "share": share, "public": m.Public, "image": m.Image, "run": m.Run,
-			"versions": []string{m.digest()},
-			"limits": gin.H{"cpu": m.Limits.CPU, "memory": m.Limits.memory(), "timeout_s": m.Limits.TimeoutS,
-				"gpu": false, "network": "none", "max_output": "1 MiB", "max_inputs": "256 KiB"}}
-		if len(m.Notes) > 0 {
-			item["notes"] = m.Notes
-		}
-		out = append(out, item)
+		out = append(out, moduleListItem(app+"."+m.ID, m))
 	}
 	keys := make([]string, 0, len(bad))
 	for k := range bad {

@@ -46,8 +46,9 @@ type workflowDeletePlan struct {
 	ReparentedWorkflows []string
 }
 
-// onlyRemovesLegacyLoop: the edit is exactly "drop one loops[] entry" — the
-// scheduler's remove_loop intent does that (and archives the history).
+// onlyRemovesLegacyLoop: the edit is exactly "drop one loops[] entry" — what
+// even a scheduler older than the simple-scheme remove_loop does (and it
+// archives the history). See schedulerRemovesWorkflows.
 func (p *workflowDeletePlan) onlyRemovesLegacyLoop() bool {
 	return len(p.Lists) == 1 && p.Lists[0] == "loops" &&
 		len(p.DroppedExperiments) == 0 && len(p.ReparentedNodes) == 0 && len(p.ReparentedWorkflows) == 0

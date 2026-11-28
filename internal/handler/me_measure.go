@@ -174,7 +174,9 @@ func measureScope(inst measureInstrument, sub string) string {
 
 // mlsysDefaultImages: tag=ref pairs. MEASURE_MLSYS_IMAGES replaces the list
 // (comma separated) when a new image is pinned, without a release.
-const mlsysDefaultImages = "v0.1.3=ghcr.io/mlsys-io/hello-mlsys-agent@sha256:3c9e1fbb0b4c7efbaed8cae4411342e2bb6d12ebd0b3308766ea224679f599e2"
+const mlsysDefaultImages = "v0.1.3=ghcr.io/mlsys-io/hello-mlsys-agent@sha256:3c9e1fbb0b4c7efbaed8cae4411342e2bb6d12ebd0b3308766ea224679f599e2," +
+	// v0.1.4: evaluate accepts resamples (fresh prompt mixes from the development trace).
+	"v0.1.4=ghcr.io/mlsys-io/hello-mlsys-agent@sha256:c0fe3c0f9b379553be127a40cb1b44bf7fdb1519fd7558f6905d7173481f0e14"
 
 var mlsysJobs = map[string]bool{"evaluate": true}
 
@@ -411,7 +413,11 @@ type measureBody struct {
 }
 
 // MeMeasureInstruments lists what can be measured; with ?app=<app>, also
-// the compute modules that app may call (its own install's modules).
+// the compute modules of the caller's own install of that app; with
+// ?public=1, also every public module of other owners' published apps
+// (owner-qualified, `public: true`, from the TTL-cached index — see
+// me_measure_public_modules.go), minus the apps the caller's own installs
+// shadow.
 func MeMeasureInstruments(c *gin.Context) {
 	sub, authed := currentUserID(c)
 	if !authed {
@@ -441,7 +447,23 @@ func MeMeasureInstruments(c *gin.Context) {
 		}
 		out = append(out, item)
 	}
-	for _, item := range moduleListing(sub, strings.TrimSpace(c.Query("app"))) {
+	app := strings.TrimSpace(c.Query("app"))
+	own := moduleListing(sub, app)
+	mods := own
+	resp := gin.H{}
+	if truthyParam(c.Query("public")) {
+		shadow := map[string]bool{}
+		for _, name := range moduleInstalledApps(sub) {
+			shadow[name] = true
+		}
+		if own != nil {
+			shadow[app] = true
+		}
+		pub, status := publicModuleListing(sub, shadow)
+		mods = append(append([]gin.H{}, own...), pub...)
+		resp["public_modules"] = status
+	}
+	for _, item := range mods {
 		if name, _ := item["name"].(string); name != "" && item["refused"] == nil {
 			if g, cp, t, k := measureEstimate(name); k > 0 {
 				item["estimate"] = gin.H{"from_runs": k, "cost_usd": currentRates().cost(g, cp, t), "cpu_s": round3(cp)}
@@ -449,7 +471,8 @@ func MeMeasureInstruments(c *gin.Context) {
 		}
 		out = append(out, item)
 	}
-	ok(c, "", gin.H{"instruments": out})
+	resp["instruments"] = out
+	ok(c, "", resp)
 }
 
 // MeMeasure: POST /me/measure.

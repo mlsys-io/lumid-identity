@@ -239,6 +239,12 @@ func engineForWorkflow(w, appCompute map[string]any, exps []string) map[string]a
 	if g := feedbackGates(w); len(g) > 0 {
 		eng["gates"] = g
 	}
+	// The one step allowed to read held-out data (feedback[].holdout: true);
+	// the runner gives it LUMID_HOLDOUT=1. A marking feedbackHoldoutError
+	// refuses is never translated. Twin of LumidOS spec_v2.feedback_holdout.
+	if h := feedbackHoldout(w); len(h) > 0 && feedbackHoldoutError(w) == nil {
+		eng["holdout_step"] = h[0]
+	}
 	if len(exps) == 1 {
 		eng["experiment"] = exps[0]
 	} else if len(exps) > 1 {
@@ -668,6 +674,66 @@ func feedbackGates(w map[string]any) map[string]any {
 	return out
 }
 
+// feedbackHoldout lists the feedback steps marked `holdout: true`, in order.
+func feedbackHoldout(w map[string]any) []string {
+	self := strings.TrimSpace(specStr(w["id"]))
+	if self == "" {
+		self = strings.TrimSpace(specStr(w["name"]))
+	}
+	var out []string
+	for _, f := range asList(w["feedback"]) {
+		fm := asMap(f)
+		if b, ok := fm["holdout"].(bool); fm == nil || !ok || !b {
+			continue
+		}
+		step := strings.TrimSpace(specStr(fm["step"]))
+		if step == "" {
+			step = self
+		}
+		if step != "" && !slicesContains(out, step) {
+			out = append(out, step)
+		}
+	}
+	return out
+}
+
+func slicesContains(xs []string, x string) bool {
+	for _, y := range xs {
+		if y == x {
+			return true
+		}
+	}
+	return false
+}
+
+// feedbackHoldoutError: only one step may read held-out data, and it must be
+// the last feedback step (the steps after it would choose with it). Twin of
+// LumidOS spec_v2.holdout_error.
+func feedbackHoldoutError(w map[string]any) error {
+	marked := feedbackHoldout(w)
+	if len(marked) == 0 {
+		return nil
+	}
+	id := strings.TrimSpace(specStr(w["id"]))
+	if id == "" {
+		id = strings.TrimSpace(specStr(w["name"]))
+	}
+	if len(marked) > 1 {
+		return fmt.Errorf("workflow %s: only one step may read held-out data (%s)", id, strings.Join(marked, ", "))
+	}
+	fb := asList(w["feedback"])
+	last := id
+	if len(fb) > 0 {
+		if st := strings.TrimSpace(specStr(asMap(fb[len(fb)-1])["step"])); st != "" {
+			last = st
+		}
+	}
+	if marked[0] != last {
+		return fmt.Errorf("workflow %s: %s reads held-out data but is not the last step; the steps after it would choose with it", id, marked[0])
+	}
+	return nil
+}
+
 // feedbackGateError names the first `feedback[].gate` that is present but not
 // a non-empty string, or nil.
 func feedbackGateError(id string, w map[string]any) error {
@@ -746,6 +812,9 @@ func specV2ChainError(doc map[string]any) error {
 			}
 			ids[id] = true
 			if err := feedbackGateError(id, wm); err != nil {
+				problems = append(problems, err)
+			}
+			if err := feedbackHoldoutError(wm); err != nil {
 				problems = append(problems, err)
 			}
 			stages, ok := chainStages(wm)

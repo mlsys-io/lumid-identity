@@ -160,9 +160,7 @@ func sandboxPrecheck(c *gin.Context, sub string, plan measurePlan, app, workflow
 	}
 	// A measurement that never got a GPU (not_measured: no worker picked it up,
 	// refused) used nothing, so it does not count against the day.
-	var today int64
-	common.DB.Model(&models.MeasureResult{}).Where("executor_sub = ? AND instrument = ? AND created_at > ? AND status <> ?",
-		sub, "mlsys-sandbox", time.Now().Add(-24*time.Hour), "not_measured").Count(&today)
+	today := gpuMeasurementsToday(sub)
 	if budget := gpuDailyBudget(sub); today >= int64(budget) {
 		return fmt.Sprintf("your daily budget of %d GPU measurements is used; it resets over the next 24 hours", budget), false
 	}
@@ -319,4 +317,13 @@ func gpuDailyBudget(sub string) int {
 		}
 	}
 	return def
+}
+
+// gpuMeasurementsToday: the user's GPU measurements in the rolling 24 h the daily
+// budget counts (never-ran ones excluded). Shared by the precheck and /me/usage.
+func gpuMeasurementsToday(sub string) int64 {
+	var today int64
+	common.DB.Model(&models.MeasureResult{}).Where("executor_sub = ? AND instrument = ? AND created_at > ? AND status <> ?",
+		sub, "mlsys-sandbox", time.Now().Add(-24*time.Hour), "not_measured").Count(&today)
+	return today
 }

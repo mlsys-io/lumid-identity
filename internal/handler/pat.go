@@ -534,6 +534,12 @@ func callerHasLumidWrite(c *gin.Context) bool {
 // currentUserID resolves the session cookie, Bearer JWT, or lm_pat_*
 // PAT to a user id. Returns (id, true) on success.
 func currentUserID(c *gin.Context) (string, bool) {
+	return currentUserIDFor(c, common.IdentityAudiences...)
+}
+
+// currentUserIDFor is currentUserID with an explicit audience set — only for routes that deliberately accept a
+// narrower bridge audience too (see common.SSHKeyReadAudiences).
+func currentUserIDFor(c *gin.Context, audiences ...string) (string, bool) {
 	tok := bearerToken(c)
 	if tok == "" {
 		return "", false
@@ -550,7 +556,7 @@ func currentUserID(c *gin.Context) (string, bool) {
 	// Identity audiences only (common.IdentityAudiences): a JWT minted for
 	// another service, or an OIDC id_token for a client, is not a lum.id
 	// credential.
-	if claims, err := common.VerifyIdentityJWT(tok); err == nil {
+	if claims, err := common.VerifyJWTFor(tok, audiences...); err == nil {
 		if common.IsSessionRevoked(c.Request.Context(), claims.ID) {
 			return "", false
 		}

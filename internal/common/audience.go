@@ -59,6 +59,13 @@ func VerifyJWTFor(tok string, accepted ...string) (*JWTClaims, error) {
 	return c, nil
 }
 
+// SSHKeyReadAudiences may READ the caller's own SSH public keys (GET /api/v1/user/ssh-keys): the identity
+// audiences plus "flowmesh". The sandbox page talks to sandbox-control with a 10-min flowmesh session-bearer and
+// sandbox-control reads the caller's keys with that same bearer, so since 2026-11-25 (audience binding) every
+// sandbox created from the page got NO keys and answered "Permission denied" (seen 2026-11-28). Public keys are
+// not secret and this is read-only and self-scoped; upload/delete stay identity-audience only.
+var SSHKeyReadAudiences = append(append([]string{}, IdentityAudiences...), "flowmesh")
+
 // VerifyIdentityJWT is VerifyJWTFor with IdentityAudiences — use it for every
 // check that authenticates a caller to lum.id's own API.
 func VerifyIdentityJWT(tok string) (*JWTClaims, error) {

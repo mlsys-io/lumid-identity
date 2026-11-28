@@ -18,6 +18,12 @@ type User struct {
 	Status        string `gorm:"type:varchar(16);default:'active'" json:"status"` // active | suspended | pending
 	// InvitationCodeUsed preserves LQA's existing invitation gating.
 	// Migrated from tbl_user.invitation_code; may drop in Phase 8.
+	// Username is the ONE login name this person has on every cluster (sandboxes, host logins at office,
+	// home and NUS), chosen by them on the Sandboxes page; PosixUID is the ONE numeric user id that goes with it,
+	// assigned here (>= 20000) the first time a username is set and never changed or reused. Both nullable:
+	// nil = not chosen yet. History of renames lives in UsernameChange so site agents can rename old -> new.
+	Username           *string   `gorm:"type:varchar(32);uniqueIndex" json:"username,omitempty"`
+	PosixUID           *int      `gorm:"uniqueIndex" json:"uid,omitempty"`
 	InvitationCodeUsed string    `gorm:"type:varchar(64)" json:"invitation_code_used,omitempty"`
 	CreatedAt          time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt          time.Time `gorm:"autoUpdateTime" json:"updated_at"`
@@ -38,3 +44,15 @@ type Identity struct {
 }
 
 func (Identity) TableName() string { return "identities" }
+
+// UsernameChange records every username a person has held (old -> new), oldest first. Site agents and
+// sandbox-control replay it to rename accounts, home folders and sandbox namespaces; the old name stays reserved
+// to its owner so nobody else can take it while links to it still exist.
+type UsernameChange struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	UserID    string    `gorm:"type:varchar(36);index;not null" json:"user_id"`
+	OldName   string    `gorm:"type:varchar(32);index" json:"old"`
+	NewName   string    `gorm:"type:varchar(32);index;not null" json:"new"`
+	By        string    `gorm:"type:varchar(36)" json:"by,omitempty"` // admin user id when an admin made the change
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"at"`
+}

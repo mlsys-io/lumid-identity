@@ -6,6 +6,7 @@ import "gorm.io/gorm"
 // startup. Order doesn't matter for GORM but we group by domain.
 var AllTables = []interface{}{
 	&User{},
+	&UsernameChange{},
 	&Identity{},
 	&Token{},
 	&AuditLog{},

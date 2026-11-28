@@ -148,6 +148,9 @@ func Register(r *gin.Engine) {
 		// User-uploaded SSH public keys. Needed for future git-over-SSH
 		// push and for commit-signature verification. Actual server
 		// component lives elsewhere; this just stores the material.
+		// Unified username + uid (username.go): chosen on the Sandboxes page, applied on every cluster.
+		v1.GET("/user/username", UsernameGetHandler)
+		v1.PUT("/user/username", UsernameSetHandler)
 		v1.GET("/user/ssh-keys", SSHKeysListHandler)
 		v1.POST("/user/ssh-keys", SSHKeysUploadHandler)
 		v1.DELETE("/user/ssh-keys/:id", SSHKeysDeleteHandler)
@@ -167,6 +170,9 @@ func Register(r *gin.Engine) {
 			// gate internal doc routes (e.g. lum.id/docs/plugin-image-cd) to
 			// admin/super_admin only — RequireAdmin admits both roles.
 			admin.GET("/check", AdminCheck)
+			// What sandbox-control and the per-machine host agents apply (username.go).
+			admin.GET("/usernames", AdminUsernamesListHandler)
+			admin.PUT("/users/:id/username", AdminUsernameSetHandler)
 
 			// Cohort research review — the reviewer's side of the progress
 			// protocol. Every /me/* path is scoped to the caller, which is right

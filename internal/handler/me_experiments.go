@@ -14,6 +14,7 @@ package handler
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -899,6 +900,23 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 	}
 	st := sharedExpState(decl, app, readExpStateFor(userSub, app, appDir, id))
 	rows, rowsTotal := readExpRowsCounted(appDir, id, expResultsTailCap)
+	// The disk read finds nothing for a scheduler-run tenant: the ledger is on
+	// the scheduler's volume, which identity does not mount. Measured: every
+	// on-prem research app served `results: []`, so the evidence grid
+	// (results[].dims.stage/passed/reason) was empty although the rows existed.
+	// Serve the tail the cycle bridged instead. The disk wins whenever it has
+	// rows; series and cases below derive from either source identically.
+	resultsSource := "results_ledger"
+	if len(rows) == 0 && userSub != "" && app != "" {
+		sub := userSub
+		if shared, _ := st["shared"].(bool); shared {
+			// The centrally measured state is the operator's; so are its rows.
+			sub = operatorStateSub
+		}
+		if tail := bridgedExpRows(sub, app, id, expResultsTailCap); len(tail) > 0 {
+			rows, rowsTotal, resultsSource = tail, bridgedRowsTotal(st, len(tail)), "bridge_tail"
+		}
+	}
 	metricName, _ := st["metric"].(string)
 	stateMetric := metricName
 	if spec := specMetricName(decl); spec != "" && spec != metricName {
@@ -1043,6 +1061,10 @@ func loadExperimentDetailFor(userSub, app, appDir, id string) (gin.H, bool) {
 		"results_total":     rowsTotal,
 		"results_truncated": rowsTotal > len(rows),
 		"results_cap":       expResultsTailCap,
+		// Where `results` came from: "results_ledger" = identity's own disk read;
+		// "bridge_tail" = the newest rows the scheduler's cycle reported (at most
+		// 200), for the installs whose ledger identity cannot read.
+		"results_source": resultsSource,
 		// Where `series` came from. `run_store` means the ledger was unreadable
 		// and the curve was rebuilt from me_app_runs (newest expRunSeriesCap
 		// points); `results`/`cases` stay empty then — they ARE the ledger.
@@ -1414,6 +1436,101 @@ type appExperimentBody struct {
 	App          string         `json:"app"`
 	ExperimentID string         `json:"experiment_id"`
 	State        map[string]any `json:"state"`
+	// Rows — the ledger's newest rows, oldest first (LumidOS sends the last 200,
+	// compacted, <= 1 MiB). A pointer so ABSENT (an older scheduler, or a tail
+	// read that failed) is told apart from EMPTY (no rows yet): absent leaves the
+	// stored tail alone, empty replaces it.
+	Rows *[]json.RawMessage `json:"rows"`
+}
+
+// expRowsTailMaxBytes bounds the stored rows tail (a MEDIUMTEXT column, 16 MiB).
+// The scheduler already sends <= 1 MiB; this is identity's own ceiling, so a
+// misbehaving reporter cannot grow the row without limit.
+const expRowsTailMaxBytes = 2 << 20
+
+// encodeRowsTail serializes rows as one JSON array of at most maxBytes,
+// dropping the OLDEST (leading) rows until it fits. Rows that are not JSON
+// objects are discarded. Always returns a valid array, "[]" when nothing fits.
+func encodeRowsTail(rows []json.RawMessage, maxBytes int) string {
+	kept := make([][]byte, 0, len(rows))
+	for _, r := range rows {
+		var buf bytes.Buffer
+		if json.Compact(&buf, r) != nil || buf.Len() == 0 || buf.Bytes()[0] != '{' {
+			continue
+		}
+		kept = append(kept, buf.Bytes())
+	}
+	// "[" + rows joined by "," + "]"
+	total := 2
+	for i, r := range kept {
+		total += len(r)
+		if i > 0 {
+			total++
+		}
+	}
+	drop := 0
+	for drop < len(kept) && total > maxBytes {
+		total -= len(kept[drop])
+		if len(kept)-drop > 1 {
+			total--
+		}
+		drop++
+	}
+	return "[" + string(bytes.Join(kept[drop:], []byte(","))) + "]"
+}
+
+// expRowsFromTail parses a stored tail into the SAME row type the disk read
+// produces (normalized, arm-less rows dropped), keeping at most the newest
+// capN. One malformed row costs only itself.
+func expRowsFromTail(tail string, capN int) []expRow {
+	if tail == "" {
+		return nil
+	}
+	var raws []json.RawMessage
+	if json.Unmarshal([]byte(tail), &raws) != nil {
+		return nil
+	}
+	if capN > 0 && len(raws) > capN {
+		raws = raws[len(raws)-capN:]
+	}
+	rows := make([]expRow, 0, len(raws))
+	for _, raw := range raws {
+		var r expRow
+		if json.Unmarshal(raw, &r) == nil {
+			r.normalize()
+			if r.VariantID != "" {
+				rows = append(rows, r)
+			}
+		}
+	}
+	return rows
+}
+
+// storedExpRowsTail is the bridged ledger tail for one experiment, or nil.
+func storedExpRowsTail(userSub, app, experimentID string, capN int) []expRow {
+	if common.DB == nil {
+		return nil
+	}
+	var row models.MeAppExperiment
+	if common.DB.Select("rows_tail").Where("user_sub = ? AND app = ? AND experiment_id = ?",
+		userSub, app, experimentID).First(&row).Error != nil {
+		return nil
+	}
+	return expRowsFromTail(row.RowsTail, capN)
+}
+
+// bridgedExpRows is the tail source loadExperimentDetailFor falls back to; a
+// var so the fallback rule can be tested without a database.
+var bridgedExpRows = storedExpRowsTail
+
+// bridgedRowsTotal is results_total for a served tail: the ledger size the
+// scheduler counted (state.n_rows_total) when it reported one, else the tail's
+// own length — never less than the rows actually served.
+func bridgedRowsTotal(st map[string]any, served int) int {
+	if v, ok := st["n_rows_total"].(float64); ok && int(v) > served {
+		return int(v)
+	}
+	return served
 }
 
 // InternalAppExperimentRecord — POST /api/v1/internal/app-experiments
@@ -1473,6 +1590,15 @@ func InternalAppExperimentRecord(c *gin.Context) {
 		UserSub: b.UserSub, App: b.App, ExperimentID: b.ExperimentID,
 		State: sj, NResults: n,
 	}
+	// Only a body that CARRIES rows touches the tail. Assign with a struct
+	// writes non-zero fields only, so RowsTail == "" (no `rows` key — every
+	// scheduler that predates this) leaves the stored tail as it was; an empty
+	// list is "[]", which is non-zero and does replace it.
+	data := gin.H{"app": b.App, "experiment_id": b.ExperimentID, "n_results": n}
+	if b.Rows != nil {
+		row.RowsTail = encodeRowsTail(*b.Rows, expRowsTailMaxBytes)
+		data["rows_stored"] = len(expRowsFromTail(row.RowsTail, 0))
+	}
 	res := common.DB.Where("user_sub = ? AND app = ? AND experiment_id = ?",
 		b.UserSub, b.App, b.ExperimentID).Assign(row).FirstOrCreate(&models.MeAppExperiment{})
 	if res.Error != nil {
@@ -1480,7 +1606,7 @@ func InternalAppExperimentRecord(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "recorded",
-		"data": gin.H{"app": b.App, "experiment_id": b.ExperimentID, "n_results": n}})
+		"data": data})
 }
 
 // storedExpState returns the self-reported state for one experiment, or nil.
@@ -1508,6 +1634,9 @@ func sharedExpState(d *expDecl, app string, st map[string]any) map[string]any {
 }
 
 func storedExpState(userSub, app, experimentID string) map[string]any {
+	if common.DB == nil {
+		return nil
+	}
 	var row models.MeAppExperiment
 	q := common.DB.Where("user_sub = ? AND app = ? AND experiment_id = ?",
 		userSub, app, experimentID).First(&row)

@@ -409,6 +409,61 @@ func appBundlePath(userID, role, rawPath string) string {
 	return ""
 }
 
+// ownAppBundlePath resolves "<app>/<rel>" against an app the CALLER has
+// installed, for any role, read-only: their own tenant install, else the
+// published bundle materialised for them (materialiseTenantApp resolves via the
+// caller's own install record). A non-admin's read_file was jailed to their
+// workspace, so the chat grounded on an app could not read that app's own notes
+// or spec — "read_file failed … the installed app is inaccessible to me", 15
+// minutes, no proposal (Quant Research researcher, 2026-11-28). The operator's
+// local copy (~/.xp/apps) is NOT consulted here: it can hold runtime state.
+// Runtime/secret segments (.lumid, .git, .env*) are refused.
+func ownAppBundlePath(userID, rawPath string) string {
+	clean := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+rawPath)), "/")
+	app, rel, _ := strings.Cut(clean, "/")
+	if app == "" || app == "." || strings.Contains(app, "..") || !slugRe.MatchString(app) {
+		return ""
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == ".lumid" || seg == ".git" || strings.HasPrefix(seg, ".env") {
+			return ""
+		}
+	}
+	dir := filepath.Join(tenantAppsDir(userID), app)
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		dir = ""
+		if common.DB != nil { // the install record lives there
+			dir = materialiseTenantApp(userID, app)
+		}
+	}
+	if dir == "" {
+		return ""
+	}
+	abs, err := jailPath(dir, rel)
+	if err != nil {
+		return ""
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return ""
+	}
+	return abs
+}
+
+// ownAppOverlay is the caller's own saved edit of "<app>/<rel>" (notes, a
+// workflow, the spec edited in Studio), which wins over the bundle copy.
+func ownAppOverlay(userID, rawPath string) ([]byte, bool) {
+	clean := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+rawPath)), "/")
+	app, rel, _ := strings.Cut(clean, "/")
+	if app == "" || rel == "" || !slugRe.MatchString(app) {
+		return nil, false
+	}
+	b, deleted, found := appFileOverlay(userID, app, rel)
+	if !found || deleted {
+		return nil, false
+	}
+	return b, true
+}
+
 // jailPath resolves rawPath relative to the given root and ensures it cannot
 // escape via symlinks or ".." traversal. Callers pick the root (readRoot for
 // reads, writeRoot for writes/exec) so a read-only role can't write where it
@@ -440,6 +495,18 @@ func toolReadFile(userID, role, rawPath string) (map[string]any, bool) {
 		if alt := appBundlePath(userID, role, rawPath); alt != "" {
 			if ai, aerr := os.Stat(alt); aerr == nil {
 				abs, info, err = alt, ai, nil
+			}
+		}
+		// Any role: an app the caller installed — their saved edit first,
+		// then the bundle.
+		if err != nil {
+			if b, ok := ownAppOverlay(userID, rawPath); ok {
+				return map[string]any{"content": string(b), "path": rawPath, "truncated": false, "size": len(b)}, true
+			}
+			if alt := ownAppBundlePath(userID, rawPath); alt != "" {
+				if ai, aerr := os.Stat(alt); aerr == nil {
+					abs, info, err = alt, ai, nil
+				}
 			}
 		}
 		if err != nil {
@@ -3206,6 +3273,7 @@ Search the tree with glob_files('**/*.go') / grep_files('pattern', path_glob='**
 			extra = `
 
 ## Your workspace
+YOUR INSTALLED APPS are readable by app name: read_file('<app>/') lists one, read_file('<app>/.xpcloud.yaml') is its spec, read_file('<app>/notes/<file>.md') its notes — your own saved edits included. Read them before proposing anything for an app.
 You have a private, isolated workspace. Find files with glob_files('**/*') and grep_files('pattern'); read them with read_file; create/modify them with write_file, edit_file, or multi_edit (these ask for your approval first). bash_exec runs commands in a network-free sandbox with your workspace mounted. Delegate parallel sub-tasks with spawn_agents. Everything is confined to your own space — you can't see or touch anyone else's.`
 		}
 		extra += renderTasksBlock(userID)

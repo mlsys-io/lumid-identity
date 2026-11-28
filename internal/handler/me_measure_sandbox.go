@@ -40,7 +40,10 @@ const sandboxDefaultQueueS = 900
 const sandboxDefaultImages = "sandbox-v0.1.0=ghcr.io/mlsys-io/hello-mlsys-agent-sandbox@sha256:" +
 	"e9eaf0de8bf7d2c1f77618137c4f5a679906dbd681e47c8f7b822dee58236400," +
 	"sandbox-v0.2.1=ghcr.io/mlsys-io/hello-mlsys-agent-sandbox@sha256:" +
-	"96ee81521a5c776ef1911abac43aae13baf4e42577d0f108b2f49fab7e63a434"
+	"96ee81521a5c776ef1911abac43aae13baf4e42577d0f108b2f49fab7e63a434," +
+	// sandbox-v0.2.2: measures resampled workloads, sent as exact trace text + sha256.
+	"sandbox-v0.2.2=ghcr.io/mlsys-io/hello-mlsys-agent-sandbox@sha256:" +
+	"30dc8313a95cfbf9672a2bf5fb720ab25736d14d7b881167b81666ffc77f5040"
 
 func sandboxImages() map[string]string {
 	raw := strings.TrimSpace(os.Getenv("MEASURE_MLSYS_SANDBOX_IMAGES"))

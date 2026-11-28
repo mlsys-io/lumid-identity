@@ -331,17 +331,15 @@ func TestPatchSpecUISurfacePage(t *testing.T) {
 }
 
 func TestSpecLoopsWithout(t *testing.T) {
-	var doc map[string]any
-	_ = yaml.Unmarshal([]byte("loops:\n  - name: a\n  - name: b\n"), &doc)
-	kept, status, _, _ := specLoopsWithout(doc, "app", "a")
-	if status != 200 || len(kept) != 1 {
-		t.Errorf("remove a: status=%d kept=%v", status, kept)
+	spec := []byte("loops:\n  - name: a\n  - name: b\n")
+	p, status, _, _ := planWorkflowDelete(spec, "app", "a", false)
+	if status != 200 || p.Remaining != 1 {
+		t.Errorf("remove a: status=%d plan=%+v", status, p)
 	}
-	if _, status, _, _ := specLoopsWithout(doc, "app", "zz"); status != 404 {
+	if _, status, _, _ := planWorkflowDelete(spec, "app", "zz", false); status != 404 {
 		t.Errorf("unknown loop: %d", status)
 	}
-	_ = yaml.Unmarshal([]byte("loops:\n  - name: only\n"), &doc)
-	if _, status, code, _ := specLoopsWithout(doc, "app", "only"); status != 409 || code != 1409 {
+	if _, status, code, _ := planWorkflowDelete([]byte("loops:\n  - name: only\n"), "app", "only", false); status != 409 || code != 1409 {
 		t.Errorf("last loop: %d/%d", status, code)
 	}
 }

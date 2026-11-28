@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -37,14 +38,18 @@ import (
 )
 
 // MeLoopDelete hard-removes a single workflow (loop) from one of the caller's
-// OWN apps — drops it from xpcloud.yaml::loops[] (and manifest.json::loops[]
-// if present) and deletes its cycle history. The lumid-scheduler unregisters
-// the apscheduler job on its next discovery pass. Synchronous (identity runs
-// as the operator uid and writes the tenant tree directly — no intent queue).
+// OWN apps — drops it from the spec's `workflows:` (simple scheme, by id) or
+// `loops:` (legacy, by name), and from manifest.json::loops[] if present, and
+// archives its cycle history. The lumid-scheduler unregisters the apscheduler
+// job on its next discovery pass.
 //
 // Guards: tenant apps only (operator-shared xpcloud.yaml lives in the operator
-// home and must not be edited per-user); refuses to remove the LAST loop (an
-// app with zero workflows is meaningless — delete the app instead).
+// home and must not be edited per-user); refuses to remove the LAST workflow
+// (an app with zero workflows is meaningless — delete the app instead); refuses
+// while a chain runs it as a stage, or while an experiment runs on it.
+//
+// `?force=1` (also true/yes) drops the experiments that run on the workflow
+// along with it. It never overrides the chain or last-workflow refusals.
 func MeLoopDelete(c *gin.Context) {
 	userID, ok := currentUserID(c)
 	if !ok {
@@ -53,89 +58,162 @@ func MeLoopDelete(c *gin.Context) {
 	}
 	app := c.Param("app")
 	loop := c.Param("loop")
-	remaining, intentID, status, code, msg := removeLoopFromApp(userID, app, loop)
-	if status != http.StatusOK {
-		fail(c, status, code, msg)
+	r := removeLoopFromApp(userID, app, loop, truthyParam(c.Query("force")))
+	if r.Status != http.StatusOK {
+		fail(c, r.Status, r.Code, r.Msg)
 		return
 	}
-	if intentID != "" {
-		// `remaining` is the scheduler's to report (the intent result carries
-		// it); identity only saw the spec it validated against.
-		respondQueued(c, intentID, gin.H{
+	if r.IntentID != "" {
+		data := gin.H{
 			"app": app, "removed_loop": loop, "remaining": nil,
 			"note": "removal queued for the scheduler; it unregisters this workflow once applied",
-		})
+		}
+		if r.Plan != nil && !r.Plan.onlyRemovesLegacyLoop() {
+			// A spec write checked against the bytes identity read (base_sha),
+			// so the count is exact if it applies at all.
+			data["remaining"] = r.Remaining
+			r.addDetails(data)
+			data["note"] = "removal queued for the scheduler (a spec write, refused if the spec " +
+				"changed since); it unregisters this workflow once applied. Its past runs stay where they are."
+		}
+		respondQueued(c, r.IntentID, data)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"ret_code": 0, "message": "ok",
-		"data": gin.H{
-			"app": app, "removed_loop": loop, "remaining": remaining,
-			"note": "scheduler unregisters this workflow within a few minutes",
-		},
-	})
+	data := gin.H{
+		"app": app, "removed_loop": loop, "remaining": r.Remaining,
+		"note": "scheduler unregisters this workflow within a few minutes",
+	}
+	r.addDetails(data)
+	c.JSON(http.StatusOK, gin.H{"ret_code": 0, "message": "ok", "data": data})
+}
+
+// truthyParam reads a boolean query/body flag: 1, true, yes (any case).
+func truthyParam(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+// loopRemoval is removeLoopFromApp's answer. Status==200 means success; a
+// non-empty IntentID means it was QUEUED, not done.
+type loopRemoval struct {
+	Remaining int
+	IntentID  string
+	Status    int
+	Code      int
+	Msg       string
+	Plan      *workflowDeletePlan // nil when identity could not read the spec
+}
+
+func loopRemovalFail(status, code int, msg string) loopRemoval {
+	return loopRemoval{Status: status, Code: code, Msg: msg}
+}
+
+// addDetails reports what the delete changed besides the workflow itself.
+func (r loopRemoval) addDetails(data gin.H) {
+	if r.Plan == nil {
+		return
+	}
+	if len(r.Plan.DroppedExperiments) > 0 {
+		data["dropped_experiments"] = r.Plan.DroppedExperiments
+	}
+	if len(r.Plan.ReparentedNodes) > 0 {
+		data["reparented_nodes"] = r.Plan.ReparentedNodes
+	}
+	if len(r.Plan.ReparentedWorkflows) > 0 {
+		data["reparented_workflows"] = r.Plan.ReparentedWorkflows
+	}
 }
 
 // removeLoopFromApp removes a loop/workflow from the caller's tenant app:
-// strips it from xpcloud.yaml::loops[] (and the manifest.json mirror) and
-// ARCHIVES its cycle history into .xp/.trash (never destroys it). Shared by
-// MeLoopDelete (HTTP) and the delete_loop chatbox tool. Returns
-// (remaining, intentID, httpStatus, retCode, message); status==200 means
-// success, and a non-empty intentID means it was QUEUED, not done.
+// strips it from the spec (planWorkflowDelete — a comment-preserving
+// yaml.Node edit that also re-parents its children and, with force, drops its
+// experiments), mirrors manifest.json::loops[], and ARCHIVES its cycle history
+// into .xp/.trash (never destroys it). Shared by MeLoopDelete (HTTP) and the
+// delete_loop chatbox tool.
 //
 // identity mounts no tenant volume; the scheduler can see the disk. For an
-// install only it can see, the removal is a `remove_loop` intent. The checks
-// identity CAN make from the spec it reads (unknown loop, last loop) still
-// answer immediately; the picker makes them again against the real file.
-func removeLoopFromApp(userID, app, loop string) (int, string, int, int, string) {
+// install only it can see, the removal is queued: a plain legacy `loops:`
+// removal goes as a `remove_loop` intent (the scheduler archives the history);
+// anything else — a simple-scheme workflow, or an edit that re-parents or drops
+// other entries, which remove_loop knows nothing about — goes as an
+// app_file_write of the rewritten spec, checked by base_sha against the bytes
+// identity planned on, so it is refused rather than applied to a spec that has
+// changed since. The checks identity CAN make from the spec it reads (unknown
+// workflow, last one, chain, experiments) answer immediately.
+func removeLoopFromApp(userID, app, loop string, force bool) loopRemoval {
 	if !slugRe.MatchString(app) || loop == "" {
-		return 0, "", http.StatusBadRequest, 1400, "invalid app or loop"
+		return loopRemovalFail(http.StatusBadRequest, 1400, "invalid app or loop")
 	}
 	appDir, direct, viaIntent, _ := ownerWriteTarget(userID, app)
 	if viaIntent {
 		if !safeSeg(loop) {
-			return 0, "", http.StatusBadRequest, 1400, "invalid loop"
+			return loopRemovalFail(http.StatusBadRequest, 1400, "invalid loop")
 		}
-		if b := readAppSpecBytes(userID, app, resolveAppDir(userID, app)); len(b) > 0 {
-			var doc map[string]any
-			if yaml.Unmarshal(b, &doc) == nil {
-				if _, status, code, msg := specLoopsWithout(doc, app, loop); status != http.StatusOK {
-					return 0, "", status, code, msg
-				}
+		// The tenant's own bytes first (applied write overlay, then the
+		// scheduler's echo of the install); the published bundle last.
+		b := readAppSpecBytes(userID, app, "")
+		if len(b) == 0 {
+			b = readAppSpecBytes(userID, app, resolveAppDir(userID, app))
+		}
+		var plan *workflowDeletePlan
+		if len(b) > 0 {
+			p, status, code, msg := planWorkflowDelete(b, app, loop, force)
+			switch {
+			case status == http.StatusOK:
+				plan = p
+			case status != http.StatusInternalServerError:
+				return loopRemovalFail(status, code, msg)
 			}
+			// Unparseable here: leave the verdict to the scheduler.
+		}
+		if plan != nil && !plan.onlyRemovesLegacyLoop() {
+			id, _, err := queueAppFileWrite(userID, app, appFileSpecRel, "write", string(plan.Out), contentSHA(b))
+			if err != nil {
+				if errors.Is(err, errAppFileTooBig) {
+					return loopRemovalFail(http.StatusRequestEntityTooLarge, 1413, err.Error())
+				}
+				return loopRemovalFail(http.StatusInternalServerError, 1500, "queue intent: "+err.Error())
+			}
+			return loopRemoval{Remaining: plan.Remaining, IntentID: id, Status: http.StatusOK, Plan: plan}
 		}
 		id, err := insertIntent("remove_loop", userID, map[string]any{"app": app, "loop": loop})
 		if err != nil {
-			return 0, "", http.StatusInternalServerError, 1500, "queue intent: " + err.Error()
+			return loopRemovalFail(http.StatusInternalServerError, 1500, "queue intent: "+err.Error())
 		}
-		return 0, id, http.StatusOK, 0, ""
+		return loopRemoval{IntentID: id, Status: http.StatusOK, Plan: plan}
 	}
 	if !direct {
-		return 0, "", http.StatusNotFound, 1404,
-			"app not found in your account (operator-shared apps can't be edited)"
+		return loopRemovalFail(http.StatusNotFound, 1404,
+			"app not found in your account (operator-shared apps can't be edited)")
 	}
+	return removeLoopInDir(userID, app, appDir, loop, force)
+}
+
+// removeLoopInDir is the direct (tenant tree mounted) half of
+// removeLoopFromApp: rewrite the spec where SpecWritePath says (the
+// .xpcloud.yaml dotfile), mirror manifest.json, archive the cycle history.
+func removeLoopInDir(userID, app, appDir, loop string, force bool) loopRemoval {
 	xpPath, _ := ResolveSpecPath(appDir)
 	b, err := os.ReadFile(xpPath)
 	if err != nil {
-		return 0, "", http.StatusNotFound, 1404,
-			"app not found in your account (operator-shared apps can't be edited)"
+		return loopRemovalFail(http.StatusNotFound, 1404,
+			"app not found in your account (operator-shared apps can't be edited)")
 	}
-	var doc map[string]any
-	if err := yaml.Unmarshal(b, &doc); err != nil {
-		return 0, "", http.StatusInternalServerError, 1500, "parse xpcloud.yaml: " + err.Error()
-	}
-	kept, status, code, msg := specLoopsWithout(doc, app, loop)
+	plan, status, code, msg := planWorkflowDelete(b, app, loop, force)
 	if status != http.StatusOK {
-		return 0, "", status, code, msg
-	}
-	doc["loops"] = kept
-	out, err := yaml.Marshal(doc)
-	if err != nil {
-		return 0, "", http.StatusInternalServerError, 1500, "marshal: " + err.Error()
+		return loopRemovalFail(status, code, msg)
 	}
 	specOut := SpecWritePath(appDir)
-	if err := os.WriteFile(specOut, out, 0o644); err != nil {
-		return 0, "", http.StatusInternalServerError, 1500, "write xpcloud.yaml: " + err.Error()
+	tmp := specOut + ".tmp"
+	if err := os.WriteFile(tmp, plan.Out, 0o644); err != nil {
+		return loopRemovalFail(http.StatusInternalServerError, 1500, "write xpcloud.yaml: "+err.Error())
+	}
+	if err := os.Rename(tmp, specOut); err != nil {
+		_ = os.Remove(tmp)
+		return loopRemovalFail(http.StatusInternalServerError, 1500, "write xpcloud.yaml: "+err.Error())
 	}
 	if xpPath != specOut {
 		_ = os.Remove(xpPath) // don't orphan a pre-existing legacy spec file
@@ -177,33 +255,7 @@ func removeLoopFromApp(userID, app, loop string) (int, string, int, int, string)
 			_ = os.RemoveAll(srcCycles) // fallback: still remove from the live tree
 		}
 	}
-	return len(kept), "", http.StatusOK, 0, ""
-}
-
-// specLoopsWithout returns the spec's loops[] minus `loop`, or the refusal:
-// 404 for an unknown loop, 409 for the last one (an app with zero
-// workflows is meaningless — delete the app instead).
-func specLoopsWithout(doc map[string]any, app, loop string) ([]any, int, int, string) {
-	rawLoops, _ := doc["loops"].([]any)
-	kept := make([]any, 0, len(rawLoops))
-	found := false
-	for _, l := range rawLoops {
-		lm, _ := l.(map[string]any)
-		name, _ := lm["name"].(string)
-		if name == loop {
-			found = true
-			continue
-		}
-		kept = append(kept, l)
-	}
-	if !found {
-		return nil, http.StatusNotFound, 1404, "workflow '" + loop + "' not found in " + app
-	}
-	if len(kept) == 0 {
-		return nil, http.StatusConflict, 1409,
-			"can't remove the last workflow — delete the app instead"
-	}
-	return kept, http.StatusOK, 0, ""
+	return loopRemoval{Remaining: plan.Remaining, Status: http.StatusOK, Plan: plan}
 }
 
 // readAppVersion reads an app's version from manifest.json (preferred) or

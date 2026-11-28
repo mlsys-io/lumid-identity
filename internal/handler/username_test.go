@@ -104,3 +104,17 @@ func TestSetUsernameLifecycle(t *testing.T) {
 		t.Fatalf("history rows for a = %d, want 2", n)
 	}
 }
+
+// The login name travels as posix_username; `username` stays the display name in every response that has it.
+func TestPosixUsernameNeverTheDisplayName(t *testing.T) {
+	login := "minhao"
+	u := models.User{ID: "x", Email: "x@y.z", Name: "Curious Learner", Username: &login}
+	h := userInfoFromModel(&u)
+	if h["username"] != "Curious Learner" || h["posix_username"] != &login {
+		t.Fatalf("userInfoFromModel = %v", h)
+	}
+	r := IntrospectResponse{Username: "Curious Learner", PosixUsername: &login}
+	if r.Username == *r.PosixUsername {
+		t.Fatal("display name leaked into posix_username")
+	}
+}

@@ -388,7 +388,9 @@ func userInfoFromModel(u *models.User) gin.H {
 	return gin.H{
 		"id":              u.ID,
 		"email":           u.Email,
-		"username":        u.Name,
+		"username":        u.Name, // DISPLAY name (historic key) — the login name is posix_username
+		"posix_username":  u.Username,
+		"posix_uid":       u.PosixUID,
 		"role":            u.Role,
 		"status":          u.Status,
 		"avatar":          u.AvatarURL,

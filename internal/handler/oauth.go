@@ -334,11 +334,14 @@ func OAuthUserinfoHandler(c *gin.Context) {
 		"email_verified":     u.EmailVerified,
 		"name":               u.Name,
 		"preferred_username": u.Email,
-		"username":           u.Username, // unified login name (nil until chosen) — sandbox-control uses it
-		"uid":                u.PosixUID,
-		"picture":            u.AvatarURL,
-		"role":               u.Role,
-		"groups":             []string{u.Role},
+		// The unified login name / numeric id (nil until chosen on the Sandboxes page). Deliberately NOT under
+		// "username": /api/v1/user and introspect already use "username" for the DISPLAY name, and sandbox-control
+		// renamed people after display names that happened to look like logins.
+		"posix_username": u.Username,
+		"posix_uid":      u.PosixUID,
+		"picture":        u.AvatarURL,
+		"role":           u.Role,
+		"groups":         []string{u.Role},
 	})
 }
 

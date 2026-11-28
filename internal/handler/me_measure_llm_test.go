@@ -247,3 +247,48 @@ func TestPooledLLMEndToEnd(t *testing.T) {
 }
 
 func jwtSegDecode(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
+
+// The generic budget check sees an LLM measurement coming: with a median own
+// cost on record and compute.budget.usd 0.01, a fresh call is refused in words.
+func TestPooledLLMBudgetRefusalUsesTheMedianCost(t *testing.T) {
+	_, owner, _ := fleetTestSetup(t)
+	sub := subOf(t, owner)
+	measureCleanup(t, sub)
+	if err := common.DB.AutoMigrate(&models.MeAppSpec{}); err != nil {
+		t.Fatal(err)
+	}
+	app := "llm-budget-test"
+	spec := "name: " + app + "\ncompute:\n  budget: {usd: 0.01, per: total}\n"
+	common.DB.Where("user_sub = ? AND app = ?", sub, app).Delete(&models.MeAppSpec{})
+	if err := common.DB.Create(&models.MeAppSpec{UserSub: sub, App: app, SpecYAML: spec,
+		UpdatedAt: time.Now()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { common.DB.Where("user_sub = ? AND app = ?", sub, app).Delete(&models.MeAppSpec{}) })
+
+	// One settled call that cost $0.006, charged to this user for this app.
+	cost, tin, tout := 0.006, 1000, 200
+	now := time.Now()
+	key := "k-" + strings.ReplaceAll(t.Name(), "/", "-")
+	row := models.MeasureResult{Key: key, Instrument: llmInstrument, Version: "claude-sonnet-4-6@v1",
+		ShareScope: "global", Status: "succeeded", Executor: "llm", ExecutorSub: sub, ExecutorRef: "llm:claude-sonnet-4-6",
+		ClaimedAt: now, SettledAt: &now, CostUSD: &cost, TokensIn: &tin, TokensOut: &tout}
+	if err := common.DB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	req := models.MeasureRequest{UserSub: sub, Key: key, App: app, Outcome: "submitted"}
+	common.DB.Create(&req)
+	common.DB.Model(&row).Update("charged_request_id", req.ID)
+
+	if usd, k := measureCostEstimate(llmInstrument); k == 0 || usd <= 0 {
+		t.Fatalf("estimate = %v from %d", usd, k)
+	}
+	// $0.006 spent + about $0.006 more > $0.01.
+	why := budgetRefusal(sub, app, "", llmInstrument, "MBB Consultant")
+	if !strings.Contains(why, "Your MBB Consultant budget has $0.00 of $0.01 left") || !strings.Contains(why, "costs about $0.01") {
+		t.Fatalf("refusal = %q", why)
+	}
+	if s := usageSpent(sub, app, "", time.Time{}); s.TokensIn != 1000 || s.TokensOut != 200 || s.USD != 0.006 {
+		t.Fatalf("spent = %+v", s)
+	}
+}

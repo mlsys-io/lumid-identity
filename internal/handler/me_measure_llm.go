@@ -287,6 +287,10 @@ func llmMeasureSubmit(row *models.MeasureResult, plan measurePlan, sub, app stri
 		return errors.New("unknown user")
 	}
 	model, _ := plan.material["model"].(string)
+	// run_id "measure:<key>" marks the proxy's usage_events row for this call.
+	// Its cost is ALREADY counted through this measure row (usageSpent), so the
+	// usage_events side of /me/usage MUST exclude run_id LIKE 'measure:%' —
+	// keep it that way; do not "fix" the apparent double count from either side.
 	tok, _, _, err := common.IssueBridgeJWTWithClaims(u.ID, u.Email, u.Role, "lumid-ecosystem", nil, llmBearerTTL,
 		common.RunClaims{App: app, RunID: "measure:" + row.Key, MeasureModel: model})
 	if err != nil {

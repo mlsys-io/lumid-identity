@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -435,7 +436,9 @@ func MeMeasureInstruments(c *gin.Context) {
 		item := gin.H{"name": in.Name, "kind": "instrument", "about": in.About, "share": in.Share,
 			"inputs": in.Inputs, "versions": in.versions()}
 		// What a fresh run of it usually uses (median of recent metered runs).
-		if g, cp, t, k := measureEstimate(in.Name); k > 0 {
+		if usd, k := measureCostEstimate(in.Name); k > 0 {
+			item["estimate"] = gin.H{"from_runs": k, "cost_usd": math.Round(usd*1e6) / 1e6}
+		} else if g, cp, t, k := measureEstimate(in.Name); k > 0 {
 			est := gin.H{"from_runs": k, "cost_usd": currentRates().cost(g, cp, t)}
 			if g > 0 {
 				est["gpu_s"], est["gpu_type"] = round3(g), t
@@ -638,6 +641,8 @@ func MeMeasure(c *gin.Context) {
 	}
 	if inst.executor == "lqt" {
 		_, _, err = lqtMeasureSubmit(&row, sub)
+	} else if inst.executor == "llm" {
+		err = llmMeasureSubmit(&row, plan, sub, labels.App)
 	} else {
 		err = measureSubmit(c, &row, plan, sub, b.App)
 	}
@@ -758,6 +763,10 @@ func measureAdvance(c *gin.Context, row *models.MeasureResult) {
 	}
 	if row.Executor == "lqt" {
 		lqtMeasureAdvance(c, row)
+		return
+	}
+	if row.Executor == "llm" {
+		llmAdvance(row)
 		return
 	}
 	if row.ExecutorRef == "" {

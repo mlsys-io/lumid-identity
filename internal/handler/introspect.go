@@ -97,6 +97,14 @@ type IntrospectResponse struct {
 	// that verify locally can check it; consumers that introspect should
 	// instead send `audience=<their service>` and let identity refuse.
 	Aud []string `json:"aud,omitempty"`
+	// What the bearer was minted for (common.RunClaims), JWTs only: a tenant
+	// run's app / loop / run id, or a central measurement's one pooled model.
+	// claude-proxy forwards App/RunID on its usage charge, and serves
+	// MeasureModel genuinely for that model alone.
+	App          string `json:"app,omitempty"`
+	Loop         string `json:"loop,omitempty"`
+	RunID        string `json:"run_id,omitempty"`
+	MeasureModel string `json:"measure_model,omitempty"`
 	// unboundAud is set when a service-specific JWT was accepted only through
 	// the migration allowance (caller sent no `audience`). Never serialised.
 	unboundAud string
@@ -522,17 +530,21 @@ func introspectJWT(token, audience string) *IntrospectResponse {
 	}
 	scopes := common.ExpandFlowmeshScopes(strings.Fields(claims.Scopes))
 	return &IntrospectResponse{
-		Active:    true,
-		Sub:       claims.Subject,
-		Email:     claims.Email,
-		Role:      claims.Role,
-		Scopes:    scopes,
-		Scope:     strings.Join(scopes, " "),
-		TokenType: "jwt",
-		Exp:       claims.ExpiresAt.Unix(),
-		Iat:       claims.IssuedAt.Unix(),
-		Source:    "native",
-		Aud:       []string(claims.Audience),
+		Active:       true,
+		Sub:          claims.Subject,
+		Email:        claims.Email,
+		Role:         claims.Role,
+		Scopes:       scopes,
+		Scope:        strings.Join(scopes, " "),
+		TokenType:    "jwt",
+		Exp:          claims.ExpiresAt.Unix(),
+		Iat:          claims.IssuedAt.Unix(),
+		Source:       "native",
+		Aud:          []string(claims.Audience),
+		App:          claims.App,
+		Loop:         claims.Loop,
+		RunID:        claims.RunID,
+		MeasureModel: claims.MeasureModel,
 		unboundAud: func() string {
 			if unbound && len(claims.Audience) > 0 {
 				return claims.Audience[0]

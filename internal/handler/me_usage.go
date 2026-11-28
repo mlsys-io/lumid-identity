@@ -258,6 +258,9 @@ func measureRecordUsage(c *gin.Context, row *models.MeasureResult, base, native,
 // usageBlock: what a response tells the requester this measurement used.
 // A reused answer used nothing and says what it saved. nil when unmetered.
 func usageBlock(row *models.MeasureResult, reused bool) gin.H {
+	if row.CostUSD != nil {
+		return llmUsageBlock(row, reused)
+	}
 	if row.GPUS == nil && row.CPUS == nil {
 		return nil
 	}
@@ -328,6 +331,16 @@ func measureEstimate(instrument string) (gpuS, cpuS float64, gpuType string, n i
 		}
 	}
 	return median(g), median(cp), gpuType, len(rows)
+}
+
+// measureCostEstimate: the median own cost (cost_usd) of the instrument's last
+// 20 settled measurements that recorded one (pooled-llm), and how many.
+func measureCostEstimate(instrument string) (float64, int) {
+	var costs []float64
+	common.DB.Model(&models.MeasureResult{}).
+		Where("instrument = ? AND status IN ? AND cost_usd IS NOT NULL", instrument, []string{"succeeded", "failed"}).
+		Order("settled_at DESC").Limit(20).Pluck("cost_usd", &costs)
+	return median(costs), len(costs)
 }
 
 func median(xs []float64) float64 {
@@ -419,6 +432,8 @@ func appBudgets(sub, app string) specBudgets {
 type spent struct {
 	GPUS, CPUS, USD          float64
 	SavedGPUS, SavedCPUS     float64
+	SavedUSD                 float64 // pooled-llm answers reused instead of paid again
+	TokensIn, TokensOut      int     // pooled-llm calls this user paid for
 	Runs, Reused, Unmetered  int
 	Running                  int
 	ByDevice                 map[string]float64
@@ -437,11 +452,14 @@ func usageSpent(sub, app, workflow string, t time.Time) spent {
 		GPUS       *float64  `gorm:"column:gpu_s"`
 		CPUS       *float64  `gorm:"column:cpu_s"`
 		GPUType    string    `gorm:"column:gpu_type"`
+		CostUSD    *float64  `gorm:"column:cost_usd"` // a pooled-llm call's own cost
+		TokensIn   *int      `gorm:"column:tokens_in"`
+		TokensOut  *int      `gorm:"column:tokens_out"`
 		CreatedAt  time.Time `gorm:"column:created_at"`
 	}
 	q := common.DB.Table("measure_requests AS q").
 		Select("q.id AS req_id, q.workflow, r.instrument, r.charged_request_id AS charged, q.outcome, r.status, r.gpu_s AS gpu_s, "+
-			"r.cpu_s AS cpu_s, r.gpu_type, q.created_at").
+			"r.cpu_s AS cpu_s, r.gpu_type, r.cost_usd AS cost_usd, r.tokens_in AS tokens_in, r.tokens_out AS tokens_out, q.created_at").
 		Joins("JOIN measure_results AS r ON r.mkey = q.mkey").
 		Where("q.user_sub = ? AND q.outcome IN ?", sub, []string{"submitted", "fresh", "cached", "joined"})
 	if !t.IsZero() {
@@ -472,6 +490,9 @@ func usageSpent(sub, app, workflow string, t time.Time) spent {
 			s.Reused++
 			s.SavedGPUS += gpu
 			s.SavedCPUS += cpu
+			if r.CostUSD != nil {
+				s.SavedUSD += *r.CostUSD
+			}
 			continue
 		}
 		if r.Status == "queued" || r.Status == "running" {
@@ -479,11 +500,20 @@ func usageSpent(sub, app, workflow string, t time.Time) spent {
 			continue
 		}
 		s.Runs++
-		if r.GPUS == nil && r.CPUS == nil {
+		if r.GPUS == nil && r.CPUS == nil && r.CostUSD == nil {
 			s.Unmetered++
 			continue
 		}
 		usd := rates.cost(gpu, cpu, r.GPUType)
+		if r.CostUSD != nil {
+			usd += *r.CostUSD
+		}
+		if r.TokensIn != nil {
+			s.TokensIn += *r.TokensIn
+		}
+		if r.TokensOut != nil {
+			s.TokensOut += *r.TokensOut
+		}
 		s.GPUS += gpu
 		s.CPUS += cpu
 		s.USD += usd
@@ -529,6 +559,10 @@ func budgetRefusal(sub, app, workflow, instrument, appLabel string) string {
 	sb := appBudgets(sub, app)
 	gpuEst, cpuEst, gpuType, _ := measureEstimate(instrument)
 	usdEst := currentRates().cost(gpuEst, cpuEst, gpuType)
+	// A pooled-llm call has no device time; its own cost is the estimate.
+	if llmUSD, k := measureCostEstimate(instrument); k > 0 {
+		usdEst += llmUSD
+	}
 	check := func(b computeBudget, scope, wf string) string {
 		if b.empty() {
 			return ""
@@ -612,10 +646,12 @@ func MeUsage(c *gin.Context) {
 	}
 	s := usageSpent(sub, app, "", since)
 	used := gin.H{"gpu_s": round3(s.GPUS), "cpu_s": round3(s.CPUS), "cost_usd": math.Round(s.USD*1e6) / 1e6,
+		"tokens_in": s.TokensIn, "tokens_out": s.TokensOut,
 		"runs": s.Runs, "running": s.Running, "unmetered_runs": s.Unmetered, "by_device": s.ByDevice, "by_workflow": s.ByWorkflow,
 		"by_instrument": s.ByInstrument, "by_day": s.ByDay}
 	out := gin.H{"app": app, "since": nil, "used": used,
-		"saved": gin.H{"gpu_s": round3(s.SavedGPUS), "cpu_s": round3(s.SavedCPUS), "reused_runs": s.Reused},
+		"saved": gin.H{"gpu_s": round3(s.SavedGPUS), "cpu_s": round3(s.SavedCPUS), "reused_runs": s.Reused,
+			"cost_usd": math.Round(s.SavedUSD*1e6) / 1e6},
 		"rates": currentRates()}
 	if !since.IsZero() {
 		out["since"] = since.UTC().Format(time.RFC3339)

@@ -207,6 +207,9 @@ type ChargeReq struct {
 	CostCents             int
 	DryRun                bool
 	Meta                  string // optional JSON blob
+	// App / RunID attribute the spend to an installed app's run; "" = unattributed.
+	App   string
+	RunID string
 }
 
 // ChargeRes is the output. Same shape served by /internal/usage/charge.
@@ -1045,6 +1048,8 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		CacheCreation1hTokens: req.CacheCreation1hTokens,
 		CostCents:             req.CostCents,
 		Meta:                  req.Meta,
+		App:                   optStr(req.App),
+		RunID:                 optStr(req.RunID),
 	}
 	if err := db.Create(&ev).Error; err != nil {
 		return ChargeRes{}, err
@@ -1062,4 +1067,12 @@ func CheckAndCharge(db *gorm.DB, req ChargeReq) (ChargeRes, error) {
 		res.SevenDayReset = formatPoolReset(status.SevenDayReset)
 	}
 	return res, nil
+}
+
+// optStr: nil for "", so an unattributed row stores NULL, not an empty string.
+func optStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

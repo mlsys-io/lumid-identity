@@ -45,33 +45,45 @@ var usageDefaultRates = usageRates{
 		"RTX 5080": 0.25, "RTX 5090": 0.40, "RTX PRO 4000": 0.30, "RTX 6000 Ada": 0.80,
 		"H100": 2.00, "H200": 2.50, "*": 0.50,
 	},
+	LLM:      usageDefaultLLMRates,
 	Notional: true,
 }
 
 type usageRates struct {
 	CPUCoreHour float64            `json:"cpu_core_hour"`
 	GPUHour     map[string]float64 `json:"gpu_hour"`
-	Notional    bool               `json:"notional"`
+	// LLM: $ per million tokens by model id or "prefix*", plus "*" (me_usage_llm.go).
+	LLM      map[string]llmTokenRate `json:"llm"`
+	Notional bool                    `json:"notional"`
 }
 
 // currentRates: USAGE_RATES (JSON) merged over the defaults; malformed → defaults.
 func currentRates() usageRates {
 	r := usageRates{CPUCoreHour: usageDefaultRates.CPUCoreHour, GPUHour: map[string]float64{},
-		Notional: usageDefaultRates.Notional}
+		LLM: map[string]llmTokenRate{}, Notional: usageDefaultRates.Notional}
 	for k, v := range usageDefaultRates.GPUHour {
 		r.GPUHour[k] = v
+	}
+	for k, v := range usageDefaultRates.LLM {
+		r.LLM[k] = v
 	}
 	raw := strings.TrimSpace(os.Getenv("USAGE_RATES"))
 	if raw == "" {
 		return r
 	}
 	var given struct {
-		CPUCoreHour *float64           `json:"cpu_core_hour"`
-		GPUHour     map[string]float64 `json:"gpu_hour"`
-		Notional    *bool              `json:"notional"`
+		CPUCoreHour *float64                `json:"cpu_core_hour"`
+		GPUHour     map[string]float64      `json:"gpu_hour"`
+		LLM         map[string]llmTokenRate `json:"llm"`
+		Notional    *bool                   `json:"notional"`
 	}
 	if json.Unmarshal([]byte(raw), &given) != nil {
 		return r
+	}
+	for k, v := range given.LLM {
+		if k = strings.ToLower(strings.TrimSpace(k)); k != "" && v.InPerMTok >= 0 && v.OutPerMTok >= 0 {
+			r.LLM[k] = v
+		}
 	}
 	if given.CPUCoreHour != nil && *given.CPUCoreHour >= 0 {
 		r.CPUCoreHour = *given.CPUCoreHour
@@ -428,7 +440,10 @@ func appBudgets(sub, app string) specBudgets {
 }
 
 // spent sums what the caller's charged measurements for app (and workflow,
-// when given) used since t.
+// when given) used since t, plus, at app level (workflow ""), the app's
+// attributed LLM calls from usage_events (LLM, me_usage_llm.go). USD includes
+// that LLM spend so every budget check sees it. usage_events carry no
+// workflow, so a workflow's own figures are its measurements only.
 type spent struct {
 	GPUS, CPUS, USD          float64
 	SavedGPUS, SavedCPUS     float64
@@ -439,6 +454,8 @@ type spent struct {
 	ByDevice                 map[string]float64
 	ByWorkflow, ByInstrument map[string]gin.H
 	ByDay                    map[string]float64
+	LLM                      llmSpend
+	HasLLM                   bool // LLM calls were recorded; false = leave the llm block out
 }
 
 func usageSpent(sub, app, workflow string, t time.Time) spent {
@@ -547,7 +564,79 @@ func usageSpent(sub, app, workflow string, t time.Time) spent {
 		}
 		s.ByDay[r.CreatedAt.UTC().Format("2006-01-02")] += gpu
 	}
+	if workflow == "" {
+		if l, ok := llmSpent(sub, app, t); ok {
+			s.LLM, s.HasLLM = l, true
+			s.USD += l.CostUSD
+		}
+	}
 	return s
+}
+
+// budgetSpend / budgetEstimate: what the budget words compare. Seconds and $.
+type budgetSpend struct{ GPUS, CPUS, USD float64 }
+type budgetEstimate struct{ USD, GPUS, CPUS float64 }
+
+// budgetWords: "" when the estimate fits every declared dimension of b, else
+// the refusal in words. A dimension is over when it is already spent, or when
+// a known (non-zero) estimate would take it over; with no estimate only
+// "already spent" applies and the "this would take" clause is left out.
+// GPU first, then CPU, then $. LumidOS sdk/apps/usage.py budget_check says
+// the same words; change both together.
+//
+//	"Your mbb-consultant budget has $6 of $40 left; this would take about $7"
+//	"Your trace-lab budget has 9 of 168 GPU-min left; this would take about 7"
+func budgetWords(b computeBudget, s budgetSpend, est budgetEstimate, scope string) string {
+	about := func(v string, est float64) string {
+		if est > 0 {
+			return "; this would take about " + v
+		}
+		return ""
+	}
+	if b.GPUMinutes > 0 && (s.GPUS >= b.GPUMinutes*60 || (est.GPUS > 0 && s.GPUS+est.GPUS > b.GPUMinutes*60)) {
+		return fmt.Sprintf("%s has %s of %s GPU-min left%s", scope, fmtBudgetMin(math.Max(0, b.GPUMinutes-s.GPUS/60)),
+			fmtBudgetMin(b.GPUMinutes), about(fmtBudgetMin(est.GPUS/60), est.GPUS))
+	}
+	if b.CPUMinutes > 0 && (s.CPUS >= b.CPUMinutes*60 || (est.CPUS > 0 && s.CPUS+est.CPUS > b.CPUMinutes*60)) {
+		return fmt.Sprintf("%s has %s of %s CPU-min left%s", scope, fmtBudgetMin(math.Max(0, b.CPUMinutes-s.CPUS/60)),
+			fmtBudgetMin(b.CPUMinutes), about(fmtBudgetMin(est.CPUS/60), est.CPUS))
+	}
+	if b.USD > 0 && (s.USD >= b.USD || (est.USD > 0 && s.USD+est.USD > b.USD)) {
+		return fmt.Sprintf("%s has %s of %s left%s", scope, fmtBudgetUSD(math.Max(0, b.USD-s.USD)),
+			fmtBudgetUSD(b.USD), about(fmtBudgetUSD(est.USD), est.USD))
+	}
+	return ""
+}
+
+// budgetScope: "Your <app> budget" ("Your budget" with no label).
+func budgetScope(label string) string {
+	if label = strings.TrimSpace(label); label == "" {
+		return "Your budget"
+	}
+	return "Your " + label + " budget"
+}
+
+// fmtBudgetUSD: "$40" for whole dollars, else "$0.40". Rounded half up to the
+// cent (floor(x+0.5), which Python reproduces exactly).
+func fmtBudgetUSD(v float64) string {
+	c := math.Floor(v*100 + 0.5)
+	if math.Mod(c, 100) == 0 {
+		return fmt.Sprintf("$%.0f", c/100)
+	}
+	return fmt.Sprintf("$%.2f", c/100)
+}
+
+// fmtBudgetMin: minutes as "168", "9.5", "7" (no ".0"), or "under 1".
+func fmtBudgetMin(m float64) string {
+	switch {
+	case m <= 0:
+		return "0"
+	case m < 1:
+		return "under 1"
+	case m < 10:
+		return strings.TrimSuffix(fmt.Sprintf("%.1f", m), ".0")
+	}
+	return fmt.Sprintf("%.0f", m)
 }
 
 // budgetRefusal: words when a fresh measurement of instrument would take
@@ -563,30 +652,15 @@ func budgetRefusal(sub, app, workflow, instrument, appLabel string) string {
 	if llmUSD, k := measureCostEstimate(instrument); k > 0 {
 		usdEst += llmUSD
 	}
+	est := budgetEstimate{USD: usdEst, GPUS: gpuEst, CPUS: cpuEst}
 	check := func(b computeBudget, scope, wf string) string {
 		if b.empty() {
 			return ""
 		}
 		s := usageSpent(sub, app, wf, b.since(time.Now()))
-		// Over when already spent, or when the usual run would take it over.
-		// With no history the estimate is 0 and only "already spent" applies.
-		if b.GPUMinutes > 0 && (s.GPUS >= b.GPUMinutes*60 || (gpuEst > 0 && s.GPUS+gpuEst > b.GPUMinutes*60)) {
-			left := math.Max(0, b.GPUMinutes-s.GPUS/60)
-			return fmt.Sprintf("%s has %s of %s GPU-min left; this run takes about %s",
-				scope, fmtMin(left), fmtMin(b.GPUMinutes), fmtMin(gpuEst/60))
-		}
-		if b.CPUMinutes > 0 && (s.CPUS >= b.CPUMinutes*60 || (cpuEst > 0 && s.CPUS+cpuEst > b.CPUMinutes*60)) {
-			left := math.Max(0, b.CPUMinutes-s.CPUS/60)
-			return fmt.Sprintf("%s has %s of %s CPU-min left; this run takes about %s",
-				scope, fmtMin(left), fmtMin(b.CPUMinutes), fmtMin(cpuEst/60))
-		}
-		if b.USD > 0 && (s.USD >= b.USD || (usdEst > 0 && s.USD+usdEst > b.USD)) {
-			return fmt.Sprintf("%s has $%.2f of $%.2f left; this run costs about $%.2f",
-				scope, math.Max(0, b.USD-s.USD), b.USD, usdEst)
-		}
-		return ""
+		return budgetWords(b, budgetSpend{GPUS: s.GPUS, CPUS: s.CPUS, USD: s.USD}, est, scope)
 	}
-	if why := check(sb.App, "Your "+appLabel+" budget", ""); why != "" {
+	if why := check(sb.App, budgetScope(appLabel), ""); why != "" {
 		return why
 	}
 	if wb, ok := sb.Workflows[workflow]; ok {
@@ -607,22 +681,21 @@ func appParallel(sub, app, workflow string) int {
 	return p
 }
 
-func fmtMin(m float64) string {
-	switch {
-	case m < 1:
-		return "under a minute"
-	case m < 10:
-		return fmt.Sprintf("%.1f min", m)
-	}
-	return fmt.Sprintf("%.0f min", m)
-}
-
 // ── GET /me/usage, GET /me/usage/rates ──────────────────────────────────
 
-// MeUsage: what the caller's measurements used, for one app or all of them,
-// against the app's declared budget.
+// MeUsage: what the caller's measurements and attributed LLM calls used, for
+// one app or all of them, against the app's declared budget.
 //
 //	GET /api/v1/me/usage?app=<name>&since=<RFC3339>
+//
+// used.llm (present only when the app made attributed model calls):
+//
+//	{"calls": 4, "tokens_in": 3050000, "tokens_out": 1010000, "cost_usd": 1.95, "notional_usd": 1.7,
+//	 "by_model": {"deepseek-v4.1-flash": {"calls", "tokens_in", "tokens_out", "cost_usd"}, ...},
+//	 "by_run":   {"<run credential id>": {...}, ...}, "runs_omitted": 0}
+//
+// used.cost_usd includes llm.cost_usd; the gpu/cpu/measure fields are the
+// measurements' alone, as before.
 func MeUsage(c *gin.Context) {
 	sub, authed := currentUserID(c)
 	if !authed {
@@ -649,6 +722,9 @@ func MeUsage(c *gin.Context) {
 		"tokens_in": s.TokensIn, "tokens_out": s.TokensOut,
 		"runs": s.Runs, "running": s.Running, "unmetered_runs": s.Unmetered, "by_device": s.ByDevice, "by_workflow": s.ByWorkflow,
 		"by_instrument": s.ByInstrument, "by_day": s.ByDay}
+	if s.HasLLM {
+		used["llm"] = s.LLM
+	}
 	out := gin.H{"app": app, "since": nil, "used": used,
 		"saved": gin.H{"gpu_s": round3(s.SavedGPUS), "cpu_s": round3(s.SavedCPUS), "reused_runs": s.Reused,
 			"cost_usd": math.Round(s.SavedUSD*1e6) / 1e6},

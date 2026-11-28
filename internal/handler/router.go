@@ -634,6 +634,9 @@ func Register(r *gin.Engine) {
 		{
 			// Tier-1 caps: the cycle charges its own LLM / external calls.
 			runInternal.POST("/usage/charge", InternalUsageCharge)
+			// Would this take the user's app over its compute.budget? claude-proxy's
+			// pre-call gate and a cycle's pre-spend check (internal_budget_verdict.go).
+			runInternal.POST("/budget-verdict", InternalBudgetVerdict)
 			// A detached Run-now posts its own result (bin/lumid-run-cycle).
 			runInternal.POST("/me-intents/:id/result", InternalMeIntentResult)
 			// Trajectory control signals for installs identity cannot see —
@@ -663,7 +666,7 @@ func Register(r *gin.Engine) {
 			// DB-backed /me/apps intent queue — the scheduler picker claims
 			// pending intents (atomic SKIP LOCKED) + posts results back.
 			internal.POST("/me-intents/claim", InternalMeIntentsClaim)
-			// (/me-intents/:id/result, /usage/charge, /app-signals/*, /app-runs
+			// (/me-intents/:id/result, /usage/charge, /budget-verdict, /app-signals/*, /app-runs
 			// and /app-experiments are in runInternal above.)
 			// Decrypted per-(user,app) secrets for the scheduler to inject
 			// into the cycle env (pure-UI credential path).

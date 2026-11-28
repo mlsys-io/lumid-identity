@@ -285,7 +285,7 @@ func TestPooledLLMBudgetRefusalUsesTheMedianCost(t *testing.T) {
 	}
 	// $0.006 spent + about $0.006 more > $0.01.
 	why := budgetRefusal(sub, app, "", llmInstrument, "MBB Consultant")
-	if !strings.Contains(why, "Your MBB Consultant budget has $0.00 of $0.01 left") || !strings.Contains(why, "costs about $0.01") {
+	if !strings.Contains(why, "Your MBB Consultant budget has $0 of $0.01 left; this would take about $0.01") {
 		t.Fatalf("refusal = %q", why)
 	}
 	if s := usageSpent(sub, app, "", time.Time{}); s.TokensIn != 1000 || s.TokensOut != 200 || s.USD != 0.006 {

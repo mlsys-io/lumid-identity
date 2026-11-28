@@ -44,6 +44,7 @@ func TestSuggestUsername(t *testing.T) {
 		"9fred@x.org":              "fred",
 		"x@y.z":                    "",
 		"ctree4113@gmail.com":      "ctree4113",
+		"admin@lum.id":             "",
 	} {
 		if got := suggestUsername(in); got != want {
 			t.Errorf("suggestUsername(%q) = %q, want %q", in, got, want)

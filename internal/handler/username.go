@@ -85,8 +85,8 @@ func suggestUsername(email string) string {
 	if len(s) > 32 {
 		s = s[:32]
 	}
-	if len(s) < 2 {
-		return ""
+	if len(s) < 2 || reservedUsernames()[s] {
+		return "" // never suggest a name Save would refuse (e.g. "admin")
 	}
 	return s
 }

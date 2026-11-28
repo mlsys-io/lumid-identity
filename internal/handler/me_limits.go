@@ -134,6 +134,9 @@ func InternalUsageCharge(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 1500, "charge: "+err.Error())
 		return
 	}
+	if !body.DryRun {
+		invalidateBudgetVerdict(body.UserSub, body.App)
+	}
 	// Return 200 regardless of allowed — the caller branches on res.allowed.
 	// For the claude pool, piggyback the user's recording preference so the
 	// proxy can skip shipping a transcript blob when the user opted out.

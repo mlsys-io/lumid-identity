@@ -43,7 +43,10 @@ const sandboxDefaultImages = "sandbox-v0.1.0=ghcr.io/mlsys-io/hello-mlsys-agent-
 	"96ee81521a5c776ef1911abac43aae13baf4e42577d0f108b2f49fab7e63a434," +
 	// sandbox-v0.2.2: measures resampled workloads, sent as exact trace text + sha256.
 	"sandbox-v0.2.2=ghcr.io/mlsys-io/hello-mlsys-agent-sandbox@sha256:" +
-	"30dc8313a95cfbf9672a2bf5fb720ab25736d14d7b881167b81666ffc77f5040"
+	"30dc8313a95cfbf9672a2bf5fb720ab25736d14d7b881167b81666ffc77f5040," +
+	// sandbox-v0.2.3: energy per request on the card (NVML counter, idle-subtracted).
+	"sandbox-v0.2.3=ghcr.io/mlsys-io/hello-mlsys-agent-sandbox@sha256:" +
+	"90c4ddaa78ea40c47717efabc85afce206df7a371a80b7720f34519acb4d4029"
 
 func sandboxImages() map[string]string {
 	raw := strings.TrimSpace(os.Getenv("MEASURE_MLSYS_SANDBOX_IMAGES"))

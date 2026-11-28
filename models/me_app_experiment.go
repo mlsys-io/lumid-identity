@@ -28,8 +28,14 @@ type MeAppExperiment struct {
 	App          string `gorm:"column:app;size:128;not null;uniqueIndex:uq_appexp,priority:2"     json:"app"`
 	ExperimentID string `gorm:"column:experiment_id;size:128;not null;uniqueIndex:uq_appexp,priority:3" json:"experiment_id"`
 
-	State     string    `gorm:"column:state;type:text"           json:"-"` // state.json, verbatim
-	NResults  int       `gorm:"column:n_results"                 json:"n_results"`
+	State    string `gorm:"column:state;type:text"           json:"-"` // state.json, verbatim
+	NResults int    `gorm:"column:n_results"                 json:"n_results"`
+	// RowsTail — the ledger's newest rows (a JSON array of results.jsonl rows,
+	// compacted by the scheduler, oldest first), served as the detail view's
+	// `results` when identity cannot read the ledger itself, which for a tenant
+	// install is always. MEDIUMTEXT: the handler caps it at 2 MiB, far past
+	// TEXT's 64 KiB. Absent from a report = left as it was.
+	RowsTail  string    `gorm:"column:rows_tail;type:mediumtext" json:"-"`
 	UpdatedAt time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
 	CreatedAt time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
 }

@@ -53,6 +53,25 @@ type UsernameChange struct {
 	UserID    string    `gorm:"type:varchar(36);index;not null" json:"user_id"`
 	OldName   string    `gorm:"type:varchar(32);index" json:"old"`
 	NewName   string    `gorm:"type:varchar(32);index;not null" json:"new"`
-	By        string    `gorm:"type:varchar(36)" json:"by,omitempty"` // admin user id when an admin made the change
+	By        string    `gorm:"type:varchar(80)" json:"by,omitempty"` // admin user id, or "claim:<host>" when a host proved the login
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"at"`
 }
+
+// UsernameClaim is a person's request to take an EXISTING host login (one of RESERVED_USERNAMES) as their username.
+// They prove control of the login by writing a one-time code into ~/.lumid-claim on any machine where they log in
+// as it; the per-host verifier (deploy_infra k8s-lift/host-users) reads that file and calls the admin verify route.
+// Only the SHA-256 of the code is stored; the code itself is returned once, to the person, at creation.
+// Status: pending | verified | expired | rejected (rejected = replaced by a newer claim, or the login got bound
+// to someone else first). A claim expires 24 h after CreatedAt.
+type UsernameClaim struct {
+	ID         uint       `gorm:"primaryKey" json:"id"`
+	UserID     string     `gorm:"type:varchar(36);index;not null" json:"user_id"`
+	Login      string     `gorm:"type:varchar(32);index;not null" json:"login"`
+	CodeHash   string     `gorm:"type:varchar(64);not null" json:"-"`
+	Status     string     `gorm:"type:varchar(16);index;not null;default:'pending'" json:"status"`
+	Host       string     `gorm:"type:varchar(64)" json:"host,omitempty"`
+	CreatedAt  time.Time  `gorm:"autoCreateTime" json:"created_at"`
+	VerifiedAt *time.Time `json:"verified_at,omitempty"`
+}
+
+func (UsernameClaim) TableName() string { return "username_claims" }

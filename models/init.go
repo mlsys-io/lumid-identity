@@ -59,6 +59,7 @@ var AllTables = []interface{}{
 	&SocAPIKey{},
 	&SocKeyUsage{},
 	&ModelUsageMinute{},
+	&RunCredential{},
 }
 
 func AutoMigrate(db *gorm.DB) error {

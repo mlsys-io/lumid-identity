@@ -52,12 +52,15 @@ func accountToolDefs() []map[string]any {
 		{
 			"name": "delete_loop",
 			"description": "Delete a workflow/loop from one of YOUR apps. Its run history is " +
-				"archived (not destroyed). Can't remove the last workflow in an app.",
+				"archived (not destroyed). Can't remove the last workflow in an app, or one a " +
+				"chain runs as a stage. Refused while an experiment runs on it unless force=true, " +
+				"which drops those experiments too. Its child workflows and nodes move up to its parent.",
 			"input_schema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"app":  map[string]any{"type": "string", "description": "the app slug (must be your own tenant app)"},
-					"loop": map[string]any{"type": "string", "description": "the loop/workflow name to remove"},
+					"app":   map[string]any{"type": "string", "description": "the app slug (must be your own tenant app)"},
+					"loop":  map[string]any{"type": "string", "description": "the loop/workflow name (or simple-scheme workflow id) to remove"},
+					"force": map[string]any{"type": "boolean", "description": "also drop the experiments that run on this workflow (only after the user confirmed)"},
 				},
 				"required": []string{"app", "loop"},
 			},
@@ -73,15 +76,25 @@ func toolDeleteLoop(userID string, args map[string]any) (map[string]any, bool) {
 	if app == "" || loop == "" {
 		return map[string]any{"error": "app and loop are required"}, false
 	}
-	remaining, intentID, status, _, msg := removeLoopFromApp(userID, app, loop)
-	if status != 200 {
-		return map[string]any{"error": msg}, false
+	force, _ := args["force"].(bool)
+	if !force {
+		force = truthyParam(toStr(args["force"]))
 	}
-	if intentID != "" {
-		return queuedOpsToolResult(intentID, map[string]any{
-			"deleted": false, "app": app, "loop": loop, "remaining": nil}), true
+	r := removeLoopFromApp(userID, app, loop, force)
+	if r.Status != 200 {
+		return map[string]any{"error": r.Msg}, false
 	}
-	return map[string]any{"deleted": true, "app": app, "loop": loop, "remaining": remaining}, true
+	if r.IntentID != "" {
+		out := map[string]any{"deleted": false, "app": app, "loop": loop, "remaining": nil}
+		if r.Plan != nil && !r.Plan.onlyRemovesLegacyLoop() {
+			out["remaining"] = r.Remaining
+		}
+		r.addDetails(out)
+		return queuedOpsToolResult(r.IntentID, out), true
+	}
+	out := map[string]any{"deleted": true, "app": app, "loop": loop, "remaining": r.Remaining}
+	r.addDetails(out)
+	return out, true
 }
 
 func toolAccountListPat(userID string) (map[string]any, bool) {

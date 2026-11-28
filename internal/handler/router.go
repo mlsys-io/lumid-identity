@@ -619,6 +619,37 @@ func Register(r *gin.Engine) {
 			me.POST("/mind/evaluate", MeMindEvaluate)
 		}
 
+		// Per-run refresh credential (run_credential.go). A tenant cycle trades
+		// LUMID_RUN_REFRESH for its own 15-min lum.id bearer here, and hands it
+		// back when the run ends. Authenticated by the credential itself.
+		v1.POST("/run-credential/refresh", RunCredentialRefresh)
+		v1.POST("/run-credential/revoke", RunCredentialRevoke)
+
+		// The run-reporting slice of /internal: what a CYCLE calls. Bridge secret
+		// exactly as before (daemon, operator cycles, old schedulers), OR a run
+		// credential, in which case each handler refuses any write outside the
+		// credential's own user (and app). Tenant cycles no longer get the
+		// bridge secret, which let app code mint tokens for ANY user.
+		runInternal := v1.Group("/internal", RequireBridgeOrRunCredential())
+		{
+			// Tier-1 caps: the cycle charges its own LLM / external calls.
+			runInternal.POST("/usage/charge", InternalUsageCharge)
+			// A detached Run-now posts its own result (bin/lumid-run-cycle).
+			runInternal.POST("/me-intents/:id/result", InternalMeIntentResult)
+			// Trajectory control signals for installs identity cannot see —
+			// the runner claims them at cycle start, appends them to its
+			// signals.jsonl, then acks (app_runner._sync_identity_overlays).
+			runInternal.POST("/app-signals/claim", InternalAppSignalsClaim)
+			runInternal.POST("/app-signals/ack", InternalAppSignalsAck)
+			// Cross-node run store — the cycle self-reports each run's metrics
+			// here so the Studio trajectory/experiments surfaces (which can't
+			// read the scheduler PVC) can reconstruct run history. App-agnostic.
+			runInternal.POST("/app-runs", InternalAppRunRecord)
+			// Experiment state, same reason as app-runs: the ledger is on the
+			// scheduler volume and identity mounts none.
+			runInternal.POST("/app-experiments", InternalAppExperimentRecord)
+		}
+
 		// Internal service-to-service surface. The scheduler/picker
 		// (Python) calls /usage/charge at cycle-fire time + per LLM /
 		// external-API call to atomically check-and-record against the
@@ -626,16 +657,14 @@ func Register(r *gin.Engine) {
 		// never reachable from the public surface.
 		internal := v1.Group("/internal", RequireBridge())
 		{
-			internal.POST("/usage/charge", InternalUsageCharge)
+			// The scheduler daemon mints each TENANT cycle a per-run refresh
+			// credential (run_credential.go) so the cycle never holds this secret.
+			internal.POST("/run-credential", InternalRunCredentialMint)
 			// DB-backed /me/apps intent queue — the scheduler picker claims
 			// pending intents (atomic SKIP LOCKED) + posts results back.
 			internal.POST("/me-intents/claim", InternalMeIntentsClaim)
-			internal.POST("/me-intents/:id/result", InternalMeIntentResult)
-			// Trajectory control signals for installs identity cannot see —
-			// the runner claims them at cycle start, appends them to its
-			// signals.jsonl, then acks (app_runner._sync_identity_overlays).
-			internal.POST("/app-signals/claim", InternalAppSignalsClaim)
-			internal.POST("/app-signals/ack", InternalAppSignalsAck)
+			// (/me-intents/:id/result, /usage/charge, /app-signals/*, /app-runs
+			// and /app-experiments are in runInternal above.)
 			// Decrypted per-(user,app) secrets for the scheduler to inject
 			// into the cycle env (pure-UI credential path).
 			internal.POST("/app-secrets/fetch", InternalAppSecretsFetch)
@@ -645,14 +674,9 @@ func Register(r *gin.Engine) {
 			// handler documents — this is the ONLY route that decrypts it, and
 			// it must never be reachable with a user's own token.
 			internal.POST("/findata-sql/fetch", InternalFindataSQLFetch)
-			// Cross-node run store — the cycle self-reports each run's metrics
-			// here so the Studio trajectory/experiments surfaces (which can't
-			// read the scheduler PVC) can reconstruct run history. App-agnostic.
-			internal.POST("/app-runs", InternalAppRunRecord)
-			// Experiment state, same reason as app-runs: the ledger is on the
-			// scheduler volume and identity mounts none, so the panel could show
-			// declared arms whose results never appeared.
-			internal.POST("/app-experiments", InternalAppExperimentRecord)
+			// Proposals, same reason as app-runs/app-experiments: the ledger is on
+			// the scheduler volume and identity mounts none. Bridge-only — no
+			// cycle-side caller posts here.
 			internal.POST("/app-proposals", InternalAppProposalRecord)
 			// The installed app's own spec — same reason again, but for the
 			// DECLARATION rather than the results. Without it every read

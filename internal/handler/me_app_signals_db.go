@@ -128,6 +128,9 @@ func InternalAppSignalsClaim(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "user_sub and a valid app are required")
 		return
 	}
+	if !allowRunAppWrite(c, req.UserSub, req.App) {
+		return
+	}
 	out := []claimedAppSignal{}
 	stale := time.Now().Add(-appSignalStaleClaim)
 	err := retryTxConflict("[app-signals] claim", func() error {
@@ -187,6 +190,9 @@ func InternalAppSignalsAck(c *gin.Context) {
 	var req appSignalAckReq
 	if err := c.ShouldBindJSON(&req); err != nil || req.UserSub == "" {
 		fail(c, http.StatusBadRequest, 1400, "user_sub and ids are required")
+		return
+	}
+	if !allowRunWrite(c, req.UserSub) {
 		return
 	}
 	ids := make([]string, 0, len(req.IDs))

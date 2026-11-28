@@ -103,6 +103,9 @@ func InternalUsageCharge(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 1400, "invalid body: "+err.Error())
 		return
 	}
+	if !allowRunWrite(c, body.UserSub) || !runChargeAllowed(c, body) {
+		return
+	}
 	res, err := common.CheckAndCharge(common.DB, common.ChargeReq{
 		UserSub:               body.UserSub,
 		Kind:                  body.Kind,

@@ -174,7 +174,9 @@ func measureScope(inst measureInstrument, sub string) string {
 
 // mlsysDefaultImages: tag=ref pairs. MEASURE_MLSYS_IMAGES replaces the list
 // (comma separated) when a new image is pinned, without a release.
-const mlsysDefaultImages = "v0.1.3=ghcr.io/mlsys-io/hello-mlsys-agent@sha256:3c9e1fbb0b4c7efbaed8cae4411342e2bb6d12ebd0b3308766ea224679f599e2"
+const mlsysDefaultImages = "v0.1.3=ghcr.io/mlsys-io/hello-mlsys-agent@sha256:3c9e1fbb0b4c7efbaed8cae4411342e2bb6d12ebd0b3308766ea224679f599e2," +
+	// v0.1.4: evaluate accepts resamples (fresh prompt mixes from the development trace).
+	"v0.1.4=ghcr.io/mlsys-io/hello-mlsys-agent@sha256:c0fe3c0f9b379553be127a40cb1b44bf7fdb1519fd7558f6905d7173481f0e14"
 
 var mlsysJobs = map[string]bool{"evaluate": true}
 
